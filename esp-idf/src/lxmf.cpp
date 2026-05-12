@@ -33,6 +33,16 @@
 
 static const char* TAG = "lxmf";
 
+/* Cached `s.lxmf.debug.only_local` — when true, the per-announce
+ * directory dbg() lines (everyone else's announces, not us) are
+ * demoted to verb() so they only show at verbose. dbg-level then
+ * surfaces just traffic that affects this node directly (sends,
+ * receives, cmd processing, etc.). Live-mirrored from storage via
+ * subscription, so writes take effect immediately. */
+static bool s_dbg_only_local = false;
+
+#define DBG_REMOTE(...) do { if (s_dbg_only_local) verb(__VA_ARGS__); else dbg(__VA_ARGS__); } while (0)
+
 /* ─────────────── constants ─────────────── */
 
 #define LXMF_VERSION 1
@@ -659,9 +669,17 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
 }
 
 /* Build the full LXM wire bytes: dest || src || sig || msgpack.
- * `identity_key` is the storage path of the sender's private key (used
- * by rnsdSign + rnsdIdentityHash). Returns empty on failure. */
+ *
+ * `src_hash` is the sender's *delivery destination hash* (not the
+ * identity hash). The recipient does `Identity.recall(src_hash)` to
+ * look up the sender for signature verification, and that map is
+ * keyed by destination hash — passing the identity hash would make
+ * the recipient see SOURCE_UNKNOWN and reject our signature.
+ *
+ * `identity_key` is the storage path of the sender's private key used
+ * by rnsdSign. Returns empty on failure. */
 static std::vector<uint8_t> lxmPackWire(const char* identity_key,
+                                         const uint8_t src_hash[LXMF_DEST_HASH_LEN],
                                          const uint8_t dest_hash[LXMF_DEST_HASH_LEN],
                                          uint64_t ts_ms,
                                          std::string_view title,
@@ -670,14 +688,11 @@ static std::vector<uint8_t> lxmPackWire(const char* identity_key,
 {
     std::vector<uint8_t> packed = lxmPackPayload(ts_ms, title, content, fields);
 
-    uint8_t src_hash[RNSD_IDENT_HASH_LEN];
-    if (!rnsdIdentityHash(identity_key, src_hash)) return {};
-
     /* signable = dest || src || packed || SHA-256(dest || src || packed) */
     std::vector<uint8_t> signable;
     signable.reserve(LXMF_DEST_HASH_LEN * 2 + packed.size() + RNSD_HASH_LEN);
     signable.insert(signable.end(), dest_hash, dest_hash + LXMF_DEST_HASH_LEN);
-    signable.insert(signable.end(), src_hash,  src_hash  + RNSD_IDENT_HASH_LEN);
+    signable.insert(signable.end(), src_hash,  src_hash  + LXMF_DEST_HASH_LEN);
     signable.insert(signable.end(), packed.begin(), packed.end());
     uint8_t hash[RNSD_HASH_LEN];
     rnsdSha256(signable.data(), signable.size(), hash);
@@ -690,7 +705,7 @@ static std::vector<uint8_t> lxmPackWire(const char* identity_key,
     std::vector<uint8_t> wire;
     wire.reserve(LXMF_OVERHEAD + packed.size());
     wire.insert(wire.end(), dest_hash, dest_hash + LXMF_DEST_HASH_LEN);
-    wire.insert(wire.end(), src_hash,  src_hash  + RNSD_IDENT_HASH_LEN);
+    wire.insert(wire.end(), src_hash,  src_hash  + LXMF_DEST_HASH_LEN);
     wire.insert(wire.end(), sig,       sig       + RNSD_SIG_LEN);
     wire.insert(wire.end(), packed.begin(), packed.end());
     return wire;
@@ -913,7 +928,7 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
                 std::snprintf(old_key, sizeof(old_key),
                               "lxmf.directory.%s", oldest.c_str());
                 storageUnset(old_key);
-                dbg("directory: evicted oldest %s (cap=%d)",
+                DBG_REMOTE("directory: evicted oldest %s (cap=%d)",
                     oldest.c_str(), max_dir);
             }
         }
@@ -927,7 +942,7 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     e.name    = info.name;         /* may be empty */
     storageSet(key, buildDirValue(e).c_str());
 
-    dbg("directory: %s name=\"%s\" cost=%d hops=%d",
+    DBG_REMOTE("directory: %s name=\"%s\" cost=%d hops=%d",
         dh_hex.c_str(), sanitizeForLog(info.name).c_str(),
         info.stamp_cost, hops);
 }
@@ -966,15 +981,10 @@ static bool connectMailbox(lxmf_id_t& id)
 {
     if (id.handle >= 0) return true;
 
-    rnsd_mailbox_connect_t req = {};
-    safeStrncpy(req.aspect, "lxmf.delivery", sizeof(req.aspect));
     std::string ikey = secretsPath(id.index, "privkey");
-    safeStrncpy(req.identity_key, ikey.c_str(), sizeof(req.identity_key));
-    req.dest_type = 0;   /* SINGLE */
-
-    int h = itsConnect("rnsd", RNSD_PORT_DEST,
-                       &req, sizeof(req), pdMS_TO_TICKS(2000),
-                       /*ref*/ id.index, onMailboxRecv, onMailboxDisconnect);
+    int h = rnsdDestOpen("lxmf.delivery", ikey.c_str(), /*SINGLE*/ 0,
+                         /*ref*/ id.index,
+                         onMailboxRecv, onMailboxDisconnect);
     if (h < 0) {
         err("id %d: mailbox connect failed", id.index);
         return false;
@@ -1163,7 +1173,13 @@ static void sendAnnounce(lxmf_id_t& id)
                (int)(nowUnixMs() / 1000));
     id.last_announce_tick = xTaskGetTickCount();
     if (id.last_announce_tick == 0) id.last_announce_tick = 1;  /* 0 means "never" */
-    info("id %d: announce sent (%zu B app_data)", id.index, app_data.size());
+    /* Pretty-print the app_data we just built: name + cost (the [b] shape
+     * from parseLxmfAnnounce). rnsd will log the wire contents too, but
+     * showing it here keeps each line self-contained for debugging. */
+    std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
+    int cost = storageGetInt(idPath(id.index, "stamp_cost").c_str(), 16);
+    info("id %d: announce sent name=\"%s\" cost=%d (%zu B app_data)",
+         id.index, sanitizeForLog(name).c_str(), cost, app_data.size());
 }
 
 /* Move a draft from `ready` into the packed/sending pipeline. */
@@ -1206,7 +1222,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
 
     uint64_t ts_ms = nowUnixMs();
     std::vector<uint8_t> wire = lxmPackWire(id.identity_key.c_str(),
-                                             dh, ts_ms, title, content, fields);
+                                             id.dest_hash, dh,
+                                             ts_ms, title, content, fields);
     if (wire.empty()) {
         err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
         storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
@@ -1709,7 +1726,6 @@ static void unsubscribePerIdCmds(int n)
 /* ─────────────── periodic publish ─────────────── */
 
 static TickType_t s_lastPublishTick = 0;
-static TickType_t s_lastSummaryTick = 0;
 #define LXMF_PUBLISH_INTERVAL_MS 1000
 
 /* When non-zero, the absolute tick at which any newly-armed announce
@@ -1760,27 +1776,6 @@ static int dirCount(void)
     s_dir_count_tmp = 0;
     storageForEach("lxmf.directory.", dirCountLeaf);
     return s_dir_count_tmp;
-}
-
-/* One-line info() snapshot of LXMF state. Gated on s.lxmf.log_summary
- * (seconds; 0 disables). Aggregates across all identities. */
-static void logSummary(void)
-{
-    int n_used = 0, n_up = 0;
-    uint32_t sent = 0, recv = 0, pending = 0, failed = 0;
-    for (auto& id : s_ids) {
-        if (!id.used) continue;
-        n_used++;
-        if (id.handle >= 0) n_up++;
-        sent    += id.sent;
-        recv    += id.received;
-        pending += id.pending;
-        failed  += id.failed;
-    }
-    info("ids=%d/%d dir=%d sent=%u recv=%u pending=%u failed=%u%s",
-         n_up, n_used, dirCount(),
-         (unsigned)sent, (unsigned)recv, (unsigned)pending, (unsigned)failed,
-         s_announce_sub_handle < 0 ? " (announce_sub=down)" : "");
 }
 
 /* ─────────────── bootstrap ─────────────── */
@@ -2404,6 +2399,13 @@ static void lxmfTaskMain(void*)
      * transition — narrow single-key subscription, no filtering). */
     storageSubscribeChanges("rnsd.iface_event_seq", onRnsdIfaceEvent);
 
+    /* Live-mirror s.lxmf.debug.only_local into the cached bool so
+     * toggling at runtime takes effect on the next directory write. */
+    storageSubscribeChanges("s.lxmf.debug.only_local",
+        [](const char* /*key*/, const char* val) {
+            s_dbg_only_local = val && val[0] && std::atoi(val) != 0;
+        });
+
     /* Bootstrap. rnsd should be up by the time the first events arrive;
      * we'll just block in itsConnect if it's not. loadAllIdentities
      * calls loadIdentityForSlot which installs per-id cmd subs. We do
@@ -2462,23 +2464,19 @@ static void lxmfTaskMain(void*)
              * mailbox comes back). */
             int announce_s = storageGetInt("s.lxmf.announce_interval_s", 1800);
             if (announce_s > 0) {
-                TickType_t threshold = pdMS_TO_TICKS(announce_s * 1000);
+                int32_t threshold = (int32_t)pdMS_TO_TICKS(announce_s * 1000);
                 for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
                     lxmf_id_t& id = s_ids[n];
                     if (!id.used || id.handle < 0) continue;
                     if (id.last_announce_tick == 0) continue;   /* never — wait for trigger */
-                    if (now - id.last_announce_tick >= threshold)
+                    /* Signed compare: sendAnnounce() updates
+                     * last_announce_tick via a fresh xTaskGetTickCount()
+                     * after the rnsd mailbox call, which can land
+                     * *past* the outer `now`. Unsigned compare would
+                     * underflow and re-fire immediately. */
+                    if ((int32_t)(now - id.last_announce_tick) >= threshold)
                         sendAnnounce(id);
                 }
-            }
-
-            /* Periodic info() summary line. Interval is read live from
-             * storage; 0 disables. */
-            int summary_s = storageGetInt("s.lxmf.log_summary", 60);
-            if (summary_s > 0 &&
-                now - s_lastSummaryTick >= pdMS_TO_TICKS(summary_s * 1000)) {
-                logSummary();
-                s_lastSummaryTick = now;
             }
 
             s_lastPublishTick = now;
@@ -2494,12 +2492,14 @@ void lxmfInit(void)
         storageDefault("s.lxmf.enable",                 1);
         storageDefault("s.lxmf.enforce_stamps",         0);
         storageDefault("s.lxmf.auto_ticket",            1);
-        storageDefault("s.lxmf.log_summary",            60);    /* seconds; 0 disables */
         storageDefault("s.lxmf.announce_interval_s",    1800);  /* periodic re-announce; 0 disables */
         storageDefault("s.lxmf.max_dir_size",           2048);  /* directory cap; 0 disables eviction */
+        storageDefault("s.lxmf.debug.only_local",       0);     /* demote directory dbg lines to verb */
         storageSet("s.lxmf.version", LXMF_VERSION);
         storageEnd();
     }
+
+    s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;
 
     cliRegisterCmd("lxmf", cliLxmf);
 
