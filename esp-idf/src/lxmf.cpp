@@ -97,6 +97,12 @@ struct outbound_t {
     int         link_handle;
     std::string link_tag;
     uint32_t    direct_deadline_s;  /* unix s; fail if not active by then */
+
+    /* Phase F: this DIRECT send is a Resource (wire > one Link packet).
+     * Settled by the RNSD_LINK_RESOURCE_OUTBOUND_DONE aux (or
+     * rnsd.links.<tag>.resource.state) — NOT by link "active", because
+     * the Link must stay up for the whole transfer. */
+    bool        is_resource;
 };
 
 struct lxmf_id_t {
@@ -1281,6 +1287,7 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
     o->link_handle = -1;
     o->link_tag.clear();
     o->direct_deadline_s = 0;
+    o->is_resource = false;
 
     /* Persist firmware-owned fields. */
     storageBegin();
@@ -1311,18 +1318,46 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
             storageSet(msgPath(id.index, mid, "last_error").c_str(), "link open failed");
             return;
         }
-        /* Full wire, one Link packet (no strip — DIRECT keeps dest16). */
-        if (itsSend(lh, wire.data(), wire.size(), 0) == 0) {
-            rnsdLinkTeardown(tag);
-            o->used = false;
-            storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-            storageSet(msgPath(id.index, mid, "last_error").c_str(), "link send dropped");
-            return;
+        /* One Link packet carries ~Link ENCRYPTED_MDU of content; a
+         * larger LXM must ride a Resource (link.md §9 / upstream
+         * LXMessage). Conservative threshold well under Link MDU. */
+        constexpr size_t LXMF_LINK_PACKET_MAX = 360;
+        bool as_resource = wire.size() > LXMF_LINK_PACKET_MAX;
+        if (as_resource) {
+            void* rbuf = malloc(wire.size());
+            if (!rbuf) {
+                rnsdLinkTeardown(tag);
+                o->used = false;
+                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, mid, "last_error").c_str(), "resource malloc failed");
+                return;
+            }
+            memcpy(rbuf, wire.data(), wire.size());
+            /* rnsd takes ownership of rbuf and frees it after the engine
+             * copies it. opaque_id = send_id for OUTBOUND_DONE matching. */
+            if (!rnsdLinkSendResource(tag, rbuf, wire.size(), o->send_id)) {
+                rnsdLinkTeardown(tag);
+                o->used = false;
+                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, mid, "last_error").c_str(), "resource send failed");
+                return;
+            }
+        } else {
+            /* Full wire, one Link packet (no strip — DIRECT keeps dest16). */
+            if (itsSend(lh, wire.data(), wire.size(), 0) == 0) {
+                rnsdLinkTeardown(tag);
+                o->used = false;
+                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, mid, "last_error").c_str(), "link send dropped");
+                return;
+            }
         }
         o->direct            = true;
+        o->is_resource       = as_resource;
         o->link_handle       = lh;
         o->link_tag          = tag;
-        o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000) + 45;
+        o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000)
+                             + (as_resource ? 120 : 45);
         storageSet(msgPath(id.index, mid, "method").c_str(),     "direct");
         storageSet(msgPath(id.index, mid, "stage").c_str(),      "sending");
         storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
@@ -1687,6 +1722,82 @@ static void onLinkInboxDisconnect(int ref)
     s.handle = -1;
 }
 
+/* ─────────────── Phase F: Resource aux (rnsd → lxmf, §9.1) ───────────────
+ *
+ * rnsd sends one rnsd_link_resource_done_t aux frame to
+ * LXMF_LINK_RESOURCE_AUX_PORT when a Resource transfer concludes:
+ *   INBOUND_DONE  — buf holds the reassembled LXM wire; we own it and
+ *                   must rnsdResourceRelease() it.
+ *   OUTBOUND_DONE — our big DIRECT send was proven; settle the outbox.
+ *   FAILED        — transfer aborted (buf null). */
+static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
+{
+    if (len < sizeof(rnsd_link_resource_done_t)) {
+        warn("resaux: short frame %zu", len);
+        return;
+    }
+    rnsd_link_resource_done_t d;
+    std::memcpy(&d, data, sizeof(d));
+
+    if (d.opcode == RNSD_LINK_RESOURCE_INBOUND_DONE) {
+        int idx = -1;
+        for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+            if (s_ids[n].used &&
+                std::memcmp(s_ids[n].dest_hash, d.local_dest_hash,
+                            LXMF_DEST_HASH_LEN) == 0) { idx = n; break; }
+        }
+        if (idx < 0) {
+            warn("resaux: inbound resource for unknown dest %s — dropping",
+                 bytesToHex(d.local_dest_hash, LXMF_DEST_HASH_LEN).c_str());
+        } else if (d.buf && d.len > 0) {
+            info("id %d: inbound resource %uB → onInboundLxm",
+                 idx, (unsigned)d.len);
+            onInboundLxm(s_ids[idx], (const uint8_t*)d.buf, d.len);
+        }
+        rnsdResourceRelease(d.buf);   /* we own it; release even if dropped */
+        return;
+    }
+
+    if (d.opcode == RNSD_LINK_RESOURCE_OUTBOUND_DONE ||
+        d.opcode == RNSD_LINK_RESOURCE_FAILED) {
+        bool ok = (d.opcode == RNSD_LINK_RESOURCE_OUTBOUND_DONE);
+        for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+            lxmf_id_t& id = s_ids[n];
+            if (!id.used) continue;
+            for (auto& o : id.outboxes) {
+                if (!o.used || !o.is_resource || o.send_id != d.opaque_id)
+                    continue;
+                const std::string& mid = o.msg_key;
+                if (ok) {
+                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "sent");
+                    storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+                    id.sent++;
+                    info("id %d: DIRECT resource proven mid=%s tag=%s",
+                         id.index, mid.c_str(), o.link_tag.c_str());
+                } else {
+                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+                    storageSet(msgPath(id.index, mid, "last_error").c_str(),
+                               "resource transfer failed");
+                    id.failed++;
+                    warn("id %d: DIRECT resource failed mid=%s tag=%s",
+                         id.index, mid.c_str(), o.link_tag.c_str());
+                }
+                if (id.pending > 0) id.pending--;
+                rnsdLinkTeardown(o.link_tag.c_str());
+                o.used        = false;
+                o.direct      = false;
+                o.is_resource = false;
+                return;
+            }
+        }
+        /* No outbox match → an inbound transfer FAILED; nothing to free
+         * (rnsd already released its buffer on the failure path). */
+        return;
+    }
+
+    warn("resaux: unknown opcode %u", d.opcode);
+}
+
 /* Resolve outbound DIRECT sends from the 1 Hz tick by watching the
  * rnsd-published `rnsd.links.<tag>.*` state (RNSD_PORT_LINK carries no
  * OUT_RESULT). `tx_packets>=1` means rnsd's pre-active outbox flushed
@@ -1709,6 +1820,42 @@ static void resolveDirectSends(void)
 
             bool done = false, ok = false;
             std::string err;
+
+            if (o.is_resource) {
+                /* Resource sends settle on the transfer outcome, NOT on
+                 * link "active" — the Link must stay up for the whole
+                 * transfer. The OUTBOUND_DONE aux (onResourceAux) is the
+                 * fast path; this is the timeout/teardown fallback. */
+                std::string rst = storageGetStr((base + ".resource.state").c_str(), "");
+                if (rst == "sent") { done = true; ok = true; }
+                else if (rst == "failed" || st == "failed" || st == "closed") {
+                    done = true;
+                    err  = storageGetStr((base + ".last_error").c_str(),
+                                         "resource failed");
+                } else if (now_s >= o.direct_deadline_s) {
+                    done = true; err = "resource timeout";
+                }
+                if (!done) continue;
+                if (ok) {
+                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "sent");
+                    storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+                    id.sent++;
+                    info("id %d: DIRECT resource sent mid=%s tag=%s",
+                         id.index, mid.c_str(), o.link_tag.c_str());
+                } else {
+                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+                    storageSet(msgPath(id.index, mid, "last_error").c_str(), err.c_str());
+                    id.failed++;
+                    warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
+                         id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
+                }
+                if (id.pending > 0) id.pending--;
+                rnsdLinkTeardown(o.link_tag.c_str());
+                o.used   = false;
+                o.direct = false;
+                continue;
+            }
+
             if (st == "active" || tx >= 1) {
                 done = true; ok = true;
             } else if (st == "failed") {
@@ -2623,6 +2770,13 @@ static void lxmfTaskMain(void*)
     itsServerOnConnect(LXMF_LINK_INBOX_PORT,    onLinkInboxConnect);
     itsServerOnDisconnect(LXMF_LINK_INBOX_PORT, onLinkInboxDisconnect);
     itsServerOnRecv(LXMF_LINK_INBOX_PORT,       onLinkInboxRecv);
+
+    /* Phase F: resource hand-off is a one-shot aux frame from rnsd
+     * (not a connection) — open the port aux-only and register the
+     * handler. See docs/plans/phase-f-resource-port.md / link.md §9. */
+    itsServerPortOpen(LXMF_LINK_RESOURCE_AUX_PORT, /*packetBased=*/false,
+                      /*maxHandles=*/1, /*toSize=*/0, /*fromSize=*/0);
+    itsOnAux(LXMF_LINK_RESOURCE_AUX_PORT, onResourceAux);
 
     /* itsClient initialisation — one connection per identity plus the
      * shared announce-fanout subscription. */
