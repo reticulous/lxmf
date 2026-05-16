@@ -2644,6 +2644,28 @@ static void cliSend(const char* rest)
     if (!*sp) { cliPrintf("send: empty message\n"); return; }
     std::string text = sp;
 
+    /* Test-rig affordance (mirrors `rnsd link`/`clink`): `@randN`
+     * substitutes an N-byte incompressible printable body so a
+     * >74-part outbound Resource can be exercised without typing it
+     * (device CLI line buffer is 128 B). See docs/plans/link.md §F. */
+    if (text.size() > 5 && text.compare(0, 5, "@rand") == 0) {
+        char* end = nullptr;
+        long n = std::strtol(text.c_str() + 5, &end, 10);
+        if (end && *end == '\0' && n > 0 && n <= 262144) {
+            static const char alphabet[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            std::string body;
+            body.resize((size_t)n);
+            for (size_t i = 0; i < (size_t)n; ++i)
+                body[i] = alphabet[cheapRand() % 62];
+            text.swap(body);
+            cliPrintf("send: generated %ld-byte random body\n", n);
+        } else {
+            cliPrintf("send: bad @rand size (1..262144)\n");
+            return;
+        }
+    }
+
     std::string peer_hex = cliResolvePeer(peer_arg);
     if (peer_hex.empty()) return;
 
