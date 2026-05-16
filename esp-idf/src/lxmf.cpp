@@ -88,6 +88,15 @@ struct outbound_t {
     bool        used;
     uint16_t    send_id;
     std::string msg_key;        /* "o_<...>" — the local outbound key under id.<n>.msgs */
+
+    /* Phase E DIRECT: when this send went out over a Link instead of
+     * opportunistic. link_handle is the RNSD_PORT_LINK ITS handle;
+     * link_tag keys rnsd.links.<tag>.* which the 1 Hz tick polls for
+     * the active/failed transition (rnsd has no OUT_RESULT on links). */
+    bool        direct;
+    int         link_handle;
+    std::string link_tag;
+    uint32_t    direct_deadline_s;  /* unix s; fail if not active by then */
 };
 
 struct lxmf_id_t {
@@ -187,7 +196,7 @@ static std::string bytesToHex(const uint8_t* data, size_t n)
     return out;
 }
 
-static bool hexToBytes(const char* hex, size_t hex_len,
+[[maybe_unused]] static bool hexToBytes(const char* hex, size_t hex_len,
                        uint8_t* out, size_t out_len)
 {
     if (hex_len != out_len * 2) return false;
@@ -992,6 +1001,13 @@ static bool connectMailbox(lxmf_id_t& id)
     id.handle = h;
     info("id %d: mailbox connected (handle=%d)", id.index, h);
 
+    /* Phase E: accept inbound DIRECT Links to this delivery dest. rnsd
+     * flips accepts_links(true) and back-connects to LXMF_LINK_INBOX_PORT
+     * with an rnsd_link_incoming_t per accepted Link. Without this,
+     * real-world LXMF peers (default DIRECT) can't deliver to us. */
+    if (!rnsdDestListenLinks(h, LXMF_LINK_INBOX_PORT))
+        warn("id %d: rnsdDestListenLinks failed", id.index);
+
     storageSet(idEphPath(id.index, "up").c_str(), 1);
     storageSet(idEphPath(id.index, "dest_hash").c_str(),
                bytesToHex(id.dest_hash, LXMF_DEST_HASH_LEN).c_str());
@@ -1043,6 +1059,7 @@ static bool createIdentityForSlot(int n, const std::string& display_name)
     storageSet    (idPath(n, "display_name").c_str(), display_name.c_str());
     storageDefault(idPath(n, "enabled").c_str(),      1);
     storageDefault(idPath(n, "stamp_cost").c_str(),   16);
+    storageDefault(idPath(n, "default_method").c_str(), "auto");  /* §8.2 */
     storageEnd();
 
     subscribePerIdCmds(n);
@@ -1205,16 +1222,31 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
     std::string content = storageGetStr(msgPath(id.index, mid, "content").c_str(), "");
     std::string thread  = storageGetStr(msgPath(id.index, mid, "thread").c_str(),  "");
 
-    /* 4a: refuse drafts whose packed payload alone wouldn't fit the
-     * opportunistic single-packet budget. Plan §10. We approximate the
-     * encoded size with the raw byte counts plus a small msgpack
-     * overhead allowance. */
-    if (title.size() + content.size() + 32 > LXMF_OPP_CONTENT_BUDGET) {
-        warn("id %d: msg %s exceeds opportunistic budget (%zu B)",
-             id.index, mid.c_str(), title.size() + content.size());
-        storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "too large for opportunistic");
-        return;
+    /* Phase E §8.2: delivery-method selection. Resolution order is
+     * per-message override → per-identity default → "auto". "auto"
+     * picks opportunistic when the payload fits a single RNS packet,
+     * else DIRECT (a Reticulum Link). Explicit "opportunistic" still
+     * hard-fails oversize (unchanged 4a behaviour); explicit "direct"
+     * always uses a Link. */
+    bool oversize = (title.size() + content.size() + 32 > LXMF_OPP_CONTENT_BUDGET);
+    std::string method = storageGetStr(msgPath(id.index, mid, "method").c_str(), "");
+    if (method.empty())
+        method = storageGetStr(idPath(id.index, "default_method").c_str(), "auto");
+    bool use_direct;
+    if (method == "direct") {
+        use_direct = true;
+    } else if (method == "opportunistic") {
+        if (oversize) {
+            warn("id %d: msg %s exceeds opportunistic budget (%zu B)",
+                 id.index, mid.c_str(), title.size() + content.size());
+            storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
+            storageSet(msgPath(id.index, mid, "last_error").c_str(),
+                       "too large for opportunistic");
+            return;
+        }
+        use_direct = false;
+    } else {                                  /* "auto" (default) */
+        use_direct = oversize;
     }
 
     LxmFields fields;
@@ -1245,6 +1277,10 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
     o->send_id = id.next_send_id++;
     if (id.next_send_id == 0) id.next_send_id = 1;
     o->msg_key = mid;
+    o->direct  = false;            /* reset stale DIRECT state on reuse */
+    o->link_handle = -1;
+    o->link_tag.clear();
+    o->direct_deadline_s = 0;
 
     /* Persist firmware-owned fields. */
     storageBegin();
@@ -1254,6 +1290,47 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
     storageSet(msgPath(id.index, mid, "stage").c_str(),      "queued");
     storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
     storageEnd();
+
+    if (use_direct) {
+        /* DIRECT: open a Link to the peer's lxmf.delivery and send the
+         * *full* LXM wire (incl. the 16-byte dest hash) as one Link
+         * packet — upstream `LXMessage.__as_packet` DIRECT sends
+         * `self.packed` whole; only OPPORTUNISTIC strips dest16
+         * (LXMessage.py:630-632). rnsd's pre-active one-packet outbox
+         * buffers it and flushes on establishment; the 1 Hz tick
+         * watches rnsd.links.<tag>.state (RNSD_PORT_LINK has no
+         * OUT_RESULT). */
+        char tag[24];
+        std::snprintf(tag, sizeof(tag), "lxmf.id%d.%.8s", id.index, mid.c_str());
+        int lh = rnsdLinkOpen(dh, "lxmf.delivery", id.identity_key.c_str(),
+                              tag, /*path_timeout_ms=*/0, /*ref=*/id.index,
+                              nullptr, nullptr);
+        if (lh < 0) {
+            o->used = false;
+            storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+            storageSet(msgPath(id.index, mid, "last_error").c_str(), "link open failed");
+            return;
+        }
+        /* Full wire, one Link packet (no strip — DIRECT keeps dest16). */
+        if (itsSend(lh, wire.data(), wire.size(), 0) == 0) {
+            rnsdLinkTeardown(tag);
+            o->used = false;
+            storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+            storageSet(msgPath(id.index, mid, "last_error").c_str(), "link send dropped");
+            return;
+        }
+        o->direct            = true;
+        o->link_handle       = lh;
+        o->link_tag          = tag;
+        o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000) + 45;
+        storageSet(msgPath(id.index, mid, "method").c_str(),     "direct");
+        storageSet(msgPath(id.index, mid, "stage").c_str(),      "sending");
+        storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+        id.pending++;
+        info("id %d: send DIRECT mid=%s peer=%s tag=%s wire=%zuB",
+             id.index, mid.c_str(), peer_hex.c_str(), tag, wire.size());
+        return;
+    }
 
     /* OUT_PACKET frame: op | send_id(2) | lxm_wire_bytes */
     std::vector<uint8_t> frame;
@@ -1519,6 +1596,155 @@ static void onMailboxDisconnect(int handle)
     /* Reconnect attempted on the next 1 Hz publish tick. */
 }
 
+/* ─────────────── Phase E: inbound DIRECT (Link → onInboundLxm) ───────────────
+ *
+ * docs/plans/link.md §8.1. lxmf registers for inbound Links on each
+ * lxmf.delivery destination via rnsdDestListenLinks(handle,
+ * LXMF_LINK_INBOX_PORT). rnsd accepts the Link and back-connects here
+ * with an rnsd_link_incoming_t. The link is a packet-mode stream of
+ * LXMF wire bytes with the 16-byte destination prefix stripped (the
+ * Link *is* the destination) — we prepend our delivery dest hash and
+ * run the exact same onInboundLxm pipeline as the opportunistic path.
+ * This is what lets real-world LXMF peers (which default to DIRECT)
+ * deliver to us — see plan §1. */
+
+#define LXMF_MAX_INLINKS 8
+struct inlink_t {
+    bool used;
+    int  handle;     /* ITS handle of the forwarded Link */
+    int  id_index;   /* which s_ids[] hosts the destination */
+};
+static inlink_t s_inlinks[LXMF_MAX_INLINKS];
+
+static inlink_t* inlinkByHandle(int handle)
+{
+    for (auto& s : s_inlinks)
+        if (s.used && s.handle == handle) return &s;
+    return nullptr;
+}
+
+static int onLinkInboxConnect(int handle, const void* data, size_t len)
+{
+    if (len < sizeof(rnsd_link_incoming_t)) {
+        warn("inlink: short connect payload %zu", len);
+        return -1;
+    }
+    rnsd_link_incoming_t pl;
+    std::memcpy(&pl, data, sizeof(pl));
+    pl.tag[sizeof(pl.tag) - 1] = '\0';
+
+    /* Map to the identity whose delivery dest the Link landed on. */
+    int idx = -1;
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        if (s_ids[n].used &&
+            std::memcmp(s_ids[n].dest_hash, pl.local_dest_hash,
+                        LXMF_DEST_HASH_LEN) == 0) { idx = n; break; }
+    }
+    if (idx < 0) {
+        warn("inlink: no identity for local dest %s",
+             bytesToHex(pl.local_dest_hash, LXMF_DEST_HASH_LEN).c_str());
+        return -1;
+    }
+    inlink_t* slot = nullptr;
+    for (auto& s : s_inlinks) if (!s.used) { slot = &s; break; }
+    if (!slot) { warn("inlink: table full"); return -1; }
+    slot->used     = true;
+    slot->handle   = handle;
+    slot->id_index = idx;
+    info("id %d: inbound Link %s (tag=%s) from %s",
+         idx, bytesToHex(pl.link_id, 16).c_str(), pl.tag,
+         bytesToHex(pl.remote_identity_hash, 16).c_str());
+    return (int)(slot - s_inlinks);
+}
+
+static void onLinkInboxRecv(int handle, size_t /*bytesAvail*/)
+{
+    inlink_t* s = inlinkByHandle(handle);
+    if (!s) return;
+    lxmf_id_t& id = s_ids[s->id_index];
+
+    static uint8_t buf[2048];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (n == 0) return;
+
+    /* Unlike opportunistic (which strips dest16 on the wire and the
+     * receiver prepends it), a DIRECT Link packet carries the *full*
+     * LXM wire including the 16-byte destination hash — upstream
+     * `LXMessage.__as_packet` DIRECT sends `self.packed` whole and
+     * `LXMRouter.delivery_packet` does `lxmf_data = data` for LINK with
+     * no prepend (LXMRouter.py:1831-1833). So hand it straight to the
+     * shared pipeline; onInboundLxm validates dh == our delivery dest. */
+    onInboundLxm(id, buf, n);
+}
+
+static void onLinkInboxDisconnect(int ref)
+{
+    if (ref < 0 || ref >= LXMF_MAX_INLINKS) return;
+    inlink_t& s = s_inlinks[ref];
+    if (!s.used) return;
+    verb("id %d: inbound Link forward closed", s.id_index);
+    s.used = false;
+    s.handle = -1;
+}
+
+/* Resolve outbound DIRECT sends from the 1 Hz tick by watching the
+ * rnsd-published `rnsd.links.<tag>.*` state (RNSD_PORT_LINK carries no
+ * OUT_RESULT). `tx_packets>=1` means rnsd's pre-active outbox flushed
+ * our one LXM packet onto the established Link → treat as "sent"
+ * (egress acknowledged, mirrors opportunistic SENT semantics; true
+ * proof-on-delivery would need a Phase-C feedback channel — follow-up).
+ * A `failed` state, or no resolution by the slot's deadline, fails it. */
+static void resolveDirectSends(void)
+{
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        lxmf_id_t& id = s_ids[n];
+        if (!id.used) continue;
+        for (auto& o : id.outboxes) {
+            if (!o.used || !o.direct) continue;
+            const std::string& mid = o.msg_key;
+            std::string base = "rnsd.links." + o.link_tag;
+            std::string st   = storageGetStr((base + ".state").c_str(), "");
+            int tx           = storageGetInt((base + ".tx_packets").c_str(), 0);
+
+            bool done = false, ok = false;
+            std::string err;
+            if (st == "active" || tx >= 1) {
+                done = true; ok = true;
+            } else if (st == "failed") {
+                done = true;
+                err  = storageGetStr((base + ".last_error").c_str(), "link failed");
+            } else if (st == "closed") {
+                done = true; ok = (tx >= 1);
+                if (!ok) err = "link closed before send";
+            } else if (st.empty() && now_s >= o.direct_deadline_s) {
+                done = true; err = "direct timeout";
+            } else if (now_s >= o.direct_deadline_s + 15) {
+                done = true; err = "direct timeout";   /* stuck establishing */
+            }
+            if (!done) continue;
+
+            if (ok) {
+                storageSet(msgPath(id.index, mid, "stage").c_str(),      "sent");
+                storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+                id.sent++;
+                info("id %d: DIRECT sent mid=%s tag=%s",
+                     id.index, mid.c_str(), o.link_tag.c_str());
+            } else {
+                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, mid, "last_error").c_str(), err.c_str());
+                id.failed++;
+                warn("id %d: DIRECT failed mid=%s tag=%s (%s)",
+                     id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
+            }
+            if (id.pending > 0) id.pending--;
+            rnsdLinkTeardown(o.link_tag.c_str());
+            o.used   = false;
+            o.direct = false;
+        }
+    }
+}
+
 /* ─────────────── command processing (self-clearing keys) ─────────────── */
 
 /* Storage subscriptions are narrow by design: `lxmf.cmd.` for identity-
@@ -1622,6 +1848,7 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                         storageDefault(idPath(n, "enabled").c_str(),      1);
                         storageDefault(idPath(n, "display_name").c_str(), "");
                         storageDefault(idPath(n, "stamp_cost").c_str(),   16);
+                        storageDefault(idPath(n, "default_method").c_str(), "auto");
                         storageEnd();
                         connectMailbox(s_ids[n]);
                     }
@@ -1771,7 +1998,7 @@ static void dirCountLeaf(const char* key, const char* /*val*/)
     if (std::strchr(tail, '.')) return;
     s_dir_count_tmp++;
 }
-static int dirCount(void)
+[[maybe_unused]] static int dirCount(void)
 {
     s_dir_count_tmp = 0;
     storageForEach("lxmf.directory.", dirCountLeaf);
@@ -2385,6 +2612,18 @@ static void lxmfTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
+    /* lxmf is both an ITS client (RNSD_PORT_DEST / RNSD_PORT_LINK /
+     * announce-fanout connects) and — Phase E — a server hosting
+     * LXMF_LINK_INBOX_PORT for rnsd's inbound-Link back-connects.
+     * itsServerInit sets up the shared inbox; itsClientInit reuses it. */
+    if (!itsServerInit()) err("lxmf itsServerInit failed");
+    itsServerPortOpen(LXMF_LINK_INBOX_PORT, /*packetBased=*/true,
+                      /*maxHandles=*/LXMF_MAX_INLINKS,
+                      /*toSize=*/4096, /*fromSize=*/4096);
+    itsServerOnConnect(LXMF_LINK_INBOX_PORT,    onLinkInboxConnect);
+    itsServerOnDisconnect(LXMF_LINK_INBOX_PORT, onLinkInboxDisconnect);
+    itsServerOnRecv(LXMF_LINK_INBOX_PORT,       onLinkInboxRecv);
+
     /* itsClient initialisation — one connection per identity plus the
      * shared announce-fanout subscription. */
     itsClientInit(LXMF_MAX_IDENTITIES + 1);
@@ -2436,6 +2675,7 @@ static void lxmfTaskMain(void*)
         TickType_t now = xTaskGetTickCount();
         if (now - s_lastPublishTick >= pdMS_TO_TICKS(LXMF_PUBLISH_INTERVAL_MS)) {
             publishStats();
+            resolveDirectSends();   /* Phase E: settle outbound DIRECT */
             /* Reconnect anything that dropped since the last tick. */
             for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
                 lxmf_id_t& id = s_ids[n];
