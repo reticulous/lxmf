@@ -87,7 +87,8 @@ enum : int {
 struct outbound_t {
     bool        used;
     uint16_t    send_id;
-    std::string msg_key;        /* "o_<...>" — the local outbound key under id.<n>.msgs */
+    std::string peer;           /* 32-hex destination — the conversation subtree */
+    std::string msg_key;        /* "o_<...>" — the local outbound key under id.<n>.msgs.<peer> */
 
     /* Phase E DIRECT: when this send went out over a Link instead of
      * opportunistic. link_handle is the RNSD_PORT_LINK ITS handle;
@@ -161,10 +162,30 @@ static std::string secretsPath(int n, const char* tail)
     return buf;
 }
 
-static std::string msgPath(int n, const std::string& mid, const char* field)
+/* Per-contact message store: s.lxmf.id.<n>.msgs.<peer>.<key>.<field>.
+ * `peer` is a 32-hex destination (the conversation subtree); `key` is
+ * the real message_id (inbound) or a local o_<ms>_<rand> (outbound).
+ * See docs/plans/lxmf-messages-per-contact.md. */
+static std::string msgPath(int n, const std::string& peer,
+                           const std::string& key, const char* field)
 {
-    char buf[120];
-    snprintf(buf, sizeof(buf), "s.lxmf.id.%d.msgs.%s.%s", n, mid.c_str(), field);
+    char buf[160];
+    snprintf(buf, sizeof(buf), "s.lxmf.id.%d.msgs.%s.%s.%s",
+             n, peer.c_str(), key.c_str(), field);
+    return buf;
+}
+
+/* Prefix of one conversation's subtree (key empty) or one message's
+ * subtree — for storageForEach / storageDeleteTree. */
+static std::string msgPrefix(int n, const std::string& peer,
+                             const std::string& key = "")
+{
+    char buf[160];
+    if (key.empty())
+        snprintf(buf, sizeof(buf), "s.lxmf.id.%d.msgs.%s.", n, peer.c_str());
+    else
+        snprintf(buf, sizeof(buf), "s.lxmf.id.%d.msgs.%s.%s.",
+                 n, peer.c_str(), key.c_str());
     return buf;
 }
 
@@ -1206,27 +1227,25 @@ static void sendAnnounce(lxmf_id_t& id)
 }
 
 /* Move a draft from `ready` into the packed/sending pipeline. */
-static void processReady(lxmf_id_t& id, const std::string& mid)
+static void processReady(lxmf_id_t& id, const std::string& peer_hex,
+                         const std::string& mid)
 {
-    std::string peer_hex = storageGetStr(msgPath(id.index, mid, "peer").c_str(), "");
-    if (peer_hex.size() != 32) {
+    /* peer arrives from the cmd.send sentinel (<peer>/<key>) — it *is*
+     * the record's path segment, so it is authoritative, not read back
+     * from storage. On a malformed peer we still write the failed stage
+     * under whatever path the client used, so the client sees it. */
+    uint8_t dh[16];
+    if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh)) {
         warn("id %d: msg %s ready but peer is malformed (\"%s\")",
              id.index, mid.c_str(), peer_hex.c_str());
-        storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "bad peer");
-        return;
-    }
-    uint8_t dh[16];
-    if (!hexToDestHash(peer_hex, dh)) {
-        warn("id %d: msg %s peer hex invalid", id.index, mid.c_str());
-        storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "bad peer hex");
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "bad peer");
         return;
     }
 
-    std::string title   = storageGetStr(msgPath(id.index, mid, "title").c_str(),   "");
-    std::string content = storageGetStr(msgPath(id.index, mid, "content").c_str(), "");
-    std::string thread  = storageGetStr(msgPath(id.index, mid, "thread").c_str(),  "");
+    std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
+    std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
+    std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
 
     /* Phase E §8.2: delivery-method selection. Resolution order is
      * per-message override → per-identity default → "auto". "auto"
@@ -1235,7 +1254,7 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
      * hard-fails oversize (unchanged 4a behaviour); explicit "direct"
      * always uses a Link. */
     bool oversize = (title.size() + content.size() + 32 > LXMF_OPP_CONTENT_BUDGET);
-    std::string method = storageGetStr(msgPath(id.index, mid, "method").c_str(), "");
+    std::string method = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
     if (method.empty())
         method = storageGetStr(idPath(id.index, "default_method").c_str(), "auto");
     bool use_direct;
@@ -1245,8 +1264,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
         if (oversize) {
             warn("id %d: msg %s exceeds opportunistic budget (%zu B)",
                  id.index, mid.c_str(), title.size() + content.size());
-            storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
-            storageSet(msgPath(id.index, mid, "last_error").c_str(),
+            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
+            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
                        "too large for opportunistic");
             return;
         }
@@ -1264,8 +1283,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
                                              ts_ms, title, content, fields);
     if (wire.empty()) {
         err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
-        storageSet(msgPath(id.index, mid, "stage").c_str(), "failed");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "pack/sign failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "pack/sign failed");
         return;
     }
 
@@ -1275,13 +1294,14 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
     outbound_t* o = outboundAlloc(id);
     if (!o) {
         warn("id %d: outbox full", id.index);
-        storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "outbox full");
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "outbox full");
         return;
     }
     o->used    = true;
     o->send_id = id.next_send_id++;
     if (id.next_send_id == 0) id.next_send_id = 1;
+    o->peer    = peer_hex;
     o->msg_key = mid;
     o->direct  = false;            /* reset stale DIRECT state on reuse */
     o->link_handle = -1;
@@ -1291,11 +1311,11 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
 
     /* Persist firmware-owned fields. */
     storageBegin();
-    storageSet(msgPath(id.index, mid, "wire").c_str(),       bytesToHex(wire.data(), wire.size()).c_str());
-    storageSet(msgPath(id.index, mid, "message_id").c_str(), msg_id_hex.c_str());
-    storageSet(msgPath(id.index, mid, "ts").c_str(),         (int)(ts_ms / 1000));
-    storageSet(msgPath(id.index, mid, "stage").c_str(),      "queued");
-    storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+    storageSet(msgPath(id.index, peer_hex, mid, "wire").c_str(),       bytesToHex(wire.data(), wire.size()).c_str());
+    storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
+    storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
+    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "queued");
+    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
     storageEnd();
 
     if (use_direct) {
@@ -1314,8 +1334,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
                               nullptr, nullptr);
         if (lh < 0) {
             o->used = false;
-            storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-            storageSet(msgPath(id.index, mid, "last_error").c_str(), "link open failed");
+            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "link open failed");
             return;
         }
         /* One Link packet carries ~Link ENCRYPTED_MDU of content; a
@@ -1328,8 +1348,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
             if (!rbuf) {
                 rnsdLinkTeardown(tag);
                 o->used = false;
-                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, mid, "last_error").c_str(), "resource malloc failed");
+                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "resource malloc failed");
                 return;
             }
             memcpy(rbuf, wire.data(), wire.size());
@@ -1338,8 +1358,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
             if (!rnsdLinkSendResource(tag, rbuf, wire.size(), o->send_id)) {
                 rnsdLinkTeardown(tag);
                 o->used = false;
-                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, mid, "last_error").c_str(), "resource send failed");
+                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "resource send failed");
                 return;
             }
         } else {
@@ -1347,8 +1367,8 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
             if (itsSend(lh, wire.data(), wire.size(), 0) == 0) {
                 rnsdLinkTeardown(tag);
                 o->used = false;
-                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, mid, "last_error").c_str(), "link send dropped");
+                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "link send dropped");
                 return;
             }
         }
@@ -1358,9 +1378,9 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
         o->link_tag          = tag;
         o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000)
                              + (as_resource ? 120 : 45);
-        storageSet(msgPath(id.index, mid, "method").c_str(),     "direct");
-        storageSet(msgPath(id.index, mid, "stage").c_str(),      "sending");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+        storageSet(msgPath(id.index, peer_hex, mid, "method").c_str(),     "direct");
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sending");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
         id.pending++;
         info("id %d: send DIRECT mid=%s peer=%s tag=%s wire=%zuB",
              id.index, mid.c_str(), peer_hex.c_str(), tag, wire.size());
@@ -1377,12 +1397,12 @@ static void processReady(lxmf_id_t& id, const std::string& mid)
 
     if (!sendFrame(id, frame.data(), frame.size())) {
         o->used = false;
-        storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-        storageSet(msgPath(id.index, mid, "last_error").c_str(), "OUT_PACKET send dropped");
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "OUT_PACKET send dropped");
         return;
     }
-    storageSet(msgPath(id.index, mid, "stage").c_str(),      "sending");
-    storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sending");
+    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
     id.pending++;
     info("id %d: send mid=%s peer=%s send_id=%u wire=%zuB",
          id.index, mid.c_str(), peer_hex.c_str(),
@@ -1464,6 +1484,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     uint8_t mid_hash[RNSD_HASH_LEN];
     rnsdSha256(mid_input.data(), mid_input.size(), mid_hash);
     std::string mid_hex = bytesToHex(mid_hash, RNSD_HASH_LEN);
+    std::string sh_hex  = bytesToHex(sh, LXMF_DEST_HASH_LEN);  /* peer = conversation subtree */
 
     if (dedupSeen(mid_hex)) {
         verb("id %d: inbound LXM dup (mid=%s)", id.index, mid_hex.c_str());
@@ -1472,7 +1493,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     dedupAdd(mid_hex);
 
     /* Storage existence is the authoritative dedup. */
-    std::string stage_key = msgPath(id.index, mid_hex, "stage");
+    std::string stage_key = msgPath(id.index, sh_hex, mid_hex, "stage");
     if (storageExists(stage_key.c_str())) {
         verb("id %d: inbound LXM already stored (mid=%s)", id.index, mid_hex.c_str());
         return;
@@ -1489,18 +1510,17 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     }
 
     /* Persist. */
-    std::string sh_hex = bytesToHex(sh, LXMF_DEST_HASH_LEN);
     storageBegin();
     storageSet(stage_key.c_str(),                                "received");
-    storageSet(msgPath(id.index, mid_hex, "dir").c_str(),        "in");
-    storageSet(msgPath(id.index, mid_hex, "peer").c_str(),       sh_hex.c_str());
-    storageSet(msgPath(id.index, mid_hex, "title").c_str(),      title.c_str());
-    storageSet(msgPath(id.index, mid_hex, "content").c_str(),    content.c_str());
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "dir").c_str(),        "in");
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "peer").c_str(),       sh_hex.c_str());
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "title").c_str(),      title.c_str());
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "content").c_str(),    content.c_str());
     if (!fields.thread.empty())
-        storageSet(msgPath(id.index, mid_hex, "thread").c_str(), fields.thread.c_str());
-    storageSet(msgPath(id.index, mid_hex, "ts").c_str(),         (int)(ts / 1000));
-    storageSet(msgPath(id.index, mid_hex, "read").c_str(),       0);
-    storageSet(msgPath(id.index, mid_hex, "message_id").c_str(), mid_hex.c_str());
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "thread").c_str(), fields.thread.c_str());
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "ts").c_str(),         (int)(ts / 1000));
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "read").c_str(),       0);
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "message_id").c_str(), mid_hex.c_str());
     /* Stub contact if new — copy display_name across from the cross-
      * identity announce catalogue if we've heard them announce. */
     if (!storageExists(contactPath(id.index, sh_hex, "hash").c_str())) {
@@ -1532,7 +1552,8 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         verb("id %d: OUT_RESULT for unknown send_id=%u", id.index, (unsigned)send_id);
         return;
     }
-    std::string mid = o->msg_key;
+    std::string mid      = o->msg_key;
+    std::string peer_hex = o->peer;
     o->used = false;
     if (id.pending > 0) id.pending--;
 
@@ -1546,8 +1567,8 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         default:                         next_stage = "failed";    id.failed++; err_msg = "unknown status"; break;
     }
     storageBegin();
-    storageSet(msgPath(id.index, mid, "stage").c_str(),      next_stage);
-    storageSet(msgPath(id.index, mid, "last_error").c_str(), err_msg);
+    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      next_stage);
+    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), err_msg);
     storageEnd();
     dbg("id %d: msg %s → %s%s%s%s",
         id.index, mid.c_str(), next_stage,
@@ -1571,8 +1592,8 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
                 char buf[40];
                 std::snprintf(buf, sizeof(buf), "retry %u (reason 0x%02x)",
                               (unsigned)tail[0], (unsigned)tail[1]);
-                storageSet(msgPath(id.index, o->msg_key, "last_error").c_str(), buf);
-                storageSet(msgPath(id.index, o->msg_key, "attempts").c_str(),
+                storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), buf);
+                storageSet(msgPath(id.index, o->peer, o->msg_key, "attempts").c_str(),
                            (int)tail[0]);
                 return;
             }
@@ -1581,7 +1602,7 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
         default: note = nullptr; break;
     }
     if (note)
-        storageSet(msgPath(id.index, o->msg_key, "last_error").c_str(), note);
+        storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), note);
 }
 
 static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
@@ -1767,16 +1788,17 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
             for (auto& o : id.outboxes) {
                 if (!o.used || !o.is_resource || o.send_id != d.opaque_id)
                     continue;
-                const std::string& mid = o.msg_key;
+                const std::string& mid      = o.msg_key;
+                const std::string& peer_hex = o.peer;
                 if (ok) {
-                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "sent");
-                    storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sent");
+                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
                     id.sent++;
                     info("id %d: DIRECT resource proven mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-                    storageSet(msgPath(id.index, mid, "last_error").c_str(),
+                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
                                "resource transfer failed");
                     id.failed++;
                     warn("id %d: DIRECT resource failed mid=%s tag=%s",
@@ -1813,7 +1835,8 @@ static void resolveDirectSends(void)
         if (!id.used) continue;
         for (auto& o : id.outboxes) {
             if (!o.used || !o.direct) continue;
-            const std::string& mid = o.msg_key;
+            const std::string& mid      = o.msg_key;
+            const std::string& peer_hex = o.peer;
             std::string base = "rnsd.links." + o.link_tag;
             std::string st   = storageGetStr((base + ".state").c_str(), "");
             int tx           = storageGetInt((base + ".tx_packets").c_str(), 0);
@@ -1837,14 +1860,14 @@ static void resolveDirectSends(void)
                 }
                 if (!done) continue;
                 if (ok) {
-                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "sent");
-                    storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sent");
+                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
                     id.sent++;
                     info("id %d: DIRECT resource sent mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-                    storageSet(msgPath(id.index, mid, "last_error").c_str(), err.c_str());
+                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), err.c_str());
                     id.failed++;
                     warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
                          id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
@@ -1872,14 +1895,14 @@ static void resolveDirectSends(void)
             if (!done) continue;
 
             if (ok) {
-                storageSet(msgPath(id.index, mid, "stage").c_str(),      "sent");
-                storageSet(msgPath(id.index, mid, "last_error").c_str(), "");
+                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sent");
+                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
                 id.sent++;
                 info("id %d: DIRECT sent mid=%s tag=%s",
                      id.index, mid.c_str(), o.link_tag.c_str());
             } else {
-                storageSet(msgPath(id.index, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, mid, "last_error").c_str(), err.c_str());
+                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), err.c_str());
                 id.failed++;
                 warn("id %d: DIRECT failed mid=%s tag=%s (%s)",
                      id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
@@ -1904,20 +1927,24 @@ static void resolveDirectSends(void)
 /* `processReady` from the pre-sentinel design now triggered via cmd.send.
  * Renamed processSend; body unchanged. Defined above; see processReady. */
 
-static void processSend(lxmf_id_t& id, const std::string& mid)
+static void processSend(lxmf_id_t& id, const std::string& peer_hex,
+                        const std::string& mid)
 {
-    processReady(id, mid);
+    processReady(id, peer_hex, mid);
 }
 
 /* cmd.cancel — abort an in-flight send. If we have an outbox slot for
  * the message, push OUT_CANCEL; rnsd will reply with OUT_RESULT status=2
  * which applyOutResult maps to stage=cancelled. Otherwise the message is
  * already terminal — just stamp the stage. */
-static void processCancel(lxmf_id_t& id, const std::string& mid)
+static void processCancel(lxmf_id_t& id, const std::string& peer_hex,
+                          const std::string& mid)
 {
     outbound_t* o = nullptr;
     for (auto& slot : id.outboxes)
-        if (slot.used && slot.msg_key == mid) { o = &slot; break; }
+        if (slot.used && slot.peer == peer_hex && slot.msg_key == mid) {
+            o = &slot; break;
+        }
 
     if (o && id.handle >= 0) {
         uint8_t f[3] = {
@@ -1936,17 +1963,33 @@ static void processCancel(lxmf_id_t& id, const std::string& mid)
     }
 
     /* Not in flight — mark cancelled directly. */
-    storageSet(msgPath(id.index, mid, "stage").c_str(), "cancelled");
+    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "cancelled");
 }
 
-/* cmd.delete — wipe the message record entirely. Frees `wire` storage. */
-static void processDelete(lxmf_id_t& id, const std::string& mid)
+/* cmd.delete — wipe a message record (frees `wire` storage), or, when
+ * `mid` is empty (sentinel value was "<peer>/" or "<peer>"), the whole
+ * conversation subtree. The whole-conversation form is the primitive
+ * evictable_storage.md reuses. */
+static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
+                          const std::string& mid)
 {
-    char prefix[120];
-    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.%s.",
-                  id.index, mid.c_str());
-    storageDeleteTree(prefix);
-    info("id %d: deleted msg %s", id.index, mid.c_str());
+    /* storageDeleteTree → deleteFromTree splits on the LAST dot, so the
+     * argument must be the node path WITHOUT a trailing dot (cf.
+     * destroyIdentity's idPath(n,"")). msgPrefix's trailing dot is for
+     * storageForEach/collectTokens only — do not reuse it here. */
+    char path[160];
+    if (mid.empty())
+        std::snprintf(path, sizeof(path), "s.lxmf.id.%d.msgs.%s",
+                      id.index, peer_hex.c_str());
+    else
+        std::snprintf(path, sizeof(path), "s.lxmf.id.%d.msgs.%s.%s",
+                      id.index, peer_hex.c_str(), mid.c_str());
+    storageDeleteTree(path);
+    if (mid.empty())
+        info("id %d: deleted conversation %s", id.index, peer_hex.c_str());
+    else
+        info("id %d: deleted msg %s/%s", id.index,
+             peer_hex.c_str(), mid.c_str());
 }
 
 /* ── lxmf.cmd.* — identity-level commands ──
@@ -2037,7 +2080,18 @@ static void handleIdCmd(int n, const char* key, const char* val)
     const char* verb = p + 5;
     dbg("id %d: cmd.%s val=\"%s\"", n, verb, val);
 
-    std::string mid = val;   /* used by send/cancel/delete; ignored by announce */
+    /* send/cancel/delete value is "<peer>/<key>" (per-contact store).
+     * delete also accepts "<peer>/" or "<peer>" → whole conversation.
+     * announce ignores the value. */
+    std::string raw = val;
+    std::string peer_hex, mid;
+    size_t slash = raw.find('/');
+    if (slash == std::string::npos) {
+        peer_hex = raw;                 /* delete: whole conversation */
+    } else {
+        peer_hex = raw.substr(0, slash);
+        mid      = raw.substr(slash + 1);
+    }
 
     try {
         if (std::strcmp(verb, "announce") == 0) {
@@ -2048,13 +2102,19 @@ static void handleIdCmd(int n, const char* key, const char* val)
             warn("id %d: cmd.%s for absent identity", n, verb);
         }
         else if (std::strcmp(verb, "send") == 0) {
-            processSend(id, mid);
+            if (mid.empty())
+                warn("id %d: cmd.send needs <peer>/<key> (got \"%s\")", n, val);
+            else
+                processSend(id, peer_hex, mid);
         }
         else if (std::strcmp(verb, "cancel") == 0) {
-            processCancel(id, mid);
+            if (mid.empty())
+                warn("id %d: cmd.cancel needs <peer>/<key> (got \"%s\")", n, val);
+            else
+                processCancel(id, peer_hex, mid);
         }
         else if (std::strcmp(verb, "delete") == 0) {
-            processDelete(id, mid);
+            processDelete(id, peer_hex, mid);
         }
         else {
             warn("id %d: unknown cmd %s", n, verb);
@@ -2173,8 +2233,9 @@ static void loadAllIdentities(void)
 /* Numbered-list state for the CLI. CLI commands all run on the same
  * (single-threaded) cli task, so plain statics are race-free here. */
 static std::vector<std::string> s_peer_list;          /* hex dest hashes */
-static std::vector<std::string> s_msgs_list;          /* message_id segments */
-static const char*              s_peer_list_label = "";  /* "contacts" / "announces" */
+struct MsgRef { std::string peer; std::string key; };
+static std::vector<MsgRef>      s_msgs_list;          /* (peer, msg key) from last `msgs`/thread */
+static const char*              s_peer_list_label = "";  /* "contacts" / "announces" / "chats" */
 
 static int selectedId(void)
 {
@@ -2225,17 +2286,17 @@ static void cliEnqueueSend(int id_n, const std::string& peer_hex,
                   (long long)(nowUnixMs()), (unsigned)(r & 0xFFFF));
     std::string mid = key;
     storageBegin();
-    storageSet(msgPath(id_n, mid, "dir").c_str(),     "out");
-    storageSet(msgPath(id_n, mid, "peer").c_str(),    peer_hex.c_str());
-    storageSet(msgPath(id_n, mid, "title").c_str(),   "");
-    storageSet(msgPath(id_n, mid, "content").c_str(), text.c_str());
-    storageSet(msgPath(id_n, mid, "method").c_str(),  "opp");
-    storageSet(msgPath(id_n, mid, "stage").c_str(),   "draft");
+    storageSet(msgPath(id_n, peer_hex, mid, "dir").c_str(),     "out");
+    storageSet(msgPath(id_n, peer_hex, mid, "peer").c_str(),    peer_hex.c_str());
+    storageSet(msgPath(id_n, peer_hex, mid, "title").c_str(),   "");
+    storageSet(msgPath(id_n, peer_hex, mid, "content").c_str(), text.c_str());
+    storageSet(msgPath(id_n, peer_hex, mid, "method").c_str(),  "opp");
+    storageSet(msgPath(id_n, peer_hex, mid, "stage").c_str(),   "draft");
     /* cmd.send fires *last* so the record is fully present when the
-     * lxmf task sees the sentinel. */
+     * lxmf task sees the sentinel. Value is "<peer>/<key>". */
     char send_key[40];
     std::snprintf(send_key, sizeof(send_key), "lxmf.id.%d.cmd.send", id_n);
-    storageSet(send_key, mid.c_str());
+    storageSet(send_key, (peer_hex + "/" + mid).c_str());
     storageEnd();
     cliPrintf("queued %s → %s\n", mid.c_str(), peer_hex.c_str());
 }
@@ -2351,64 +2412,175 @@ static void cliId(const char* rest)
               bytesToHex(id->dest_hash, LXMF_DEST_HASH_LEN).c_str());
 }
 
-/* ── `lxmf msgs [<stage>]` ── */
+/* ── `lxmf chats` / `lxmf msgs [<peer>|<stage>]` ──
+ *
+ * The per-contact store (docs/plans/lxmf-messages-per-contact.md) makes
+ * this two-level: no arg → conversation list; <peer> → that thread;
+ * a bare stage word → cross-conversation filter. */
 
 struct MsgRow {
-    std::string mid;
+    std::string peer;
+    std::string key;
     std::string dir;
     std::string stage;
-    std::string peer;
     std::string title;
     int         ts;
     int         read;
 };
 
+static bool isStageWord(const std::string& s)
+{
+    static const char* const ST[] = { "draft", "queued", "sending", "sent",
+        "delivered", "failed", "cancelled", "received" };
+    for (const char* w : ST) if (s == w) return true;
+    return false;
+}
+
+static std::string peerDisplayName(int sel, const std::string& peer)
+{
+    std::string nm = storageGetStr(contactPath(sel, peer, "display_name").c_str(), "");
+    if (nm.empty()) {
+        char annKey[120];
+        std::snprintf(annKey, sizeof(annKey),
+                      "lxmf.announces.%s.display_name", peer.c_str());
+        nm = storageGetStr(annKey, "");
+    }
+    return nm;
+}
+
+static MsgRow readMsgRow(int sel, const std::string& peer, const std::string& key)
+{
+    MsgRow r;
+    r.peer  = peer;
+    r.key   = key;
+    r.dir   = storageGetStr(msgPath(sel, peer, key, "dir").c_str(),   "");
+    r.stage = storageGetStr(msgPath(sel, peer, key, "stage").c_str(), "");
+    r.title = storageGetStr(msgPath(sel, peer, key, "title").c_str(), "");
+    r.ts    = storageGetInt(msgPath(sel, peer, key, "ts").c_str(),    0);
+    r.read  = storageGetInt(msgPath(sel, peer, key, "read").c_str(),  0);
+    return r;
+}
+
+static void printMsgRows(int sel, std::vector<MsgRow>& rows, bool show_peer)
+{
+    std::sort(rows.begin(), rows.end(),
+              [](const MsgRow& a, const MsgRow& b) { return a.ts > b.ts; });
+    s_msgs_list.clear();
+    if (rows.empty()) return;
+    if (show_peer)
+        cliPrintf("  %-3s %-3s %-9s %-16s %-6s %s\n",
+                  "#", "dir", "stage", "peer", "unread", "title");
+    else
+        cliPrintf("  %-3s %-3s %-9s %-6s %s\n",
+                  "#", "dir", "stage", "unread", "title");
+    int n = 1;
+    for (const auto& r : rows) {
+        s_msgs_list.push_back({ r.peer, r.key });
+        const char* unread = (r.dir == "in" && !r.read) ? "*" : "";
+        if (show_peer) {
+            std::string p16 = r.peer.size() >= 16 ? r.peer.substr(0, 16) : r.peer;
+            cliPrintf("  %-3d %-3s %-9s %-16s %-6s %s\n",
+                      n++, r.dir.c_str(), r.stage.c_str(), p16.c_str(),
+                      unread, r.title.c_str());
+        } else {
+            cliPrintf("  %-3d %-3s %-9s %-6s %s\n",
+                      n++, r.dir.c_str(), r.stage.c_str(),
+                      unread, r.title.c_str());
+        }
+    }
+}
+
+/* `lxmf chats` — one row per conversation (peer subtree). */
+static void cliChats(int sel)
+{
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.", sel);
+    auto peers = collectTokens(prefix);
+
+    struct ChatRow {
+        std::string peer, name, last_title;
+        int count = 0, unread = 0, last_ts = 0;
+    };
+    std::vector<ChatRow> rows;
+    rows.reserve(peers.size());
+    for (const auto& peer : peers) {
+        ChatRow c;
+        c.peer = peer;
+        c.name = peerDisplayName(sel, peer);
+        for (const auto& key : collectTokens(msgPrefix(sel, peer))) {
+            c.count++;
+            int ts  = storageGetInt(msgPath(sel, peer, key, "ts").c_str(), 0);
+            if (storageGetStr(msgPath(sel, peer, key, "dir").c_str(), "") == "in" &&
+                storageGetInt(msgPath(sel, peer, key, "read").c_str(), 0) == 0)
+                c.unread++;
+            if (ts >= c.last_ts) {
+                c.last_ts    = ts;
+                c.last_title = storageGetStr(msgPath(sel, peer, key, "title").c_str(), "");
+            }
+        }
+        rows.push_back(std::move(c));
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const ChatRow& a, const ChatRow& b) { return a.last_ts > b.last_ts; });
+
+    s_peer_list.clear();
+    s_peer_list_label = "chats";
+    cliPrintf("id %d  %zu conversation(s)\n", sel, rows.size());
+    if (rows.empty()) return;
+    cliPrintf("  %-3s %-16s %-5s %-6s %-11s %s\n",
+              "#", "peer", "msgs", "unread", "last", "who");
+    int n = 1;
+    for (const auto& c : rows) {
+        s_peer_list.push_back(c.peer);
+        std::string p16 = c.peer.size() >= 16 ? c.peer.substr(0, 16) : c.peer;
+        std::string who = !c.name.empty() ? c.name
+                        : (c.last_title.empty() ? "(unknown)" : c.last_title);
+        cliPrintf("  %-3d %-16s %-5d %-6d %-11d %s\n",
+                  n++, p16.c_str(), c.count, c.unread, c.last_ts,
+                  sanitizeForLog(who).c_str());
+    }
+}
+
 static void cliMsgs(const char* rest)
 {
     while (*rest == ' ') rest++;
-    std::string filter = rest;
+    std::string arg = rest;
     int sel = selectedId();
     lxmf_id_t* id = idAt(sel);
     if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
 
-    char prefix[64];
-    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.", sel);
+    if (arg.empty()) { cliChats(sel); return; }
 
-    auto mids = collectTokens(prefix);
+    if (isStageWord(arg)) {
+        /* Cross-conversation filter — walk every peer subtree. */
+        char prefix[64];
+        std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.", sel);
+        std::vector<MsgRow> rows;
+        for (const auto& peer : collectTokens(prefix))
+            for (const auto& key : collectTokens(msgPrefix(sel, peer))) {
+                MsgRow r = readMsgRow(sel, peer, key);
+                if (r.stage == arg) rows.push_back(std::move(r));
+            }
+        cliPrintf("id %d  %zu message(s) filtered to stage=%s\n",
+                  sel, rows.size(), arg.c_str());
+        printMsgRows(sel, rows, /*show_peer=*/true);
+        return;
+    }
+
+    /* Otherwise a conversation: 32-hex / list-# / name substring. */
+    std::string peer = cliResolvePeer(arg);
+    if (peer.empty()) return;
+
     std::vector<MsgRow> rows;
-    rows.reserve(mids.size());
-    for (const auto& mid : mids) {
-        MsgRow r;
-        r.mid   = mid;
-        r.dir   = storageGetStr(msgPath(sel, mid, "dir").c_str(),   "");
-        r.stage = storageGetStr(msgPath(sel, mid, "stage").c_str(), "");
-        r.peer  = storageGetStr(msgPath(sel, mid, "peer").c_str(),  "");
-        r.title = storageGetStr(msgPath(sel, mid, "title").c_str(), "");
-        r.ts    = storageGetInt(msgPath(sel, mid, "ts").c_str(),    0);
-        r.read  = storageGetInt(msgPath(sel, mid, "read").c_str(),  0);
-        if (!filter.empty() && r.stage != filter) continue;
-        rows.push_back(std::move(r));
-    }
-    std::sort(rows.begin(), rows.end(),
-              [](const MsgRow& a, const MsgRow& b) { return a.ts > b.ts; });
-
-    s_msgs_list.clear();
-    cliPrintf("id %d  %zu message(s)%s%s\n", sel, rows.size(),
-              filter.empty() ? "" : " filtered to stage=",
-              filter.empty() ? "" : filter.c_str());
-    if (rows.empty()) return;
-    cliPrintf("  %-3s %-3s %-9s %-16s %-7s %s\n",
-              "#", "dir", "stage", "peer", "unread", "title");
-    int n = 1;
-    for (const auto& r : rows) {
-        s_msgs_list.push_back(r.mid);
-        std::string peer16 = r.peer.size() >= 16 ? r.peer.substr(0, 16) : r.peer;
-        cliPrintf("  %-3d %-3s %-9s %-16s %-7s %s\n",
-                  n++,
-                  r.dir.c_str(), r.stage.c_str(), peer16.c_str(),
-                  (r.dir == "in" && !r.read) ? "yes" : "",
-                  r.title.c_str());
-    }
+    for (const auto& key : collectTokens(msgPrefix(sel, peer)))
+        rows.push_back(readMsgRow(sel, peer, key));
+    std::string name = peerDisplayName(sel, peer);
+    cliPrintf("id %d  conversation with %s%s%s  %zu message(s)\n",
+              sel,
+              name.empty() ? peer.c_str() : sanitizeForLog(name).c_str(),
+              name.empty() ? "" : " (", name.empty() ? "" : (peer + ")").c_str(),
+              rows.size());
+    printMsgRows(sel, rows, /*show_peer=*/false);
 }
 
 /* ── `lxmf read <n>` ── */
@@ -2422,16 +2594,17 @@ static void cliRead(const char* rest)
         return;
     }
     int sel = selectedId();
-    const std::string& mid = s_msgs_list[(size_t)n - 1];
+    const MsgRef& ref = s_msgs_list[(size_t)n - 1];
+    const std::string& peer = ref.peer;
+    const std::string& mid  = ref.key;
 
-    std::string dir     = storageGetStr(msgPath(sel, mid, "dir").c_str(),     "");
-    std::string stage   = storageGetStr(msgPath(sel, mid, "stage").c_str(),   "");
-    std::string peer    = storageGetStr(msgPath(sel, mid, "peer").c_str(),    "");
-    std::string title   = storageGetStr(msgPath(sel, mid, "title").c_str(),   "");
-    std::string content = storageGetStr(msgPath(sel, mid, "content").c_str(), "");
-    std::string thread  = storageGetStr(msgPath(sel, mid, "thread").c_str(),  "");
-    std::string err_msg = storageGetStr(msgPath(sel, mid, "last_error").c_str(), "");
-    int ts              = storageGetInt(msgPath(sel, mid, "ts").c_str(),       0);
+    std::string dir     = storageGetStr(msgPath(sel, peer, mid, "dir").c_str(),     "");
+    std::string stage   = storageGetStr(msgPath(sel, peer, mid, "stage").c_str(),   "");
+    std::string title   = storageGetStr(msgPath(sel, peer, mid, "title").c_str(),   "");
+    std::string content = storageGetStr(msgPath(sel, peer, mid, "content").c_str(), "");
+    std::string thread  = storageGetStr(msgPath(sel, peer, mid, "thread").c_str(),  "");
+    std::string err_msg = storageGetStr(msgPath(sel, peer, mid, "last_error").c_str(), "");
+    int ts              = storageGetInt(msgPath(sel, peer, mid, "ts").c_str(),       0);
 
     cliPrintf("─── id %d  msg #%d  %s ───\n", sel, n, mid.c_str());
     cliPrintf("dir:    %s\n", dir.c_str());
@@ -2446,8 +2619,8 @@ static void cliRead(const char* rest)
     cliPrintf("\n%s\n", content.c_str());
 
     if (dir == "in" &&
-        storageGetInt(msgPath(sel, mid, "read").c_str(), 0) == 0) {
-        storageSet(msgPath(sel, mid, "read").c_str(), 1);
+        storageGetInt(msgPath(sel, peer, mid, "read").c_str(), 0) == 0) {
+        storageSet(msgPath(sel, peer, mid, "read").c_str(), 1);
     }
 }
 
@@ -2690,7 +2863,8 @@ static void cliLxmf(const char* args)
         cliPrintf("  lxmf destroy <n>        wipe identity at slot <n> (secrets + storage)\n");
         cliPrintf("  lxmf id                 list identities (* = selected)\n");
         cliPrintf("  lxmf id <n>             switch selected identity\n");
-        cliPrintf("  lxmf msgs [<stage>]     list messages for selected id (numbered)\n");
+        cliPrintf("  lxmf chats              list conversations for selected id (numbered)\n");
+        cliPrintf("  lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <stage> = filter\n");
         cliPrintf("  lxmf read <n>           print msg n from last listing; marks read\n");
         cliPrintf("  lxmf contacts           list contacts for selected id (numbered)\n");
         cliPrintf("  lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");
@@ -2747,6 +2921,11 @@ static void cliLxmf(const char* args)
         return;
     }
     if (verb == "id")        { cliId(rest); return; }
+    if (verb == "chats")     { int s = selectedId();
+                               lxmf_id_t* i = idAt(s);
+                               if (!i || !i->used) cliPrintf("no identity at slot %d\n", s);
+                               else cliChats(s);
+                               return; }
     if (verb == "msgs")      { cliMsgs(rest); return; }
     if (verb == "read")      { cliRead(rest); return; }
     if (verb == "contacts")  { cliContacts(); return; }
