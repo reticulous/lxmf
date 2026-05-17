@@ -34,7 +34,7 @@
 static const char* TAG = "lxmf";
 
 /* Cached `s.lxmf.debug.only_local` — when true, the per-announce
- * directory dbg() lines (everyone else's announces, not us) are
+ * catalogue dbg() lines (everyone else's announces, not us) are
  * demoted to verb() so they only show at verbose. dbg-level then
  * surfaces just traffic that affects this node directly (sends,
  * receives, cmd processing, etc.). Live-mirrored from storage via
@@ -776,7 +776,7 @@ static outbound_t* outboundAlloc(lxmf_id_t& id)
     return nullptr;
 }
 
-/* ─────────────── directory of seen LXMF mailboxes ─────────────── */
+/* ─────────────── announces of seen LXMF mailboxes ─────────────── */
 
 /* Cross-identity, ephemeral catalogue of every `lxmf.delivery` announce
  * we've heard recently. Populated by onAnnounceFromRnsd — fired on the
@@ -784,7 +784,7 @@ static outbound_t* outboundAlloc(lxmf_id_t& id)
  * subscription. All storage writes happen here, on our task — the rnsd
  * task only memcpys the announce into one ITS packet and forwards.
  *
- * Path: `lxmf.directory.<dest_hex>.{hash,display_name,stamp_cost,ratchet,
+ * Path: `lxmf.announces.<dest_hex>.{hash,display_name,stamp_cost,ratchet,
  *        hops,last_announce_s}`. Pruning is left to a future cron job —
  * for Phase 4a entries simply accumulate. */
 
@@ -803,7 +803,7 @@ static int s_announce_sub_handle = -1;
 /* RNSD_PORT_ANNOUNCES frame: hops(1) | dest_hash(16) | identity_hash(16) | app_data(N) */
 constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16;
 
-/* ── lxmf.directory.<hex> packed-value format ──
+/* ── lxmf.announces.<hex> packed-value format ──
  *
  *   <last_s>|<cost>|<hops>|<ratchet>|<name>
  *
@@ -815,12 +815,12 @@ constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16;
  *
  * Replaces the previous per-field subtree (6 leaves per entry). One
  * cJSON_String + the parent's child pointer per entry; ~3× fewer
- * heap blocks attributed to lxmf as the directory grows.
+ * heap blocks attributed to lxmf as the announce catalogue grows.
  *
  * For eviction we only need last_s; that's the first field, so
  * atoi(value) is enough — stops at the first '|'. */
 
-struct DirEntry {
+struct AnnounceEntry {
     int         last_s;
     int         cost;
     int         hops;
@@ -828,7 +828,7 @@ struct DirEntry {
     std::string name;
 };
 
-static std::string buildDirValue(const DirEntry& e)
+static std::string buildAnnounceValue(const AnnounceEntry& e)
 {
     char buf[256];
     std::snprintf(buf, sizeof(buf), "%d|%d|%d|%s|",
@@ -839,7 +839,7 @@ static std::string buildDirValue(const DirEntry& e)
     return out;
 }
 
-static bool parseDirValue(const char* val, DirEntry* out)
+static bool parseAnnounceValue(const char* val, AnnounceEntry* out)
 {
     if (!val) return false;
     /* Find the first 4 pipes. Anything after pipe #4 is the name. */
@@ -856,46 +856,46 @@ static bool parseDirValue(const char* val, DirEntry* out)
     return true;
 }
 
-/* ── directory size cap + LRU-by-announce-time eviction ──
+/* ── announce-catalogue size cap + LRU-by-announce-time eviction ──
  *
- * Walk `lxmf.directory.` and find the oldest entry. Used when the
- * directory hits `s.lxmf.max_dir_size` (default 2048) so a new
+ * Walk `lxmf.announces.` and find the oldest entry. Used when the
+ * catalogue hits `s.lxmf.max_announces` (default 2048) so a new
  * insert evicts one. Walk is O(N) under CFG_LOCK; at 2048 entries
  * ≈ 12 ms. Eviction only fires for brand-new destinations after
  * the cap is reached — re-announces from existing entries just
  * update in place. */
 
-struct DirOldestCtx {
+struct AnnounceOldestCtx {
     int         count;
     int         oldest_s;
     std::string oldest_hex;
 };
-static DirOldestCtx* s_dir_oldest_ctx = nullptr;
+static AnnounceOldestCtx* s_ann_oldest_ctx = nullptr;
 
-static void dirOldestLeaf(const char* key, const char* val)
+static void annOldestLeaf(const char* key, const char* val)
 {
-    if (!s_dir_oldest_ctx || !key || !val) return;
-    const char* tail = key + sizeof("lxmf.directory.") - 1;
-    /* Bare `lxmf.directory.<hex>` (no nested key). */
+    if (!s_ann_oldest_ctx || !key || !val) return;
+    const char* tail = key + sizeof("lxmf.announces.") - 1;
+    /* Bare `lxmf.announces.<hex>` (no nested key). */
     if (std::strchr(tail, '.')) return;
-    s_dir_oldest_ctx->count++;
+    s_ann_oldest_ctx->count++;
     int ls = std::atoi(val);
-    if (s_dir_oldest_ctx->oldest_hex.empty() ||
-        ls < s_dir_oldest_ctx->oldest_s) {
-        s_dir_oldest_ctx->oldest_s   = ls;
-        s_dir_oldest_ctx->oldest_hex = tail;
+    if (s_ann_oldest_ctx->oldest_hex.empty() ||
+        ls < s_ann_oldest_ctx->oldest_s) {
+        s_ann_oldest_ctx->oldest_s   = ls;
+        s_ann_oldest_ctx->oldest_hex = tail;
     }
 }
 
 /* Find (count, oldest entry). Returns count. If max_entries is non-
  * zero and count >= max_entries, sets oldest_hex_out so the caller
  * can evict. */
-static int dirCountAndMaybeOldest(int max_entries, std::string* oldest_hex_out)
+static int annCountAndMaybeOldest(int max_entries, std::string* oldest_hex_out)
 {
-    DirOldestCtx ctx{};
-    s_dir_oldest_ctx = &ctx;
-    storageForEach("lxmf.directory.", dirOldestLeaf);
-    s_dir_oldest_ctx = nullptr;
+    AnnounceOldestCtx ctx{};
+    s_ann_oldest_ctx = &ctx;
+    storageForEach("lxmf.announces.", annOldestLeaf);
+    s_ann_oldest_ctx = nullptr;
     if (max_entries > 0 && ctx.count >= max_entries &&
         !ctx.oldest_hex.empty() && oldest_hex_out)
         *oldest_hex_out = ctx.oldest_hex;
@@ -927,37 +927,37 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     std::string dh_hex = bytesToHex(dh, LXMF_DEST_HASH_LEN);
 
     char key[64];
-    std::snprintf(key, sizeof(key), "lxmf.directory.%s", dh_hex.c_str());
+    std::snprintf(key, sizeof(key), "lxmf.announces.%s", dh_hex.c_str());
 
     /* If this is a brand-new destination (no existing entry) and we
      * would exceed the cap, evict the oldest entry by last_s. Re-
      * announces from existing entries skip this scan. */
     bool is_new = !storageExists(key);
     if (is_new) {
-        int max_dir = storageGetInt("s.lxmf.max_dir_size", 2048);
-        if (max_dir > 0) {
+        int max_ann = storageGetInt("s.lxmf.max_announces", 2048);
+        if (max_ann > 0) {
             std::string oldest;
-            int cur = dirCountAndMaybeOldest(max_dir, &oldest);
-            if (cur >= max_dir && !oldest.empty()) {
+            int cur = annCountAndMaybeOldest(max_ann, &oldest);
+            if (cur >= max_ann && !oldest.empty()) {
                 char old_key[64];
                 std::snprintf(old_key, sizeof(old_key),
-                              "lxmf.directory.%s", oldest.c_str());
+                              "lxmf.announces.%s", oldest.c_str());
                 storageUnset(old_key);
-                DBG_REMOTE("directory: evicted oldest %s (cap=%d)",
-                    oldest.c_str(), max_dir);
+                DBG_REMOTE("announces: evicted oldest %s (cap=%d)",
+                    oldest.c_str(), max_ann);
             }
         }
     }
 
-    DirEntry e;
+    AnnounceEntry e;
     e.last_s  = (int)(nowUnixMs() / 1000);
     e.cost    = info.stamp_cost;   /* -1 if unknown */
     e.hops    = hops;
     e.ratchet = info.ratchet_hex;  /* empty if unknown */
     e.name    = info.name;         /* may be empty */
-    storageSet(key, buildDirValue(e).c_str());
+    storageSet(key, buildAnnounceValue(e).c_str());
 
-    DBG_REMOTE("directory: %s name=\"%s\" cost=%d hops=%d",
+    DBG_REMOTE("announces: %s name=\"%s\" cost=%d hops=%d",
         dh_hex.c_str(), sanitizeForLog(info.name).c_str(),
         info.stamp_cost, hops);
 }
@@ -1502,13 +1502,13 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     storageSet(msgPath(id.index, mid_hex, "read").c_str(),       0);
     storageSet(msgPath(id.index, mid_hex, "message_id").c_str(), mid_hex.c_str());
     /* Stub contact if new — copy display_name across from the cross-
-     * identity directory if we've heard them announce. */
+     * identity announce catalogue if we've heard them announce. */
     if (!storageExists(contactPath(id.index, sh_hex, "hash").c_str())) {
         storageSet(contactPath(id.index, sh_hex, "hash").c_str(),  sh_hex.c_str());
         storageSet(contactPath(id.index, sh_hex, "trust").c_str(), 0);
-        char dirKey[120];
-        std::snprintf(dirKey, sizeof(dirKey), "lxmf.directory.%s.display_name", sh_hex.c_str());
-        std::string peer_name = storageGetStr(dirKey, "");
+        char annKey[120];
+        std::snprintf(annKey, sizeof(annKey), "lxmf.announces.%s.display_name", sh_hex.c_str());
+        std::string peer_name = storageGetStr(annKey, "");
         if (!peer_name.empty())
             storageSet(contactPath(id.index, sh_hex, "display_name").c_str(), peer_name.c_str());
     }
@@ -2133,23 +2133,23 @@ static void publishStats(void)
 }
 
 /* collectTokens is defined later (in the CLI section). */
-/* Count entries under `lxmf.directory.` without allocating per-entry —
+/* Count entries under `lxmf.announces.` without allocating per-entry —
  * each entry is one packed leaf, so we just count leaves. Replaces the
  * old `collectTokens` call which built a std::vector<std::string> per
  * summary tick. */
-static int s_dir_count_tmp = 0;
-static void dirCountLeaf(const char* key, const char* /*val*/)
+static int s_ann_count_tmp = 0;
+static void annCountLeaf(const char* key, const char* /*val*/)
 {
     if (!key) return;
-    const char* tail = key + sizeof("lxmf.directory.") - 1;
+    const char* tail = key + sizeof("lxmf.announces.") - 1;
     if (std::strchr(tail, '.')) return;
-    s_dir_count_tmp++;
+    s_ann_count_tmp++;
 }
-[[maybe_unused]] static int dirCount(void)
+[[maybe_unused]] static int annCount(void)
 {
-    s_dir_count_tmp = 0;
-    storageForEach("lxmf.directory.", dirCountLeaf);
-    return s_dir_count_tmp;
+    s_ann_count_tmp = 0;
+    storageForEach("lxmf.announces.", annCountLeaf);
+    return s_ann_count_tmp;
 }
 
 /* ─────────────── bootstrap ─────────────── */
@@ -2174,7 +2174,7 @@ static void loadAllIdentities(void)
  * (single-threaded) cli task, so plain statics are race-free here. */
 static std::vector<std::string> s_peer_list;          /* hex dest hashes */
 static std::vector<std::string> s_msgs_list;          /* message_id segments */
-static const char*              s_peer_list_label = "";  /* "contacts" / "directory" */
+static const char*              s_peer_list_label = "";  /* "contacts" / "announces" */
 
 static int selectedId(void)
 {
@@ -2243,9 +2243,9 @@ static void cliEnqueueSend(int id_n, const std::string& peer_hex,
 /* Resolve a CLI `<peer>` argument. Accepts:
  *   - 32-char hex (the LXMF destination hash) → returned directly
  *   - a positive integer N → the Nth entry from the most recent
- *     `lxmf contacts` / `lxmf directory` listing
+ *     `lxmf contacts` / `lxmf announces` listing
  *   - any other text → case-insensitive substring match against
- *     `lxmf.directory.<hex>.display_name`; exactly one match returns
+ *     `lxmf.announces.<hex>.display_name`; exactly one match returns
  *     the hash, multiple prints a disambiguation list (name + hash),
  *     zero prints an error.
  * Returns empty string on failure (and prints an explanation). */
@@ -2262,11 +2262,11 @@ static PeerNameLookupCtx* s_peer_name_ctx = nullptr;
 static void peerNameLookupLeaf(const char* key, const char* val)
 {
     if (!s_peer_name_ctx || !key || !val) return;
-    /* key = "lxmf.directory.<hex>" — one packed leaf per dest. */
-    const char* tail = key + sizeof("lxmf.directory.") - 1;
+    /* key = "lxmf.announces.<hex>" — one packed leaf per dest. */
+    const char* tail = key + sizeof("lxmf.announces.") - 1;
     if (std::strchr(tail, '.')) return;   /* skip stray nested keys */
-    DirEntry e;
-    if (!parseDirValue(val, &e)) return;
+    AnnounceEntry e;
+    if (!parseAnnounceValue(val, &e)) return;
     if (!nameContainsCI(e.name, s_peer_name_ctx->query)) return;
     s_peer_name_ctx->matches.push_back({std::string(tail), e.name});
 }
@@ -2281,7 +2281,7 @@ static std::string cliResolvePeer(const std::string& arg)
     long n = std::strtol(arg.c_str(), &end, 10);
     if (end && *end == '\0' && n >= 1) {
         if (s_peer_list.empty()) {
-            cliPrintf("no peer list — run `lxmf contacts` or `lxmf directory` first\n");
+            cliPrintf("no peer list — run `lxmf contacts` or `lxmf announces` first\n");
             return "";
         }
         if ((size_t)n > s_peer_list.size()) {
@@ -2293,10 +2293,10 @@ static std::string cliResolvePeer(const std::string& arg)
     }
 
     /* Treat the remainder as a case-insensitive display-name substring
-     * lookup against the cross-identity directory. */
+     * lookup against the cross-identity announce catalogue. */
     PeerNameLookupCtx ctx{arg, {}};
     s_peer_name_ctx = &ctx;
-    storageForEach("lxmf.directory.", peerNameLookupLeaf);
+    storageForEach("lxmf.announces.", peerNameLookupLeaf);
     s_peer_name_ctx = nullptr;
 
     if (ctx.matches.empty()) {
@@ -2309,7 +2309,7 @@ static std::string cliResolvePeer(const std::string& arg)
      * so the user can pick by line number on a retry:
      *   lxmf send 2 "hi"   */
     s_peer_list.clear();
-    s_peer_list_label = "directory match";
+    s_peer_list_label = "announce match";
     cliPrintf("ambiguous \"%s\" — %zu matches:\n",
               arg.c_str(), ctx.matches.size());
     cliPrintf("  %-3s %-32s %s\n", "#", "destination", "name");
@@ -2479,11 +2479,11 @@ static void cliContacts(void)
         r.nick         = storageGetStr(contactPath(sel, h, "nick").c_str(),         "");
         r.display_name = storageGetStr(contactPath(sel, h, "display_name").c_str(), "");
         if (r.display_name.empty()) {
-            /* Fall back to the cross-identity directory entry. */
-            char dirKey[120];
-            std::snprintf(dirKey, sizeof(dirKey),
-                          "lxmf.directory.%s.display_name", h.c_str());
-            r.display_name = storageGetStr(dirKey, "");
+            /* Fall back to the cross-identity announce-catalogue entry. */
+            char annKey[120];
+            std::snprintf(annKey, sizeof(annKey),
+                          "lxmf.announces.%s.display_name", h.c_str());
+            r.display_name = storageGetStr(annKey, "");
         }
         r.trust     = storageGetInt(contactPath(sel, h, "trust").c_str(),     0);
         r.last_seen = storageGetInt(contactPath(sel, h, "last_seen").c_str(), 0);
@@ -2510,10 +2510,10 @@ static void cliContacts(void)
     }
 }
 
-/* ── `lxmf directory [<hash>|<name substring>]` ──
+/* ── `lxmf announces [<hash>|<name substring>]` ──
  *
  * Three modes:
- *   - no arg               → stream the entire directory
+ *   - no arg               → stream the entire announce catalogue
  *   - 32-hex destination   → direct storage path lookup, one row,
  *                            instant (no walk)
  *   - anything else        → stream with display_name substring
@@ -2529,71 +2529,71 @@ static void cliContacts(void)
  * transition, emit the accumulated row.
  *
  * storageForEach holds CFG_LOCK for the duration; our cliPrintf-in-
- * callback inherits that lock. For a few-thousand-row directory
+ * callback inherits that lock. For a few-thousand-row catalogue
  * that's ~tens of ms of held lock; lxmf's own storage writes during
  * that window queue at the announce-fanout ITS recv buffer, no data
  * loss. */
 
-/* Streaming directory walker for `lxmf directory` (with optional
- * substring filter). Each `lxmf.directory.<hex>` is a single packed
- * leaf; one row per leaf. */
-struct DirStreamState {
+/* Streaming walker for `lxmf announces` (with optional substring
+ * filter). Each `lxmf.announces.<hex>` is a single packed leaf; one
+ * row per leaf. */
+struct AnnounceStreamState {
     int row_num;
     int now_s;
 };
-static DirStreamState s_dir_stream;
-static std::string    s_dir_filter;        /* empty = no filter; not 32-hex */
+static AnnounceStreamState s_ann_stream;
+static std::string         s_ann_filter;   /* empty = no filter; not 32-hex */
 
-static void dirEmitRow(const char* hex, const DirEntry& e)
+static void annEmitRow(const char* hex, const AnnounceEntry& e)
 {
-    if (!nameContainsCI(e.name, s_dir_filter)) return;
-    int age = (e.last_s > 0) ? (s_dir_stream.now_s - e.last_s) : -1;
-    s_dir_stream.row_num++;
+    if (!nameContainsCI(e.name, s_ann_filter)) return;
+    int age = (e.last_s > 0) ? (s_ann_stream.now_s - e.last_s) : -1;
+    s_ann_stream.row_num++;
     s_peer_list.push_back(hex);
     cliPrintf("  %-3d %-32s %-5d %-5d %-7d %s\n",
-              s_dir_stream.row_num, hex,
+              s_ann_stream.row_num, hex,
               e.hops, e.cost, age,
               sanitizeForLog(e.name).c_str());
 }
 
-static void dirStreamLeaf(const char* key, const char* val)
+static void annStreamLeaf(const char* key, const char* val)
 {
     if (!key || !val) return;
-    const char* tail = key + sizeof("lxmf.directory.") - 1;
+    const char* tail = key + sizeof("lxmf.announces.") - 1;
     if (std::strchr(tail, '.')) return;   /* skip stray nested keys */
-    DirEntry e;
-    if (!parseDirValue(val, &e)) return;
-    dirEmitRow(tail, e);
+    AnnounceEntry e;
+    if (!parseAnnounceValue(val, &e)) return;
+    annEmitRow(tail, e);
 }
 
-/* Direct lookup — `lxmf directory <32-hex>`. One row, instant. */
-static void cliDirectoryByHash(const std::string& hex)
+/* Direct lookup — `lxmf announces <32-hex>`. One row, instant. */
+static void cliAnnouncesByHash(const std::string& hex)
 {
     int now_s = (int)(nowUnixMs() / 1000);
     char k[64];
-    std::snprintf(k, sizeof(k), "lxmf.directory.%s", hex.c_str());
+    std::snprintf(k, sizeof(k), "lxmf.announces.%s", hex.c_str());
     std::string val = storageGetStr(k, "");
     if (val.empty()) {
-        cliPrintf("(no directory entry for %s)\n", hex.c_str());
+        cliPrintf("(no announce entry for %s)\n", hex.c_str());
         return;
     }
-    DirEntry e;
-    if (!parseDirValue(val.c_str(), &e)) {
-        cliPrintf("(malformed directory entry for %s)\n", hex.c_str());
+    AnnounceEntry e;
+    if (!parseAnnounceValue(val.c_str(), &e)) {
+        cliPrintf("(malformed announce entry for %s)\n", hex.c_str());
         return;
     }
     int age = e.last_s > 0 ? (now_s - e.last_s) : -1;
     cliPrintf("  %-3s %-32s %-5s %-5s %-7s %s\n",
               "#", "destination", "hops", "cost", "age(s)", "name");
     s_peer_list.clear();
-    s_peer_list_label = "directory";
+    s_peer_list_label = "announces";
     s_peer_list.push_back(hex);
     cliPrintf("  %-3d %-32s %-5d %-5d %-7d %s\n",
               1, hex.c_str(), e.hops, e.cost, age,
               sanitizeForLog(e.name).c_str());
 }
 
-static void cliDirectory(const char* rest)
+static void cliAnnounces(const char* rest)
 {
     while (rest && *rest == ' ') rest++;
     std::string arg = (rest && *rest) ? std::string(rest) : "";
@@ -2601,29 +2601,29 @@ static void cliDirectory(const char* rest)
     /* 32-hex → direct lookup. */
     if (arg.size() == 32) {
         uint8_t dh[16];
-        if (hexToDestHash(arg, dh)) { cliDirectoryByHash(arg); return; }
+        if (hexToDestHash(arg, dh)) { cliAnnouncesByHash(arg); return; }
         /* not valid hex despite the length — fall through to substring */
     }
 
     s_peer_list.clear();
-    s_peer_list_label = "directory";
+    s_peer_list_label = "announces";
 
-    s_dir_stream       = DirStreamState{};
-    s_dir_stream.now_s = (int)(nowUnixMs() / 1000);
-    s_dir_filter       = arg;   /* empty = no filter */
+    s_ann_stream       = AnnounceStreamState{};
+    s_ann_stream.now_s = (int)(nowUnixMs() / 1000);
+    s_ann_filter       = arg;   /* empty = no filter */
 
     cliPrintf("  %-3s %-32s %-5s %-5s %-7s %s\n",
               "#", "destination", "hops", "cost", "age(s)", "name");
 
-    storageForEach("lxmf.directory.", dirStreamLeaf);
+    storageForEach("lxmf.announces.", annStreamLeaf);
 
-    if (s_dir_stream.row_num == 0) {
+    if (s_ann_stream.row_num == 0) {
         if (arg.empty()) cliPrintf("(no mailboxes heard yet)\n");
         else             cliPrintf("(no match for \"%s\")\n", arg.c_str());
     } else if (arg.empty()) {
-        cliPrintf("%d mailbox(es)\n", s_dir_stream.row_num);
+        cliPrintf("%d mailbox(es)\n", s_ann_stream.row_num);
     } else {
-        cliPrintf("%d match(es) for \"%s\"\n", s_dir_stream.row_num, arg.c_str());
+        cliPrintf("%d match(es) for \"%s\"\n", s_ann_stream.row_num, arg.c_str());
     }
 }
 
@@ -2636,7 +2636,7 @@ static void cliSend(const char* rest)
     const char* sp = std::strchr(rest, ' ');
     if (!sp || sp == rest) {
         cliPrintf("usage: lxmf send <peer> <text>\n");
-        cliPrintf("  <peer> = 32-hex destination, or a number from `contacts`/`directory`\n");
+        cliPrintf("  <peer> = 32-hex destination, or a number from `contacts`/`announces`\n");
         return;
     }
     std::string peer_arg(rest, sp - rest);
@@ -2693,7 +2693,7 @@ static void cliLxmf(const char* args)
         cliPrintf("  lxmf msgs [<stage>]     list messages for selected id (numbered)\n");
         cliPrintf("  lxmf read <n>           print msg n from last listing; marks read\n");
         cliPrintf("  lxmf contacts           list contacts for selected id (numbered)\n");
-        cliPrintf("  lxmf directory [<arg>]  every lxmf.delivery announce we've heard;\n");
+        cliPrintf("  lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");
         cliPrintf("                          arg = 32-hex (instant lookup) or name substring\n");
         cliPrintf("  lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
         cliPrintf("  lxmf announce           emit a delivery announce for selected id\n");
@@ -2750,7 +2750,7 @@ static void cliLxmf(const char* args)
     if (verb == "msgs")      { cliMsgs(rest); return; }
     if (verb == "read")      { cliRead(rest); return; }
     if (verb == "contacts")  { cliContacts(); return; }
-    if (verb == "directory") { cliDirectory(rest); return; }
+    if (verb == "announces") { cliAnnounces(rest); return; }
     if (verb == "send")      { cliSend(rest); return; }
     if (verb == "announce") {
         int sel = selectedId();
@@ -2815,7 +2815,7 @@ static void lxmfTaskMain(void*)
     storageSubscribeChanges("rnsd.iface_event_seq", onRnsdIfaceEvent);
 
     /* Live-mirror s.lxmf.debug.only_local into the cached bool so
-     * toggling at runtime takes effect on the next directory write. */
+     * toggling at runtime takes effect on the next announce write. */
     storageSubscribeChanges("s.lxmf.debug.only_local",
         [](const char* /*key*/, const char* val) {
             s_dbg_only_local = val && val[0] && std::atoi(val) != 0;
@@ -2832,8 +2832,8 @@ static void lxmfTaskMain(void*)
     }
 
     /* Subscribe to lxmf.delivery announces via rnsd's fan-out port. All
-     * directory writes happen on this task — rnsd's task only memcpys
-     * the announce into one ITS packet. */
+     * announce-catalogue writes happen on this task — rnsd's task only
+     * memcpys the announce into one ITS packet. */
     connectAnnounceSub();
 
     /* Arm the initial announce debounce window. Covers the case where
@@ -2909,8 +2909,8 @@ void lxmfInit(void)
         storageDefault("s.lxmf.enforce_stamps",         0);
         storageDefault("s.lxmf.auto_ticket",            1);
         storageDefault("s.lxmf.announce_interval_s",    1800);  /* periodic re-announce; 0 disables */
-        storageDefault("s.lxmf.max_dir_size",           2048);  /* directory cap; 0 disables eviction */
-        storageDefault("s.lxmf.debug.only_local",       0);     /* demote directory dbg lines to verb */
+        storageDefault("s.lxmf.max_announces",          2048);  /* announce-catalogue cap; 0 disables eviction */
+        storageDefault("s.lxmf.debug.only_local",       0);     /* demote announce dbg lines to verb */
         storageSet("s.lxmf.version", LXMF_VERSION);
         storageEnd();
     }
