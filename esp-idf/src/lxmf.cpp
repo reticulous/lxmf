@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include <sys/time.h>
 
 #include <cstring>
 #include <cstdio>
@@ -61,6 +62,13 @@ constexpr size_t LXMF_OPP_CONTENT_BUDGET = 311;  /* single RNS packet plaintext 
  * defence against accidental duplicates from path-flapping repeats.
  * Storage existence is the authoritative dedup. */
 #define LXMF_DEDUP_RING 64
+
+/* Inbound LXMs from a sender whose identity we don't have yet are held
+ * here (per identity) until their lxmf.delivery announce arrives, then
+ * re-verified. Bounds: at most N buffered, oldest dropped on overflow;
+ * an entry that never resolves is TTL-evicted so the queue can't leak. */
+#define LXMF_MAX_PENDING_VERIFY     25
+#define LXMF_PENDING_VERIFY_TTL_MS  (30u * 60u * 1000u)
 
 /* LXMF field registry keys (msgpack int keys in `fields` map). See
  * docs/plans/lxmf.md §2.5. */
@@ -106,6 +114,18 @@ struct outbound_t {
     bool        is_resource;
 };
 
+/* A received LXM we can't verify yet because the sender's identity
+ * (public key) isn't in rnsd's cache — we never heard their announce.
+ * onInboundLxm issues a path request (which makes them re-announce) and
+ * parks the raw wire here; drainPendingVerify replays it once the
+ * announce lands. Without this, opportunistic single-packet messages
+ * from a not-yet-known sender are lost — LXMF has no retransmission. */
+struct pending_verify_t {
+    uint8_t              sender[LXMF_DEST_HASH_LEN];
+    std::vector<uint8_t> wire;
+    uint64_t             enqueued_ms;
+};
+
 struct lxmf_id_t {
     bool          used;
     int         index;                              /* 0..LXMF_MAX_IDENTITIES-1 */
@@ -124,6 +144,10 @@ struct lxmf_id_t {
     /* Monotonic tick of last successful announce. 0 = never announced
      * this session. Used to schedule periodic re-announces. */
     TickType_t    last_announce_tick;
+
+    /* Inbound messages waiting on their sender's identity. Touched only
+     * on the lxmf task (onInboundLxm / onAnnounceFromRnsd), no locking. */
+    std::vector<pending_verify_t> pending_verify;
 };
 
 static TaskHandle_t s_task = nullptr;
@@ -138,6 +162,13 @@ static int         s_dedup_head = 0;
  * identity lifecycle. */
 static void subscribePerIdCmds(int n);
 static void unsubscribePerIdCmds(int n);
+
+/* Inbound pipeline + the pending-verification drain. onAnnounceFromRnsd
+ * (defined above onInboundLxm) calls the drain; both run on the lxmf
+ * task only. */
+static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n);
+static void drainPendingVerify(lxmf_id_t& id, const uint8_t* sender_hash);
+static void drainAllPendingVerify(lxmf_id_t& id);
 
 /* ─────────────── small helpers ─────────────── */
 
@@ -198,11 +229,26 @@ static std::string contactPath(int n, const std::string& peer_hex, const char* f
 
 static uint64_t nowUnixMs(void)
 {
-    /* Monotonic since boot. lxmf doesn't care about wall clock except
-     * for the user-facing `ts` / `last_announce_s` fields, where
-     * uptime is still a useful coarse "since when" indicator without
-     * needing NTP. */
+    /* Monotonic since boot. Use this for deadline/retry math and the
+     * coarse user-facing "since when" fields — it never steps when the
+     * platform clock is synced, so durations stay correct. NOT for the
+     * LXMF wire timestamp: that must be real wall-clock time (see
+     * wallUnixMs). */
     return (uint64_t)(esp_timer_get_time() / 1000);
+}
+
+static uint64_t wallUnixMs(void)
+{
+    /* Real wall-clock Unix ms for the LXMF message timestamp (payload
+     * field [0]). The platform syncs the system clock via SNTP /
+     * sys.time.set (diptych-core ntp.cpp); once valid, gettimeofday()
+     * returns true Unix time. Before the clock is ever set the ESP
+     * system clock counts up from the 1970 epoch, so an offline,
+     * never-synced device still produces near-epoch stamps — that's a
+     * missing time source, not something lxmf can paper over. */
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (uint64_t)tv.tv_sec * 1000ull + (uint64_t)tv.tv_usec / 1000ull;
 }
 
 static uint32_t cheapRand(void)
@@ -278,10 +324,12 @@ static bool nameContainsCI(std::string_view haystack, std::string_view needle)
  * str/bin content, map<int,*> fields]. Decoding accepts the same shape
  * plus an optional stamp element at index 4. */
 
-static void mpPackUint64(std::vector<uint8_t>& out, uint64_t v)
+static void mpPackFloat64(std::vector<uint8_t>& out, double d)
 {
-    out.push_back(0xCF);
-    for (int i = 7; i >= 0; --i) out.push_back((uint8_t)((v >> (8*i)) & 0xFF));
+    uint64_t bits;
+    std::memcpy(&bits, &d, 8);
+    out.push_back(0xCB);
+    for (int i = 7; i >= 0; --i) out.push_back((uint8_t)((bits >> (8*i)) & 0xFF));
 }
 
 static void mpPackInt(std::vector<uint8_t>& out, int v)
@@ -591,14 +639,24 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
     /* Top-level fixarray of 4. */
     mpPackArrayHeader(out, 4);
 
-    /* [0] timestamp (uint64, ms-precision unix). The reference impl uses
-     * float seconds, but uint64 ms decodes identically on the wire (just
-     * a different msgpack type) and reads cleanly on both sides. */
-    mpPackUint64(out, ts_ms);
+    /* [0] timestamp — msgpack float64 POSIX SECONDS, exactly like the
+     * reference (LXMessage: `self.timestamp = time.time()`, repacked
+     * as-is). It does NO unit conversion on receive, so packing uint64
+     * ms here makes our messages land ~1000x in the future on every
+     * real upstream peer / echo server and sort to the bottom of any
+     * shared timeline. ts_ms stays ms internally; we divide here. Our
+     * own inbound parser already accepts float64 and *=1000 → ms. */
+    mpPackFloat64(out, (double)ts_ms / 1000.0);
 
-    /* [1] title (str), [2] content (str). */
-    mpPackStr(out, title);
-    mpPackStr(out, content);
+    /* [1] title, [2] content — packed as msgpack BIN, not str. The
+     * reference impl UTF-8-encodes both to Python `bytes` before
+     * msgpack.packb (LXMessage.set_{title,content}_from_string), so
+     * they go on the wire as bin. A real upstream peer that gets str
+     * decodes them to a Python str; its echo/display paths then call
+     * `.decode("utf-8")` on a str and the content arrives empty. Our
+     * own inbound path uses mpReadStrOrBin, so this round-trips. */
+    mpPackBin(out, reinterpret_cast<const uint8_t*>(title.data()),   title.size());
+    mpPackBin(out, reinterpret_cast<const uint8_t*>(content.data()), content.size());
 
     /* [3] fields — map of int → value. Only emit non-empty entries. */
     size_t field_count = 0;
@@ -981,6 +1039,12 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     DBG_REMOTE("announces: %s name=\"%s\" cost=%d hops=%d",
         dh_hex.c_str(), sanitizeForLog(info.name).c_str(),
         info.stamp_cost, hops);
+
+    /* This sender's pubkey is now cached. Replay anything we buffered
+     * waiting on it (event-driven — the path request we issued on the
+     * unknown-sender drop is what triggered this re-announce). */
+    for (auto& id : s_ids)
+        if (id.used) drainPendingVerify(id, dh);
 }
 
 static void onAnnounceSubDisconnect(int /*handle*/)
@@ -1079,6 +1143,7 @@ static bool createIdentityForSlot(int n, const std::string& display_name)
     }
     slot.next_send_id = 1;
     for (auto& o : slot.outboxes) o.used = false;
+    slot.pending_verify.clear();
     slot.sent = slot.received = slot.pending = slot.failed = 0;
 
     storageBegin();
@@ -1121,6 +1186,7 @@ static bool loadIdentityForSlot(int n)
     }
     slot.next_send_id = 1;
     for (auto& o : slot.outboxes) o.used = false;
+    slot.pending_verify.clear();
     slot.sent = slot.received = slot.pending = slot.failed = 0;
 
     subscribePerIdCmds(n);
@@ -1198,10 +1264,24 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
     return out;
 }
 
+/* Per-identity participation switch — `s.lxmf.id.<n>.enabled`, default
+ * on (default written in createIdentityForSlot/loadIdentityForSlot). A
+ * disabled identity does not announce, does not send, and drops inbound
+ * LXM: it goes dark on the mesh until re-enabled. There is no global
+ * lxmf enable — participation is per identity. */
+static bool idEnabled(int n)
+{
+    return storageGetInt(idPath(n, "enabled").c_str(), 1) != 0;
+}
+
 static void sendAnnounce(lxmf_id_t& id)
 {
     if (id.handle < 0) {
         warn("id %d: announce skipped (no mailbox handle)", id.index);
+        return;
+    }
+    if (!idEnabled(id.index)) {
+        dbg("id %d: announce suppressed (identity disabled)", id.index);
         return;
     }
     std::vector<uint8_t> app_data = buildAnnounceAppData(id.index);
@@ -1243,6 +1323,13 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         return;
     }
 
+    if (!idEnabled(id.index)) {
+        warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "identity disabled");
+        return;
+    }
+
     std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
     std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
     std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
@@ -1277,7 +1364,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     LxmFields fields;
     fields.thread = thread;
 
-    uint64_t ts_ms = nowUnixMs();
+    uint64_t ts_ms = wallUnixMs();
     std::vector<uint8_t> wire = lxmPackWire(id.identity_key.c_str(),
                                              id.dest_hash, dh,
                                              ts_ms, title, content, fields);
@@ -1426,6 +1513,10 @@ static void dedupAdd(const std::string& mid_hex)
 
 static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
 {
+    if (!idEnabled(id.index)) {
+        dbg("id %d: inbound LXM dropped (identity disabled)", id.index);
+        return;
+    }
     if (n < LXMF_OVERHEAD) {
         warn("id %d: inbound LXM too short (%zu B)", id.index, n);
         return;
@@ -1449,12 +1540,27 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     }
 
     /* Recall sender pubkey from rnsd's cache (populated by their
-     * announces). If absent, request a path and drop for now — Phase 4a
-     * doesn't buffer pending verifications. */
+     * announces). If absent, buffer the wire and request a path: the
+     * path request makes the sender re-announce, and drainPendingVerify
+     * replays this message once their announce lands. Opportunistic
+     * LXMF has no retransmission, so dropping here loses the message. */
     uint8_t sender_pubkey[RNSD_PUBKEY_LEN];
     if (!rnsdRecallPubkey(sh, sender_pubkey)) {
-        warn("id %d: inbound LXM from unknown sender %s — issuing path request",
+        warn("id %d: inbound LXM from unknown sender %s — buffering, issuing path request",
              id.index, bytesToHex(sh, LXMF_DEST_HASH_LEN).c_str());
+        uint64_t now_ms = nowUnixMs();
+        auto& q = id.pending_verify;
+        q.erase(std::remove_if(q.begin(), q.end(),
+                    [&](const pending_verify_t& e) {
+                        return now_ms - e.enqueued_ms > LXMF_PENDING_VERIFY_TTL_MS;
+                    }),
+                q.end());
+        while (q.size() >= LXMF_MAX_PENDING_VERIFY) q.erase(q.begin());
+        pending_verify_t e;
+        std::memcpy(e.sender, sh, LXMF_DEST_HASH_LEN);
+        e.wire.assign(wire, wire + n);
+        e.enqueued_ms = now_ms;
+        q.push_back(std::move(e));
         rnsdRequestPath(sh);
         return;
     }
@@ -1542,6 +1648,57 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
          sanitizeForLog(title).c_str());
 }
 
+/* A sender's lxmf.delivery announce just arrived (rnsd cached their
+ * pubkey). Replay every buffered message from that sender through the
+ * normal pipeline — now the rnsdRecallPubkey gate passes, so they
+ * verify and persist. Called from onAnnounceFromRnsd, lxmf task only. */
+static void drainPendingVerify(lxmf_id_t& id, const uint8_t* sender_hash)
+{
+    if (id.pending_verify.empty()) return;
+
+    uint8_t pk[RNSD_PUBKEY_LEN];
+    if (!rnsdRecallPubkey(sender_hash, pk)) return;  /* still unknown — keep buffered */
+
+    std::vector<std::vector<uint8_t>> ready;
+    for (auto it = id.pending_verify.begin(); it != id.pending_verify.end(); ) {
+        if (std::memcmp(it->sender, sender_hash, LXMF_DEST_HASH_LEN) == 0) {
+            ready.push_back(std::move(it->wire));
+            it = id.pending_verify.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto& w : ready) {
+        info("id %d: sender %s now known — replaying buffered LXM (%zuB)",
+             id.index, bytesToHex(sender_hash, LXMF_DEST_HASH_LEN).c_str(),
+             w.size());
+        onInboundLxm(id, w.data(), w.size());
+    }
+}
+
+/* Backstop sweep: try to drain every distinct buffered sender. Called
+ * from the 1 Hz tick. The onAnnounceFromRnsd hook only fires drain on
+ * the lxmf.delivery announce-fanout; an identity learned via a
+ * path-request response (the common case here — we issue a path
+ * request on the unknown-sender drop) never triggers it, so buffered
+ * messages sat forever. This sweep replays them as soon as the sender
+ * becomes recallable by ANY means. Bounded: <=LXMF_MAX_PENDING_VERIFY
+ * entries per id, distinct-sender deduped. */
+static void drainAllPendingVerify(lxmf_id_t& id)
+{
+    if (id.pending_verify.empty()) return;
+    /* Snapshot distinct sender hashes first — drainPendingVerify mutates
+     * id.pending_verify (erases drained entries). */
+    std::vector<std::vector<uint8_t>> senders;
+    for (auto& e : id.pending_verify) {
+        std::vector<uint8_t> s(e.sender, e.sender + LXMF_DEST_HASH_LEN);
+        bool dup = false;
+        for (auto& x : senders) if (x == s) { dup = true; break; }
+        if (!dup) senders.push_back(std::move(s));
+    }
+    for (auto& s : senders) drainPendingVerify(id, s.data());
+}
+
 /* ─────────────── mailbox frame handlers ─────────────── */
 
 static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
@@ -1564,6 +1721,7 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         case RNSD_DEST_STATUS_DELIVERED: next_stage = "delivered"; id.sent++;   break;
         case RNSD_DEST_STATUS_CANCELLED: next_stage = "cancelled"; id.failed++; err_msg = "cancelled"; break;
         case RNSD_DEST_STATUS_EVICTED:   next_stage = "failed";    id.failed++; err_msg = "evicted (resource limit)"; break;
+        case RNSD_DEST_STATUS_FAILED:    next_stage = "failed";    id.failed++; err_msg = "no route to recipient"; break;
         default:                         next_stage = "failed";    id.failed++; err_msg = "unknown status"; break;
     }
     storageBegin();
@@ -1977,6 +2135,31 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
      * argument must be the node path WITHOUT a trailing dot (cf.
      * destroyIdentity's idPath(n,"")). msgPrefix's trailing dot is for
      * storageForEach/collectTokens only — do not reuse it here. */
+    /* Stop any in-flight send(s) for what we're about to wipe: push
+     * OUT_CANCEL so rnsd unparks the mailbox and stops emitting route
+     * requests for a recipient no one is messaging anymore. Free the
+     * outbox slot locally too — the resulting OUT_RESULT (cancelled)
+     * then no-ops in applyOutResult (unknown send_id) instead of
+     * re-creating storage under a just-deleted message. mid empty =
+     * whole conversation → cancel every slot for this peer. */
+    for (auto& o : id.outboxes) {
+        if (!o.used || o.peer != peer_hex) continue;
+        if (!mid.empty() && o.msg_key != mid) continue;
+        if (id.handle >= 0) {
+            uint8_t f[3] = {
+                RNSD_DEST_OUT_CANCEL,
+                (uint8_t)(o.send_id >> 8),
+                (uint8_t)(o.send_id & 0xFF),
+            };
+            itsSend(id.handle, f, sizeof(f), pdMS_TO_TICKS(200));
+            dbg("id %d: delete cancels in-flight send_id=%u (%s/%s)",
+                id.index, (unsigned)o.send_id, peer_hex.c_str(),
+                o.msg_key.c_str());
+        }
+        o.used = false;
+        if (id.pending > 0) id.pending--;
+    }
+
     char path[160];
     if (mid.empty())
         std::snprintf(path, sizeof(path), "s.lxmf.id.%d.msgs.%s",
@@ -3039,6 +3222,16 @@ static void lxmfTaskMain(void*)
             }
             if (s_announce_sub_handle < 0) connectAnnounceSub();
 
+            /* Backstop: replay anything buffered on a now-known sender.
+             * Covers the path-response case the announce-fanout hook
+             * misses — without this, decrypted messages from a peer
+             * whose identity isn't cached buffer and never deliver. */
+            for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+                lxmf_id_t& id = s_ids[n];
+                if (id.used && !id.pending_verify.empty())
+                    drainAllPendingVerify(id);
+            }
+
             /* Debounced announce: fires once 10 s after the last iface
              * came up (per onRnsdIfaceEvent). Re-armed by each
              * iface-up; this branch runs at most once per debounce
@@ -3084,7 +3277,6 @@ void lxmfInit(void)
     /* Storage defaults gated on version. */
     if (storageGetInt("s.lxmf.version", 0) < LXMF_VERSION) {
         storageBegin();
-        storageDefault("s.lxmf.enable",                 1);
         storageDefault("s.lxmf.enforce_stamps",         0);
         storageDefault("s.lxmf.auto_ticket",            1);
         storageDefault("s.lxmf.announce_interval_s",    1800);  /* periodic re-announce; 0 disables */
