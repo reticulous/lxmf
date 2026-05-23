@@ -193,6 +193,15 @@ static std::string secretsPath(int n, const char* tail)
     return buf;
 }
 
+/* Write an int key only when the value actually changes. storageSet fires change
+ * subscriptions on every write, so rewriting an unchanged value churns
+ * subscribers for nothing — notably the on-device LXMF UI, which rebuilds itself
+ * on any `lxmf.id.*` / `s.lxmf.id.*` change. */
+static void setIntIfChanged(const std::string& key, int v)
+{
+    if (storageGetInt(key.c_str(), INT32_MIN) != v) storageSet(key.c_str(), v);
+}
+
 /* Per-contact message store: s.lxmf.id.<n>.msgs.<peer>.<key>.<field>.
  * `peer` is a 32-hex destination (the conversation subtree); `key` is
  * the real message_id (inbound) or a local o_<ms>_<rand> (outbound).
@@ -1638,8 +1647,11 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
         if (!peer_name.empty())
             storageSet(contactPath(id.index, sh_hex, "display_name").c_str(), peer_name.c_str());
     }
-    storageSet(contactPath(id.index, sh_hex, "last_seen").c_str(),
-               (int)(nowUnixMs() / 1000));
+    /* Floor to the whole minute and write only when it advances: contacts then
+     * all age in lockstep, and a burst of messages within a minute doesn't
+     * re-trigger the on-device UI rebuild. */
+    setIntIfChanged(contactPath(id.index, sh_hex, "last_seen"),
+                    (int)(nowUnixMs() / 60000) * 60);
     storageEnd();
 
     id.received++;
@@ -2367,10 +2379,13 @@ static void publishStats(void)
     for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
         lxmf_id_t& id = s_ids[n];
         if (!id.used) continue;
-        storageSet(idEphPath(n, "stats.sent").c_str(),     (int)id.sent);
-        storageSet(idEphPath(n, "stats.received").c_str(), (int)id.received);
-        storageSet(idEphPath(n, "stats.pending").c_str(),  (int)id.pending);
-        storageSet(idEphPath(n, "stats.failed").c_str(),   (int)id.failed);
+        /* Only on change — these are under lxmf.id.*, which the on-device UI
+         * subscribes to; rewriting unchanged counts at 1 Hz rebuilt the LXMF UI
+         * every second (idle CPU, even when hidden). */
+        setIntIfChanged(idEphPath(n, "stats.sent"),     (int)id.sent);
+        setIntIfChanged(idEphPath(n, "stats.received"), (int)id.received);
+        setIntIfChanged(idEphPath(n, "stats.pending"),  (int)id.pending);
+        setIntIfChanged(idEphPath(n, "stats.failed"),   (int)id.failed);
     }
     storageEnd();
 }
