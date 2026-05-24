@@ -229,6 +229,20 @@ static std::string msgPrefix(int n, const std::string& peer,
     return buf;
 }
 
+/* Register the per-conversation external file before the first message write,
+ * so a chatty conversation rewrites only its own small file instead of growing
+ * root.json on every change (the same separate-file mechanism timezones use).
+ * Idempotent and cheap once registered. No eviction yet — the subtree still
+ * lives in cfgRoot and still syncs to the browser. Deleting the conversation
+ * (or the identity) via storageDeleteTree drops the file automatically.
+ * See storage.h storageNewTreeFile + docs/plans/evictable_storage.md. */
+static void ensureConvFile(int n, const std::string& peer)
+{
+    char prefix[96];
+    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.%s", n, peer.c_str());
+    storageNewTreeFile(prefix);
+}
+
 static std::string contactPath(int n, const std::string& peer_hex, const char* field)
 {
     char buf[120];
@@ -1332,6 +1346,11 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         return;
     }
 
+    /* Valid peer → back this conversation with its own file before we write
+       the record (a browser-composed draft may already be in root.json; the
+       next flush detaches it into this file). */
+    ensureConvFile(id.index, peer_hex);
+
     if (!idEnabled(id.index)) {
         warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
         storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
@@ -1625,6 +1644,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     }
 
     /* Persist. */
+    ensureConvFile(id.index, sh_hex);
     storageBegin();
     storageSet(stage_key.c_str(),                                "received");
     storageSet(msgPath(id.index, sh_hex, mid_hex, "dir").c_str(),        "in");
@@ -2483,6 +2503,7 @@ static void cliEnqueueSend(int id_n, const std::string& peer_hex,
     std::snprintf(key, sizeof(key), "o_%lld_%04x",
                   (long long)(nowUnixMs()), (unsigned)(r & 0xFFFF));
     std::string mid = key;
+    ensureConvFile(id_n, peer_hex);
     storageBegin();
     storageSet(msgPath(id_n, peer_hex, mid, "dir").c_str(),     "out");
     storageSet(msgPath(id_n, peer_hex, mid, "peer").c_str(),    peer_hex.c_str());
