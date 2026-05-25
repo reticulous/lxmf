@@ -1,10 +1,12 @@
 /**
  * lxmf — LXMF messaging protocol task.
  *
- * Phase 4a scope: single-identity, opportunistic-only. Identity bootstrap
- * on first run; storage-driven lifecycle for outbound (client writes
- * stage=draft → ready, firmware packs/signs/queues/sends); inbound
- * verification + dedup + storage write.
+ * Multi-identity (slots 0..LXMF_MAX_IDENTITIES-1); opportunistic single-packet
+ * delivery plus on-demand Link + Resource transfer for larger messages. No
+ * auto-create at boot — identities are created explicitly (lxmfCreateIdentity),
+ * so a node with none runs transport-only. Storage-driven lifecycle for
+ * outbound (client writes stage=draft → ready, firmware packs/signs/queues/
+ * sends); inbound verification + dedup + storage write.
  *
  * Storage is the API — no DataChannel, no ITS port for clients. Every
  * frontend (browser, CLI, on-device UI) reads/writes the `s.lxmf.*` /
