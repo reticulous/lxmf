@@ -575,7 +575,7 @@ export function registerLxmf() {
   const menu = useMenuStore()
 
   menu.register('status', 'Status', 20, [
-    { id: 'status.messages', label: 'Messages', type: 'action', order: 5,
+    { id: 'status.messages', label: 'LXMF', type: 'action', order: 5,
       action: () => { messagesVisible.value = !messagesVisible.value } },
     { id: 'status.announces', label: 'Announces', type: 'action', order: 6,
       action: () => { announcesVisible.value = !announcesVisible.value } },
