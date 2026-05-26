@@ -124,7 +124,7 @@ const clock = computed(() =>
 .mi {
   display: flex; align-items: center; gap: 8px; width: 100%;
   background: none; border: none; color: #e8e8e8;
-  font-size: 13px; text-align: left; padding: 7px 9px;
+  font-size: calc(13px * var(--rfs, 1)); text-align: left; padding: 7px 9px;
   border-radius: 5px; cursor: pointer;
 }
 .mi:hover { background: rgba(255,255,255,0.07); }
@@ -134,7 +134,7 @@ const clock = computed(() =>
   max-width: 78%;
   padding: 6px 10px 4px;
   border-radius: 12px;
-  font-size: 13px;
+  font-size: calc(13px * var(--rfs, 1));
   line-height: 1.35;
   color: #e8e8e8;
   word-break: break-word;
@@ -147,22 +147,22 @@ const clock = computed(() =>
   display: flex; align-items: center; gap: 5px;
   justify-content: flex-end;
   margin-top: 2px;
-  font-size: 11px;
+  font-size: calc(11px * var(--rfs, 1));
   color: #9a9a9a;
 }
 .time { font-variant-numeric: tabular-nums; }
 .chip { display: inline-flex; align-items: center; color: #9a9a9a; }
 .chip.ok  { color: #6fb98f; }
 .chip.bad { color: #d98a8a; }
-.subnote { margin-top: 3px; font-size: 11px; color: #8fa6c0; font-style: italic; }
+.subnote { margin-top: 3px; font-size: calc(11px * var(--rfs, 1)); color: #8fa6c0; font-style: italic; }
 .failrow {
   margin-top: 4px; display: flex; align-items: center; gap: 8px;
-  font-size: 11px;
+  font-size: calc(11px * var(--rfs, 1));
 }
 .err { color: #d98a8a; }
 .resend {
   background: none; border: 1px solid #d98a8a; color: #d98a8a;
-  border-radius: 5px; padding: 1px 8px; font-size: 11px; cursor: pointer;
+  border-radius: 5px; padding: 1px 8px; font-size: calc(11px * var(--rfs, 1)); cursor: pointer;
 }
 .resend:hover { background: rgba(217, 138, 138, 0.15); }
 </style>

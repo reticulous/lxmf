@@ -63,12 +63,12 @@ function doSend() {
 
 <style scoped>
 .composer { border-top: 1px solid rgba(255,255,255,0.08); padding: 8px 10px; }
-.hint { font-size: 11px; color: #8fa6c0; margin-bottom: 5px; }
+.hint { font-size: calc(11px * var(--rfs, 1)); color: #8fa6c0; margin-bottom: 5px; }
 .row { display: flex; align-items: flex-end; gap: 8px; }
 .input {
   flex: 1; resize: none; background: #2a2a2a; color: #e8e8e8;
   border: 1px solid rgba(255,255,255,0.12); border-radius: 16px;
-  padding: 8px 12px; font-size: 13px; line-height: 1.35;
+  padding: 8px 12px; font-size: calc(13px * var(--rfs, 1)); line-height: 1.35;
   font-family: inherit; outline: none; max-height: 120px;
   /* Auto-grow textarea: scrollHeight (content+padding) makes the UA paint
    * a vertical overlay scrollbar — the rounded pill at the right edge,

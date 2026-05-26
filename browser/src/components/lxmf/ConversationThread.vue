@@ -90,20 +90,20 @@ watch(() => props.buckets, toBottom, { deep: true, immediate: true })
 .back { display: none; } /* shown by the device composition root only */
 .who { flex: 1; min-width: 0; }
 .name {
-  font-weight: 600; color: #e8e8e8; font-size: 14px;
+  font-weight: 600; color: #e8e8e8; font-size: calc(14px * var(--rfs, 1));
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.sub { font-size: 11px; color: #8a8a8a; height: 13px; }
+.sub { font-size: calc(11px * var(--rfs, 1)); color: #8a8a8a; height: 13px; }
 .info, .back {
   background: none; border: none; color: #9a9a9a; cursor: pointer;
   padding: 2px; border-radius: 5px;
 }
 .info:hover { background: rgba(255,255,255,0.08); color: #cfcfcf; }
 .scroll { flex: 1; overflow-y: auto; padding: 8px 10px; }
-.empty { color: #888; font-style: italic; text-align: center; padding: 20px; font-size: 13px; }
+.empty { color: #888; font-style: italic; text-align: center; padding: 20px; font-size: calc(13px * var(--rfs, 1)); }
 .daysep { text-align: center; margin: 10px 0 6px; }
 .daysep span {
   background: rgba(255,255,255,0.06); color: #9a9a9a;
-  font-size: 11px; padding: 2px 10px; border-radius: 9px;
+  font-size: calc(11px * var(--rfs, 1)); padding: 2px 10px; border-radius: 9px;
 }
 </style>

@@ -104,37 +104,37 @@ const reachLine = computed(() => {
 .chead {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
-  color: #e8e8e8; font-weight: 600; font-size: 14px;
+  color: #e8e8e8; font-weight: 600; font-size: calc(14px * var(--rfs, 1));
 }
 .x { background: none; border: none; color: #9a9a9a; cursor: pointer; padding: 2px; }
 .body { flex: 1; overflow-y: auto; padding: 16px; }
 .hero { text-align: center; margin-bottom: 14px; display: flex;
         flex-direction: column; align-items: center; gap: 6px; }
-.hname { color: #e8e8e8; font-size: 17px; font-weight: 600; margin-top: 6px; }
+.hname { color: #e8e8e8; font-size: calc(17px * var(--rfs, 1)); font-weight: 600; margin-top: 6px; }
 .verified {
   display: inline-flex; align-items: center; gap: 4px;
-  color: #6fb98f; font-size: 12px;
+  color: #6fb98f; font-size: calc(12px * var(--rfs, 1));
 }
-.unverified { color: #888; font-size: 12px; }
-.reach { text-align: center; color: #8a8a8a; font-size: 12px; margin-bottom: 12px; }
+.unverified { color: #888; font-size: calc(12px * var(--rfs, 1)); }
+.reach { text-align: center; color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); margin-bottom: 12px; }
 .sect {
-  color: #aaa; font-size: 12px; text-transform: uppercase;
+  color: #aaa; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase;
   letter-spacing: 0.05em; margin: 16px 0 6px;
 }
-.hint { color: #8a8a8a; font-size: 12px; line-height: 1.4; margin-bottom: 8px; }
+.hint { color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); line-height: 1.4; margin-bottom: 8px; }
 .sn {
-  font-family: 'JetBrains Mono', 'Menlo', monospace; font-size: 13px;
+  font-family: 'JetBrains Mono', 'Menlo', monospace; font-size: calc(13px * var(--rfs, 1));
   color: #c8d8c8; background: #232323; border-radius: 8px;
   padding: 10px 12px; word-break: break-word; line-height: 1.6;
 }
-.sn.small { font-size: 11px; color: #9a9a9a; }
+.sn.small { font-size: calc(11px * var(--rfs, 1)); color: #9a9a9a; }
 .addr {
   display: flex; align-items: center; gap: 8px;
   background: #232323; border-radius: 8px; padding: 8px 8px 8px 12px;
 }
 .addrhex {
   flex: 1; min-width: 0;
-  font-family: 'JetBrains Mono', 'Menlo', monospace; font-size: 12px;
+  font-family: 'JetBrains Mono', 'Menlo', monospace; font-size: calc(12px * var(--rfs, 1));
   color: #c8d8c8; word-break: break-all; line-height: 1.5;
 }
 .copy {
@@ -145,7 +145,7 @@ const reachLine = computed(() => {
 .danger {
   margin-top: 22px; width: 100%; background: none;
   border: 1px solid #a05656; color: #d98a8a; border-radius: 8px;
-  padding: 9px; font-size: 13px; cursor: pointer;
+  padding: 9px; font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
 }
 .danger:hover { background: rgba(160,86,86,0.15); }
 </style>

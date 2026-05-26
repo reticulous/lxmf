@@ -14,8 +14,13 @@
     :min-size="{ w: 34, h: 18 }"
     @update:visible="v => emit('update:visible', v)"
   >
+    <template #titlebar-right>
+      <span class="rfs-btn" title="Smaller" @click="zoomOut">-</span>
+      <span class="rfs-btn" title="Larger" @click="zoomIn">+</span>
+    </template>
+
     <template #default>
-      <div class="msg-root">
+      <div class="msg-root" :style="{ '--rfs': scale }">
         <div v-if="lxmf.usableIdentities.value.length > 1" class="idbar">
           <span class="idlbl">Identity</span>
           <select v-model.number="lxmf.activeIdentity.value" class="idsel">
@@ -118,12 +123,14 @@ import Composer from '../components/lxmf/Composer.vue'
 import PeerPicker from '../components/lxmf/PeerPicker.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import { useLxmf, type Message } from '../modules/lxmf'
+import { useWinZoom } from '../lib/winZoom'
 
 defineProps<{ visible: boolean; title: string }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
 
 const defaultGeom = { x: 10, y: 7, w: 76, h: 78 }
 const lxmf = useLxmf()
+const { scale, zoomIn, zoomOut } = useWinZoom('lxmf')
 
 /* Draggable master/detail divider. Width persisted client-side. */
 const RAIL_MIN = 180, RAIL_MAX = 520, LS_RAIL = 'lxmf.railW'
@@ -219,7 +226,14 @@ function askDeleteMsg(m: Message) {
   background: #2a2a2a; color: #e8e8e8; border: 1px solid rgba(255,255,255,0.12);
   border-radius: 6px; padding: 3px 8px; font-size: 12px; outline: none;
 }
-.noident { color: #9a9a9a; font-size: 13px; padding: 24px; text-align: center; line-height: 1.5; }
+.noident { color: #9a9a9a; font-size: calc(13px * var(--rfs, 1)); padding: 24px; text-align: center; line-height: 1.5; }
+.rfs-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 4px; font-size: 14px; font-weight: 700;
+  color: rgba(255,255,255,0.5); cursor: pointer; font-family: system-ui; line-height: 1;
+  user-select: none;
+}
+.rfs-btn:hover { color: rgba(255,255,255,0.9); background: rgba(255,255,255,0.1); }
 .panes { flex: 1; display: flex; min-height: 0; }
 .rail {
   flex: none;
@@ -237,7 +251,7 @@ function askDeleteMsg(m: Message) {
 .detail { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .placeholder {
   flex: 1; display: flex; align-items: center; justify-content: center;
-  color: #777; font-size: 13px; font-style: italic;
+  color: #777; font-size: calc(13px * var(--rfs, 1)); font-style: italic;
 }
 .sheet-bg {
   position: absolute; inset: 0; background: rgba(0,0,0,0.45); z-index: 7;

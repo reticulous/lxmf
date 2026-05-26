@@ -63,13 +63,13 @@ function formatAge(epochSecs: number): string {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
 }
-.title { font-weight: 600; color: #e8e8e8; font-size: 14px; }
+.title { font-weight: 600; color: #e8e8e8; font-size: calc(14px * var(--rfs, 1)); }
 .new {
   background: none; border: none; color: #9fb8d8; cursor: pointer;
   display: flex; padding: 2px; border-radius: 5px;
 }
 .new:hover { background: rgba(255,255,255,0.08); }
-.empty { color: #888; font-style: italic; padding: 16px; font-size: 13px; text-align: center; }
+.empty { color: #888; font-style: italic; padding: 16px; font-size: calc(13px * var(--rfs, 1)); text-align: center; }
 .conv {
   display: flex; gap: 10px; padding: 9px 10px; cursor: pointer;
   border-bottom: 1px solid rgba(255,255,255,0.05);
@@ -80,17 +80,17 @@ function formatAge(epochSecs: number): string {
 .line1, .line2 { display: flex; align-items: baseline; gap: 8px; }
 .line2 { margin-top: 2px; }
 .name {
-  flex: 1; min-width: 0; font-weight: 500; color: #e8e8e8; font-size: 13px;
+  flex: 1; min-width: 0; font-weight: 500; color: #e8e8e8; font-size: calc(13px * var(--rfs, 1));
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.time { color: #888; font-size: 11px; flex: none; }
+.time { color: #888; font-size: calc(11px * var(--rfs, 1)); flex: none; }
 .preview {
-  flex: 1; min-width: 0; color: #9a9a9a; font-size: 12px;
+  flex: 1; min-width: 0; color: #9a9a9a; font-size: calc(12px * var(--rfs, 1));
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .you { color: #7a7a7a; }
 .badge {
-  flex: none; background: #4a7d5e; color: #eaffea; font-size: 11px;
+  flex: none; background: #4a7d5e; color: #eaffea; font-size: calc(11px * var(--rfs, 1));
   min-width: 18px; height: 18px; border-radius: 9px; padding: 0 5px;
   display: flex; align-items: center; justify-content: center;
   font-variant-numeric: tabular-nums;
