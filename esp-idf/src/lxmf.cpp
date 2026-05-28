@@ -13,13 +13,14 @@
  * is distinct and not used in Phase 4a.
  */
 #include "lxmf.h"
-#include "diptych.h"
+#include "spangap.h"
 #include "ports.h"
 #include "rnsd.h"     /* SHA-256, sign/verify, dest-hash, recall, request_path */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include <sys/time.h>
 
 #include <cstring>
@@ -264,7 +265,7 @@ static uint64_t wallUnixMs(void)
 {
     /* Real wall-clock Unix ms for the LXMF message timestamp (payload
      * field [0]). The platform syncs the system clock via SNTP /
-     * sys.time.set (diptych-core ntp.cpp); once valid, gettimeofday()
+     * sys.time.set (spangap-core ntp.cpp); once valid, gettimeofday()
      * returns true Unix time. Before the clock is ever set the ESP
      * system clock counts up from the 1970 epoch, so an offline,
      * never-synced device still produces near-epoch stamps — that's a

@@ -116,14 +116,14 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import FloatingWindow from 'diptych-browser/components/FloatingWindow.vue'
+import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import ConversationList from '../components/lxmf/ConversationList.vue'
 import ConversationThread from '../components/lxmf/ConversationThread.vue'
 import Composer from '../components/lxmf/Composer.vue'
 import PeerPicker from '../components/lxmf/PeerPicker.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import { useLxmf, type Message } from '../modules/lxmf'
-import { useWinZoom } from '../lib/winZoom'
+import { useWinZoom } from 'reticulous-core/lib/winZoom'
 
 defineProps<{ visible: boolean; title: string }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()

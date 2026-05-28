@@ -1,0 +1,24 @@
+# reticulous-lxmf — LXMF messaging on spangap.
+#
+# Multi-identity, opportunistic single-packet delivery plus on-demand
+# Link + Resource transfer for larger messages. Storage is the API —
+# every frontend (browser, CLI, on-device UI) reads/writes the
+# `s.lxmf.*` / `lxmf.*` / `secrets.lxmf.*` keys; the lxmf task subscribes
+# to its own subtree.
+#
+# Browser half: settings + the LXMessenger chat UI (ConversationList,
+# Composer, MessageBubble, PeerPicker, …).
+# LCD slice (firmware sub-dir): the on-device LXMessenger program.
+schema_version: 1
+name: reticulous/reticulous-lxmf
+prefix: lxmf
+version: 0.1.0
+firmware: esp-idf
+# LCD slice (esp-idf/lcd/) is hardcoded into the firmware CMakeLists.txt
+# for now — the activator-driven source-list exclusion is a future CLI
+# feature, so there's no manifest field to declare it yet. The slice's
+# .cpp body is wrapped in #if CONFIG_SPANGAP_LCD until then.
+browser: browser
+platforms: [idf]
+requires:
+  - reticulous/reticulous-core

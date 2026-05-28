@@ -12,8 +12,8 @@
  * docs/internals/lxmf.md — this file maps it onto reactive state.
  */
 import { ref, reactive, computed, watch, type ComputedRef } from 'vue'
-import { useDeviceStore } from 'diptych-browser/stores/device'
-import { useMenuStore } from 'diptych-browser/stores/menu'
+import { useDeviceStore } from 'spangap-browser/stores/device'
+import { useMenuStore } from 'spangap-browser/stores/menu'
 import LxmfPanel from '../panels/LxmfPanel.vue'
 
 /* ── Composition-layer wiring (pattern mirrors modules/rnsd.ts) ──────── */

@@ -27,7 +27,7 @@
  */
 #include "sdkconfig.h"
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 
 #include "lcd.h"
 #include "storage.h"
@@ -540,4 +540,4 @@ extern "C" void lxmfLcdRegister(void) {
     lcdRegisterSettings("Reticulum/LXMF", "LXMF", lxmfSettingsPane);
 }
 
-#endif /* CONFIG_DIPTYCH_LCD */
+#endif /* CONFIG_SPANGAP_LCD */
