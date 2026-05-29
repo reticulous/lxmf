@@ -22,3 +22,7 @@ browser: browser
 platforms: [idf]
 requires:
   - reticulous/reticulous-core
+optional_requires:
+  # On-device LXMessenger program — lcd/src/lxmf_lcd.cpp body wrapped in
+  # #if CONFIG_SPANGAP_LCD until activator-driven source-list exclusion lands.
+  - spangap/spangap-lcd
