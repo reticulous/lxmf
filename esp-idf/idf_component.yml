@@ -1,5 +1,5 @@
-description: "reticulous-lxmf: LXMF messaging on spangap. Multi-identity, opportunistic + Link + Resource delivery, storage-as-API."
-url: https://github.com/reticulous/reticulous-lxmf
+description: "lxmf: LXMF messaging on spangap. Multi-identity, opportunistic + Link + Resource delivery, storage-as-API."
+url: https://github.com/reticulous/lxmf
 version: "0.1.0"
 license: "Apache-2.0"
 targets:

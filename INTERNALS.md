@@ -1,4 +1,4 @@
-# reticulous-lxmf — internals
+# lxmf — internals
 
 ## Task
 
@@ -86,4 +86,4 @@ feature, so there's no manifest field to declare it yet. The slice's
 LXMF 0.9.8, hardware-verified against upstream Python LXMF. Per-
 contact threads, Link + Resource transfer working. Full storage-key
 schema documented in
-[reticulous-tdeck/docs/internals/lxmf.md](../reticulous-tdeck/docs/internals/lxmf.md).
+[hw-tdeck/docs/internals/lxmf.md](../hw-tdeck/docs/internals/lxmf.md).

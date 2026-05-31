@@ -1,5 +1,5 @@
 {
-  "name": "reticulous-lxmf",
+  "name": "lxmf",
   "version": "0.1.0",
   "type": "module",
   "description": "Browser-side LXMessenger UI for reticulous: settings panel, MessagesWindow, conversation thread/composer/contact card components.",
@@ -14,6 +14,6 @@
     "quasar": "^2.17.0",
     "pinia": "^3.0.4",
     "spangap-browser": "*",
-    "reticulous-core": "*"
+    "rns": "*"
   }
 }

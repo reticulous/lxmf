@@ -1,6 +1,6 @@
 # License
 
-This repository, **reticulous-lxmf** (LXMF messaging on spangap;
+This repository, **lxmf** (LXMF messaging on spangap;
 multi-identity, opportunistic + Link + Resource delivery, storage-as-API), is
 released under the **Apache License, Version 2.0**.
 

@@ -1,9 +1,9 @@
-# reticulous-lxmf
+# lxmf
 
 ## What is this?
 
-**reticulous-lxmf** is LXMF messaging on
-[reticulous-core](../reticulous-core): multi-identity opportunistic
+**lxmf** is LXMF messaging on
+[rns](../rns): multi-identity opportunistic
 single-packet delivery plus on-demand Link + Resource transfer for
 larger messages. Storage is the API — every frontend (browser, CLI,
 on-device LCD) reads/writes the `s.lxmf.*` / `lxmf.*` / `secrets.lxmf.*`
@@ -17,7 +17,7 @@ human-messaging layer on Reticulum.
 ## What this straddle owns
 
 ```
-reticulous-lxmf/
+lxmf/
 ├── esp-idf/
 │   ├── include/lxmf.h
 │   ├── src/lxmf.cpp         the lxmf task: multi-identity, mailbox, peers
@@ -58,7 +58,7 @@ create` (CLI), or via the Settings panel.
 
 ## Dependencies
 
-- [reticulous-core](../reticulous-core)
+- [rns](../rns)
 - (transports are decoupled — pick whichever ones suit the deployment)
 
 ## Read next
@@ -66,7 +66,7 @@ create` (CLI), or via the Settings panel.
 - [INTERNALS.md](INTERNALS.md) — task layout, sentinel cmd surface,
   storage shape, multi-identity model.
 - Deep-dive in the consuming app:
-  [docs/lxmf.md](../reticulous-tdeck/docs/lxmf.md) — black-box view;
-  [docs/internals/lxmf.md](../reticulous-tdeck/docs/internals/lxmf.md)
+  [docs/lxmf.md](../hw-tdeck/docs/lxmf.md) — black-box view;
+  [docs/internals/lxmf.md](../hw-tdeck/docs/internals/lxmf.md)
   — the reach-inside view (upstream LXMF 0.9.8 summary, our deltas,
   full schema, phasing).

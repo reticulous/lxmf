@@ -2593,11 +2593,11 @@ static std::string cliResolvePeer(const std::string& arg)
     s_peer_list_label = "announce match";
     cliPrintf("ambiguous \"%s\" — %zu matches:\n",
               arg.c_str(), ctx.matches.size());
-    cliPrintf("  %-3s %-32s %s\n", "#", "destination", "name");
+    cliPrintf("%-3s %-32s %s\n", "#", "destination", "name");
     int row = 1;
     for (const auto& m : ctx.matches) {
         s_peer_list.push_back(m.hash);
-        cliPrintf("  %-3d %-32s %s\n",
+        cliPrintf("%-3d %-32s %s\n",
                   row++, m.hash.c_str(), sanitizeForLog(m.name).c_str());
     }
     cliPrintf("(retry with `lxmf send <#> <text>`, a longer substring, or the 32-hex hash)\n");
@@ -2612,7 +2612,7 @@ static void cliId(const char* rest)
     while (*rest == ' ') rest++;
     if (!*rest) {
         int sel = selectedId();
-        cliPrintf("  %-3s %-12s %s\n", "id", "label", "destination");
+        cliPrintf("%-3s %-12s %s\n", "id", "label", "destination");
         for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
             lxmf_id_t& id = s_ids[n];
             if (!id.used) continue;
@@ -2688,10 +2688,10 @@ static void printMsgRows(int sel, std::vector<MsgRow>& rows, bool show_peer)
     s_msgs_list.clear();
     if (rows.empty()) return;
     if (show_peer)
-        cliPrintf("  %-3s %-3s %-9s %-16s %-6s %s\n",
+        cliPrintf("%-3s %-3s %-9s %-16s %-6s %s\n",
                   "#", "dir", "stage", "peer", "unread", "title");
     else
-        cliPrintf("  %-3s %-3s %-9s %-6s %s\n",
+        cliPrintf("%-3s %-3s %-9s %-6s %s\n",
                   "#", "dir", "stage", "unread", "title");
     int n = 1;
     for (const auto& r : rows) {
@@ -2699,11 +2699,11 @@ static void printMsgRows(int sel, std::vector<MsgRow>& rows, bool show_peer)
         const char* unread = (r.dir == "in" && !r.read) ? "*" : "";
         if (show_peer) {
             std::string p16 = r.peer.size() >= 16 ? r.peer.substr(0, 16) : r.peer;
-            cliPrintf("  %-3d %-3s %-9s %-16s %-6s %s\n",
+            cliPrintf("%-3d %-3s %-9s %-16s %-6s %s\n",
                       n++, r.dir.c_str(), r.stage.c_str(), p16.c_str(),
                       unread, r.title.c_str());
         } else {
-            cliPrintf("  %-3d %-3s %-9s %-6s %s\n",
+            cliPrintf("%-3d %-3s %-9s %-6s %s\n",
                       n++, r.dir.c_str(), r.stage.c_str(),
                       unread, r.title.c_str());
         }
@@ -2747,7 +2747,7 @@ static void cliChats(int sel)
     s_peer_list_label = "chats";
     cliPrintf("id %d  %zu conversation(s)\n", sel, rows.size());
     if (rows.empty()) return;
-    cliPrintf("  %-3s %-16s %-5s %-6s %-11s %s\n",
+    cliPrintf("%-3s %-16s %-5s %-6s %-11s %s\n",
               "#", "peer", "msgs", "unread", "last", "who");
     int n = 1;
     for (const auto& c : rows) {
@@ -2755,7 +2755,7 @@ static void cliChats(int sel)
         std::string p16 = c.peer.size() >= 16 ? c.peer.substr(0, 16) : c.peer;
         std::string who = !c.name.empty() ? c.name
                         : (c.last_title.empty() ? "(unknown)" : c.last_title);
-        cliPrintf("  %-3d %-16s %-5d %-6d %-11d %s\n",
+        cliPrintf("%-3d %-16s %-5d %-6d %-11d %s\n",
                   n++, p16.c_str(), c.count, c.unread, c.last_ts,
                   sanitizeForLog(who).c_str());
     }
@@ -2892,12 +2892,12 @@ static void cliContacts(void)
 
     cliPrintf("id %d  %zu contact(s)\n", sel, rows.size());
     if (rows.empty()) return;
-    cliPrintf("  %-3s %-32s %-5s %-12s %s\n",
+    cliPrintf("%-3s %-32s %-5s %-12s %s\n",
               "#", "destination", "trust", "nick", "display_name");
     int n = 1;
     for (const auto& r : rows) {
         s_peer_list.push_back(r.hash);
-        cliPrintf("  %-3d %-32s %-5d %-12s %s\n",
+        cliPrintf("%-3d %-32s %-5d %-12s %s\n",
                   n++, r.hash.c_str(), r.trust,
                   r.nick.c_str(), r.display_name.c_str());
     }
@@ -2943,7 +2943,7 @@ static void annEmitRow(const char* hex, const AnnounceEntry& e)
     int age = (e.last_s > 0) ? (s_ann_stream.now_s - e.last_s) : -1;
     s_ann_stream.row_num++;
     s_peer_list.push_back(hex);
-    cliPrintf("  %-3d %-32s %-5d %-5d %-7d %s\n",
+    cliPrintf("%-3d %-32s %-5d %-5d %-7d %s\n",
               s_ann_stream.row_num, hex,
               e.hops, e.cost, age,
               sanitizeForLog(e.name).c_str());
@@ -2976,12 +2976,12 @@ static void cliAnnouncesByHash(const std::string& hex)
         return;
     }
     int age = e.last_s > 0 ? (now_s - e.last_s) : -1;
-    cliPrintf("  %-3s %-32s %-5s %-5s %-7s %s\n",
+    cliPrintf("%-3s %-32s %-5s %-5s %-7s %s\n",
               "#", "destination", "hops", "cost", "age(s)", "name");
     s_peer_list.clear();
     s_peer_list_label = "announces";
     s_peer_list.push_back(hex);
-    cliPrintf("  %-3d %-32s %-5d %-5d %-7d %s\n",
+    cliPrintf("%-3d %-32s %-5d %-5d %-7d %s\n",
               1, hex.c_str(), e.hops, e.cost, age,
               sanitizeForLog(e.name).c_str());
 }
@@ -3005,7 +3005,7 @@ static void cliAnnounces(const char* rest)
     s_ann_stream.now_s = (int)(nowUnixMs() / 1000);
     s_ann_filter       = arg;   /* empty = no filter */
 
-    cliPrintf("  %-3s %-32s %-5s %-5s %-7s %s\n",
+    cliPrintf("%-3s %-32s %-5s %-5s %-7s %s\n",
               "#", "destination", "hops", "cost", "age(s)", "name");
 
     storageForEach("lxmf.announces.", annStreamLeaf);
@@ -3029,7 +3029,7 @@ static void cliSend(const char* rest)
     const char* sp = std::strchr(rest, ' ');
     if (!sp || sp == rest) {
         cliPrintf("usage: lxmf send <peer> <text>\n");
-        cliPrintf("  <peer> = 32-hex destination, or a number from `contacts`/`announces`\n");
+        cliPrintf("<peer> = 32-hex destination, or a number from `contacts`/`announces`\n");
         return;
     }
     std::string peer_arg(rest, sp - rest);
@@ -3077,22 +3077,24 @@ static void cliLxmf(const char* args)
     /* Skip leading spaces. */
     while (*args == ' ') args++;
 
-    if (!*args || std::strcmp(args, "help") == 0) {
-        cliPrintf("usage:\n");
-        cliPrintf("  lxmf create <name>      generate a new identity with display_name=<name>\n");
-        cliPrintf("  lxmf destroy <n>        wipe identity at slot <n> (secrets + storage)\n");
-        cliPrintf("  lxmf id                 list identities (* = selected)\n");
-        cliPrintf("  lxmf id <n>             switch selected identity\n");
-        cliPrintf("  lxmf chats              list conversations for selected id (numbered)\n");
-        cliPrintf("  lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <stage> = filter\n");
-        cliPrintf("  lxmf read <n>           print msg n from last listing; marks read\n");
-        cliPrintf("  lxmf contacts           list contacts for selected id (numbered)\n");
-        cliPrintf("  lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");
-        cliPrintf("                          arg = 32-hex (instant lookup) or name substring\n");
-        cliPrintf("  lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
-        cliPrintf("  lxmf announce           emit a delivery announce for selected id\n");
+    if (std::strcmp(args, "help") == 0) { cliPrintf("%-*s LXMF messaging: identities, chats, send\n", CLI_HELP_COL, "lxmf [...]"); return; }
+    if (cliWantsHelp(args)) {
+        cliPrintf("lxmf create <name>      generate a new identity with display_name=<name>\n");
+        cliPrintf("lxmf destroy <n>        wipe identity at slot <n> (secrets + storage)\n");
+        cliPrintf("lxmf id                 list identities (* = selected)\n");
+        cliPrintf("lxmf id <n>             switch selected identity\n");
+        cliPrintf("lxmf chats              list conversations for selected id (numbered)\n");
+        cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <stage> = filter\n");
+        cliPrintf("lxmf read <n>           print msg n from last listing; marks read\n");
+        cliPrintf("lxmf contacts           list contacts for selected id (numbered)\n");
+        cliPrintf("lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");
+        cliPrintf("                      arg = 32-hex (instant lookup) or name substring\n");
+        cliPrintf("lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
+        cliPrintf("lxmf announce           emit a delivery announce for selected id\n");
         return;
     }
+    /* Bare `lxmf` → identity list as status. */
+    if (!*args) args = "id";
 
     /* Split into verb + rest. */
     const char* sp = std::strchr(args, ' ');
@@ -3163,7 +3165,7 @@ static void cliLxmf(const char* args)
         return;
     }
 
-    cliPrintf("unknown subcommand `%s`. try `lxmf help`.\n", verb.c_str());
+    cliPrintf("unknown subcommand `%s`. try `lxmf -h`.\n", verb.c_str());
 }
 
 /* ─────────────── task ─────────────── */

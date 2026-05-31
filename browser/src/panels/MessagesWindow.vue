@@ -123,7 +123,7 @@ import Composer from '../components/lxmf/Composer.vue'
 import PeerPicker from '../components/lxmf/PeerPicker.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import { useLxmf, type Message } from '../modules/lxmf'
-import { useWinZoom } from 'reticulous-core/lib/winZoom'
+import { useWinZoom } from 'rns/lib/winZoom'
 
 defineProps<{ visible: boolean; title: string }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
