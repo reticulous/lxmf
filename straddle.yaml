@@ -26,3 +26,10 @@ optional_requires:
   # On-device LXMessenger program — lcd/src/lxmf_lcd.cpp body wrapped in
   # #if CONFIG_SPANGAP_LCD until activator-driven source-list exclusion lands.
   - spangap/spangap-lcd
+# Auto-init: folded into the generated spangapInitStraddles() dispatcher in the
+# app-layer band (>150), after rnsd + transports. lxmfInit() also self-registers
+# its LCD launcher tile (lxmfLcdRegister, a no-op stub in non-LCD builds), so
+# the consumer's app_main references lxmf nowhere.
+init:
+  - call: lxmfInit
+    order: 180
