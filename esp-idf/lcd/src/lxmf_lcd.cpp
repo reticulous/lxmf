@@ -540,4 +540,10 @@ extern "C" void lxmfLcdRegister(void) {
     lcdRegisterSettings("Reticulum/LXMF", "LXMF", lxmfSettingsPane);
 }
 
+#else /* !CONFIG_SPANGAP_LCD */
+
+/* No-op stub so lxmfInit()'s unconditional lxmfLcdRegister() links in non-LCD
+ * (--no-lcd) builds, where the launcher program above compiles to nothing. */
+extern "C" void lxmfLcdRegister(void) {}
+
 #endif /* CONFIG_SPANGAP_LCD */
