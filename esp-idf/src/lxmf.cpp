@@ -3332,12 +3332,9 @@ void lxmfInit(void)
     /* Core 1, prio 1, 8 KB PSRAM stack per the plan. */
     s_task = spawnTask(lxmfTaskMain, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);
 
-    /* Self-register the on-device LXMessenger launcher tile. lxmfLcdRegister()
-     * lives in the lcd/ slice and compiles to a no-op stub in non-LCD builds,
-     * so this is unconditional — the consumer's app_main wires nothing. The lcd
-     * task reads the launcher registry lazily, so registering here (before or
-     * after lcdInit) is fine. */
-    lxmfLcdRegister();
+    /* The on-device LXMessenger launcher tile registers via lxmfLcdRegister(),
+     * a when: spangap/spangap-lcd init: hook (conditional/spangap-lcd/ slice).
+     * Not called from here, so non-LCD builds never reference it. */
 }
 
 /* ─────────────── public API (lxmf.h) ─────────────── */

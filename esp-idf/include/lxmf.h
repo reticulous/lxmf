@@ -47,12 +47,3 @@ int lxmfCreateIdentity(const char* display_name, bool sync = false);
  *  Returns true on success, false on validation error / timeout /
  *  lxmf-side failure. */
 bool lxmfDestroyIdentity(int n, bool sync = false);
-
-/** Register the LXMessenger LCD launcher program with the lcd task.
- *  Implemented in the lcd/ slice (esp-idf/lcd/src/lxmf_lcd.cpp), gated
- *  on CONFIG_SPANGAP_LCD; in non-LCD builds the body of the function
- *  is `#if`'d out and the call is a tiny no-op. Called by lxmfInit()
- *  itself, so consumers never wire it — exposed only for that internal
- *  call. The lcd task reads the launcher registry lazily, so it is
- *  order-independent of lcdInit(). */
-extern "C" void lxmfLcdRegister(void);

@@ -33,3 +33,5 @@ optional_requires:
 # builds) directly. The consumer's app_main references lxmf nowhere.
 init:
   - call: lxmfInit
+  - call: lxmfLcdRegister
+    when: spangap/spangap-lcd

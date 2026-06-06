@@ -25,10 +25,6 @@
  * Everything runs on the lcd task; storage subscriptions are dispatched there,
  * so we touch LVGL straight from the change callback.
  */
-#include "sdkconfig.h"
-
-#if CONFIG_SPANGAP_LCD
-
 #include "lcd.h"
 #include "storage.h"
 #include "compat.h"
@@ -532,18 +528,11 @@ void lxmfSettingsPane(void* arg) {
 
 }  // namespace
 
-/* Register the LXMessenger launcher program. Call once at startup (lcd build).
- * extern "C": main.cpp's app_main is extern "C", so its forward decl resolves to
- * a C symbol — match it here so the linker finds the definition. */
-extern "C" void lxmfLcdRegister(void) {
+/* Register the LXMessenger launcher program — a when:-gated init: hook
+ * (spangap/spangap-lcd). This whole file lives under conditional/spangap-lcd/,
+ * compiled only when the lcd straddle is staged, so no #if is needed. Plain
+ * C++ linkage to match the generated dispatcher's forward decl. */
+void lxmfLcdRegister(void) {
     lcdRegister("LXMF", "rns", lxmfApp);
     lcdRegisterSettings("Reticulum/LXMF", "LXMF", lxmfSettingsPane);
 }
-
-#else /* !CONFIG_SPANGAP_LCD */
-
-/* No-op stub so lxmfInit()'s unconditional lxmfLcdRegister() links in non-LCD
- * (--no-lcd) builds, where the launcher program above compiles to nothing. */
-extern "C" void lxmfLcdRegister(void) {}
-
-#endif /* CONFIG_SPANGAP_LCD */
