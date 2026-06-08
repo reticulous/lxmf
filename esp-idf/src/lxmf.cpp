@@ -2387,10 +2387,22 @@ static TickType_t s_lastPublishTick = 0;
  * not after each one). */
 static TickType_t s_announce_due_tick = 0;
 #define LXMF_ANNOUNCE_DEBOUNCE_MS 10000
+/* The first announce of the session is held this long after the clock goes
+ * valid (waitForTime returns in lxmfTaskMain), so rnsd + the transports are up
+ * and stable before we advertise. Armed once at startup; later announces use
+ * the 10 s iface-up debounce only. */
+#define LXMF_FIRST_ANNOUNCE_DELAY_MS 30000
 
 static void onRnsdIfaceEvent(const char* /*key*/, const char* /*val*/)
 {
-    s_announce_due_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LXMF_ANNOUNCE_DEBOUNCE_MS);
+    /* Re-arm the debounce, but only ever push the announce LATER — never pull
+     * it in. This keeps the startup 30 s floor (set in lxmfTaskMain) intact
+     * when ifaces come up inside that window, while still extending the wait if
+     * an iface settles late. After the first announce fires (due reset to 0)
+     * this re-arms normally. */
+    TickType_t due = xTaskGetTickCount() + pdMS_TO_TICKS(LXMF_ANNOUNCE_DEBOUNCE_MS);
+    if (s_announce_due_tick == 0 || (int32_t)(due - s_announce_due_tick) > 0)
+        s_announce_due_tick = due;
 }
 
 static void publishStats(void)
@@ -3222,6 +3234,12 @@ static void lxmfTaskMain(void*)
             s_dbg_only_local = val && val[0] && std::atoi(val) != 0;
         });
 
+    /* Hold off until the platform clock is valid (rnsd + the transports gate on
+     * the same signal), so our first delivery announce isn't stamped with the
+     * 1970 epoch and rnsd is already up before we connect to its ports below.
+     * Bounded; proceeds on timeout. */
+    waitForTime(0);
+
     /* Bootstrap. rnsd should be up by the time the first events arrive;
      * we'll just block in itsConnect if it's not. loadAllIdentities
      * calls loadIdentityForSlot which installs per-id cmd subs. We do
@@ -3237,11 +3255,12 @@ static void lxmfTaskMain(void*)
      * memcpys the announce into one ITS packet. */
     connectAnnounceSub();
 
-    /* Arm the initial announce debounce window. Covers the case where
-     * rnsd brought ifaces up before our subscription landed; either
-     * way, the first announce fires 10 s from now (or later if more
-     * ifaces come up in the meantime). */
-    s_announce_due_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LXMF_ANNOUNCE_DEBOUNCE_MS);
+    /* Arm the first announce 30 s out (measured from the waitForTime() return
+     * above) so the rest of the stack — rnsd + every transport — is up and
+     * stable before we advertise. onRnsdIfaceEvent only pushes this later, never
+     * earlier, so ifaces coming up inside the window can't pull it in. Covers
+     * the case where rnsd brought ifaces up before our subscription landed. */
+    s_announce_due_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LXMF_FIRST_ANNOUNCE_DELAY_MS);
 
     s_lastPublishTick = xTaskGetTickCount();
     publishStats();

@@ -1,10 +1,11 @@
 <!-- Browser composition root (plan §7.1). One FloatingWindow, a
-     master/detail two-pane: ConversationList rail + ConversationThread
-     + Composer, with PeerPicker and ContactCard as in-window overlays.
-     This is the ONLY place layout is decided; views below stay
-     layout-agnostic so the on-device port is a second root, not a
-     rewrite. The identity selector is rendered only when there is more
-     than one identity (single-identity stays invisible, Signal-like). -->
+     master/detail two-pane: the ConversationList rail (a searchable
+     Contacts / On-the-Mesh directory — the primary way to open or start
+     a conversation) + ConversationThread + Composer, with ContactCard as
+     an in-window overlay. This is the ONLY place layout is decided; views
+     below stay layout-agnostic so the on-device port is a second root,
+     not a rewrite. The identity selector is rendered only when there is
+     more than one identity (single-identity stays invisible). -->
 <template>
   <FloatingWindow
     id="lxmf-messages"
@@ -47,9 +48,9 @@
           <div class="rail" :style="{ width: railW + 'px' }">
             <ConversationList
               :conversations="lxmf.conversations.value"
+              :directory="lxmf.peerDirectory.value"
               :active-peer="lxmf.activePeer.value"
               @open-peer="openPeer"
-              @compose="picking = true"
             />
           </div>
 
@@ -79,13 +80,6 @@
             </template>
           </div>
         </div>
-
-        <PeerPicker
-          v-if="picking"
-          :directory="lxmf.peerDirectory.value"
-          @pick="openPeer"
-          @close="picking = false"
-        />
 
         <ContactCard
           v-if="showContact && lxmf.activePeer.value"
@@ -120,7 +114,6 @@ import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import ConversationList from '../components/lxmf/ConversationList.vue'
 import ConversationThread from '../components/lxmf/ConversationThread.vue'
 import Composer from '../components/lxmf/Composer.vue'
-import PeerPicker from '../components/lxmf/PeerPicker.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import { useLxmf, type Message } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
@@ -157,7 +150,6 @@ function startResize(e: MouseEvent) {
   window.addEventListener('mouseup', onUp)
 }
 
-const picking = ref(false)
 const showContact = ref(false)
 const menuMsg = ref<Message | null>(null)
 
@@ -166,7 +158,6 @@ function setDraft(v: string) { lxmf.setDraft(lxmf.activePeer.value, v) }
 
 function openPeer(peer: string) {
   lxmf.openPeer(peer)
-  picking.value = false
   showContact.value = false
   lxmf.markConversationRead(peer)
 }

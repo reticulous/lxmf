@@ -114,6 +114,7 @@ lv_obj_t* s_msgList  = nullptr;         /* scroll container inside s_thread */
 lv_obj_t* s_bubbles  = nullptr;         /* bubble column (cleaned+rebuilt) inside s_msgList */
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_compose  = nullptr;         /* compose textarea (last child of s_msgList) */
+lv_obj_t* s_newIdTa  = nullptr;         /* "Add identity" name field (settings pane) */
 
 void rebuildContacts();
 void rebuildThread();
@@ -212,6 +213,19 @@ void onSend(lv_event_t*) {
     if (t && *t) {
         sendMessage(g_curPeer, t);
         lv_textarea_set_text(s_compose, "");
+    }
+}
+
+/* "Add identity" commit — reads the name field and writes the ephemeral create
+ * sentinel (the lxmf task picks a free slot and generates the identity). Fired
+ * by the explicit Create button or by Enter, so it works without the keystroke
+ * being obvious. No-op on an empty name. */
+void onAddIdentity(lv_event_t*) {
+    if (!s_newIdTa) return;
+    const char* t = lv_textarea_get_text(s_newIdTa);
+    if (t && *t) {
+        storageSet("lxmf.cmd.identity_new", t);
+        lv_textarea_set_text(s_newIdTa, "");
     }
 }
 
@@ -522,8 +536,43 @@ void lxmfSettingsPane(void* arg) {
     }
 
     lcdSettingSection(p, "Add identity");
-    /* Type a name + Enter -> writes the ephemeral create sentinel. */
-    lcdSettingText   (p, "New (name)", "lxmf.cmd.identity_new");
+    if (lcdHasKeyboard()) {
+        /* Hardware keyboard: a name field + an explicit Create button. Enter in
+         * the field commits too, but pressing it is non-obvious, so the button
+         * is the discoverable affordance. */
+        lv_obj_t* row = lv_obj_create(p);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_newIdTa = lv_textarea_create(row);
+        lv_textarea_set_one_line(s_newIdTa, true);
+        lv_textarea_set_placeholder_text(s_newIdTa, "Name");
+        lv_obj_set_style_text_font(s_newIdTa, kFont, 0);
+        lv_obj_set_flex_grow(s_newIdTa, 1);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_newIdTa);
+        lv_obj_add_event_cb(s_newIdTa, onAddIdentity, LV_EVENT_READY, nullptr);   /* Enter commits */
+        lv_obj_add_event_cb(s_newIdTa, [](lv_event_t*){ s_newIdTa = nullptr; },   /* avoid a dangle on rebuild */
+                            LV_EVENT_DELETE, nullptr);
+
+        lv_obj_t* add = lv_button_create(row);
+        lv_obj_set_style_pad_ver(add, 2, 0);
+        lv_obj_set_style_pad_hor(add, 8, 0);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), add);
+        lv_obj_t* al = lv_label_create(add);
+        lv_obj_set_style_text_font(al, kFont, 0);
+        lv_label_set_text(al, "Create");
+        lv_obj_center(al);
+        lv_obj_add_event_cb(add, onAddIdentity, LV_EVENT_CLICKED, nullptr);
+    } else {
+        /* Touch-only: tapping opens the full-screen on-screen keyboard, which
+         * carries its own OK (commit) button. */
+        lcdSettingText(p, "New (name)", "lxmf.cmd.identity_new");
+    }
 }
 
 }  // namespace
