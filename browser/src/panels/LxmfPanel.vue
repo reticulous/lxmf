@@ -1,4 +1,4 @@
-<!-- Settings → Reticulum → LXMF. The identity admin surface (create /
+<!-- Settings → Mesh Network → LXMF Messages. The identity admin surface (create /
      import / destroy) and config knobs — deliberately NOT the chat
      window (plan §1). Identity destroy is irreversible and wipes the
      secret + all of that identity's storage, so it double-confirms. -->

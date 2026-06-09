@@ -34,13 +34,13 @@
         <div v-if="lxmf.usableIdentities.value.length === 0" class="noident">
           <template v-if="lxmf.identities.value.length === 0">
             No LXMF identity yet. Create one in
-            <em>Settings → Reticulum → LXMF</em> to send and receive messages.
+            <em>Settings → Mesh Network → LXMF Messages</em> to send and receive messages.
           </template>
           <template v-else>
             No <strong>connected</strong> identity. A slot exists in storage
             but the firmware hasn’t brought it up (no keypair — e.g. leftover
             test state). Create a real identity in
-            <em>Settings → Reticulum → LXMF</em>.
+            <em>Settings → Mesh Network → LXMF Messages</em>.
           </template>
         </div>
 

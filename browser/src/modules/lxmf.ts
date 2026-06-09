@@ -18,9 +18,16 @@ import LxmfPanel from '../panels/LxmfPanel.vue'
 
 /* ── Composition-layer wiring (pattern mirrors modules/rnsd.ts) ──────── */
 
-/** Visibility refs for the Status floating windows; MainLayout binds to them. */
+/** Visibility refs for the floating windows; MainLayout binds to them. */
 export const messagesVisible = ref(false)
 export const announcesVisible = ref(false)
+
+/** Focus nonce — bumped to raise the Messages window even when already open.
+ *  MainLayout binds it to the window's `focus-token` prop. */
+export const messagesFocus = ref(0)
+
+/* Menu "LXMF Messages" action: only ever show + raise, never hide. */
+export function showMessages() { messagesVisible.value = true; messagesFocus.value++ }
 
 /* ── Client-local view cursor (§3.3) ────────────────────────────────────
  * activeIdentity is NOT s.lxmf.cli.selected_id — the CLI and a browser
@@ -574,10 +581,18 @@ export function useLxmf(): UseLxmf {
 export function registerLxmf() {
   const menu = useMenuStore()
 
-  menu.register('status/messages', 'LXMF',
-    { type: 'action', action: () => { messagesVisible.value = !messagesVisible.value } })
-  menu.register('status/announces', 'Announces',
-    { type: 'action', action: () => { announcesVisible.value = !announcesVisible.value } })
+  /* Top-level "LXMF Messages" menu — single action foregrounds the window. */
+  menu.setMenu('lxmf', { label: 'LXMF Messages', placement: 2 })
+  menu.register('lxmf/messages', 'LXMF Messages',
+    { type: 'action', action: showMessages })
 
-  menu.register('settings/reticulum/lxmf', 'LXMF', { type: 'panel', component: LxmfPanel })
+  /* Settings → Mesh Network → LXMF Messages (the LXMF settings panel). */
+  menu.register('settings/mesh/lxmf', 'LXMF Messages', { type: 'panel', component: LxmfPanel }, { placement: 3 })
+
+  /* #if 0 — Announces removed from the menu; AnnouncesWindow + ref kept. */
+  if (false) {
+    menu.register('status/announces', 'Announces',
+      { type: 'action', action: () => { announcesVisible.value = !announcesVisible.value } })
+  }
+  /* #endif */
 }
