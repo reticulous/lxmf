@@ -574,19 +574,10 @@ export function useLxmf(): UseLxmf {
 export function registerLxmf() {
   const menu = useMenuStore()
 
-  menu.register('status', 'Status', [
-    { id: 'status.messages', label: 'LXMF', type: 'action',
-      action: () => { messagesVisible.value = !messagesVisible.value } },
-    { id: 'status.announces', label: 'Announces', type: 'action',
-      action: () => { announcesVisible.value = !announcesVisible.value } },
-  ])
+  menu.register('status/messages', 'LXMF',
+    { type: 'action', action: () => { messagesVisible.value = !messagesVisible.value } })
+  menu.register('status/announces', 'Announces',
+    { type: 'action', action: () => { announcesVisible.value = !announcesVisible.value } })
 
-  menu.register('settings', 'Settings', [
-    { id: 'reticulum', label: 'Reticulum', type: 'submenu',
-      children: [
-        { id: 'reticulum.lxmf', label: 'LXMF', type: 'panel',
-          component: LxmfPanel },
-      ],
-    },
-  ])
+  menu.register('settings/reticulum/lxmf', 'LXMF', { type: 'panel', component: LxmfPanel })
 }
