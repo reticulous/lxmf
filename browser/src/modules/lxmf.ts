@@ -11,23 +11,28 @@
  * `s.lxmf.*` schema is documented in reticulous/docs/lxmf.md and
  * docs/internals/lxmf.md — this file maps it onto reactive state.
  */
-import { ref, reactive, computed, watch, type ComputedRef } from 'vue'
+import { ref, reactive, computed, watch,
+         type ComputedRef, type Ref, type WritableComputedRef } from 'vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useMenuStore } from 'spangap-browser/stores/menu'
 import LxmfPanel from '../panels/LxmfPanel.vue'
 
 /* ── Composition-layer wiring (pattern mirrors modules/rnsd.ts) ──────── */
 
-/** Visibility refs for the floating windows; MainLayout binds to them. */
-export const messagesVisible = ref(false)
+/** Each usable identity gets its own Messages window (no in-window identity
+ *  picker). These maps are keyed by identity slot `n`; MainLayout renders one
+ *  window per usable identity (or a single FALLBACK_ID window when there are
+ *  none, so the "create an identity" guidance is still reachable). */
+export const FALLBACK_ID = -1
+export const messagesVisibleById = reactive<Record<number, boolean>>({})
+export const messagesFocusById = reactive<Record<number, number>>({})
 export const announcesVisible = ref(false)
 
-/** Focus nonce — bumped to raise the Messages window even when already open.
- *  MainLayout binds it to the window's `focus-token` prop. */
-export const messagesFocus = ref(0)
-
-/* Menu "LXMF Messages" action: only ever show + raise, never hide. */
-export function showMessages() { messagesVisible.value = true; messagesFocus.value++ }
+/* Menu action for an identity's window: only ever show + raise, never hide. */
+export function showMessages(n: number = FALLBACK_ID) {
+  messagesVisibleById[n] = true
+  messagesFocusById[n] = (messagesFocusById[n] ?? 0) + 1
+}
 
 /* ── Client-local view cursor (§3.3) ────────────────────────────────────
  * activeIdentity is NOT s.lxmf.cli.selected_id — the CLI and a browser
@@ -38,18 +43,17 @@ const LS_IDENT = 'lxmf.activeIdentity'
 const _activeIdentity = ref<number>(
   Number(localStorage.getItem(LS_IDENT) ?? -1),
 )
-const _activePeer = ref<string>('')
-watch(_activeIdentity, (n) => {
-  localStorage.setItem(LS_IDENT, String(n))
-  _activePeer.value = '' // selection does not survive an identity switch
-})
+watch(_activeIdentity, (n) => { localStorage.setItem(LS_IDENT, String(n)) })
 
-/* Composer drafts: in-memory, per-peer, NEVER persisted (§4). Switching
- * threads and back preserves typed text without ever writing a
- * stage=draft record. Reactive so the bound `draft` computed re-tracks
- * keystrokes — a plain Map is not reactive and the model would stay
- * stale (Send would see empty content). */
-const _composerDrafts = reactive<Record<string, string>>({})
+/* Selection + composer drafts are now scoped per identity slot `n`, since
+ * each identity has its own window viewing its own conversations. The active
+ * peer naturally resets when you look at a different identity (a fresh slot).
+ *
+ * Composer drafts: in-memory, per-peer, NEVER persisted (§4). Switching
+ * threads and back preserves typed text without ever writing a stage=draft
+ * record. Reactive so the bound `draft` computed re-tracks keystrokes. */
+const _activePeerById = reactive<Record<number, string>>({})
+const _draftsById = reactive<Record<number, Record<string, string>>>({})
 
 /* ── Types ──────────────────────────────────────────────────────────── */
 
@@ -237,7 +241,7 @@ function rand4(): string {
 
 export interface UseLxmf {
   activeIdentity: typeof _activeIdentity
-  activePeer: typeof _activePeer
+  activePeer: WritableComputedRef<string>
   identities: ComputedRef<Identity[]>
   usableIdentities: ComputedRef<Identity[]>
   activeIdentityUp: ComputedRef<boolean>
@@ -266,8 +270,12 @@ export interface UseLxmf {
   setEnabled: (n: number, on: boolean) => void
 }
 
-export function useLxmf(): UseLxmf {
+/** `identity` pins this instance to one slot (a Messages window passes its
+ *  own slot). Omitted ⇒ the shared client-local cursor `_activeIdentity`
+ *  (used by the settings panel and announces view). */
+export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const device = useDeviceStore()
+  const pinned = identity !== undefined
 
   const idTree = computed<Record<string, any>>(() => device.get('s.lxmf.id') ?? {})
   const liveTree = computed<Record<string, any>>(() => device.get('lxmf.id') ?? {})
@@ -295,19 +303,30 @@ export function useLxmf(): UseLxmf {
   const usableIdentities = computed<Identity[]>(() =>
     identities.value.filter(i => i.up && i.destHash))
 
-  // Default activeIdentity to the lowest *usable* slot; fall back to the
-  // lowest existing slot only so history is still viewable.
-  watch([identities, usableIdentities], ([ids, usable]) => {
-    if (usable.length && !usable.some(i => i.n === _activeIdentity.value))
-      _activeIdentity.value = usable[0]!.n
-    else if (!usable.length && ids.length &&
-             !ids.some(i => i.n === _activeIdentity.value))
-      _activeIdentity.value = ids[0]!.n
-  }, { immediate: true })
+  // For the shared cursor only: default activeIdentity to the lowest *usable*
+  // slot; fall back to the lowest existing slot so history stays viewable.
+  // A pinned instance keeps its fixed slot and skips this.
+  if (!pinned) {
+    watch([identities, usableIdentities], ([ids, usable]) => {
+      if (usable.length && !usable.some(i => i.n === _activeIdentity.value))
+        _activeIdentity.value = usable[0]!.n
+      else if (!usable.length && ids.length &&
+               !ids.some(i => i.n === _activeIdentity.value))
+        _activeIdentity.value = ids[0]!.n
+    }, { immediate: true })
+  }
 
-  const activeId = computed(() => _activeIdentity.value)
+  const activeId = computed(() =>
+    pinned ? (typeof identity === 'number' ? identity : identity!.value)
+           : _activeIdentity.value)
   const activeIdentityUp = computed(() =>
-    usableIdentities.value.some(i => i.n === _activeIdentity.value))
+    usableIdentities.value.some(i => i.n === activeId.value))
+
+  /* Selection for this instance's identity slot (writable). */
+  const activePeer: WritableComputedRef<string> = computed({
+    get: () => _activePeerById[activeId.value] ?? '',
+    set: (v: string) => { _activePeerById[activeId.value] = v },
+  })
 
   const contacts = computed<Record<string, Contact>>(() => {
     const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
@@ -432,7 +451,7 @@ export function useLxmf(): UseLxmf {
   })
 
   const activeConversation = computed<{ day: string; messages: Message[] }[]>(() => {
-    const peer = _activePeer.value
+    const peer = activePeer.value
     if (!peer) return []
     const thread = device.get(`s.lxmf.id.${activeId.value}.msgs.${peer}`) ?? {}
     const msgs = Object.keys(thread)
@@ -489,7 +508,7 @@ export function useLxmf(): UseLxmf {
     }
     if (opts?.method) rec.method = opts.method
     const data = nest(`s.lxmf.id.${n}.msgs.${peer}.${key}`, rec)
-    delete _composerDrafts[peer]
+    if (_draftsById[n]) delete _draftsById[n]![peer]
     const stageOf = () =>
       str(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.stage`))
     // Done once the firmware moves the record off our optimistic draft.
@@ -555,17 +574,19 @@ export function useLxmf(): UseLxmf {
   const setEnabled = (n: number, on: boolean) =>
     device.set(`s.lxmf.id.${n}.enabled`, on ? 1 : 0)
 
-  function openPeer(peer: string) { _activePeer.value = peer }
-  const draftFor = (peer: string) => _composerDrafts[peer] ?? ''
+  function openPeer(peer: string) { activePeer.value = peer }
+  const draftFor = (peer: string) => _draftsById[activeId.value]?.[peer] ?? ''
   const setDraft = (peer: string, text: string) => {
-    if (text) _composerDrafts[peer] = text
-    else delete _composerDrafts[peer]
+    let d = _draftsById[activeId.value]
+    if (!d) { d = {}; _draftsById[activeId.value] = d }
+    if (text) d[peer] = text
+    else delete d[peer]
   }
   const contactOf = (peer: string) => contacts.value[peer] ?? null
 
   return {
     activeIdentity: _activeIdentity,
-    activePeer: _activePeer,
+    activePeer,
     identities, usableIdentities, activeIdentityUp,
     conversations, activeConversation, contacts, announces,
     peerDirectory, unreadTotal,
@@ -580,11 +601,33 @@ export function useLxmf(): UseLxmf {
 
 export function registerLxmf() {
   const menu = useMenuStore()
+  const lx = useLxmf()
 
-  /* Top-level "LXMF Messages" menu — single action foregrounds the window. */
-  menu.setMenu('lxmf', { label: 'LXMF Messages', placement: 2 })
-  menu.register('lxmf/messages', 'LXMF Messages',
-    { type: 'action', action: showMessages })
+  /* Top-level "LXMF Messages" menu. With ≤1 usable identity it's a single
+   * action (opens that identity's window). With >1, each identity becomes
+   * its own item opening its own window — so the set of items is rebuilt
+   * (unregister/register) whenever the usable-identity list changes. */
+  let regIds: number[] = []
+  let regSingle = false
+  watch(lx.usableIdentities, (usable) => {
+    for (const n of regIds) menu.unregister(`lxmf/id-${n}`)
+    regIds = []
+    if (regSingle) { menu.unregister('lxmf/messages'); regSingle = false }
+
+    menu.setMenu('lxmf', { label: 'LXMF Messages', placement: 2 })
+    if (usable.length > 1) {
+      for (const id of usable) {
+        menu.register(`lxmf/id-${id.n}`, id.displayName,
+          { type: 'action', action: () => showMessages(id.n) })
+        regIds.push(id.n)
+      }
+    } else {
+      const n = usable[0]?.n ?? FALLBACK_ID
+      menu.register('lxmf/messages', 'LXMF Messages',
+        { type: 'action', action: () => showMessages(n) })
+      regSingle = true
+    }
+  }, { immediate: true })
 
   /* Settings → Mesh Network → LXMF Messages (the LXMF settings panel). */
   menu.register('settings/mesh/lxmf', 'LXMF Messages', { type: 'panel', component: LxmfPanel }, { placement: 3 })

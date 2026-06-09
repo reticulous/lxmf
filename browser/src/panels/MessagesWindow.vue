@@ -8,7 +8,7 @@
      more than one identity (single-identity stays invisible). -->
 <template>
   <FloatingWindow
-    id="lxmf-messages"
+    :id="`lxmf-messages-${identity}`"
     :title="title"
     :visible="visible"
     :default-geom="defaultGeom"
@@ -22,15 +22,6 @@
 
     <template #default>
       <div class="msg-root" :style="{ '--rfs': scale }">
-        <div v-if="lxmf.usableIdentities.value.length > 1" class="idbar">
-          <span class="idlbl">Identity</span>
-          <select v-model.number="lxmf.activeIdentity.value" class="idsel">
-            <option v-for="id in lxmf.usableIdentities.value" :key="id.n" :value="id.n">
-              {{ id.displayName }}
-            </option>
-          </select>
-        </div>
-
         <div v-if="lxmf.usableIdentities.value.length === 0" class="noident">
           <template v-if="lxmf.identities.value.length === 0">
             No LXMF identity yet. Create one in
@@ -109,7 +100,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, toRef } from 'vue'
 import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import ConversationList from '../components/lxmf/ConversationList.vue'
 import ConversationThread from '../components/lxmf/ConversationThread.vue'
@@ -118,11 +109,11 @@ import ContactCard from '../components/lxmf/ContactCard.vue'
 import { useLxmf, type Message } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
 
-defineProps<{ visible: boolean; title: string }>()
+const props = defineProps<{ visible: boolean; title: string; identity: number }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
 
 const defaultGeom = { x: 10, y: 7, w: 76, h: 78 }
-const lxmf = useLxmf()
+const lxmf = useLxmf(toRef(props, 'identity'))
 const { scale, zoomIn, zoomOut } = useWinZoom('lxmf')
 
 /* Draggable master/detail divider. Width persisted client-side. */

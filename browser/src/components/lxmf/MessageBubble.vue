@@ -140,7 +140,7 @@ const clock = computed(() =>
   word-break: break-word;
   white-space: pre-wrap;
 }
-.row.out .bubble { background: #2b4d3a; border-bottom-right-radius: 4px; }
+.row.out .bubble { background: #2c6bed; border-bottom-right-radius: 4px; }
 .row.in  .bubble { background: #2a2a2a; border-bottom-left-radius: 4px; }
 .bubble.muted { opacity: 0.55; }
 .meta {

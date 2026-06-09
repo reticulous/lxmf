@@ -20,7 +20,7 @@
 <script setup lang="ts">
 import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import AnnouncesView from '../components/lxmf/AnnouncesView.vue'
-import { useLxmf, messagesVisible } from '../modules/lxmf'
+import { useLxmf, showMessages } from '../modules/lxmf'
 
 defineProps<{ visible: boolean; title: string }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
@@ -30,6 +30,6 @@ const lxmf = useLxmf()
 
 function onMessage(peer: string) {
   lxmf.openPeer(peer)
-  messagesVisible.value = true
+  showMessages(lxmf.activeIdentity.value)   // raise the active identity's window
 }
 </script>
