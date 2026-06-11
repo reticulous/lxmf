@@ -35,8 +35,13 @@
           </template>
         </div>
 
-        <div v-else class="panes">
-          <div class="rail" :style="{ width: railW + 'px' }">
+        <!-- Master/detail. Desktop: side-by-side rail + draggable splitter +
+             detail. Compact (phone): one column that slides — the contacts
+             rail, with the conversation sweeping in over it when a peer is
+             open and the thread's Back button sliding it away again (Signal). -->
+        <div v-else class="panes"
+             :class="{ mobile: compact, 'show-detail': compact && !!lxmf.activePeer.value }">
+          <div class="rail" :style="compact ? undefined : { width: railW + 'px' }">
             <ConversationList
               :conversations="lxmf.conversations.value"
               :directory="lxmf.peerDirectory.value"
@@ -45,7 +50,7 @@
             />
           </div>
 
-          <div class="splitter" :class="{ dragging }" @mousedown="startResize"></div>
+          <div v-if="!compact" class="splitter" :class="{ dragging }" @mousedown="startResize"></div>
 
           <div class="detail">
             <div v-if="!lxmf.activePeer.value" class="placeholder">
@@ -57,6 +62,7 @@
                 :name="lxmf.displayName(lxmf.activePeer.value)"
                 :buckets="lxmf.activeConversation.value"
                 :reach="lxmf.reachability(lxmf.activePeer.value)"
+                :show-back="compact"
                 @resend="m => lxmf.resend(m.peer, m.key)"
                 @msg-menu="m => (menuMsg = m)"
                 @msg-delete="askDeleteMsg"
@@ -108,6 +114,7 @@ import Composer from '../components/lxmf/Composer.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import { useLxmf, type Message } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
+import { useCompact } from 'spangap-browser/lib/viewport'
 
 const props = defineProps<{ visible: boolean; title: string; identity: number }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
@@ -115,6 +122,7 @@ const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
 const defaultGeom = { x: 10, y: 7, w: 76, h: 78 }
 const lxmf = useLxmf(toRef(props, 'identity'))
 const { scale, zoomIn, zoomOut } = useWinZoom('lxmf')
+const compact = useCompact()
 
 /* Draggable master/detail divider. Width persisted client-side. */
 const RAIL_MIN = 180, RAIL_MAX = 520, LS_RAIL = 'lxmf.railW'
@@ -222,6 +230,21 @@ function askDeleteMsg(m: Message) {
   border-right: 1px solid rgba(255,255,255,0.08);
   overflow: hidden;
 }
+
+/* Compact: stack rail + detail in one column and slide between them. Both
+ * fill the pane; the detail starts off-screen right and sweeps in when a peer
+ * is open. The rail eases slightly left underneath for a parallax-y feel. */
+.panes.mobile { position: relative; display: block; overflow: hidden; }
+.panes.mobile .rail,
+.panes.mobile .detail {
+  position: absolute; inset: 0;
+  width: 100%;
+  transition: transform 0.25s ease;
+}
+.panes.mobile .rail { border-right: none; transform: translateX(0); }
+.panes.mobile .detail { transform: translateX(100%); background: #1c1c1c; z-index: 2; }
+.panes.mobile.show-detail .rail { transform: translateX(-25%); }
+.panes.mobile.show-detail .detail { transform: translateX(0); }
 .splitter {
   flex: none; width: 6px; cursor: col-resize;
   margin: 0 -3px; z-index: 4;

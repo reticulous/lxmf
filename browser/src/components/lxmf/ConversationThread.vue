@@ -5,7 +5,7 @@
 <template>
   <div class="thread">
     <div class="thead">
-      <button class="back" title="Back" @click="emit('back')">
+      <button class="back" :class="{ 'back--shown': showBack }" title="Back" @click="emit('back')">
         <q-icon :name="matArrowBack" size="20px" />
       </button>
       <PeerAvatar :peer="peer" :name="name" :size="30" />
@@ -47,6 +47,9 @@ const props = defineProps<{
   name: string
   buckets: { day: string; messages: Message[] }[]
   reach: Reachability | null
+  /* Reveal the Back button (single-column / compact layouts). Hidden by
+   * default — desktop master/detail keeps the rail permanently visible. */
+  showBack?: boolean
 }>()
 const emit = defineEmits<{
   resend: [m: Message]
@@ -87,7 +90,11 @@ watch(() => props.buckets, toBottom, { deep: true, immediate: true })
   padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
   background: #1f1f1f;
 }
-.back { display: none; } /* shown by the device composition root only */
+/* Hidden in desktop master/detail (rail always present); shown when the host
+ * opts in via show-back — the on-device port and the browser's compact
+ * single-column layout. */
+.back { display: none; align-items: center; }
+.back--shown { display: flex; }
 .who { flex: 1; min-width: 0; }
 .name {
   font-weight: 600; color: #e8e8e8; font-size: calc(14px * var(--rfs, 1));
