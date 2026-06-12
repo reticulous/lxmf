@@ -3190,6 +3190,27 @@ static TickType_t nextDeadline(void)
     return due - now;
 }
 
+/* A nomad browser (web → lxmf.url_web, on-device LCD → lxmf.url_lcd) tapped an
+ * lxmf@<hash> link and wrote the contact's dest hash here. Our only job is the
+ * identity-independent path request, so an unknown contact's identity (pubkey +
+ * display name) gets discovered — exactly the unknown-sender flow used on
+ * inbound. The UI surfaces (lxmf web module / lxmf_lcd) bring themselves forward
+ * off these same keys, and the conversation is created by the send path on the
+ * first message. Consume the key so a repeat tap re-fires. */
+static void onOpenContactUrl(const char* key, const char* val)
+{
+    if (!val || !*val) return;                 /* the unset echo, or a clear */
+    uint8_t dh[LXMF_DEST_HASH_LEN];
+    bool ok = hexToBytes(val, std::strlen(val), dh, LXMF_DEST_HASH_LEN);
+    storageUnset(key);
+    if (!ok) return;
+    uint8_t pubkey[RNSD_PUBKEY_LEN];
+    if (!rnsdRecallPubkey(dh, pubkey)) {
+        info("open-contact %s: unknown identity — issuing path request", val);
+        rnsdRequestPath(dh);
+    }
+}
+
 static void lxmfTaskMain(void*)
 {
     info("[%s] task up", TAG);
@@ -3199,9 +3220,10 @@ static void lxmfTaskMain(void*)
      * LXMF_LINK_INBOX_PORT for rnsd's inbound-Link back-connects.
      * itsServerInit sets up the shared inbox; itsClientInit reuses it. */
     if (!itsServerInit()) err("lxmf itsServerInit failed");
-    itsServerPortOpen(LXMF_LINK_INBOX_PORT, /*packetBased=*/true,
+    itsServerPortOpen(LXMF_LINK_INBOX_PORT, ITS_PACKET,
                       /*maxHandles=*/LXMF_MAX_INLINKS,
-                      /*toSize=*/4096, /*fromSize=*/4096);
+                      /*toCap=*/4096, /*fromCap=*/4096,
+                      /*depth=*/0, /*maxMsg=*/4096);
     itsServerOnConnect(LXMF_LINK_INBOX_PORT,    onLinkInboxConnect);
     itsServerOnDisconnect(LXMF_LINK_INBOX_PORT, onLinkInboxDisconnect);
     itsServerOnRecv(LXMF_LINK_INBOX_PORT,       onLinkInboxRecv);
@@ -3226,6 +3248,12 @@ static void lxmfTaskMain(void*)
      * iface up (rnsd writes rnsd.iface_event_seq on every iface-up
      * transition — narrow single-key subscription, no filtering). */
     storageSubscribeChanges("rnsd.iface_event_seq", onRnsdIfaceEvent);
+
+    /* Open-a-conversation links from the nomad browser (web → lxmf.url_web,
+     * on-device LCD → lxmf.url_lcd). We do the identity-independent path
+     * request here; the UIs bring themselves forward off the same keys. */
+    storageSubscribeChanges("lxmf.url_web", onOpenContactUrl);
+    storageSubscribeChanges("lxmf.url_lcd", onOpenContactUrl);
 
     /* Live-mirror s.lxmf.debug.only_local into the cached bool so
      * toggling at runtime takes effect on the next announce write. */

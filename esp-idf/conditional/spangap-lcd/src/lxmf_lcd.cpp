@@ -127,6 +127,7 @@ std::vector<Msg>  g_msgs;               /* all non-draft messages for g_id */
 std::vector<Ann>  g_anns;               /* heard announces (on-the-mesh column) */
 std::vector<std::string> g_rowPeers;    /* peer per clickable list row (click index) */
 std::string       g_curPeer;            /* peer of the open thread */
+std::string       g_pendingOpenPeer;    /* contact tapped in nomad, awaiting an identity pick */
 std::string       g_query;              /* current search-box text */
 bool              g_subscribed = false;
 bool              g_listRefreshPending = false;   /* a coalesced list rebuild is queued */
@@ -151,6 +152,8 @@ void rebuildThread();
 void showContacts();
 void openThread(const std::string& peer);
 void scheduleListRefresh();
+void maybeOpenPending();
+void onLcdOpenUrl(const char* key, const char* val);
 
 /* ---- deferred focus ----
  * The launcher tile (or a tapped row) is focused into the input group on
@@ -563,6 +566,33 @@ void onContactClick(lv_event_t* e) {
     if (idx < g_rowPeers.size()) openThread(g_rowPeers[idx]);
 }
 
+/* A contact tapped in the nomad browser (lxmf.url_lcd) waits here until an
+ * identity is active — opened immediately for a single-identity box, or after
+ * the user picks one (onIdPick) when the picker is up. */
+void maybeOpenPending() {
+    if (g_id < 0 || g_pendingOpenPeer.empty()) return;
+    std::string p = g_pendingOpenPeer;
+    g_pendingOpenPeer.clear();
+    openThread(p);
+}
+
+/* The on-device nomad browser tapped an lxmf@<hash> link and wrote the dest
+ * hash to lxmf.url_lcd. Runs on the lcd task (subscribed via lcdRun in
+ * lxmfLcdRegister), so LVGL is safe here. The core lxmf task issues the path
+ * request off the same key; this is UI only. */
+void onLcdOpenUrl(const char* /*key*/, const char* val) {
+    if (!val || !*val) return;                 /* ignore the core's consume/unset echo */
+    std::string peer(val);
+    if (peer.size() != 32) return;             /* 16-byte dest hash = 32 hex */
+    for (char c : peer)
+        if (!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) return;
+    for (auto& c : peer) if (c>='A'&&c<='Z') c = (char)(c - 'A' + 'a');
+
+    g_pendingOpenPeer = peer;
+    lcdShowProgram("LXMF");   /* build (first open) + raise; routes to picker if >1 id */
+    maybeOpenPending();       /* single id: opens now; picker: waits for onIdPick */
+}
+
 /* ---- thread rendering ---- */
 
 void addBubble(const Msg& m) {
@@ -785,6 +815,7 @@ void onIdPick(lv_event_t* e) {
     int n = (int)(intptr_t)lv_event_get_user_data(e);
     selectId(n);
     showContacts();
+    maybeOpenPending();       /* resume a nomad-tapped open under the chosen identity */
 }
 
 void showIdPicker(const std::vector<int>& ids) {
@@ -1028,4 +1059,10 @@ void lxmfSettingsPane(void* arg) {
 void lxmfLcdRegister(void) {
     lcdRegister("LXMF", "rns", lxmfApp);
     lcdRegisterSettings("Mesh Network/LXMF", "LXMF Messages", lxmfSettingsPane, 2);
+
+    /* The on-device nomad browser writes a tapped contact's dest hash to
+     * lxmf.url_lcd. Subscribe ON the lcd task (via lcdRun) so the callback is
+     * delivered there and may touch LVGL directly — and register here at init,
+     * not in lxmfApp, so the trigger works even if LXMF was never opened. */
+    lcdRun([](void*) { storageSubscribeChanges("lxmf.url_lcd", onLcdOpenUrl); });
 }

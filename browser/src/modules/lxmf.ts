@@ -603,6 +603,24 @@ export function registerLxmf() {
   const menu = useMenuStore()
   const lx = useLxmf()
 
+  /* A contact tapped in the nomad web browser arrives as `lxmf.url_web`
+   * (written by the nomad module). Bring the right identity's Messages window
+   * forward and open the conversation. Decoupled from nomad — we only read the
+   * shared var; the firmware lxmf task issues the path request off the same key.
+   * Clear it after so a repeat tap on the same contact re-fires. */
+  const device = useDeviceStore()
+  watch(() => str(device.get('lxmf.url_web')), (raw) => {
+    const peer = raw.trim().toLowerCase()
+    if (!/^[0-9a-f]{32}$/.test(peer)) return
+    const usable = lx.usableIdentities.value
+    const n = usable.find(i => i.n === lx.activeIdentity.value)?.n
+      ?? usable[0]?.n ?? FALLBACK_ID
+    lx.activeIdentity.value = n
+    lx.openPeer(peer)
+    showMessages(n)
+    device.set('lxmf.url_web', '')
+  })
+
   /* Top-level "LXMF Messages" menu. With ≤1 usable identity it's a single
    * action (opens that identity's window). With >1, each identity becomes
    * its own item opening its own window — so the set of items is rebuilt
