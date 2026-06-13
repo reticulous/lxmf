@@ -55,6 +55,49 @@ generated locally and stored under `secrets.lxmf.identities.<n>.*`.
   sends a Resource. Both go through rnsd's typed conn-openers
   (`rnsdLinkOpen`, `rnsdLinkRequest`).
 
+## Delivery proofs (stage `sent` → `delivered`)
+
+`sent` means egressed / transfer accepted; `delivered` means a
+cryptographic delivery proof (or the proof-grade Resource ACK) came
+back. A proof timeout leaves the stage at `sent` with
+`last_error = "no delivery proof"` — never `failed` (the message may
+have arrived). How each path settles:
+
+- **Opportunistic** — rnsd emits `OUT_RESULT` twice per `send_id`:
+  `SENT` immediately on egress, then `DELIVERED` or `PROOF_TIMEOUT`
+  when the packet receipt concludes. The outbox slot is held (still
+  counted against the 8-slot table) until the second result;
+  `resolveDirectSends` carries a 90 s backstop in case it's lost.
+- **DIRECT, one Link packet** — `resolveDirectSends` writes `sent` on
+  egress (link active / `tx_packets` ≥ 1) as before, then keeps the
+  slot and watches `rnsd.links.<tag>.tx_proven` / `.proof_timeouts`
+  against baselines captured at send time. An increment of `tx_proven`
+  settles `delivered`; a `proof_timeouts` increment, link death, or
+  the 60 s deadline settles no-proof. Holding the slot keeps
+  `convBusy()` true, so sends stay serialized per link — that is what
+  makes the per-link counters unambiguous.
+- **DIRECT, Resource** — the transfer ACK
+  (`RNSD_LINK_RESOURCE_OUTBOUND_DONE`, or the
+  `resource.state == "sent"` fallback) is proof-grade → stage
+  `delivered` directly.
+
+The conversation link is kept on success / proof timeout and dropped
+only on real failures, exactly as before.
+
+## UI glyphs (outbound bubbles, both UIs)
+
+| stage               | glyph                  |
+| ------------------- | ---------------------- |
+| `queued`/`sending`  | small grey `…`         |
+| `sent`              | one grey checkmark     |
+| `delivered`         | two green checkmarks   |
+| `failed`/`cancelled`| red ✕                  |
+
+Web (`MessageBubble.vue`) shows `last_error` as the glyph tooltip; the
+LCD slice (`lxmf_lcd.cpp` `addBubble`) uses `LV_SYMBOL_OK` /
+`LV_SYMBOL_CLOSE` from the chrome font and re-renders on stage changes
+via its `s.lxmf.id` storage subscription.
+
 ## LCD slice
 
 `esp-idf/lcd/src/lxmf_lcd.cpp` is the on-device LXMessenger program.
