@@ -3535,6 +3535,16 @@ static void lxmfTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
+    /* Boot barrier: stay quiet until rns.ready — clock valid, network up (if
+     * configured), and the minimum settle floor elapsed. This is what stops the
+     * 1970-stamped first announce: rns.ready can't fire before the clock wait
+     * resolves. Bounded fallback so a wedged rnsd can't pin us. No rnsd, no
+     * point — so bail (don't start) if rns.ready never comes. */
+    if (!waitForFlag("rns.ready", 120)) {
+        err("[%s] rns.ready never set — not starting", TAG);
+        killSelf();
+    }
+
     /* lxmf is both an ITS client (RNSD_PORT_DEST / RNSD_PORT_LINK /
      * announce-fanout connects) and — Phase E — a server hosting
      * LXMF_LINK_INBOX_PORT for rnsd's inbound-Link back-connects.
