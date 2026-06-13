@@ -629,7 +629,37 @@ void addBubble(const Msg& m) {
         localtime_r(&tt, &tmv);
         strftime(tbuf, sizeof tbuf, "%H:%M", &tmv);
     }
-    mkLabel(bub, tbuf, lv_color_hex(0xc0c8d0));
+
+    /* Meta row: timestamp + (outbound only) a delivery-status glyph.
+     * kFont (montserrat latin) carries the LVGL symbol set:
+     *   queued/sending  "..."                 grey   (in flight)
+     *   sent            one checkmark         grey   (egressed, no proof)
+     *   delivered       two checkmarks        green  (cryptographic proof)
+     *   failed/cancelled  X                   red
+     * Stage changes re-render via the s.lxmf.id storage subscription
+     * (onStorageChange → refreshMsgs + rebuildThread). */
+    lv_obj_t* meta = lv_obj_create(bub);
+    lv_obj_remove_style_all(meta);
+    lv_obj_set_width(meta, LV_SIZE_CONTENT);
+    lv_obj_set_height(meta, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(meta, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(meta, 4, 0);
+    lv_obj_remove_flag(meta, LV_OBJ_FLAG_SCROLLABLE);
+
+    mkLabel(meta, tbuf, lv_color_hex(0xc0c8d0));
+    if (!m.in) {
+        const char* sym = nullptr;
+        lv_color_t  col = lv_color_hex(0x8a93a0);
+        if (m.stage == "sent")           { sym = LV_SYMBOL_OK; }
+        else if (m.stage == "delivered") { sym = LV_SYMBOL_OK LV_SYMBOL_OK;
+                                           col = lv_color_hex(0x4abf6a); }
+        else if (m.stage == "failed" ||
+                 m.stage == "cancelled") { sym = LV_SYMBOL_CLOSE;
+                                           col = lv_color_hex(0xd9534f); }
+        else if (m.stage == "queued" ||
+                 m.stage == "sending")   { sym = "..."; }
+        if (sym) mkLabel(meta, sym, col);
+    }
 }
 
 void rebuildThread() {

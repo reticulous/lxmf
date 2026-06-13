@@ -29,28 +29,22 @@
       <div class="meta">
         <span class="time">{{ clock }}</span>
 
+        <!-- status glyphs: … in flight · ✓ sent (grey) · ✓✓ delivered
+             (green) · ✕ failed/cancelled (red). lastError as tooltip. -->
         <template v-if="m.dir === 'out'">
-          <span v-if="m.stage === 'queued'" class="chip" title="queued">
-            <q-icon :name="matSchedule" size="14px" />
-          </span>
-          <span v-else-if="m.stage === 'sending'" class="chip">
-            <q-spinner size="12px" />
-          </span>
+          <span v-if="m.stage === 'queued' || m.stage === 'sending'"
+                class="chip dots" :title="m.lastError || m.stage">…</span>
           <span v-else-if="m.stage === 'sent'" class="chip"
-                title="sent — opportunistic messages aren't acknowledged">
+                :title="m.lastError || 'sent — no delivery proof yet'">
             <q-icon :name="matDone" size="15px" />
           </span>
           <span v-else-if="m.stage === 'delivered'" class="chip ok"
-                title="delivered (proven direct transfer)">
+                title="delivered — cryptographic proof received">
             <q-icon :name="matDoneAll" size="15px" />
           </span>
-          <span v-else-if="m.stage === 'cancelled'" class="chip"
-                title="cancelled">
-            <q-icon :name="matBlock" size="14px" />
-          </span>
-          <span v-else-if="m.stage === 'failed'" class="chip bad"
-                title="failed">
-            <q-icon :name="matErrorOutline" size="15px" />
+          <span v-else-if="m.stage === 'failed' || m.stage === 'cancelled'"
+                class="chip bad" :title="m.lastError || m.stage">
+            <q-icon :name="matClose" size="15px" />
           </span>
         </template>
       </div>
@@ -71,8 +65,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { matSchedule, matDone, matDoneAll, matBlock, matErrorOutline,
-         matMoreVert, matDelete }
+import { matDone, matDoneAll, matClose, matMoreVert, matDelete }
   from '@quasar/extras/material-icons'
 import type { Message } from '../../modules/lxmf'
 
@@ -151,9 +144,10 @@ const clock = computed(() =>
   color: #9a9a9a;
 }
 .time { font-variant-numeric: tabular-nums; }
-.chip { display: inline-flex; align-items: center; color: #9a9a9a; }
-.chip.ok  { color: #6fb98f; }
-.chip.bad { color: #d98a8a; }
+.chip { display: inline-flex; align-items: center; color: #8a93a0; }
+.chip.ok  { color: #4abf6a; }
+.chip.bad { color: #d9534f; }
+.chip.dots { font-weight: 700; line-height: 1; }
 .subnote { margin-top: 3px; font-size: calc(11px * var(--rfs, 1)); color: #8fa6c0; font-style: italic; }
 .failrow {
   margin-top: 4px; display: flex; align-items: center; gap: 8px;
