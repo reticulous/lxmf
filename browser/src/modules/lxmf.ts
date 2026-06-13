@@ -610,7 +610,9 @@ export function registerLxmf() {
    * Clear it after so a repeat tap on the same contact re-fires. */
   const device = useDeviceStore()
   watch(() => str(device.get('lxmf.url_web')), (raw) => {
-    const peer = raw.trim().toLowerCase()
+    /* "<hash>[:<nonce>]" — the nonce makes every tap a fresh value, so the
+     * key is never consumed (an unset raced the sync and ate the hash). */
+    const peer = raw.trim().toLowerCase().split(':')[0] ?? ''
     if (!/^[0-9a-f]{32}$/.test(peer)) return
     const usable = lx.usableIdentities.value
     const n = usable.find(i => i.n === lx.activeIdentity.value)?.n
@@ -618,7 +620,6 @@ export function registerLxmf() {
     lx.activeIdentity.value = n
     lx.openPeer(peer)
     showMessages(n)
-    device.set('lxmf.url_web', '')
   })
 
   /* Top-level "LXMF Messages" menu. With ≤1 usable identity it's a single

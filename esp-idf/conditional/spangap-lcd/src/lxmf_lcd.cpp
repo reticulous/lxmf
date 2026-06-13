@@ -581,8 +581,10 @@ void maybeOpenPending() {
  * lxmfLcdRegister), so LVGL is safe here. The core lxmf task issues the path
  * request off the same key; this is UI only. */
 void onLcdOpenUrl(const char* /*key*/, const char* val) {
-    if (!val || !*val) return;                 /* ignore the core's consume/unset echo */
+    if (!val || !*val) return;                 /* a clear */
     std::string peer(val);
+    size_t colon = peer.find(':');             /* "<hash>[:<nonce>]" */
+    if (colon != std::string::npos) peer.erase(colon);
     if (peer.size() != 32) return;             /* 16-byte dest hash = 32 hex */
     for (char c : peer)
         if (!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) return;

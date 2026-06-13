@@ -3509,18 +3509,20 @@ static TickType_t nextDeadline(void)
 }
 
 /* A nomad browser (web → lxmf.url_web, on-device LCD → lxmf.url_lcd) tapped an
- * lxmf@<hash> link and wrote the contact's dest hash here. Our only job is the
+ * lxmf@<hash> link and wrote "<dest hash>[:<nonce>]" here. Our only job is the
  * identity-independent path request, so an unknown contact's identity (pubkey +
  * display name) gets discovered — exactly the unknown-sender flow used on
  * inbound. The UI surfaces (lxmf web module / lxmf_lcd) bring themselves forward
  * off these same keys, and the conversation is created by the send path on the
- * first message. Consume the key so a repeat tap re-fires. */
-static void onOpenContactUrl(const char* key, const char* val)
+ * first message. The nonce makes a repeat tap a fresh value, so the key is NOT
+ * consumed here — unsetting it raced the browser sync (set+unset coalesced in
+ * one flush and the SPA's mirror never saw the hash). */
+static void onOpenContactUrl(const char* /*key*/, const char* val)
 {
-    if (!val || !*val) return;                 /* the unset echo, or a clear */
+    if (!val || !*val) return;                 /* a clear */
+    if (std::strlen(val) < LXMF_DEST_HASH_LEN * 2) return;
     uint8_t dh[LXMF_DEST_HASH_LEN];
-    bool ok = hexToBytes(val, std::strlen(val), dh, LXMF_DEST_HASH_LEN);
-    storageUnset(key);
+    bool ok = hexToBytes(val, LXMF_DEST_HASH_LEN * 2, dh, LXMF_DEST_HASH_LEN);
     if (!ok) return;
     uint8_t pubkey[RNSD_PUBKEY_LEN];
     if (!rnsdRecallPubkey(dh, pubkey)) {
