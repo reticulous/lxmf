@@ -37,6 +37,7 @@
  * so we touch LVGL straight from the change callback.
  */
 #include "lcd.h"
+#include "mem.h"
 #include "storage.h"
 #include "compat.h"
 
@@ -425,7 +426,7 @@ void lxmfIdentityBlock(lv_obj_t* p, int n, const char* destKey, const char* enKe
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, "Destroy");
     lv_obj_center(l);
-    auto* d = static_cast<DestroyState*>(malloc(sizeof(DestroyState)));
+    auto* d = static_cast<DestroyState*>(gp_alloc(sizeof(DestroyState)));
     d->slot = n; d->armed = false; d->lbl = l; d->t = nullptr;
     lv_obj_add_event_cb(b, onDestroyClick,  LV_EVENT_CLICKED, d);
     lv_obj_add_event_cb(b, onDestroyDelete, LV_EVENT_DELETE,  d);

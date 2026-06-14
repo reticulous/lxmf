@@ -13,6 +13,7 @@
  * is distinct and not used in Phase 4a.
  */
 #include "lxmf.h"
+#include "mem.h"
 #include "spangap.h"
 #include "ports.h"
 #include "rnsd.h"     /* SHA-256, sign/verify, dest-hash, recall, request_path */
@@ -1638,7 +1639,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         constexpr size_t LXMF_LINK_PACKET_MAX = 360;
         bool as_resource = wire.size() > LXMF_LINK_PACKET_MAX;
         if (as_resource) {
-            void* rbuf = malloc(wire.size());
+            void* rbuf = gp_alloc(wire.size());
             if (!rbuf) {
                 o->used = false;
                 storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
