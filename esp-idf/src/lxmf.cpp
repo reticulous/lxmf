@@ -1996,6 +1996,19 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         *err_msg ? " (" : "", err_msg, *err_msg ? ")" : "");
 }
 
+/* Human-readable RNSD_DEST_AUX_RETRY reason byte. The reason *values* are
+ * shared with rnsd via ports.h (RNSD_DEST_RETRY_REASON_*); only these display
+ * strings are duplicated here so the message-status UI can show words instead
+ * of a hex code. Keep this table in step with ports.h as reasons are added;
+ * unmapped codes fall back to the numeric form below. */
+static const char* retryReasonName(uint8_t reason)
+{
+    switch (reason) {
+        case RNSD_DEST_RETRY_REASON_PATH_TIMEOUT: return "path timeout";
+        default: return nullptr;
+    }
+}
+
 static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
                            const uint8_t* tail, size_t tail_n)
 {
@@ -2008,11 +2021,32 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
         case RNSD_DEST_AUX_EGRESS_QUEUED:   note = "egress queued";   break;
         case RNSD_DEST_AUX_LINK_ESTABLISHING: note = "establishing link"; break;
         case RNSD_DEST_AUX_PATH_LOST:       note = "path lost";       break;
+        case RNSD_DEST_AUX_QUEUE_FULL: {
+            /* rnsd's pending path-search table is full — it did NOT accept
+             * this send. Hold the message: release the in-flight slot,
+             * revert to "queued", and let the 1 Hz tick resend once rnsd
+             * frees a slot (same defer path as a busy conversation link).
+             * Nothing is dropped — this is backpressure. */
+            std::string peer = o->peer, mid = o->msg_key;
+            o->used = false;
+            if (id.pending) id.pending--;
+            storageSet(msgPath(id.index, peer, mid, "stage").c_str(),      "queued");
+            storageSet(msgPath(id.index, peer, mid, "last_error").c_str(), "rnsd busy — queued");
+            s_deferred.push_back({ id.index, peer, mid });
+            verb("id %d: send_id=%u held (rnsd queue full), requeued %s",
+                 id.index, (unsigned)send_id, mid.c_str());
+            return;
+        }
         case RNSD_DEST_AUX_RETRY:
             if (tail_n >= 2) {
-                char buf[40];
-                std::snprintf(buf, sizeof(buf), "retry %u (reason 0x%02x)",
-                              (unsigned)tail[0], (unsigned)tail[1]);
+                char buf[64];
+                const char* rname = retryReasonName(tail[1]);
+                if (rname)
+                    std::snprintf(buf, sizeof(buf), "retry %u (%s)",
+                                  (unsigned)tail[0], rname);
+                else
+                    std::snprintf(buf, sizeof(buf), "retry %u (reason 0x%02x)",
+                                  (unsigned)tail[0], (unsigned)tail[1]);
                 storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), buf);
                 storageSet(msgPath(id.index, o->peer, o->msg_key, "attempts").c_str(),
                            (int)tail[0]);
