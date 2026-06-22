@@ -22,6 +22,12 @@ browser: browser
 platforms: [idf]
 requires:
   - reticulous/rns
+# Soft, default-on: the audio engine that plays the message-notification sound
+# (s.lxmf.sound). Pulled in automatically when available and pruned silently
+# when absent; every call site is gated on CONFIG_STRADDLE_AUDIO, so a build
+# without it still links (just no notification sound).
+additional_installs:
+  - spangap/audio
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher. Runs
 # in the straddle band; `requires: reticulous/rns` puts rnsd ahead of it, and
 # the platform band guarantees the lcd task already exists, so lxmfInit() can

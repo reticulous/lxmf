@@ -18,6 +18,9 @@
 #include "spangap.h"
 #include "ports.h"
 #include "rnsd.h"     /* SHA-256, sign/verify, dest-hash, recall, request_path */
+#if CONFIG_STRADDLE_AUDIO
+#include "audio.h"    /* audioPlayWav — message-notification sound (optional dep) */
+#endif
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -1799,6 +1802,19 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
 /* ─────────────── inbound: verify + dedup + store ─────────────── */
 
+/* Play the message-notification sound on a genuinely-new inbound message.
+ * Gated on s.lxmf.sound_enabled; the path (s.lxmf.sound) defaults to the
+ * bundled /fixed/lxmf/ding.wav but the user can point it elsewhere. No-op
+ * unless the optional spangap/audio engine is staged. */
+static void lxmfNotifySound()
+{
+#if CONFIG_STRADDLE_AUDIO
+    if (storageGetInt("s.lxmf.sound_enabled", 1) == 0) return;
+    std::string p = storageGetStr("s.lxmf.sound", "/fixed/lxmf/ding.wav");
+    if (!p.empty()) audioPlayWav(p.c_str());
+#endif
+}
+
 static bool dedupSeen(const std::string& mid_hex)
 {
     for (int k = 0; k < LXMF_DEDUP_RING; ++k)
@@ -1969,6 +1985,8 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     info("id %d: recv mid=%s from=%s len=%zuB title=\"%s\"",
          id.index, mid_hex.c_str(), sh_hex.c_str(), n,
          sanitizeForLog(title).c_str());
+
+    lxmfNotifySound();
 }
 
 /* A sender's lxmf.delivery announce just arrived (rnsd cached their
@@ -3859,6 +3877,14 @@ void lxmfInit(void)
      * Whether we *require* inbound stamps is the enforce_stamps toggle. */
     storageDefault("s.lxmf.stamp_cost",      16);
     storageDefault("s.lxmf.generate_stamps", 1);
+
+    /* Message-notification sound (played via the optional spangap/audio engine).
+     * Default to the bundled ding shipped into /fixed; the path is a setting so
+     * users can point it at their own device-rate WAV. sound_enabled is the
+     * on/off toggle exposed in the LXMF settings. Set unconditionally (not
+     * behind the version gate) so they land on already-initialised devices. */
+    storageDefault("s.lxmf.sound",         "/fixed/lxmf/ding.wav");
+    storageDefault("s.lxmf.sound_enabled", 1);
 
     s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;
 

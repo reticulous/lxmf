@@ -28,6 +28,12 @@
       Drop incoming messages that lack a valid stamp for our advertised cost.
     </div>
 
+    <SettingToggle label="Notification sound" k="s.lxmf.sound_enabled" />
+    <div class="text-caption text-grey-5">
+      Play a sound out the speaker when a message arrives. Requires audio
+      hardware; the sound file is set in <code>s.lxmf.sound</code>.
+    </div>
+
     <q-separator dark />
 
     <div class="text-caption text-grey-5">Identities</div>
