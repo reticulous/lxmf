@@ -1463,8 +1463,11 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
     }
     char tag[24];
     std::snprintf(tag, sizeof(tag), "lxmf.id%d.%.8s", id.index, peer_hex.c_str());
+    /* s.lxmf.link_timeout (seconds, 0 = let rnsd derive from interface speed)
+     * overrides the establishment timeout for delivery links. */
+    uint32_t link_to_ms = (uint32_t)storageGetInt("s.lxmf.link_timeout", 0) * 1000;
     int lh = rnsdLinkOpen(dh, "lxmf.delivery", id.identity_key.c_str(),
-                          tag, /*path_timeout_ms=*/0,
+                          tag, /*path_timeout_ms=*/0, link_to_ms,
                           /*ref=*/(int)(slot - s_convlinks),
                           onConvLinkRecv, onConvLinkDisc);
     if (lh < 0) return nullptr;

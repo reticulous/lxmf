@@ -11,7 +11,10 @@ Link that is then kept and reused for the whole chat — for our sends
 and for the peer's deliveries back over it — and left open (set
 `s.lxmf.link.idle_s` to close idle links after that many seconds;
 default 0 = never — LRU eviction at the 4-link cap and Reticulum's own
-STALE teardown bound the cost). While a
+STALE teardown bound the cost). Set `s.lxmf.link_timeout` (seconds) to
+override how long a conversation Link may sit establishing before it
+fails; default 0 lets rnsd derive the budget from the next hop's
+interface speed. While a
 conversation Link is warm, even small messages ride it instead of going
 opportunistic. Storage is the API — every frontend (browser, CLI,
 on-device LCD) reads/writes the `s.lxmf.*` / `lxmf.*` / `secrets.lxmf.*`
