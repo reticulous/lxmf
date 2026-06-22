@@ -1003,6 +1003,10 @@ void lxmfSettingsPane(void* arg) {
     lcdSettingSlider (p, "Re-announce interval (s)", "s.lxmf.announce_interval_s", 0, 21600);
     lcdSettingCaption(p, "0 = announce on demand only.");
     lcdSettingSlider (p, "Announce catalogue cap", "s.lxmf.max_announces", 256, 8192);
+    lcdSettingSwitch (p, "Generate stamps", "s.lxmf.generate_stamps");
+    lcdSettingCaption(p, "Pay a peer's advertised PoW cost when sending.");
+    lcdSettingSwitch (p, "Require stamps", "s.lxmf.enforce_stamps");
+    lcdSettingCaption(p, "Drop inbound messages without a valid stamp.");
 
     lcdSettingSection(p, "Identities");
     /* One block per existing slot; literal dest/enabled keys (the helpers keep

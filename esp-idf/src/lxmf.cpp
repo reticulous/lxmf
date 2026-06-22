@@ -13,6 +13,7 @@
  * is distinct and not used in Phase 4a.
  */
 #include "lxmf.h"
+#include "lxmf_stamp.h"
 #include "mem.h"
 #include "spangap.h"
 #include "ports.h"
@@ -804,6 +805,11 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
     return true;
 }
 
+/* Yield hook handed to lxmfStampGenerate: stamp generation runs ~4 s of
+ * tight CPU on the lxmf task (mostly the workblock build), so let
+ * lower-priority tasks (and the idle task / WDT) breathe periodically. */
+static void stampYield(void) { vTaskDelay(1); }
+
 /* Build the full LXM wire bytes: dest || src || sig || msgpack.
  *
  * `src_hash` is the sender's *delivery destination hash* (not the
@@ -813,18 +819,28 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
  * the recipient see SOURCE_UNKNOWN and reject our signature.
  *
  * `identity_key` is the storage path of the sender's private key used
- * by rnsdSign. Returns empty on failure. */
+ * by rnsdSign. `out_message_id` (if non-null) receives the 32-byte
+ * message_id = SHA-256(dest||src||packed-4-element) — the same value
+ * regardless of any appended stamp.
+ *
+ * When `stamp_cost > 0` an LXMF proof-of-work stamp meeting that cost is
+ * generated over the message_id and appended as payload element [4]
+ * (this is AFTER the signature, exactly like the reference: the stamp is
+ * not signed and not part of message_id). Returns empty on failure. */
 static std::vector<uint8_t> lxmPackWire(const char* identity_key,
                                          const uint8_t src_hash[LXMF_DEST_HASH_LEN],
                                          const uint8_t dest_hash[LXMF_DEST_HASH_LEN],
                                          uint64_t ts_ms,
                                          std::string_view title,
                                          std::string_view content,
-                                         const LxmFields& fields)
+                                         const LxmFields& fields,
+                                         int stamp_cost,
+                                         uint8_t out_message_id[RNSD_HASH_LEN])
 {
     std::vector<uint8_t> packed = lxmPackPayload(ts_ms, title, content, fields);
 
-    /* signable = dest || src || packed || SHA-256(dest || src || packed) */
+    /* signable = dest || src || packed || SHA-256(dest || src || packed).
+     * The inner SHA-256 IS the message_id. */
     std::vector<uint8_t> signable;
     signable.reserve(LXMF_DEST_HASH_LEN * 2 + packed.size() + RNSD_HASH_LEN);
     signable.insert(signable.end(), dest_hash, dest_hash + LXMF_DEST_HASH_LEN);
@@ -832,6 +848,7 @@ static std::vector<uint8_t> lxmPackWire(const char* identity_key,
     signable.insert(signable.end(), packed.begin(), packed.end());
     uint8_t hash[RNSD_HASH_LEN];
     rnsdSha256(signable.data(), signable.size(), hash);
+    if (out_message_id) std::memcpy(out_message_id, hash, RNSD_HASH_LEN);
     signable.insert(signable.end(), hash, hash + RNSD_HASH_LEN);
 
     uint8_t sig[RNSD_SIG_LEN];
@@ -839,28 +856,67 @@ static std::vector<uint8_t> lxmPackWire(const char* identity_key,
         return {};
 
     std::vector<uint8_t> wire;
-    wire.reserve(LXMF_OVERHEAD + packed.size());
+    wire.reserve(LXMF_OVERHEAD + packed.size() + 2 + LXMF_STAMP_LEN);
     wire.insert(wire.end(), dest_hash, dest_hash + LXMF_DEST_HASH_LEN);
     wire.insert(wire.end(), src_hash,  src_hash  + LXMF_DEST_HASH_LEN);
     wire.insert(wire.end(), sig,       sig       + RNSD_SIG_LEN);
     wire.insert(wire.end(), packed.begin(), packed.end());
+
+    /* Append the proof-of-work stamp as a 5th payload element. The
+     * 4-element payload always starts with a fixarray header (0x94, since
+     * 4 ≤ 15); bump it to 0x95 and append the stamp as msgpack bin. The
+     * recipient strips it back to 4 elements to re-derive message_id and
+     * verify the signature. */
+    if (stamp_cost > 0 && wire[LXMF_OVERHEAD] == 0x94) {
+        uint8_t stamp[LXMF_STAMP_LEN];
+        uint64_t t0 = nowUnixMs();
+        if (lxmfStampGenerate(hash, stamp_cost, stamp, stampYield)) {
+            wire[LXMF_OVERHEAD] = 0x95;
+            mpPackBin(wire, stamp, sizeof stamp);
+            info("stamp generated cost=%d in %llu ms",
+                 stamp_cost, (unsigned long long)(nowUnixMs() - t0));
+        } else {
+            warn("stamp generation failed (cost=%d) — sending unstamped", stamp_cost);
+        }
+    }
     return wire;
 }
 
-/* Compute message_id = SHA-256(dest || src || packed). 32 B → 64-hex. */
-static std::string lxmMessageIdHex(const uint8_t* wire, size_t n)
+/* Split an on-wire packed payload into the bytes that were hashed/signed
+ * (the 4-element payload) and, if present, the appended PoW stamp.
+ *
+ * For a 4-element payload `*hashed_ptr` aliases `packed` directly. For a
+ * ≥5-element payload the fixarray header is rewritten to 4 elements into
+ * `scratch` (elements 0..3 are byte-identical to what the sender signed)
+ * and the stamp (element [4]) is decoded into `stamp_out`. Reference
+ * peers always use a single-byte fixarray header, so a non-fixarray
+ * header is treated as "no stamp" and left untouched. */
+static void lxmSplitStamp(const uint8_t* packed, size_t packed_n,
+                          std::vector<uint8_t>& scratch,
+                          const uint8_t** hashed_ptr, size_t* hashed_n,
+                          std::vector<uint8_t>& stamp_out)
 {
-    if (n < LXMF_OVERHEAD) return "";
-    /* The wire is already laid out as dest(16)||src(16)||sig(64)||packed.
-     * Skip the sig (64 B) when computing the message_id input. */
-    std::vector<uint8_t> mid_input;
-    mid_input.reserve(LXMF_DEST_HASH_LEN * 2 + (n - LXMF_OVERHEAD));
-    mid_input.insert(mid_input.end(), wire, wire + LXMF_DEST_HASH_LEN * 2);
-    mid_input.insert(mid_input.end(),
-                     wire + LXMF_OVERHEAD, wire + n);
-    uint8_t hash[RNSD_HASH_LEN];
-    rnsdSha256(mid_input.data(), mid_input.size(), hash);
-    return bytesToHex(hash, RNSD_HASH_LEN);
+    *hashed_ptr = packed;
+    *hashed_n   = packed_n;
+    stamp_out.clear();
+    if (packed_n < 1) return;
+    uint8_t b = packed[0];
+    if (b < 0x90 || b > 0x9F) return;     /* not a fixarray → leave as-is */
+    if ((b & 0x0F) <= 4) return;          /* no stamp element */
+
+    mpScan s{packed, packed_n, 1, 0, 0};
+    for (int k = 0; k < 4; ++k) if (!mpScanNext(s)) return;  /* malformed */
+    size_t stamp_start = s.i;
+
+    scratch.clear();
+    scratch.reserve(stamp_start);
+    scratch.push_back(0x94);              /* 4-element fixarray header */
+    scratch.insert(scratch.end(), packed + 1, packed + stamp_start);
+    *hashed_ptr = scratch.data();
+    *hashed_n   = scratch.size();
+
+    std::string st;
+    if (mpReadStrOrBin(s, st)) stamp_out.assign(st.begin(), st.end());
 }
 
 /* ─────────────── identity table ─────────────── */
@@ -1565,10 +1621,23 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     LxmFields fields;
     fields.thread = thread;
 
+    /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
+     * but only when generation is enabled and they actually advertise a
+     * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case). */
+    int stamp_cost = 0;
+    if (storageGetInt("s.lxmf.generate_stamps", 1) != 0) {
+        AnnounceEntry ae;
+        std::string av = storageGetStr(("lxmf.announces." + peer_hex).c_str(), "");
+        if (!av.empty() && parseAnnounceValue(av.c_str(), &ae) && ae.cost > 0)
+            stamp_cost = ae.cost;
+    }
+
     uint64_t ts_ms = wallUnixMs();
+    uint8_t  mid_raw[RNSD_HASH_LEN];
     std::vector<uint8_t> wire = lxmPackWire(id.identity_key.c_str(),
                                              id.dest_hash, dh,
-                                             ts_ms, title, content, fields);
+                                             ts_ms, title, content, fields,
+                                             stamp_cost, mid_raw);
     if (wire.empty()) {
         err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
         storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
@@ -1576,7 +1645,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         return;
     }
 
-    std::string msg_id_hex = lxmMessageIdHex(wire.data(), wire.size());
+    std::string msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
 
     /* Reserve an outbox slot. */
     outbound_t* o = outboundAlloc(id);
@@ -1788,15 +1857,24 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
         return;
     }
 
-    /* Signature over dest || src || packed || SHA-256(...). */
+    /* A stamped message carries the PoW as payload element [4], appended
+     * AFTER signing. Recover the 4-element payload the sender actually
+     * hashed/signed (and the stamp, if any) and verify against that. */
+    std::vector<uint8_t> hashed_scratch, stamp_bytes;
+    const uint8_t* hashed   = packed;
+    size_t         hashed_n = packed_n;
+    lxmSplitStamp(packed, packed_n, hashed_scratch, &hashed, &hashed_n, stamp_bytes);
+
+    /* Signature over dest || src || packed4 || SHA-256(...). The inner
+     * SHA-256 IS the message_id (Plan §2.1). */
     std::vector<uint8_t> signable;
-    signable.reserve(LXMF_DEST_HASH_LEN * 2 + packed_n + RNSD_HASH_LEN);
+    signable.reserve(LXMF_DEST_HASH_LEN * 2 + hashed_n + RNSD_HASH_LEN);
     signable.insert(signable.end(), dh,     dh     + LXMF_DEST_HASH_LEN);
     signable.insert(signable.end(), sh,     sh     + LXMF_DEST_HASH_LEN);
-    signable.insert(signable.end(), packed, packed + packed_n);
-    uint8_t sig_hash[RNSD_HASH_LEN];
-    rnsdSha256(signable.data(), signable.size(), sig_hash);
-    signable.insert(signable.end(), sig_hash, sig_hash + RNSD_HASH_LEN);
+    signable.insert(signable.end(), hashed, hashed + hashed_n);
+    uint8_t mid_hash[RNSD_HASH_LEN];
+    rnsdSha256(signable.data(), signable.size(), mid_hash);
+    signable.insert(signable.end(), mid_hash, mid_hash + RNSD_HASH_LEN);
 
     if (!rnsdVerify(sender_pubkey, signable.data(), signable.size(), sig)) {
         warn("id %d: inbound LXM signature invalid (from=%s)",
@@ -1804,14 +1882,6 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
         return;
     }
 
-    /* message_id = SHA-256(dest || src || packed). Plan §2.1. */
-    std::vector<uint8_t> mid_input;
-    mid_input.reserve(LXMF_DEST_HASH_LEN * 2 + packed_n);
-    mid_input.insert(mid_input.end(), dh,     dh     + LXMF_DEST_HASH_LEN);
-    mid_input.insert(mid_input.end(), sh,     sh     + LXMF_DEST_HASH_LEN);
-    mid_input.insert(mid_input.end(), packed, packed + packed_n);
-    uint8_t mid_hash[RNSD_HASH_LEN];
-    rnsdSha256(mid_input.data(), mid_input.size(), mid_hash);
     std::string mid_hex = bytesToHex(mid_hash, RNSD_HASH_LEN);
     std::string sh_hex  = bytesToHex(sh, LXMF_DEST_HASH_LEN);  /* peer = conversation subtree */
 
@@ -1826,6 +1896,22 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     if (storageExists(stage_key.c_str())) {
         verb("id %d: inbound LXM already stored (mid=%s)", id.index, mid_hex.c_str());
         return;
+    }
+
+    /* Stamp enforcement (opt-in via s.lxmf.enforce_stamps). When on, a
+     * message that doesn't carry a valid PoW stamp meeting our advertised
+     * cost is dropped. Validation rebuilds the 768 KB workblock — done
+     * only here, for novel messages, after dedup. */
+    if (storageGetInt("s.lxmf.enforce_stamps", 0) != 0) {
+        int required = storageGetInt(idPath(id.index, "stamp_cost").c_str(), 16);
+        if (required > 0 &&
+            !lxmfStampValid(mid_hash, required,
+                            stamp_bytes.data(), stamp_bytes.size())) {
+            warn("id %d: inbound LXM dropped — %s (require cost %d) from=%s mid=%s",
+                 id.index, stamp_bytes.empty() ? "no stamp" : "stamp below cost",
+                 required, sh_hex.c_str(), mid_hex.c_str());
+            return;
+        }
     }
 
     /* Parse payload. */
@@ -3756,6 +3842,11 @@ void lxmfInit(void)
         storageSet("s.lxmf.version", LXMF_VERSION);
         storageEnd();
     }
+
+    /* Outbound stamp generation, default on. Set unconditionally (not
+     * behind the version gate) so it lands on already-initialised
+     * devices too. Honoured only when a peer advertises a cost > 0. */
+    storageDefault("s.lxmf.generate_stamps", 1);
 
     s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;
 

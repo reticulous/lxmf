@@ -124,9 +124,42 @@ the activator-driven source-list exclusion is a future build-CLI
 feature, so there's no manifest field to declare it yet. The slice's
 `.cpp` is wrapped in `#if CONFIG_SPANGAP_LCD` until then.
 
+## Stamps (proof-of-work)
+
+LXStamper-compatible (reference LXMF). A stamp is a 32-byte nonce chosen
+so `SHA-256(workblock ‖ stamp)`, as a big-endian 256-bit integer, is
+`≤ 2^(256 − cost)`. The `workblock` is 768 KB expanded from the
+`message_id` via HKDF-SHA256 over 3000 rounds — fixed by the protocol so
+both ends derive the same block. Implemented in `src/lxmf_stamp.cpp`
+(self-contained software SHA-256 + HMAC + HKDF, kept off the shared HW
+SHA engine).
+
+- **message_id / signing.** The stamp is payload element **[4]**,
+  appended *after* signing, so it is neither signed nor part of
+  `message_id` (which is `SHA-256(dest ‖ src ‖ 4-element-payload)` — the
+  same value the signature's inner hash already computes). On the wire a
+  stamped payload is a 5-element fixarray (`0x95`); inbound, `lxmSplitStamp`
+  rewrites the header back to `0x94` to recover the exact bytes the sender
+  signed before verifying the signature and re-deriving `message_id`.
+- **Generation** (`s.lxmf.generate_stamps`, default on). Only runs when
+  the recipient's announce advertised a cost > 0; otherwise no stamp, no
+  delay. The 768 KB block is built once, then a midstate is cached and
+  each nonce attempt compresses only the final 64-byte block. ~4 s on the
+  T-Deck (workblock build dominates; cost barely matters over the usual
+  range), run on the lxmf task with periodic yields.
+- **Verification** (`s.lxmf.enforce_stamps`, default off). When on,
+  inbound messages without a stamp meeting our advertised
+  `s.lxmf.id.<n>.stamp_cost` (default 16) are dropped post-dedup.
+- **Tickets** (the contact-exemption path) are not implemented — every
+  stamped send pays the full PoW.
+
+Interop-verified both directions against reference **LXMF 1.0.1**: our
+generated cost-N stamp validates upstream (`stamp_valid=True`), we accept
+a genuine upstream stamp, and we reject an under-cost one.
+
 ## Status
 
 LXMF 0.9.8, hardware-verified against upstream Python LXMF. Per-
-contact threads, Link + Resource transfer working. Full storage-key
-schema documented in
+contact threads, Link + Resource transfer, and proof-of-work stamps
+working. Full storage-key schema documented in
 [hw-tdeck/docs/internals/lxmf.md](../hw-tdeck/docs/internals/lxmf.md).

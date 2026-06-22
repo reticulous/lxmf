@@ -94,6 +94,30 @@ Both UIs render the stage on outbound bubbles:
 - `delivered` — two green checkmarks
 - `failed` / `cancelled` — red ✕ (web shows `last_error` as tooltip)
 
+## Stamps (proof-of-work)
+
+LXMF lets a recipient advertise a **stamp cost** in its announce — a
+proof-of-work price (in bits; each bit doubles the work) a sender must
+pay per message as spam friction. We advertise `s.lxmf.id.<n>.stamp_cost`
+(default 16) and implement both sides:
+
+- **Generating** (`s.lxmf.generate_stamps`, default on): when sending to
+  a peer who advertises a cost > 0, we compute a stamp meeting it and
+  append it to the message. The PoW runs on the lxmf task and takes ~4 s
+  on a T-Deck (dominated by the one-time workblock build, so cost has
+  little effect over this range); it is skipped entirely (no delay) when
+  the peer advertises no cost — the common case. Turn off to never pay.
+- **Verifying** (`s.lxmf.enforce_stamps`, default off): when on, inbound
+  messages lacking a valid stamp for our advertised cost are dropped.
+  Left off, stamps on inbound messages are accepted but not required.
+
+A stamp is a 32-byte nonce over a 768 KB workblock expanded from the
+message_id (reference LXStamper, 3000 HKDF rounds — fixed by the
+protocol). The stamp is payload element [4], appended after signing, so
+it is neither signed nor part of the message_id; the receiver strips it
+to re-derive both. Tickets (the contact-exemption mechanism) are not yet
+implemented — every stamped send pays the full PoW.
+
 ## Dependencies
 
 - [rns](../rns)

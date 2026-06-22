@@ -12,6 +12,16 @@
     <SettingSlider label="Announce catalogue cap" k="s.lxmf.max_announces"
                    :min="256" :max="8192" :step="256" />
 
+    <SettingToggle label="Generate outbound stamps" k="s.lxmf.generate_stamps" />
+    <div class="text-caption text-grey-5">
+      Pay a peer's advertised proof-of-work cost when sending. No cost
+      advertised → no work, no delay.
+    </div>
+    <SettingToggle label="Require inbound stamps" k="s.lxmf.enforce_stamps" />
+    <div class="text-caption text-grey-5">
+      Drop incoming messages that lack a valid stamp for our advertised cost.
+    </div>
+
     <q-separator dark />
 
     <div class="text-caption text-grey-5">Identities</div>
