@@ -98,18 +98,29 @@ Both UIs render the stage on outbound bubbles:
 
 LXMF lets a recipient advertise a **stamp cost** in its announce — a
 proof-of-work price (in bits; each bit doubles the work) a sender must
-pay per message as spam friction. We advertise `s.lxmf.id.<n>.stamp_cost`
-(default 16) and implement both sides:
+pay per message as spam friction. Three independent knobs (all surfaced
+in the Settings panel / on-device pane):
 
-- **Generating** (`s.lxmf.generate_stamps`, default on): when sending to
-  a peer who advertises a cost > 0, we compute a stamp meeting it and
-  append it to the message. The PoW runs on the lxmf task and takes ~4 s
-  on a T-Deck (dominated by the one-time workblock build, so cost has
-  little effect over this range); it is skipped entirely (no delay) when
-  the peer advertises no cost — the common case. Turn off to never pay.
-- **Verifying** (`s.lxmf.enforce_stamps`, default off): when on, inbound
-  messages lacking a valid stamp for our advertised cost are dropped.
-  Left off, stamps on inbound messages are accepted but not required.
+- **`s.lxmf.stamp_cost`** (slider 0–18, default 16): the single cost we
+  advertise to everyone. `0` advertises no cost. The cap of 18 keeps it
+  in the range we can still generate ourselves with acceptable effort;
+  validation is cheap at any cost. This is *only* what we advertise —
+  whether we act on it on inbound is the separate toggle below.
+- **`s.lxmf.generate_stamps`** (default on): when sending to a peer who
+  advertises a cost > 0, compute a stamp meeting it and append it. The
+  PoW runs on the lxmf task and takes ~4 s on a T-Deck (dominated by the
+  one-time workblock build, so cost has little effect over this range);
+  skipped entirely (no delay) when the peer advertises no cost — the
+  common case. A peer advertising above 18 is refused (sent unstamped)
+  rather than freezing the task for minutes. Turn off to never pay.
+- **`s.lxmf.enforce_stamps`** (default off): when on, drop inbound
+  messages lacking a valid stamp for the cost we advertise
+  (`s.lxmf.stamp_cost`). Left off, inbound stamps are accepted but not
+  required.
+
+Both generation and validation run on the lxmf task and yield ~every
+500 ms (covering the workblock build, not just the search) so the rest of
+the system keeps ticking.
 
 A stamp is a 32-byte nonce over a 768 KB workblock expanded from the
 message_id (reference LXStamper, 3000 HKDF rounds — fixed by the

@@ -870,7 +870,7 @@ static std::vector<uint8_t> lxmPackWire(const char* identity_key,
     if (stamp_cost > 0 && wire[LXMF_OVERHEAD] == 0x94) {
         uint8_t stamp[LXMF_STAMP_LEN];
         uint64_t t0 = nowUnixMs();
-        if (lxmfStampGenerate(hash, stamp_cost, stamp, stampYield)) {
+        if (lxmfStampGenerate(hash, stamp_cost, stamp, stampYield, nowUnixMs)) {
             wire[LXMF_OVERHEAD] = 0x95;
             mpPackBin(wire, stamp, sizeof stamp);
             info("stamp generated cost=%d in %llu ms",
@@ -1248,7 +1248,6 @@ static bool createIdentityForSlot(int n, const std::string& display_name)
     storageSet    (idPath(n, "label").c_str(),        display_name.c_str());
     storageSet    (idPath(n, "display_name").c_str(), display_name.c_str());
     storageDefault(idPath(n, "enabled").c_str(),      1);
-    storageDefault(idPath(n, "stamp_cost").c_str(),   16);
     storageDefault(idPath(n, "default_method").c_str(), "auto");  /* §8.2 */
     storageEnd();
 
@@ -1352,7 +1351,10 @@ static bool sendFrame(lxmf_id_t& id, const uint8_t* frame, size_t n)
 static std::vector<uint8_t> buildAnnounceAppData(int id_n)
 {
     std::string name = storageGetStr(idPath(id_n, "display_name").c_str(), "");
-    int cost = storageGetInt(idPath(id_n, "stamp_cost").c_str(), 16);
+    /* Advertised stamp cost is a single global knob (0 = advertise none).
+     * Whether we *require* it on inbound is the separate enforce_stamps
+     * toggle. */
+    int cost = storageGetInt("s.lxmf.stamp_cost", 16);
 
     std::vector<uint8_t> out;
     mpPackArrayHeader(out, 2);
@@ -1399,7 +1401,7 @@ static void sendAnnounce(lxmf_id_t& id)
      * from parseLxmfAnnounce). rnsd will log the wire contents too, but
      * showing it here keeps each line self-contained for debugging. */
     std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
-    int cost = storageGetInt(idPath(id.index, "stamp_cost").c_str(), 16);
+    int cost = storageGetInt("s.lxmf.stamp_cost", 16);
     info("id %d: announce sent name=\"%s\" cost=%d (%zu B app_data)",
          id.index, sanitizeForLog(name).c_str(), cost, app_data.size());
 }
@@ -1623,13 +1625,20 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
     /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
      * but only when generation is enabled and they actually advertise a
-     * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case). */
+     * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case).
+     * A cost above what we're willing to grind (LXMF_STAMP_MAX_COST) is
+     * refused — send unstamped rather than freeze the task for minutes. */
     int stamp_cost = 0;
     if (storageGetInt("s.lxmf.generate_stamps", 1) != 0) {
         AnnounceEntry ae;
         std::string av = storageGetStr(("lxmf.announces." + peer_hex).c_str(), "");
-        if (!av.empty() && parseAnnounceValue(av.c_str(), &ae) && ae.cost > 0)
-            stamp_cost = ae.cost;
+        if (!av.empty() && parseAnnounceValue(av.c_str(), &ae) && ae.cost > 0) {
+            if (ae.cost > LXMF_STAMP_MAX_COST)
+                warn("id %d: peer stamp cost %d > max %d — sending unstamped",
+                     id.index, ae.cost, LXMF_STAMP_MAX_COST);
+            else
+                stamp_cost = ae.cost;
+        }
     }
 
     uint64_t ts_ms = wallUnixMs();
@@ -1899,14 +1908,15 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     }
 
     /* Stamp enforcement (opt-in via s.lxmf.enforce_stamps). When on, a
-     * message that doesn't carry a valid PoW stamp meeting our advertised
-     * cost is dropped. Validation rebuilds the 768 KB workblock — done
-     * only here, for novel messages, after dedup. */
+     * message that doesn't carry a valid PoW stamp meeting the cost we
+     * advertise (s.lxmf.stamp_cost) is dropped. Validation rebuilds the
+     * 768 KB workblock — done only here, for novel messages, after dedup. */
     if (storageGetInt("s.lxmf.enforce_stamps", 0) != 0) {
-        int required = storageGetInt(idPath(id.index, "stamp_cost").c_str(), 16);
+        int required = storageGetInt("s.lxmf.stamp_cost", 16);
         if (required > 0 &&
             !lxmfStampValid(mid_hash, required,
-                            stamp_bytes.data(), stamp_bytes.size())) {
+                            stamp_bytes.data(), stamp_bytes.size(),
+                            stampYield, nowUnixMs)) {
             warn("id %d: inbound LXM dropped — %s (require cost %d) from=%s mid=%s",
                  id.index, stamp_bytes.empty() ? "no stamp" : "stamp below cost",
                  required, sh_hex.c_str(), mid_hex.c_str());
@@ -2695,7 +2705,6 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                         storageDefault(idPath(n, "label").c_str(),        "imported");
                         storageDefault(idPath(n, "enabled").c_str(),      1);
                         storageDefault(idPath(n, "display_name").c_str(), "");
-                        storageDefault(idPath(n, "stamp_cost").c_str(),   16);
                         storageDefault(idPath(n, "default_method").c_str(), "auto");
                         storageEnd();
                         connectMailbox(s_ids[n]);
@@ -3843,9 +3852,12 @@ void lxmfInit(void)
         storageEnd();
     }
 
-    /* Outbound stamp generation, default on. Set unconditionally (not
-     * behind the version gate) so it lands on already-initialised
-     * devices too. Honoured only when a peer advertises a cost > 0. */
+    /* Stamp knobs, set unconditionally (not behind the version gate) so
+     * they land on already-initialised devices too:
+     *  - stamp_cost: the single advertised proof-of-work cost (0 = none).
+     *  - generate_stamps: pay a peer's advertised cost when sending.
+     * Whether we *require* inbound stamps is the enforce_stamps toggle. */
+    storageDefault("s.lxmf.stamp_cost",      16);
     storageDefault("s.lxmf.generate_stamps", 1);
 
     s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;

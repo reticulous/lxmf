@@ -141,15 +141,22 @@ SHA engine).
   stamped payload is a 5-element fixarray (`0x95`); inbound, `lxmSplitStamp`
   rewrites the header back to `0x94` to recover the exact bytes the sender
   signed before verifying the signature and re-deriving `message_id`.
+- **Advertised cost** is a single global `s.lxmf.stamp_cost` (default 16,
+  UI slider 0–18, 0 = advertise none) — packed into every identity's
+  announce. It is purely what we advertise; acting on it inbound is the
+  separate `enforce_stamps` toggle.
 - **Generation** (`s.lxmf.generate_stamps`, default on). Only runs when
   the recipient's announce advertised a cost > 0; otherwise no stamp, no
   delay. The 768 KB block is built once, then a midstate is cached and
   each nonce attempt compresses only the final 64-byte block. ~4 s on the
   T-Deck (workblock build dominates; cost barely matters over the usual
-  range), run on the lxmf task with periodic yields.
+  range), on the lxmf task yielding ~every 500 ms (build + search). A
+  peer cost above `LXMF_STAMP_MAX_COST` (18) is refused — sent unstamped
+  rather than grinding for minutes.
 - **Verification** (`s.lxmf.enforce_stamps`, default off). When on,
   inbound messages without a stamp meeting our advertised
-  `s.lxmf.id.<n>.stamp_cost` (default 16) are dropped post-dedup.
+  `s.lxmf.stamp_cost` are dropped post-dedup. Validation is one workblock
+  hash (also yields ~every 500 ms).
 - **Tickets** (the contact-exemption path) are not implemented — every
   stamped send pays the full PoW.
 

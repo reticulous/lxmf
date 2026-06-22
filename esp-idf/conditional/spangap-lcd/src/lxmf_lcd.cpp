@@ -1003,6 +1003,8 @@ void lxmfSettingsPane(void* arg) {
     lcdSettingSlider (p, "Re-announce interval (s)", "s.lxmf.announce_interval_s", 0, 21600);
     lcdSettingCaption(p, "0 = announce on demand only.");
     lcdSettingSlider (p, "Announce catalogue cap", "s.lxmf.max_announces", 256, 8192);
+    lcdSettingSlider (p, "Advertised stamp cost", "s.lxmf.stamp_cost", 0, 18);
+    lcdSettingCaption(p, "PoW cost (bits) senders pay; 0 = none.");
     lcdSettingSwitch (p, "Generate stamps", "s.lxmf.generate_stamps");
     lcdSettingCaption(p, "Pay a peer's advertised PoW cost when sending.");
     lcdSettingSwitch (p, "Require stamps", "s.lxmf.enforce_stamps");

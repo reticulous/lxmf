@@ -156,13 +156,30 @@ size_t packb_uint(int n, uint8_t out[3])
     out[0] = 0xcd; out[1] = (uint8_t)(n >> 8); out[2] = (uint8_t)n; return 3;
 }
 
+/* Cooperative yielder: invokes `yield` whenever ~YIELD_MS of wall time
+ * has passed since the last yield, using a monotonic-ms clock. Both
+ * callbacks may be null (no-op). */
+constexpr uint64_t YIELD_MS = 500;
+struct Yielder {
+    lxmf_yield_fn  yield;
+    lxmf_now_ms_fn now_ms;
+    uint64_t       last;
+    void reset() { last = (now_ms ? now_ms() : 0); }
+    void tick() {
+        if (!yield || !now_ms) return;
+        uint64_t t = now_ms();
+        if (t - last >= YIELD_MS) { yield(); last = now_ms(); }
+    }
+};
+
 /* Protocol constant — must match the reference exactly so both ends
  * derive the same workblock. 3000 * 256 B = 768000 B (block-aligned). */
 constexpr int    WORKBLOCK_EXPAND_ROUNDS = 3000;
 constexpr size_t WORKBLOCK_LEN = (size_t)WORKBLOCK_EXPAND_ROUNDS * 256;
 
-/* Expand message_id into the 768 KB workblock (caller frees with gp_free). */
-uint8_t* build_workblock(const uint8_t message_id[32])
+/* Expand message_id into the 768 KB workblock (caller frees with gp_free).
+ * Yields ~every 500 ms — this build is the bulk of the ~4 s. */
+uint8_t* build_workblock(const uint8_t message_id[32], Yielder& y)
 {
     uint8_t* wb = (uint8_t*)gp_alloc(WORKBLOCK_LEN);
     if (!wb) return nullptr;
@@ -176,6 +193,7 @@ uint8_t* build_workblock(const uint8_t message_id[32])
         uint8_t salt[32];
         sha256(saltbuf, 32 + pbl, salt);
         hkdf256(message_id, 32, salt, 32, wb + (size_t)n * 256);
+        y.tick();
     }
     return wb;
 }
@@ -195,11 +213,14 @@ bool hash_meets_cost(const uint8_t digest[32], int cost)
 } // namespace
 
 bool lxmfStampValid(const uint8_t message_id[32], int target_cost,
-                    const uint8_t* stamp, size_t stamp_len)
+                    const uint8_t* stamp, size_t stamp_len,
+                    lxmf_yield_fn yield, lxmf_now_ms_fn now_ms)
 {
     if (target_cost <= 0) return true;
     if (!stamp || stamp_len == 0) return false;
-    uint8_t* wb = build_workblock(message_id);
+    Yielder y{yield, now_ms, 0};
+    y.reset();
+    uint8_t* wb = build_workblock(message_id, y);
     if (!wb) return false;
     Sha256 s;
     sha256_init(s);
@@ -212,10 +233,13 @@ bool lxmfStampValid(const uint8_t message_id[32], int target_cost,
 }
 
 bool lxmfStampGenerate(const uint8_t message_id[32], int target_cost,
-                       uint8_t out_stamp[LXMF_STAMP_LEN], void (*yield)(void))
+                       uint8_t out_stamp[LXMF_STAMP_LEN],
+                       lxmf_yield_fn yield, lxmf_now_ms_fn now_ms)
 {
     if (target_cost <= 0) return false;
-    uint8_t* wb = build_workblock(message_id);
+    Yielder y{yield, now_ms, 0};
+    y.reset();
+    uint8_t* wb = build_workblock(message_id, y);
     if (!wb) return false;
 
     /* Absorb the whole (block-aligned) workblock once; `base` now holds
@@ -240,6 +264,6 @@ bool lxmfStampGenerate(const uint8_t message_id[32], int target_cost,
             return true;
         }
         ++counter;
-        if (yield && (counter & 0xfff) == 0) yield();
+        if ((counter & 0x1ff) == 0) y.tick();   /* time-based, ~every 500 ms */
     }
 }

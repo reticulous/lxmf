@@ -12,6 +12,12 @@
     <SettingSlider label="Announce catalogue cap" k="s.lxmf.max_announces"
                    :min="256" :max="8192" :step="256" />
 
+    <SettingSlider label="Advertised stamp cost" k="s.lxmf.stamp_cost"
+                   :min="0" :max="18" :step="1" />
+    <div class="text-caption text-grey-5">
+      Proof-of-work cost (bits) we ask senders to pay. 0 = advertise none.
+      Higher costs take senders longer to compute.
+    </div>
     <SettingToggle label="Generate outbound stamps" k="s.lxmf.generate_stamps" />
     <div class="text-caption text-grey-5">
       Pay a peer's advertised proof-of-work cost when sending. No cost
