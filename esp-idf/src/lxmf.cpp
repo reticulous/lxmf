@@ -174,10 +174,10 @@ struct lxmf_id_t {
 };
 
 static TaskHandle_t s_task = nullptr;
-static lxmf_id_t    s_ids[LXMF_MAX_IDENTITIES];
+PSRAM_BSS static lxmf_id_t    s_ids[LXMF_MAX_IDENTITIES];
 
 /* Inbound dedup ring (recent message_ids, hex64). */
-static std::string s_dedup_ring[LXMF_DEDUP_RING];
+PSRAM_BSS static std::string s_dedup_ring[LXMF_DEDUP_RING];
 static int         s_dedup_head = 0;
 
 /* Forward declarations for per-identity cmd-subscription helpers (defined
@@ -671,7 +671,8 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
 
 struct LxmFields {
     std::string thread;        /* hex64 root message_id, empty if none */
-    /* Future: telemetry, attachments, ticket, etc. */
+    std::string ticket;        /* raw msgpack value of FIELD_TICKET, empty if none */
+    /* Future: telemetry, attachments, etc. */
 };
 
 /* Pack the msgpack payload alone (no dest/src/sig). title/content may
@@ -799,6 +800,14 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
                     std::snprintf(hex + 2*j, 3, "%02x", (uint8_t)raw[j]);
                 fields_out->thread.assign(hex, 64);
             }
+        } else if (key == LXMF_FIELD_TICKET) {
+            /* Capture the raw msgpack value span regardless of its shape
+             * (str/bin/array) so it can be logged. We don't yet cache or
+             * use tickets — see onInboundLxm. */
+            size_t v0 = s.i;
+            if (!mpScanNext(s)) return false;
+            if (fields_out)
+                fields_out->ticket.assign((const char*)s.p + v0, s.i - v0);
         } else {
             /* Phase 4a: skip everything else but stay parseable. */
             if (!mpScanNext(s)) return false;
@@ -1085,7 +1094,7 @@ static int annCountAndMaybeOldest(int max_entries, std::string* oldest_hex_out)
 static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
 {
     if (handle != s_announce_sub_handle) return;
-    static uint8_t buf[LXMF_ANNOUNCE_HDR + 1024];
+    PSRAM_BSS static uint8_t buf[LXMF_ANNOUNCE_HDR + 1024];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n < LXMF_ANNOUNCE_HDR) {
         if (n > 0) warn("announce sub: short frame %zu B", n);
@@ -1460,7 +1469,7 @@ static void convDrop(convlink_t& c)
  * like the inbound-Link path) — feed the shared pipeline. */
 static void onConvLinkRecv(int handle, size_t /*bytesAvail*/)
 {
-    static uint8_t buf[2048];
+    PSRAM_BSS static uint8_t buf[2048];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
     for (auto& c : s_convlinks) {
@@ -1923,21 +1932,31 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
         return;
     }
 
-    /* Stamp enforcement (opt-in via s.lxmf.enforce_stamps). When on, a
-     * message that doesn't carry a valid PoW stamp meeting the cost we
-     * advertise (s.lxmf.stamp_cost) is dropped. Validation rebuilds the
-     * 768 KB workblock — done only here, for novel messages, after dedup. */
+    /* Stamp handling. When enforcing (s.lxmf.enforce_stamps), verify the
+     * PoW against the cost we advertise (s.lxmf.stamp_cost), log the
+     * result, and drop on failure. Validation rebuilds the 768 KB
+     * workblock, so when NOT enforcing we skip that work entirely and
+     * just log whether a stamp rode along. Either path runs only here,
+     * for novel messages, after dedup. */
     if (storageGetInt("s.lxmf.enforce_stamps", 0) != 0) {
         int required = storageGetInt("s.lxmf.stamp_cost", 16);
-        if (required > 0 &&
-            !lxmfStampValid(mid_hash, required,
-                            stamp_bytes.data(), stamp_bytes.size(),
-                            stampYield, nowUnixMs)) {
-            warn("id %d: inbound LXM dropped — %s (require cost %d) from=%s mid=%s",
-                 id.index, stamp_bytes.empty() ? "no stamp" : "stamp below cost",
-                 required, sh_hex.c_str(), mid_hex.c_str());
-            return;
+        if (required > 0) {
+            if (lxmfStampValid(mid_hash, required,
+                               stamp_bytes.data(), stamp_bytes.size(),
+                               stampYield, nowUnixMs)) {
+                info("id %d: inbound stamp valid (cost>=%d, %zuB) from=%s mid=%s",
+                     id.index, required, stamp_bytes.size(),
+                     sh_hex.c_str(), mid_hex.c_str());
+            } else {
+                warn("id %d: inbound LXM dropped — stamp %s (require cost %d) from=%s mid=%s",
+                     id.index, stamp_bytes.empty() ? "absent" : "below cost",
+                     required, sh_hex.c_str(), mid_hex.c_str());
+                return;
+            }
         }
+    } else if (!stamp_bytes.empty()) {
+        info("id %d: inbound stamp present (%zuB, unverified) from=%s mid=%s",
+             id.index, stamp_bytes.size(), sh_hex.c_str(), mid_hex.c_str());
     }
 
     /* Parse payload. */
@@ -1948,6 +1967,17 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
                          &ts, &title, &content, &fields)) {
         warn("id %d: inbound LXM payload malformed", id.index);
         return;
+    }
+
+    /* Log any LXMF ticket the sender handed us. We don't cache or use it
+     * yet (no stamp-exemption path), so it's visibility-only for now. */
+    if (!fields.ticket.empty()) {
+        size_t pfx = fields.ticket.size() < 16 ? fields.ticket.size() : 16;
+        info("id %d: inbound ticket %zuB [%s%s] from=%s mid=%s (not stored)",
+             id.index, fields.ticket.size(),
+             bytesToHex((const uint8_t*)fields.ticket.data(), pfx).c_str(),
+             fields.ticket.size() > pfx ? "…" : "",
+             sh_hex.c_str(), mid_hex.c_str());
     }
 
     /* Persist. */
@@ -2182,7 +2212,7 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
     lxmf_id_t* id = idForHandle(handle);
     if (!id) return;
 
-    static uint8_t buf[2048];
+    PSRAM_BSS static uint8_t buf[2048];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
 
@@ -2291,7 +2321,7 @@ static void onLinkInboxRecv(int handle, size_t /*bytesAvail*/)
     if (!s) return;
     lxmf_id_t& id = s_ids[s->id_index];
 
-    static uint8_t buf[2048];
+    PSRAM_BSS static uint8_t buf[2048];
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
 
