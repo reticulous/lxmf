@@ -37,6 +37,7 @@
  * so we touch LVGL straight from the change callback.
  */
 #include "lcd.h"
+#include "lcd_app.h"   /* LcdApp + lcdInstall */
 #include "mem.h"
 #include "storage.h"
 #include "compat.h"
@@ -1089,6 +1090,15 @@ void lxmfSettingsPane(void* arg) {
     }
 }
 
+/* LxmfApp — onCreate builds the screens; cleanup on eviction is handled by the
+ * layer's own onLayerDelete (it nulls every handle so a late storage change
+ * early-returns), so no onClose is needed. */
+class LxmfApp : public LcdApp {
+public:
+    LxmfApp() : LcdApp({ .name = "LXMF", .iconBasename = "rns" }) {}
+    void onCreate(lv_obj_t* root) override { lxmfApp(root); }
+};
+
 }  // namespace
 
 /* Register the LXMessenger launcher program — a when:-gated init: hook
@@ -1096,7 +1106,7 @@ void lxmfSettingsPane(void* arg) {
  * compiled only when the lcd straddle is staged, so no #if is needed. Plain
  * C++ linkage to match the generated dispatcher's forward decl. */
 void lxmfLcdRegister(void) {
-    lcdRegister("LXMF", "rns", lxmfApp);
+    lcdRun([](void*) { lcdInstall(new LxmfApp()); });   /* tile build is LVGL: on the lcd task */
     lcdRegisterSettings("Mesh Network/LXMF", "LXMF Messages", lxmfSettingsPane, 2);
 
     /* The on-device nomad browser writes a tapped contact's dest hash to
