@@ -1,8 +1,8 @@
 /**
- * lxmf — LXMF messaging protocol task (Phase 4a).
+ * lxmf — LXMF messaging protocol task.
  *
- * Architecture: docs/plans/lxmf.md. Storage is the API; the firmware
- * subscribes to its own keys and reacts. Wire format is LXMF 0.9.8:
+ * Storage is the API; the firmware subscribes to its own keys and
+ * reacts. Wire format is LXMF 0.9.8:
  *
  *   destination_hash(16) || source_hash(16) || Ed25519 sig(64) ||
  *   msgpack([timestamp, title, content, fields, stamp?])
@@ -10,7 +10,7 @@
  * Signature scope is `dest||src||packed||SHA-256(dest||src||packed)` —
  * the SHA-256 of the data is signed alongside it. message_id =
  * SHA-256(dest||src||packed). transient_id (used by propagation stores)
- * is distinct and not used in Phase 4a.
+ * is distinct and not used here.
  */
 #include "lxmf.h"
 #include "lxmf_stamp.h"
@@ -54,14 +54,12 @@ static bool s_dbg_only_local = false;
 
 #define LXMF_VERSION 1
 
-/* docs/plans/lxmf.md §2.1 */
 constexpr size_t LXMF_DEST_HASH_LEN = 16;
 constexpr size_t LXMF_SIG_LEN       = 64;
 constexpr size_t LXMF_OVERHEAD      = LXMF_DEST_HASH_LEN * 2 + LXMF_SIG_LEN;  /* 112 */
 constexpr size_t LXMF_OPP_CONTENT_BUDGET = 311;  /* single RNS packet plaintext */
 
-/* Phase 4a: one identity for now. Schema is an array (id.<n>) but
- * multi-identity features land in Phase 8. */
+/* Max concurrent LXMF identities. Schema is an array (id.<n>). */
 #define LXMF_MAX_IDENTITIES 4
 
 /* In-RAM dedup hashlist depth — last N inbound message_ids. Cheap
@@ -76,8 +74,7 @@ constexpr size_t LXMF_OPP_CONTENT_BUDGET = 311;  /* single RNS packet plaintext 
 #define LXMF_MAX_PENDING_VERIFY     25
 #define LXMF_PENDING_VERIFY_TTL_MS  (30u * 60u * 1000u)
 
-/* LXMF field registry keys (msgpack int keys in `fields` map). See
- * docs/plans/lxmf.md §2.5. */
+/* LXMF field registry keys (msgpack int keys in `fields` map). */
 enum : int {
     LXMF_FIELD_EMBEDDED_LXMS    = 0x01,
     LXMF_FIELD_TELEMETRY        = 0x02,
@@ -104,7 +101,7 @@ struct outbound_t {
     std::string peer;           /* 32-hex destination — the conversation subtree */
     std::string msg_key;        /* "o_<...>" — the local outbound key under id.<n>.msgs.<peer> */
 
-    /* Phase E DIRECT: when this send went out over a Link instead of
+    /* DIRECT: when this send went out over a Link instead of
      * opportunistic. link_handle is the RNSD_PORT_LINK ITS handle;
      * link_tag keys rnsd.links.<tag>.* which the 1 Hz tick polls for
      * the active/failed transition (rnsd has no OUT_RESULT on links). */
@@ -113,7 +110,7 @@ struct outbound_t {
     std::string link_tag;
     uint32_t    direct_deadline_s;  /* unix s; fail if not active by then */
 
-    /* Phase F: this DIRECT send is a Resource (wire > one Link packet).
+    /* This DIRECT send is a Resource (wire > one Link packet).
      * Settled by the RNSD_LINK_RESOURCE_OUTBOUND_DONE aux (or
      * rnsd.links.<tag>.resource.state) — NOT by link "active", because
      * the Link must stay up for the whole transfer. */
@@ -227,8 +224,7 @@ static void setIntIfChanged(const std::string& key, int v)
 
 /* Per-contact message store: s.lxmf.id.<n>.msgs.<peer>.<key>.<field>.
  * `peer` is a 32-hex destination (the conversation subtree); `key` is
- * the real message_id (inbound) or a local o_<ms>_<rand> (outbound).
- * See docs/plans/lxmf-messages-per-contact.md. */
+ * the real message_id (inbound) or a local o_<ms>_<rand> (outbound). */
 static std::string msgPath(int n, const std::string& peer,
                            const std::string& key, const char* field)
 {
@@ -258,7 +254,7 @@ static std::string msgPrefix(int n, const std::string& peer,
  * Idempotent and cheap once registered. No eviction yet — the subtree still
  * lives in cfgRoot and still syncs to the browser. Deleting the conversation
  * (or the identity) via storageDeleteTree drops the file automatically.
- * See storage.h storageNewTreeFile + docs/plans/evictable_storage.md. */
+ * See storage.h storageNewTreeFile. */
 static void ensureConvFile(int n, const std::string& peer)
 {
     char prefix[96];
@@ -345,7 +341,7 @@ static std::string sanitizeForLog(std::string_view s)
 /* Case-insensitive substring match. ASCII fold only (A-Z ↔ a-z); UTF-8
  * multibyte sequences compare byte-for-byte, so `é` matches `é` but
  * `é` doesn't match `É` — true Unicode case folding would need a
- * table, not worth it at Phase 4a scale. Empty needle matches
+ * table, not worth it at this scale. Empty needle matches
  * anything. */
 static bool nameContainsCI(std::string_view haystack, std::string_view needle)
 {
@@ -809,11 +805,11 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
             if (fields_out)
                 fields_out->ticket.assign((const char*)s.p + v0, s.i - v0);
         } else {
-            /* Phase 4a: skip everything else but stay parseable. */
+            /* Skip everything else but stay parseable. */
             if (!mpScanNext(s)) return false;
         }
     }
-    /* [4] optional stamp — Phase 4b. */
+    /* [4] optional stamp — not parsed here. */
     return true;
 }
 
@@ -965,7 +961,7 @@ static outbound_t* outboundAlloc(lxmf_id_t& id)
     return nullptr;
 }
 
-/* ─────────────── announces of seen LXMF mailboxes ─────────────── */
+/* ─────────────── announces of seen LXMF destinations ─────────────── */
 
 /* Cross-identity, ephemeral catalogue of every `lxmf.delivery` announce
  * we've heard recently. Populated by onAnnounceFromRnsd — fired on the
@@ -975,7 +971,7 @@ static outbound_t* outboundAlloc(lxmf_id_t& id)
  *
  * Path: `lxmf.announces.<dest_hex>.{hash,display_name,stamp_cost,ratchet,
  *        hops,last_announce_s}`. Pruning is left to a future cron job —
- * for Phase 4a entries simply accumulate. */
+ * for now entries simply accumulate. */
 
 static bool isOwnDest(const uint8_t dh[LXMF_DEST_HASH_LEN])
 {
@@ -1002,9 +998,10 @@ constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16;
  *   ratchet  64-hex or empty
  *   name     utf-8, may contain '|' (no escaping — name is last)
  *
- * Replaces the previous per-field subtree (6 leaves per entry). One
- * cJSON_String + the parent's child pointer per entry; ~3× fewer
- * heap blocks attributed to lxmf as the announce catalogue grows.
+ * Packed into one value rather than a per-field subtree (6 leaves per
+ * entry): one cJSON_String + the parent's child pointer per entry;
+ * ~3× fewer heap blocks attributed to lxmf as the announce catalogue
+ * grows.
  *
  * For eviction we only need last_s; that's the first field, so
  * atoi(value) is enough — stops at the first '|'. */
@@ -1103,7 +1100,7 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
 
     int            hops     = buf[0];
     const uint8_t* dh       = buf + 1;
-    /* buf + 17 is the announce identity hash — unused in Phase 4a but
+    /* buf + 17 is the announce identity hash — unused but
      * available if a consumer ever wants it. */
     const uint8_t* app_data = buf + LXMF_ANNOUNCE_HDR;
     size_t         app_len  = n - LXMF_ANNOUNCE_HDR;
@@ -1181,28 +1178,28 @@ static bool connectAnnounceSub(void)
     return true;
 }
 
-/* ─────────────── connect to rnsd mailbox ─────────────── */
+/* ─────────────── connect to our hosted rnsd destination ─────────────── */
 
 /* Forward decl — onIts callbacks live below. */
-static void onMailboxRecv(int handle, size_t bytesAvail);
-static void onMailboxDisconnect(int handle);
+static void onOurDestRecv(int handle, size_t bytesAvail);
+static void onOurDestDisconnect(int handle);
 
-static bool connectMailbox(lxmf_id_t& id)
+static bool connectOurDest(lxmf_id_t& id)
 {
     if (id.handle >= 0) return true;
 
     std::string ikey = secretsPath(id.index, "privkey");
     int h = rnsdDestOpen("lxmf.delivery", ikey.c_str(), /*SINGLE*/ 0,
                          /*ref*/ id.index,
-                         onMailboxRecv, onMailboxDisconnect);
+                         onOurDestRecv, onOurDestDisconnect);
     if (h < 0) {
-        err("id %d: mailbox connect failed", id.index);
+        err("id %d: our-dest connect failed", id.index);
         return false;
     }
     id.handle = h;
-    info("id %d: mailbox connected (handle=%d)", id.index, h);
+    info("id %d: our-dest connected (handle=%d)", id.index, h);
 
-    /* Phase E: accept inbound DIRECT Links to this delivery dest. rnsd
+    /* Accept inbound DIRECT Links to this delivery dest. rnsd
      * flips accepts_links(true) and back-connects to LXMF_LINK_INBOX_PORT
      * with an rnsd_link_incoming_t per accepted Link. Without this,
      * real-world LXMF peers (default DIRECT) can't deliver to us. */
@@ -1260,7 +1257,7 @@ static bool createIdentityForSlot(int n, const std::string& display_name)
     storageSet    (idPath(n, "label").c_str(),        display_name.c_str());
     storageSet    (idPath(n, "display_name").c_str(), display_name.c_str());
     storageDefault(idPath(n, "enabled").c_str(),      1);
-    storageDefault(idPath(n, "default_method").c_str(), "auto");  /* §8.2 */
+    storageDefault(idPath(n, "default_method").c_str(), "auto");
     storageEnd();
 
     subscribePerIdCmds(n);
@@ -1309,7 +1306,7 @@ static bool loadIdentityForSlot(int n)
 }
 
 /* Destroy slot n: wipe secrets, wipe inbox + contacts + tickets, close
- * the mailbox. Used by lxmf.cmd.identity_destroy. */
+ * the our-dest. Used by lxmf.cmd.identity_destroy. */
 static void destroyIdentity(int n)
 {
     lxmf_id_t* slot = idAt(n);
@@ -1358,8 +1355,9 @@ static bool sendFrame(lxmf_id_t& id, const uint8_t* frame, size_t n)
 
 /* Build LXMF announce app_data as msgpack `[display_name_bytes, stamp_cost]`
  * (the [b] shape parseLxmfAnnounce accepts). Modern clients also prefix
- * a 32-byte ratchet pubkey; that's reserved for Phase 4b alongside the
- * stamps machinery, which is when ratchet rotation becomes meaningful. */
+ * a 32-byte ratchet pubkey; we don't emit one yet — it becomes
+ * meaningful alongside the stamps machinery, when ratchet rotation
+ * matters. */
 static std::vector<uint8_t> buildAnnounceAppData(int id_n)
 {
     std::string name = storageGetStr(idPath(id_n, "display_name").c_str(), "");
@@ -1389,7 +1387,7 @@ static bool idEnabled(int n)
 static void sendAnnounce(lxmf_id_t& id)
 {
     if (id.handle < 0) {
-        warn("id %d: announce skipped (no mailbox handle)", id.index);
+        warn("id %d: announce skipped (no our-dest handle)", id.index);
         return;
     }
     if (!idEnabled(id.index)) {
@@ -1424,8 +1422,10 @@ static void sendAnnounce(lxmf_id_t& id)
  * Upstream LXMF keeps delivery Links open and reuses them for the whole
  * conversation; we mirror that. One Link per (identity, peer), tagged
  * "lxmf.id<n>.<peer8>", opened by the first DIRECT send and KEPT after
- * settlement (neither settle path tears down on success) and left open
- * by default; set s.lxmf.link.idle_s to reap idle links (0 = never).
+ * settlement (neither settle path tears down on success). rnsd ties Link
+ * lifetime to our ITS handle (no parking), so this pool IS the warm-hold:
+ * s.lxmf.link.idle_s reaps links idle past N seconds (default 600 = 10 min;
+ * 0 = never, rely on LRU + Reticulum STALE).
  * Links are bidirectional — the peer may deliver to us over
  * this link, and those bytes feed the same onInboundLxm pipeline as the
  * inbound-Link path. Sends to one peer serialize: rnsd allows one
@@ -1452,14 +1452,12 @@ static convlink_t* convFind(int id_index, const std::string& peer_hex)
     return nullptr;
 }
 
-/* Drop our conn first, then teardown — same ordering rationale as nomad's
- * dropLink: the disconnect makes rnsd null the slot's handle, so
- * linkFreeSlot won't double-disconnect a reused handle. */
+/* Closing our ITS handle tears the Link down in rnsd (onLinkDisconnect);
+ * there is no separate teardown call. */
 static void convDrop(convlink_t& c)
 {
     if (!c.used) return;
     if (c.handle >= 0) { itsDisconnect(c.handle); c.handle = -1; }
-    rnsdLinkTeardown(c.tag.c_str());
     c.used = false;
     c.peer_hex.clear();
     c.tag.clear();
@@ -1603,12 +1601,11 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
     std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
 
-    /* Phase E §8.2: delivery-method selection. Resolution order is
+    /* Delivery-method selection. Resolution order is
      * per-message override → per-identity default → "auto". "auto"
      * picks opportunistic when the payload fits a single RNS packet,
      * else DIRECT (a Reticulum Link). Explicit "opportunistic" still
-     * hard-fails oversize (unchanged 4a behaviour); explicit "direct"
-     * always uses a Link. */
+     * hard-fails oversize; explicit "direct" always uses a Link. */
     bool oversize = (title.size() + content.size() + 32 > LXMF_OPP_CONTENT_BUDGET);
     std::string method = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
     if (method.empty())
@@ -1727,8 +1724,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             return;                                /* stage stays "queued" */
         }
         /* One Link packet carries ~Link ENCRYPTED_MDU of content; a
-         * larger LXM must ride a Resource (link.md §9 / upstream
-         * LXMessage). Conservative threshold well under Link MDU. */
+         * larger LXM must ride a Resource (upstream LXMessage).
+         * Conservative threshold well under Link MDU. */
         constexpr size_t LXMF_LINK_PACKET_MAX = 360;
         bool as_resource = wire.size() > LXMF_LINK_PACKET_MAX;
         if (as_resource) {
@@ -1900,7 +1897,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     lxmSplitStamp(packed, packed_n, hashed_scratch, &hashed, &hashed_n, stamp_bytes);
 
     /* Signature over dest || src || packed4 || SHA-256(...). The inner
-     * SHA-256 IS the message_id (Plan §2.1). */
+     * SHA-256 IS the message_id. */
     std::vector<uint8_t> signable;
     signable.reserve(LXMF_DEST_HASH_LEN * 2 + hashed_n + RNSD_HASH_LEN);
     signable.insert(signable.end(), dh,     dh     + LXMF_DEST_HASH_LEN);
@@ -2070,7 +2067,7 @@ static void drainAllPendingVerify(lxmf_id_t& id)
     for (auto& s : senders) drainPendingVerify(id, s.data());
 }
 
-/* ─────────────── mailbox frame handlers ─────────────── */
+/* ─────────────── our-dest frame handlers ─────────────── */
 
 static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
                            uint32_t /*rtt_ms*/, uint8_t /*hops*/)
@@ -2083,7 +2080,7 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
     std::string mid      = o->msg_key;
     std::string peer_hex = o->peer;
 
-    /* SENT is no longer terminal: rnsd keeps the packet receipt and emits
+    /* SENT is not terminal: rnsd keeps the packet receipt and emits
      * a second OUT_RESULT (DELIVERED / PROOF_TIMEOUT) for this send_id.
      * Write "sent" (one grey check) and hold the slot for the proof.
      * pending/sent accounting settles here — the proof phase only refines
@@ -2207,7 +2204,7 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
         storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), note);
 }
 
-static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
+static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
 {
     lxmf_id_t* id = idForHandle(handle);
     if (!id) return;
@@ -2239,24 +2236,24 @@ static void onMailboxRecv(int handle, size_t /*bytesAvail*/)
             break;
         }
         default:
-            warn("id %d: unknown mailbox opcode 0x%02x", id->index, (unsigned)buf[0]);
+            warn("id %d: unknown our-dest opcode 0x%02x", id->index, (unsigned)buf[0]);
             break;
     }
 }
 
-static void onMailboxDisconnect(int handle)
+static void onOurDestDisconnect(int handle)
 {
     lxmf_id_t* id = idForHandle(handle);
     if (!id) return;
-    warn("id %d: mailbox disconnected (handle=%d)", id->index, handle);
+    warn("id %d: our-dest disconnected (handle=%d)", id->index, handle);
     id->handle = -1;
     storageSet(idEphPath(id->index, "up").c_str(), 0);
     /* Reconnect attempted on the next 1 Hz publish tick. */
 }
 
-/* ─────────────── Phase E: inbound DIRECT (Link → onInboundLxm) ───────────────
+/* ─────────────── inbound DIRECT (Link → onInboundLxm) ───────────────
  *
- * docs/plans/link.md §8.1. lxmf registers for inbound Links on each
+ * lxmf registers for inbound Links on each
  * lxmf.delivery destination via rnsdDestListenLinks(handle,
  * LXMF_LINK_INBOX_PORT). rnsd accepts the Link and back-connects here
  * with an rnsd_link_incoming_t. The link is a packet-mode stream of
@@ -2264,7 +2261,7 @@ static void onMailboxDisconnect(int handle)
  * Link *is* the destination) — we prepend our delivery dest hash and
  * run the exact same onInboundLxm pipeline as the opportunistic path.
  * This is what lets real-world LXMF peers (which default to DIRECT)
- * deliver to us — see plan §1. */
+ * deliver to us. */
 
 #define LXMF_MAX_INLINKS 8
 struct inlink_t {
@@ -2345,7 +2342,7 @@ static void onLinkInboxDisconnect(int ref)
     s.handle = -1;
 }
 
-/* ─────────────── Phase F: Resource aux (rnsd → lxmf, §9.1) ───────────────
+/* ─────────────── Resource aux (rnsd → lxmf) ───────────────
  *
  * rnsd sends one rnsd_link_resource_done_t aux frame to
  * LXMF_LINK_RESOURCE_AUX_PORT when a Resource transfer concludes:
@@ -2437,7 +2434,7 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
  * OUT_RESULT). `tx_packets>=1` means rnsd's pre-active outbox flushed
  * our one LXM packet onto the established Link → treat as "sent"
  * (egress acknowledged, mirrors opportunistic SENT semantics; true
- * proof-on-delivery would need a Phase-C feedback channel — follow-up).
+ * proof-on-delivery would need a feedback channel — follow-up).
  * A `failed` state, or no resolution by the slot's deadline, fails it. */
 static void resolveDirectSends(void)
 {
@@ -2667,7 +2664,7 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
      * destroyIdentity's idPath(n,"")). msgPrefix's trailing dot is for
      * storageForEach/collectTokens only — do not reuse it here. */
     /* Stop any in-flight send(s) for what we're about to wipe: push
-     * OUT_CANCEL so rnsd unparks the mailbox and stops emitting route
+     * OUT_CANCEL so rnsd clears the pending send and stops emitting route
      * requests for a recipient no one is messaging anymore. Free the
      * outbox slot locally too — the resulting OUT_RESULT (cancelled)
      * then no-ops in applyOutResult (unknown send_id) instead of
@@ -2732,7 +2729,7 @@ static void onIdentityLevelCmd(const char* key, const char* val)
             } else if (!createIdentityForSlot(n, val)) {
                 err("identity_new: createIdentityForSlot failed");
             } else {
-                connectMailbox(s_ids[n]);
+                connectOurDest(s_ids[n]);
             }
         }
         else if (std::strcmp(tail, "identity_import") == 0) {
@@ -2755,7 +2752,7 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                         storageDefault(idPath(n, "display_name").c_str(), "");
                         storageDefault(idPath(n, "default_method").c_str(), "auto");
                         storageEnd();
-                        connectMailbox(s_ids[n]);
+                        connectOurDest(s_ids[n]);
                     }
                 }
             }
@@ -3145,7 +3142,7 @@ static void cliId(const char* rest)
 
 /* ── `lxmf chats` / `lxmf msgs [<peer>|<stage>]` ──
  *
- * The per-contact store (docs/plans/lxmf-messages-per-contact.md) makes
+ * The per-contact store makes
  * this two-level: no arg → conversation list; <peer> → that thread;
  * a bare stage word → cross-conversation filter. */
 
@@ -3522,10 +3519,10 @@ static void cliAnnounces(const char* rest)
     storageForEach("lxmf.announces.", annStreamLeaf);
 
     if (s_ann_stream.row_num == 0) {
-        if (arg.empty()) cliPrintf("(no mailboxes heard yet)\n");
+        if (arg.empty()) cliPrintf("(no LXMF destinations heard yet)\n");
         else             cliPrintf("(no match for \"%s\")\n", arg.c_str());
     } else if (arg.empty()) {
-        cliPrintf("%d mailbox(es)\n", s_ann_stream.row_num);
+        cliPrintf("%d destination(s)\n", s_ann_stream.row_num);
     } else {
         cliPrintf("%d match(es) for \"%s\"\n", s_ann_stream.row_num, arg.c_str());
     }
@@ -3551,7 +3548,7 @@ static void cliSend(const char* rest)
     /* Test-rig affordance (mirrors `rnsd link`/`clink`): `@randN`
      * substitutes an N-byte incompressible printable body so a
      * >74-part outbound Resource can be exercised without typing it
-     * (device CLI line buffer is 128 B). See docs/plans/link.md §F. */
+     * (device CLI line buffer is 128 B). */
     if (text.size() > 5 && text.compare(0, 5, "@rand") == 0) {
         char* end = nullptr;
         long n = std::strtol(text.c_str() + 5, &end, 10);
@@ -3669,7 +3666,7 @@ static void cliLxmf(const char* args)
         lxmf_id_t* id = idAt(sel);
         if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
         /* Sentinel — actual send runs on the lxmf task (which owns the
-         * mailbox handle). Storage subscription wakes it. */
+         * our-dest handle). Storage subscription wakes it. */
         storageSet(idEphPath(sel, "cmd.announce").c_str(), 1);
         cliPrintf("announce requested for id %d (%s)\n",
                   sel, bytesToHex(id->dest_hash, LXMF_DEST_HASH_LEN).c_str());
@@ -3727,7 +3724,7 @@ static void lxmfTaskMain(void*)
     }
 
     /* lxmf is both an ITS client (RNSD_PORT_DEST / RNSD_PORT_LINK /
-     * announce-fanout connects) and — Phase E — a server hosting
+     * announce-fanout connects) and a server hosting
      * LXMF_LINK_INBOX_PORT for rnsd's inbound-Link back-connects.
      * itsServerInit sets up the shared inbox; itsClientInit reuses it. */
     if (!itsServerInit()) err("lxmf itsServerInit failed");
@@ -3739,9 +3736,9 @@ static void lxmfTaskMain(void*)
     itsServerOnDisconnect(LXMF_LINK_INBOX_PORT, onLinkInboxDisconnect);
     itsServerOnRecv(LXMF_LINK_INBOX_PORT,       onLinkInboxRecv);
 
-    /* Phase F: resource hand-off is a one-shot aux frame from rnsd
+    /* Resource hand-off is a one-shot aux frame from rnsd
      * (not a connection) — open the port aux-only and register the
-     * handler. See docs/plans/phase-f-resource-port.md / link.md §9. */
+     * handler. */
     itsServerPortOpen(LXMF_LINK_RESOURCE_AUX_PORT, /*packetBased=*/false,
                       /*maxHandles=*/1, /*toSize=*/0, /*fromSize=*/0);
     itsOnAux(LXMF_LINK_RESOURCE_AUX_PORT, onResourceAux);
@@ -3786,7 +3783,7 @@ static void lxmfTaskMain(void*)
      * periodic schedule, both checked from the 1 Hz tick. */
     loadAllIdentities();
     for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
-        if (s_ids[n].used) connectMailbox(s_ids[n]);
+        if (s_ids[n].used) connectOurDest(s_ids[n]);
     }
 
     /* Subscribe to lxmf.delivery announces via rnsd's fan-out port. All
@@ -3810,7 +3807,7 @@ static void lxmfTaskMain(void*)
         TickType_t now = xTaskGetTickCount();
         if (now - s_lastPublishTick >= pdMS_TO_TICKS(LXMF_PUBLISH_INTERVAL_MS)) {
             publishStats();
-            resolveDirectSends();   /* Phase E: settle outbound DIRECT */
+            resolveDirectSends();   /* settle outbound DIRECT */
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             /* Retry sends parked on a then-busy conversation link. Skip
              * anything no longer "queued" (cancel/competing writer wins). */
@@ -3830,7 +3827,7 @@ static void lxmfTaskMain(void*)
             for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
                 lxmf_id_t& id = s_ids[n];
                 if (!id.used || id.handle >= 0) continue;
-                connectMailbox(id);
+                connectOurDest(id);
             }
             if (s_announce_sub_handle < 0) connectAnnounceSub();
 
@@ -3859,9 +3856,9 @@ static void lxmfTaskMain(void*)
 
             /* Periodic re-announce per identity. Interval read live
              * from storage; 0 disables periodic. Identities whose
-             * mailbox is currently down are skipped (they'll
+             * our-dest is currently down are skipped (they'll
              * re-announce on the next iface_event_seq or once the
-             * mailbox comes back). */
+             * our-dest comes back). */
             int announce_s = storageGetInt("s.lxmf.announce_interval_s", 1800);
             if (announce_s > 0) {
                 int32_t threshold = (int32_t)pdMS_TO_TICKS(announce_s * 1000);
@@ -3871,7 +3868,7 @@ static void lxmfTaskMain(void*)
                     if (id.last_announce_tick == 0) continue;   /* never — wait for trigger */
                     /* Signed compare: sendAnnounce() updates
                      * last_announce_tick via a fresh xTaskGetTickCount()
-                     * after the rnsd mailbox call, which can land
+                     * after the rnsd our-dest call, which can land
                      * *past* the outer `now`. Unsigned compare would
                      * underflow and re-fire immediately. */
                     if ((int32_t)(now - id.last_announce_tick) >= threshold)
@@ -3894,8 +3891,9 @@ void lxmfInit(void)
         storageDefault("s.lxmf.announce_interval_s",    1800);  /* periodic re-announce; 0 disables */
         storageDefault("s.lxmf.max_announces",          2048);  /* announce-catalogue cap; 0 disables eviction */
         storageDefault("s.lxmf.debug.only_local",       0);     /* demote announce dbg lines to verb */
-        storageDefault("s.lxmf.link.idle_s",            0);     /* conv-link idle close; 0 = keep open (LRU
-                                                                 * eviction + Reticulum STALE still bound it) */
+        storageDefault("s.lxmf.link.idle_s",            600);   /* conv-link idle close (10 min); lxmf owns
+                                                                 * the warm-hold now that rnsd never parks.
+                                                                 * 0 = keep open (LRU + Reticulum STALE bound it) */
         storageSet("s.lxmf.version", LXMF_VERSION);
         storageEnd();
     }

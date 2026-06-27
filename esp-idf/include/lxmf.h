@@ -13,15 +13,15 @@
  * `lxmf.*` / `secrets.lxmf.*` keys; the lxmf task subscribes to its own
  * subtree and reacts.
  *
- * Consumer of rnsd over RNSD_PORT_DEST: one mailbox connection per
- * identity. See docs/plans/lxmf.md and docs/component-plan.md §15.
+ * Consumer of rnsd over RNSD_PORT_DEST: one hosted-destination (our-dest) connection per
+ * identity.
  */
 #pragma once
 
 /** Bring up the lxmf task. The task is always started — even on a
  *  transport-only node — so the announce-fanout subscription and the
  *  cmd handlers are live. With zero identities allocated it simply
- *  never announces an LXMF mailbox of its own. */
+ *  never announces an LXMF destination of its own. */
 void lxmfInit(void);
 
 /** Create a new LXMF identity with the given display name.
@@ -41,7 +41,7 @@ int lxmfCreateIdentity(const char* display_name, bool sync = false);
 
 /** Destroy the identity at slot `n`. Wipes secrets.lxmf.id.<n>.privkey
  *  + every s.lxmf.id.<n>.* and lxmf.id.<n>.* storage key, closes the
- *  mailbox, unsubscribes the per-id cmd handler.
+ *  our-dest, unsubscribes the per-id cmd handler.
  *
  *  Sync mode polls storage until secrets disappear (or 5 s timeout).
  *  Returns true on success, false on validation error / timeout /
