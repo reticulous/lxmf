@@ -16,6 +16,7 @@ import { ref, reactive, computed, watch,
 import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useMenuStore } from 'spangap-browser/stores/menu'
 import LxmfPanel from '../panels/LxmfPanel.vue'
+import { registerApp } from 'spangap-browser/lib/apps'
 
 /* ── Composition-layer wiring (pattern mirrors modules/rnsd.ts) ──────── */
 
@@ -26,7 +27,6 @@ import LxmfPanel from '../panels/LxmfPanel.vue'
 export const FALLBACK_ID = -1
 export const messagesVisibleById = reactive<Record<number, boolean>>({})
 export const messagesFocusById = reactive<Record<number, number>>({})
-export const announcesVisible = ref(false)
 
 /* Menu action for an identity's window: only ever show + raise, never hide. */
 export function showMessages(n: number = FALLBACK_ID) {
@@ -651,10 +651,21 @@ export function registerLxmf() {
   /* Settings → Mesh Network → LXMF Messages (the LXMF settings panel). */
   menu.register('settings/mesh/lxmf', 'LXMF Messages', { type: 'panel', component: LxmfPanel }, { placement: 3 })
 
-  /* #if 0 — Announces removed from the menu; AnnouncesWindow + ref kept. */
-  if (false) {
-    menu.register('status/announces', 'Announces',
-      { type: 'action', action: () => { announcesVisible.value = !announcesVisible.value } })
-  }
-  /* #endif */
+  /* Dock app: the messenger. (Announces has no separate app — the announce
+   * stream lives inside the LXMF window.) */
+  registerApp({ id: 'lxmf', label: 'LXMF', icon: 'lxmf', placement: 5,
+                open: () => {
+                  /* Open the active identity's window (or the first usable one);
+                   * MainLayout only mounts a window per usable identity, so
+                   * defaulting to FALLBACK_ID would target an unmounted window
+                   * when identities exist. showMessages bumps the focus token,
+                   * which raises an already-open window to the front. */
+                  const usable = lx.usableIdentities.value
+                  const active = lx.activeIdentity.value
+                  const n = usable.length
+                    ? (usable.some(i => i.n === active) ? active : usable[0]!.n)
+                    : FALLBACK_ID
+                  showMessages(n)
+                },
+                isOpen: () => Object.values(messagesVisibleById).some(Boolean) })
 }

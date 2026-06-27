@@ -69,6 +69,14 @@ const int HDR_H = 20;   /* thread top bar height */
  * footer notes the remainder, and the search box narrows the column. */
 const int MESH_ROW_CAP = 48;
 
+/* Debounce the search: rebuildList walks the message store + the (up to
+ * thousands) announce catalogue and re-creates every row, which runs on the lcd
+ * task at a higher prio than the core-1 keyboard poll. Doing it inline on every
+ * keystroke stalls that poll long enough that the C3 keyboard (which holds only
+ * the last unread key, no real FIFO) overwrites keys typed during the rebuild —
+ * they go missing. So coalesce: rebuild once the typing pauses this long. */
+const int SEARCH_DEBOUNCE_MS = 300;
+
 /* Keep only what the UI font can actually draw: strip C0/C1 control bytes and any
  * codepoint with no glyph (emoji, CJK, …). Valid UTF-8 multibyte sequences whose
  * glyph the font carries (accented Latin, if present) pass through unchanged.
@@ -133,6 +141,7 @@ std::string       g_pendingOpenPeer;    /* contact tapped in nomad, awaiting an 
 std::string       g_query;              /* current search-box text */
 bool              g_subscribed = false;
 bool              g_listRefreshPending = false;   /* a coalesced list rebuild is queued */
+lv_timer_t*       g_searchTimer = nullptr;        /* one-shot search debounce (null = idle) */
 
 lv_obj_t* s_layer    = nullptr;
 lv_obj_t* s_idpick   = nullptr;         /* identity picker (first screen, >1 ident) */
@@ -800,14 +809,33 @@ void rebuildList(bool keepScroll) {
 
 /* ---- search box ---- */
 
+void searchTimerCb(lv_timer_t*) {
+    g_searchTimer = nullptr;   /* one-shot: LVGL deletes it after this returns */
+    rebuildList();
+}
+
 void onSearchChanged(lv_event_t*) {
     if (!s_search) return;
     const char* t = lv_textarea_get_text(s_search);
     g_query = t ? t : "";
-    rebuildList();
+    /* Postpone the rebuild to SEARCH_DEBOUNCE_MS after the last keystroke so a
+     * fast typist isn't fighting a per-key rebuild (see SEARCH_DEBOUNCE_MS). */
+    if (g_searchTimer) {
+        lv_timer_reset(g_searchTimer);
+    } else {
+        g_searchTimer = lv_timer_create(searchTimerCb, SEARCH_DEBOUNCE_MS, nullptr);
+        lv_timer_set_repeat_count(g_searchTimer, 1);
+    }
 }
 
 void onSearchEnter(lv_event_t*) {
+    /* Enter acts on the current query — flush any pending debounce first so
+     * g_rowPeers reflects what's typed, not the last settled rebuild. */
+    if (g_searchTimer) {
+        lv_timer_delete(g_searchTimer);
+        g_searchTimer = nullptr;
+        rebuildList();
+    }
     std::string needle = lower(trim(g_query));
     if (isHex32(needle)) { openThread(needle); return; }
     if (g_rowPeers.size() == 1) openThread(g_rowPeers[0]);
@@ -971,6 +999,8 @@ void onLayerDelete(lv_event_t*) {
     s_list = nullptr; s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
     s_compose = nullptr; s_threadName = nullptr; g_focusTarget = nullptr;
     g_listRefreshPending = false;
+    /* A queued search rebuild would touch freed widgets — drop it. */
+    if (g_searchTimer) { lv_timer_delete(g_searchTimer); g_searchTimer = nullptr; }
 }
 
 /* ---- entry point (lcd task, on first open of a fresh layer) ---- */
@@ -982,6 +1012,7 @@ void lxmfApp(void* arg) {
     g_curPeer.clear(); g_query.clear();
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
     g_listRefreshPending = false;
+    g_searchTimer = nullptr;   /* prior layer's onLayerDelete already freed it */
 
     lv_obj_add_event_cb(s_layer, onLayerDelete, LV_EVENT_DELETE, nullptr);
 
@@ -1095,7 +1126,7 @@ void lxmfSettingsPane(void* arg) {
  * early-returns), so no onClose is needed. */
 class LxmfApp : public LcdApp {
 public:
-    LxmfApp() : LcdApp({ .name = "LXMF", .iconBasename = "rns" }) {}
+    LxmfApp() : LcdApp({ .name = "LXMF", .iconBasename = "lxmf" }) {}
     void onCreate(lv_obj_t* root) override { lxmfApp(root); }
 };
 
