@@ -24,7 +24,10 @@
 
     <div class="bubble" :class="{ muted: m.stage === 'cancelled' }"
          @contextmenu.prevent="emit('menu', m)">
-      <div class="content">{{ m.content }}</div>
+      <div class="content"><template v-for="(seg, i) in segments" :key="i"><a
+          v-if="seg.link" class="nomad-link"
+          @click.stop="openNomad(seg.link.hash, seg.link.path)"
+        >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></div>
 
       <div class="meta">
         <span class="time">{{ clock }}</span>
@@ -67,9 +70,12 @@
 import { computed, ref } from 'vue'
 import { matDone, matDoneAll, matClose, matMoreVert, matDelete }
   from '@quasar/extras/material-icons'
-import type { Message } from '../../modules/lxmf'
+import { type Message, segmentMessage, openNomad } from '../../modules/lxmf'
 
 const props = defineProps<{ m: Message }>()
+
+/* Split the body into text + tappable Nomad-page-link runs. */
+const segments = computed(() => segmentMessage(props.m.content))
 const emit = defineEmits<{
   resend: [m: Message]
   menu: [m: Message]
@@ -136,6 +142,12 @@ const clock = computed(() =>
 .row.out .bubble { background: #2c6bed; border-bottom-right-radius: 4px; }
 .row.in  .bubble { background: #2a2a2a; border-bottom-left-radius: 4px; }
 .bubble.muted { opacity: 0.55; }
+/* Nomad page links quoted in a message — tap opens the Nomad browser. Matches
+   the micron renderer's link blue; lighter on the blue outbound bubble. */
+.nomad-link { color: #6db3ff; text-decoration: underline; cursor: pointer; word-break: break-all; }
+.nomad-link:hover { color: #9ccbff; }
+.row.out .nomad-link { color: #d4e6ff; }
+.row.out .nomad-link:hover { color: #ffffff; }
 .meta {
   display: flex; align-items: center; gap: 5px;
   justify-content: flex-end;

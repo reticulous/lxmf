@@ -202,15 +202,15 @@ destination_hash(16) | source_hash(16) | Ed25519 sig(64) | msgpack(payload)
   index — **`transient_id ≠ message_id`** (unused until propagation lands).
 
 Constants: `LXMF_DEST_HASH_LEN = 16`, `LXMF_SIG_LEN = 64`,
-`LXMF_OVERHEAD = 112`, `LXMF_OPP_CONTENT_BUDGET = 311`. `FIELD_THREAD` is
-stored hex64 but packed as raw 32 B on the wire (`lxmPackPayload` converts
-both ways).
+`LXMF_OVERHEAD = 112`, `LXMF_OPP_PAYLOAD_MAX = 383` (RNS ENCRYPTED_MDU —
+single-packet plaintext ceiling). `FIELD_THREAD` is stored hex64 but packed
+as raw 32 B on the wire (`lxmPackPayload` converts both ways).
 
 ### Delivery modes (`LXMessage` mode codes)
 
 | Mode | Code | Single-packet content | Mechanics |
 |---|---|---|---|
-| OPPORTUNISTIC | 0x01 | ~311 B | one RNS encrypted packet, ECDH AES-128 per packet |
+| OPPORTUNISTIC | 0x01 | payload ≤ 383 B (ENCRYPTED_MDU); ~290 B title+content after src16+sig64+msgpack | one RNS encrypted packet, ECDH AES-128 per packet |
 | DIRECT | 0x02 | ~319 B/pkt, larger via Resource | RNS Link, ratcheted |
 | PROPAGATED | 0x03 | — | not implemented here |
 | PAPER | 0x05 | — | not implemented here |
@@ -288,9 +288,10 @@ handleIdCmd → split val on '/' → delete sentinel → processSend(id,peer,loc
   message_id = SHA-256(dest||src||packed); persist wire + message_id; stage=queued
   allocate outbox slot (send_id); processReady decides transport:
 
-processReady — method resolution:
+processReady — method resolution (after the wire is packed, so oversize
+  is measured on the real payload, not a content estimate):
   msgs.<id>.method → s.lxmf.id.<n>.default_method → "auto"
-  oversize = (title + content + 32 > LXMF_OPP_CONTENT_BUDGET=311)
+  oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "direct"        → use a Link
   "opportunistic" → fail if oversize, else OUT_PACKET on the mailbox handle
   "auto"          → use a Link if oversize OR a conversation Link to peer is already warm

@@ -57,7 +57,12 @@ static bool s_dbg_only_local = false;
 constexpr size_t LXMF_DEST_HASH_LEN = 16;
 constexpr size_t LXMF_SIG_LEN       = 64;
 constexpr size_t LXMF_OVERHEAD      = LXMF_DEST_HASH_LEN * 2 + LXMF_SIG_LEN;  /* 112 */
-constexpr size_t LXMF_OPP_CONTENT_BUDGET = 311;  /* single RNS packet plaintext */
+/* Largest plaintext that fits a single encrypted RNS packet (RNS
+ * ENCRYPTED_MDU). The opportunistic LXM payload — the packed wire minus
+ * the stripped 16-byte dest hash that rnsd re-derives — must not exceed
+ * this, or Packet::pack() throws on the MTU check (surfacing as a
+ * spurious "evicted"). Derived from MTU=500: ((464-48-32)/16)*16-1. */
+constexpr size_t LXMF_OPP_PAYLOAD_MAX = 383;
 
 /* Max concurrent LXMF identities. Schema is an array (id.<n>). */
 #define LXMF_MAX_IDENTITIES 4
@@ -1152,6 +1157,11 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
      * unknown-sender drop is what triggered this re-announce). */
     for (auto& id : s_ids)
         if (id.used) drainPendingVerify(id, dh);
+
+    /* Announces arrive in bursts (a path request makes a whole neighbourhood
+     * re-announce), and each one lands on this core-1 task. Yield between them
+     * so storage and web aren't starved through the burst. */
+    stampYield();
 }
 
 static void onAnnounceSubDisconnect(int /*handle*/)
@@ -1601,34 +1611,6 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
     std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
 
-    /* Delivery-method selection. Resolution order is
-     * per-message override → per-identity default → "auto". "auto"
-     * picks opportunistic when the payload fits a single RNS packet,
-     * else DIRECT (a Reticulum Link). Explicit "opportunistic" still
-     * hard-fails oversize; explicit "direct" always uses a Link. */
-    bool oversize = (title.size() + content.size() + 32 > LXMF_OPP_CONTENT_BUDGET);
-    std::string method = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
-    if (method.empty())
-        method = storageGetStr(idPath(id.index, "default_method").c_str(), "auto");
-    bool use_direct;
-    if (method == "direct") {
-        use_direct = true;
-    } else if (method == "opportunistic") {
-        if (oversize) {
-            warn("id %d: msg %s exceeds opportunistic budget (%zu B)",
-                 id.index, mid.c_str(), title.size() + content.size());
-            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
-            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
-                       "too large for opportunistic");
-            return;
-        }
-        use_direct = false;
-    } else {                                  /* "auto" (default) */
-        /* Prefer the Link when one to this peer is already warm — an
-         * active chat rides its conversation link for every message. */
-        use_direct = oversize || convFind(id.index, peer_hex) != nullptr;
-    }
-
     LxmFields fields;
     fields.thread = thread;
 
@@ -1650,6 +1632,10 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         }
     }
 
+    /* Pack the LXM wire up front so the opportunistic-vs-DIRECT decision
+     * keys off the *actual* packed size, not a content estimate that
+     * under-counts the signature, fields/thread, stamp and msgpack
+     * framing. */
     uint64_t ts_ms = wallUnixMs();
     uint8_t  mid_raw[RNSD_HASH_LEN];
     std::vector<uint8_t> wire = lxmPackWire(id.identity_key.c_str(),
@@ -1661,6 +1647,40 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
         storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "pack/sign failed");
         return;
+    }
+
+    /* Delivery-method selection. Resolution order is
+     * per-message override → per-identity default → "auto". "auto"
+     * picks opportunistic when the packed wire fits a single RNS packet,
+     * else DIRECT (a Reticulum Link). Explicit "opportunistic" still
+     * hard-fails oversize; explicit "direct" always uses a Link.
+     *
+     * Oversize is measured on the real opportunistic payload — the wire
+     * minus the dest16 that rnsd strips and re-derives — against the RNS
+     * single-packet plaintext ceiling. Get this wrong on the low side and
+     * an over-MTU packet reaches rnsd, where Packet::pack() throws and
+     * surfaces as a spurious "evicted (resource limit)". */
+    bool oversize = (wire.size() - LXMF_DEST_HASH_LEN) > LXMF_OPP_PAYLOAD_MAX;
+    std::string method = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
+    if (method.empty())
+        method = storageGetStr(idPath(id.index, "default_method").c_str(), "auto");
+    bool use_direct;
+    if (method == "direct") {
+        use_direct = true;
+    } else if (method == "opportunistic") {
+        if (oversize) {
+            warn("id %d: msg %s exceeds opportunistic budget (wire %zu B)",
+                 id.index, mid.c_str(), wire.size());
+            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
+            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
+                       "too large for opportunistic");
+            return;
+        }
+        use_direct = false;
+    } else {                                  /* "auto" (default) */
+        /* Prefer the Link when one to this peer is already warm — an
+         * active chat rides its conversation link for every message. */
+        use_direct = oversize || convFind(id.index, peer_hex) != nullptr;
     }
 
     std::string msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
@@ -2014,6 +2034,12 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
          sanitizeForLog(title).c_str());
 
     lxmfNotifySound();
+
+    /* Breather: this task shares core 1 (prio 1) with storage and web. A burst
+     * of inbound messages processed back-to-back monopolises the core and
+     * starves the web task, which then misses its pong and the browser drops.
+     * Yield so equal-priority peers get a slice between messages. */
+    stampYield();
 }
 
 /* A sender's lxmf.delivery announce just arrived (rnsd cached their
@@ -2128,6 +2154,8 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
             next_stage = "failed"; id.failed++; err_msg = "evicted (resource limit)"; break;
         case RNSD_DEST_STATUS_FAILED:
             next_stage = "failed"; id.failed++; err_msg = "no route to recipient"; break;
+        case RNSD_DEST_STATUS_TOO_LARGE:
+            next_stage = "failed"; id.failed++; err_msg = "too large for opportunistic"; break;
         default:
             next_stage = "failed"; id.failed++; err_msg = "unknown status"; break;
     }

@@ -136,6 +136,7 @@ std::string       g_msgsPrefix;         /* "s.lxmf.id.N.msgs" */
 std::vector<Msg>  g_msgs;               /* all non-draft messages for g_id */
 std::vector<Ann>  g_anns;               /* heard announces (on-the-mesh column) */
 std::vector<std::string> g_rowPeers;    /* peer per clickable list row (click index) */
+std::vector<std::string> g_nomadTargets;/* "<hash>:<path>" per tappable Nomad link in the open thread */
 std::string       g_curPeer;            /* peer of the open thread */
 std::string       g_pendingOpenPeer;    /* contact tapped in nomad, awaiting an identity pick */
 std::string       g_query;              /* current search-box text */
@@ -324,7 +325,10 @@ void sendMessage(const std::string& peer, const std::string& text) {
     setf("title", "");
     setf("content", text.c_str());
     setf("thread", "");
-    setf("stage", "draft");
+    /* Optimistic stage: `queued`, not `draft`, so the bubble appears the
+       instant we send (renders as the "..." in-flight chip below). The
+       lxmf task drives it on to sent/delivered/failed. */
+    setf("stage", "queued");
     snprintf(k, sizeof k, "%s.ts", base);
     storageSet(k, (int)time(nullptr));
     /* Send sentinel (ephemeral): "<peer>/<key>". The lxmf task drives the stage. */
@@ -608,6 +612,83 @@ void onLcdOpenUrl(const char* /*key*/, const char* val) {
 
 /* ---- thread rendering ---- */
 
+/* ---- Nomad page links in message text ----
+ * A message may quote a Nomad page URL "<32hex>:/path". We render those as
+ * tappable links; a tap hands the URL to the Nomad browser via nomad.url_lcd
+ * (nomad_lcd subscribes, brings itself forward, and navigates). This is the
+ * exact reverse of nomad_lcd's lxmf@<hash> links → lxmf.url_lcd. */
+
+/* Match a Nomad page link at line[pos]: 32 hex + ':' + '/' + a run of
+ * non-space path chars, not part of a longer hex token. Fills `url` with
+ * "<hash>:<path>" (hash lowercased); `len` is its byte length. */
+bool matchNomadAt(const std::string& s, size_t pos, std::string& url, size_t& len) {
+    auto hex = [](char c){ return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); };
+    if (pos + 34 > s.size()) return false;                  /* 32 + ':' + '/' */
+    for (int k = 0; k < 32; k++) if (!hex(s[pos + k])) return false;
+    if (s[pos + 32] != ':' || s[pos + 33] != '/') return false;
+    if (pos > 0 && hex(s[pos - 1])) return false;           /* inside a longer hex run */
+    size_t e = pos + 33;                                    /* at the '/' */
+    while (e < s.size() && !isspace((unsigned char)s[e])) e++;
+    while (e > pos + 34 && strchr(".,;:!?)]}'\"", s[e - 1])) e--;   /* trailing punctuation */
+    url.assign(s, pos, e - pos);
+    for (int k = 0; k < 32; k++) if (url[k] >= 'A' && url[k] <= 'Z') url[k] = (char)(url[k] - 'A' + 'a');
+    len = e - pos;
+    return true;
+}
+
+void onNomadLinkClick(lv_event_t* e) {
+    size_t idx = (size_t)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= g_nomadTargets.size()) return;
+    /* "<hash>:<path>|<nonce>" — nonce makes repeat taps re-fire (nomad_lcd
+     * strips it). Path fits comfortably; guard the buffer regardless. */
+    char v[160];
+    snprintf(v, sizeof v, "%s|%u", g_nomadTargets[idx].c_str(), (unsigned)millis());
+    storageSet("nomad.url_lcd", v);
+}
+
+/* Render a message body into the bubble. No link → one wrapping label, exactly
+ * as before. With link(s) → the body is split at link boundaries into plain
+ * labels and clickable blue link labels, each wrapping within the bubble; they
+ * stack in the bubble's column. (A label can't make a substring clickable, so
+ * a link becomes its own widget — the same constraint nomad_lcd handles for
+ * lxmf@ links.) */
+void addBubbleText(lv_obj_t* bub, const std::string& content) {
+    std::string body = printable(content, false);   /* drop unrenderables, keep newlines */
+
+    auto addText = [&](size_t from, size_t to) {
+        if (to <= from) return;
+        lv_obj_t* l = mkLabel(bub, body.substr(from, to - from), lv_color_white());
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_max_width(l, 228, 0);
+    };
+
+    size_t i = 0, textStart = 0;
+    bool any = false;
+    while (i < body.size()) {
+        std::string url; size_t len;
+        if (matchNomadAt(body, i, url, len)) {
+            addText(textStart, i);
+            lv_obj_t* l = mkLabel(bub, url, lv_color_hex(0x6db3ff));
+            lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_max_width(l, 228, 0);
+            lv_obj_set_style_text_decor(l, LV_TEXT_DECOR_UNDERLINE, 0);
+            lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_ext_click_area(l, 4);
+            size_t idx = g_nomadTargets.size();
+            g_nomadTargets.push_back(url);
+            lv_obj_add_event_cb(l, onNomadLinkClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+            if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), l);
+            i += len;
+            textStart = i;
+            any = true;
+        } else {
+            i++;
+        }
+    }
+    if (!any) { addText(0, body.size()); return; }   /* unchanged: single label */
+    addText(textStart, body.size());
+}
+
 void addBubble(const Msg& m) {
     lv_obj_t* row = lv_obj_create(s_bubbles);
     lv_obj_remove_style_all(row);
@@ -631,9 +712,7 @@ void addBubble(const Msg& m) {
     lv_obj_set_flex_flow(bub, LV_FLEX_FLOW_COLUMN);
     lv_obj_remove_flag(bub, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t* c = mkLabel(bub, printable(m.content, false), lv_color_white());
-    lv_label_set_long_mode(c, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_max_width(c, 228, 0);            /* wrap within the bubble (240 - padding) */
+    addBubbleText(bub, m.content);                    /* text + tappable Nomad links, wrapped to 228 */
 
     char tbuf[8] = "";
     if (m.ts > 0) {
@@ -678,6 +757,7 @@ void addBubble(const Msg& m) {
 void rebuildThread() {
     if (!s_bubbles || g_curPeer.empty()) return;
     lv_obj_clean(s_bubbles);
+    g_nomadTargets.clear();          /* link widgets are gone with the cleaned bubbles */
     std::vector<const Msg*> ms;
     for (auto& m : g_msgs) if (m.peer == g_curPeer) ms.push_back(&m);
     std::sort(ms.begin(), ms.end(), [](const Msg* a, const Msg* b) { return a->ts < b->ts; });

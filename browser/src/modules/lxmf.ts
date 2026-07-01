@@ -237,6 +237,49 @@ function rand4(): string {
   return Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0')
 }
 
+/* ── Nomad page links in message text (mirror of nomad's lxmf@<hash>) ─────
+ * A message may quote a Nomad page URL "<32hex>:/path" (e.g.
+ * a8d2…338:/page/index.mu). We render those as tappable links; a tap writes
+ * the shared `nomad.url_web` sentinel (with a nonce so a repeat tap re-fires)
+ * and the nomad module brings its browser window forward on that page. This
+ * is the exact reverse of nomad's openLxmf → lxmf.url_web; decoupled — we only
+ * write the var, nomad reacts. */
+const NOMAD_HASH_RE = /^[0-9a-f]{32}$/
+
+export interface MsgSegment { text: string; link: { hash: string; path: string } | null }
+
+/** Split message content into plain-text runs and Nomad-link runs. A link is a
+ *  32-hex node hash + ":" + a "/"-rooted page path. Trailing sentence
+ *  punctuation is kept outside the link. */
+export function segmentMessage(content: string): MsgSegment[] {
+  const re = /([0-9a-fA-F]{32}):(\/\S+)/g
+  const out: MsgSegment[] = []
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content))) {
+    // Don't match inside a longer hex run (e.g. a 64-hex id).
+    if (m.index > 0 && /[0-9a-fA-F]/.test(content[m.index - 1]!)) continue
+    const path = m[2]!.replace(/[.,;:!?)\]}'"]+$/, '')
+    if (!path) continue
+    const start = m.index
+    const end = start + 33 + path.length          // 32 hex + ':' + path
+    if (start > last) out.push({ text: content.slice(last, start), link: null })
+    out.push({ text: content.slice(start, end), link: { hash: m[1]!.toLowerCase(), path } })
+    last = end
+    re.lastIndex = end
+  }
+  if (last < content.length) out.push({ text: content.slice(last), link: null })
+  return out
+}
+
+/** Open a Nomad page URL tapped in a message (writes the shared sentinel). */
+export function openNomad(hash: string, path: string) {
+  const h = hash.trim().toLowerCase()
+  if (!NOMAD_HASH_RE.test(h)) return
+  const p = (path || '/page/index.mu').trim()
+  useDeviceStore().sendJson(nest('nomad.url_web', `${h}:${p}|${Date.now()}`))
+}
+
 /* ── The composable ─────────────────────────────────────────────────── */
 
 export interface UseLxmf {
@@ -503,17 +546,25 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const key = `o_${Date.now()}_${rand4()}`
     const rec: Patch = {
       dir: 'out', peer, title: '', content,
-      thread: opts?.thread ?? '', stage: 'draft',
+      thread: opts?.thread ?? '', stage: 'queued',
       ts: Math.floor(Date.now() / 1000),
     }
     if (opts?.method) rec.method = opts.method
     const data = nest(`s.lxmf.id.${n}.msgs.${peer}.${key}`, rec)
     if (_draftsById[n]) delete _draftsById[n]![peer]
-    const stageOf = () =>
-      str(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.stage`))
-    // Done once the firmware moves the record off our optimistic draft.
-    await sendQ('send').enqueue(`${peer}/${key}`,
-      { data, settle: () => { const s = stageOf(); return !!s && s !== 'draft' } })
+    // The record is written optimistically as `queued` so the bubble
+    // appears the instant we send (MessageBubble already renders queued
+    // as the in-flight "…" chip). Settling on the stage no longer works —
+    // we just wrote a non-draft stage ourselves — so key completion off a
+    // firmware-owned field instead: `message_id` (batched with the real
+    // stage in fw), or a `failed` stage on the early-return error paths.
+    // This keeps the queue pacing honest so a rapid second send can't
+    // clobber the single cmd.send sentinel before firmware reads it.
+    const recPath = `s.lxmf.id.${n}.msgs.${peer}.${key}`
+    const processed = () =>
+      !!str(device.get(`${recPath}.message_id`)) ||
+      str(device.get(`${recPath}.stage`)) === 'failed'
+    await sendQ('send').enqueue(`${peer}/${key}`, { data, settle: processed })
   }
 
   const resend = (peer: string, key: string) => {

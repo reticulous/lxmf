@@ -137,6 +137,12 @@ the contact's name and send-capability light up once the announce arrives.
 The two UI surfaces each react only to their own key. These keys are **not**
 self-deleting (the nonce already makes each tap a fresh value).
 
+The reverse also holds: a message body may quote a **Nomad page URL**
+(`<32-hex hash>:/path`, e.g. `a8d2…338:/page/index.mu`), which the messenger
+renders as a tappable link. Activating one writes `nomad.url_web` /
+`nomad.url_lcd` (same nonce trick), and [nomad](../nomad)'s browser comes
+forward on that page — the symmetric counterpart of the `lxmf.url_*` keys above.
+
 ## Identities
 
 Per loaded identity you can observe:
