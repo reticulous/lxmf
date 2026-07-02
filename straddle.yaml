@@ -12,7 +12,7 @@
 schema_version: 1
 name: reticulous/lxmf
 prefix: lxmf
-version: 0.1.0
+version: 0.0.0
 firmware: esp-idf
 browser: browser
 platforms: [idf]
