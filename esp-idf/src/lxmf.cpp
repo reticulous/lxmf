@@ -1159,8 +1159,9 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
         if (id.used) drainPendingVerify(id, dh);
 
     /* Announces arrive in bursts (a path request makes a whole neighbourhood
-     * re-announce), and each one lands on this core-1 task. Yield between them
-     * so storage and web aren't starved through the burst. */
+     * re-announce), and each one lands on this core-0 task. Yield between them
+     * so the idle task (WDT) and equal-priority core-0 peers get a slice
+     * through the burst. */
     stampYield();
 }
 
@@ -2035,10 +2036,10 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
 
     lxmfNotifySound();
 
-    /* Breather: this task shares core 1 (prio 1) with storage and web. A burst
-     * of inbound messages processed back-to-back monopolises the core and
-     * starves the web task, which then misses its pong and the browser drops.
-     * Yield so equal-priority peers get a slice between messages. */
+    /* Breather: this task runs on core 0 (prio 1) under the rnsd transport
+     * (prio 2). A burst of inbound messages processed back-to-back monopolises
+     * the core against the idle task (WDT) and equal-priority peers (cron).
+     * Yield so they get a slice between messages. */
     stampYield();
 }
 
@@ -3946,8 +3947,10 @@ void lxmfInit(void)
 
     cliRegisterCmd("lxmf", cliLxmf);
 
-    /* Core 1, prio 1, 8 KB PSRAM stack per the plan. */
-    s_task = spawnTask(lxmfTaskMain, TAG, 8192, nullptr, 1, 1, STACK_PSRAM);
+    /* Core 0, prio 1, 8 KB PSRAM stack. Pinned to the transport core (alongside
+     * rnsd, prio 2) that feeds it, so inbound-message bursts no longer contend
+     * with the LCD/audio tasks on core 1. */
+    s_task = spawnTask(lxmfTaskMain, TAG, 8192, nullptr, 1, 0, STACK_PSRAM);
 
     /* The on-device LXMessenger launcher tile registers via lxmfLcdRegister(),
      * a when: spangap/spangap-lcd init: hook (conditional/spangap-lcd/ slice).
