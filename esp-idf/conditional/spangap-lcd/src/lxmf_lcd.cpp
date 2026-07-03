@@ -316,10 +316,15 @@ void sendMessage(const std::string& peer, const std::string& text) {
     char base[120];
     snprintf(base, sizeof base, "s.lxmf.id.%d.msgs.%s.%s", g_id, peer.c_str(), key);
     char k[200];
+    long ts = (long)time(nullptr);
     auto setf = [&](const char* f, const char* v) {
         snprintf(k, sizeof k, "%s.%s", base, f);
         storageSet(k, v);
     };
+    /* One atomic write: all fields plus the send sentinel land together, so the
+       lxmf task never picks up a half-written message and the s.lxmf.id
+       subscription fires once for the whole message instead of once per field. */
+    storageBegin();
     setf("dir", "out");
     setf("peer", peer.c_str());
     setf("title", "");
@@ -330,12 +335,24 @@ void sendMessage(const std::string& peer, const std::string& text) {
        lxmf task drives it on to sent/delivered/failed. */
     setf("stage", "queued");
     snprintf(k, sizeof k, "%s.ts", base);
-    storageSet(k, (int)time(nullptr));
+    storageSet(k, (int)ts);
     /* Send sentinel (ephemeral): "<peer>/<key>". The lxmf task drives the stage. */
     char sentinel[48], payload[80];
     snprintf(sentinel, sizeof sentinel, "lxmf.id.%d.cmd.send", g_id);
     snprintf(payload, sizeof payload, "%s/%s", peer.c_str(), key);
     storageSet(sentinel, payload);
+    storageEnd();
+
+    /* Optimistic render: append the outgoing message to the in-RAM store now,
+       on the lcd task, so onSend can draw the bubble immediately. Without this
+       the bubble only appears once the storage write has round-tripped through
+       the storage task and back via the change subscription — seconds under
+       load. The eventual refreshMsgs() rebuilds g_msgs from storage and dedups
+       on peer+key, so this entry is replaced in place rather than doubled. */
+    Msg m;
+    m.peer = peer; m.key = key; m.content = text; m.stage = "queued";
+    m.ts = ts; m.in = false; m.read = false;
+    g_msgs.push_back(std::move(m));
 }
 
 void onSend(lv_event_t*) {
@@ -344,6 +361,7 @@ void onSend(lv_event_t*) {
     if (t && *t) {
         sendMessage(g_curPeer, t);
         lv_textarea_set_text(s_compose, "");
+        rebuildThread();     /* draw the optimistic bubble now, not on the storage round-trip */
     }
 }
 
