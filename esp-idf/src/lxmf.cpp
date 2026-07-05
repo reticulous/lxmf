@@ -1379,8 +1379,13 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
 
     std::vector<uint8_t> out;
     mpPackArrayHeader(out, 2);
+    /* Display name goes out as msgpack BIN, not str: LXMF's
+     * display_name_from_app_data does dn.decode("utf-8") on the unpacked
+     * value, which only works when it unpacks to Python bytes. A str
+     * value there throws "'str' object has no attribute 'decode'" and the
+     * name silently drops from the peer's catalogue. */
     if (name.empty()) out.push_back(0xC0 /* nil */);
-    else              mpPackStr(out, name);
+    else              mpPackBin(out, reinterpret_cast<const uint8_t*>(name.data()), name.size());
     mpPackInt(out, cost);
     return out;
 }
@@ -2727,11 +2732,23 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
         std::snprintf(path, sizeof(path), "s.lxmf.id.%d.msgs.%s.%s",
                       id.index, peer_hex.c_str(), mid.c_str());
     storageDeleteTree(path);
-    if (mid.empty())
-        info("id %d: deleted conversation %s", id.index, peer_hex.c_str());
-    else
+    if (mid.empty()) {
+        /* Whole-conversation delete is also the "remove contact" action:
+         * the contact (address book entry) is derived purely from the
+         * synced contacts.<peer> subtree, so dropping only the messages
+         * leaves the peer behind in every frontend. Wipe the contact
+         * subtree too. The client re-stubs a contact solely from stored
+         * messages (convPeers), which are now gone, so it stays removed. */
+        char cpath[160];
+        std::snprintf(cpath, sizeof(cpath), "s.lxmf.id.%d.contacts.%s",
+                      id.index, peer_hex.c_str());
+        storageDeleteTree(cpath);
+        info("id %d: deleted conversation + contact %s",
+             id.index, peer_hex.c_str());
+    } else {
         info("id %d: deleted msg %s/%s", id.index,
              peer_hex.c_str(), mid.c_str());
+    }
 }
 
 /* ── lxmf.cmd.* — identity-level commands ──
