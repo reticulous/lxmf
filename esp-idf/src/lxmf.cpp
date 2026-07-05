@@ -401,17 +401,6 @@ static void mpPackInt(std::vector<uint8_t>& out, int v)
     }
 }
 
-static void mpPackStrHeader(std::vector<uint8_t>& out, size_t len)
-{
-    if (len <= 31)    { out.push_back((uint8_t)(0xA0 | len)); return; }
-    if (len <= 0xFF)  { out.push_back(0xD9); out.push_back((uint8_t)len); return; }
-    if (len <= 0xFFFF){ out.push_back(0xDA);
-                        out.push_back((uint8_t)((len >> 8) & 0xFF));
-                        out.push_back((uint8_t)( len       & 0xFF)); return; }
-    out.push_back(0xDB);
-    for (int i = 3; i >= 0; --i) out.push_back((uint8_t)((len >> (8*i)) & 0xFF));
-}
-
 static void mpPackBinHeader(std::vector<uint8_t>& out, size_t len)
 {
     if (len <= 0xFF)   { out.push_back(0xC4); out.push_back((uint8_t)len); return; }
@@ -420,12 +409,6 @@ static void mpPackBinHeader(std::vector<uint8_t>& out, size_t len)
                          out.push_back((uint8_t)( len       & 0xFF)); return; }
     out.push_back(0xC6);
     for (int i = 3; i >= 0; --i) out.push_back((uint8_t)((len >> (8*i)) & 0xFF));
-}
-
-static void mpPackStr(std::vector<uint8_t>& out, std::string_view s)
-{
-    mpPackStrHeader(out, s.size());
-    out.insert(out.end(), s.begin(), s.end());
 }
 
 static void mpPackBin(std::vector<uint8_t>& out, const uint8_t* p, size_t n)
