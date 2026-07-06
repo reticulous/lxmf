@@ -295,10 +295,7 @@ and the on-device settings pane:
   lacking a valid stamp for the cost we advertise.
 
 Both generation and validation yield ~every 500 ms so the rest of the system
-keeps ticking. **Tickets** (the contact-exemption shortcut that would skip
-PoW for known senders) are not implemented: inbound tickets are parsed and
-logged but never stored or used, none are issued, and `s.lxmf.auto_ticket`
-(default 1) is read by nothing — it has no effect.
+keeps ticking.
 
 ## Storage variables
 
@@ -311,7 +308,6 @@ logged but never stored or used, none are issued, and `s.lxmf.auto_ticket`
 | `s.lxmf.stamp_cost` | `16` | Advertised PoW cost (bits, 0–18; `0` = none). |
 | `s.lxmf.generate_stamps` | `1` | Pay a peer's advertised stamp cost when sending. |
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
-| `s.lxmf.auto_ticket` | `1` | No effect — tickets are unimplemented (read by nothing). |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
 | `s.lxmf.sound` | `/fixed/lxmf/ding.wav` | Message-notification WAV (point at your own device-rate file if you like). |
