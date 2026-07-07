@@ -57,9 +57,13 @@ namespace {
 
 /* ---- look & feel (dense) ---- */
 
-/* Compact + accented: smaller than the 14 default, and (unlike LVGL's stock
- * montserrat) carries umlauts/accents so message text isn't reduced to boxes. */
-const lv_font_t* const kFont = &lv_font_montserrat_12_latin;
+/* The vector UI face at the platform zoom (was the montserrat_12 bitmap). Set by
+ * refreshFont() at the top of each top-level build, before any label or the
+ * printable() coverage check reads it. All UI + its storage callbacks run on the
+ * lcd task, so the (non-thread-safe) vector glyph lookups are safe. The bitmap
+ * default only covers the pre-build window. */
+const lv_font_t* kFont = &lv_font_montserrat_12_latin;
+void refreshFont() { kFont = lcdFont(LcdFace::UI, (int)(14 * lcdUiScale() + 0.5f)); }
 
 const int HDR_H = 20;   /* thread top bar height */
 
@@ -774,6 +778,7 @@ void addBubble(const Msg& m) {
 
 void rebuildThread() {
     if (!s_bubbles || g_curPeer.empty()) return;
+    refreshFont();
     lv_obj_clean(s_bubbles);
     g_nomadTargets.clear();          /* link widgets are gone with the cleaned bubbles */
     std::vector<const Msg*> ms;
@@ -827,6 +832,7 @@ void grpLabel(const char* t) {
 
 void rebuildList(bool keepScroll) {
     if (!s_list) return;
+    refreshFont();
     int32_t savedY = keepScroll ? lv_obj_get_scroll_y(s_list) : 0;
     lv_obj_clean(s_list);
     g_rowPeers.clear();
@@ -1104,6 +1110,7 @@ void onLayerDelete(lv_event_t*) {
 /* ---- entry point (lcd task, on first open of a fresh layer) ---- */
 
 void lxmfApp(void* arg) {
+    refreshFont();   /* vector UI font live before any label / printable() */
     s_layer = static_cast<lv_obj_t*>(arg);
     s_idpick = nullptr; s_contacts = nullptr; s_search = nullptr; s_list = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr; s_threadName = nullptr;
