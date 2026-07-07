@@ -38,6 +38,7 @@
  */
 #include "lcd.h"
 #include "lcd_app.h"   /* LcdApp + lcdInstall */
+#include "lxmf_app.h"  /* LxmfApp — this straddle's services: class */
 #include "mem.h"
 #include "storage.h"
 #include "compat.h"
@@ -1226,23 +1227,23 @@ void lxmfSettingsPane(void* arg) {
     }
 }
 
-/* LxmfApp — onCreate builds the screens; cleanup on eviction is handled by the
- * layer's own onLayerDelete (it nulls every handle so a late storage change
- * early-returns), so no onClose is needed. */
-class LxmfApp : public LcdApp {
-public:
-    LxmfApp() : LcdApp({ .name = "LXMF", .iconBasename = "lxmf" }) {}
-    void onCreate(lv_obj_t* root) override { lxmfApp(root); }
-};
-
 }  // namespace
 
-/* Register the LXMessenger launcher program — a when:-gated init: hook
- * (spangap/spangap-lcd). This whole file lives under conditional/spangap-lcd/,
- * compiled only when the lcd straddle is staged, so no #if is needed. Plain
- * C++ linkage to match the generated dispatcher's forward decl. */
-void lxmfLcdRegister(void) {
-    lcdRun([](void*) { lcdInstall(new LxmfApp()); });   /* tile build is LVGL: on the lcd task */
+/* LxmfApp — the LXMessenger launcher program as an LcdApp (and thus a Service).
+ * onCreate builds the three screens; cleanup on eviction is handled by the
+ * layer's own onLayerDelete (it nulls every handle so a late storage change
+ * early-returns), so no onClose is needed. Declared in lxmf_app.h (global, so
+ * the generated services: trampoline can `new` it); defined here where the
+ * file-static UI state lives. */
+LxmfApp::LxmfApp() : LcdApp({ .name = "LXMF", .iconBasename = "lxmf" }) {}
+
+void LxmfApp::onCreate(lv_obj_t* root) { lxmfApp(root); }
+
+/* LxmfApp::appInit — the boot-task half of bring-up, run once by LcdApp::onInit()
+ * right after it hops the launcher-tile install onto the lcd task. This whole
+ * file lives under conditional/spangap-lcd/, compiled only when the lcd straddle
+ * is staged, so no #if is needed — no lcd, no LxmfApp, no services: registration. */
+void LxmfApp::appInit() {
     lcdRegisterSettings("Mesh Network/LXMF", "LXMF Messages", lxmfSettingsPane, 2);
 
     /* The on-device nomad browser writes a tapped contact's dest hash to

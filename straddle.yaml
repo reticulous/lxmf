@@ -24,15 +24,21 @@ requires:
 # call site is gated on CONFIG_STRADDLE_AUDIO, so a build without audio still
 # links (just no notification sound) — that's how heltec/generic reticulous
 # builds stay audio-free while the T-Deck gets the ping.
-# Auto-init: folded into the generated spangapInitStraddles() dispatcher. Runs
-# in the straddle band; `requires: reticulous/rns` puts rnsd ahead of it, and
-# the platform band guarantees the lcd task already exists, so lxmfInit() can
-# self-register its LCD launcher tile (lxmfLcdRegister, a no-op stub in non-LCD
-# builds) directly. The consumer's app_main references lxmf nowhere.
-init:
-  - call: lxmfInit
-  - call: lxmfLcdRegister
-    when: spangap/spangap-lcd
+# Boot-registered Services, folded into the generated boot dispatcher. Runs in
+# the straddle band; `requires: reticulous/rns` puts rnsd ahead of both.
+#   - LxmfService (core): brings up the lxmf task — always started, even on a
+#     transport-only node, so the announce fanout + cmd handlers are live.
+#   - LxmfApp (LCD): the on-device LXMessenger. It is an LcdApp, so this entry
+#     installs its launcher tile (LcdApp::onInit) and does its boot wiring
+#     (LxmfApp::appInit — Settings pane, the lxmf.url_lcd open-URL subscription).
+#     when:-gated on spangap/spangap-lcd — the whole LxmfApp class lives under
+#     conditional/spangap-lcd/, so without the lcd straddle staged neither the
+#     trampoline nor the class compiles. The platform band brings the lcd task up
+#     before the straddle band, so the tile-install hop always has a live task.
+# The consumer's app_main references lxmf nowhere.
+services:
+  - { class: LxmfService, header: lxmf.h }
+  - { class: LxmfApp, header: lxmf_app.h, when: spangap/spangap-lcd }
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.

@@ -3910,7 +3910,7 @@ static void lxmfTaskMain(void*)
     }
 }
 
-void lxmfInit(void)
+void LxmfService::onInit()
 {
     /* Storage defaults gated on version. */
     if (storageGetInt("s.lxmf.version", 0) < LXMF_VERSION) {

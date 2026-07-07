@@ -18,11 +18,16 @@
  */
 #pragma once
 
+#include "service.h"
+
 /** Bring up the lxmf task. The task is always started — even on a
  *  transport-only node — so the announce-fanout subscription and the
  *  cmd handlers are live. With zero identities allocated it simply
  *  never announces an LXMF destination of its own. */
-void lxmfInit(void);
+class LxmfService : public Service {
+public:
+    void onInit() override;
+};
 
 /** Create a new LXMF identity with the given display name.
  *
