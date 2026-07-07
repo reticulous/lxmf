@@ -77,11 +77,14 @@ architecture and resolves several behaviours the storage model forces.
 State these as absent, not "coming":
 
 - **Tickets** (the contact-exemption shortcut). `FIELD_TICKET = 0x0C` is
-  parsed on inbound and logged, but never stored, used, or issued. No stamp
-  is ever skipped — every stamped send pays full PoW. `s.lxmf.auto_ticket`
-  is read by nothing.
+  parsed on inbound and logged, but never stored, used, or issued (upstream's
+  value shape is `[expiry_unix_s, ticket_16B]`, with 21 d expiry / 14 d renew
+  / 5 d grace lifetimes). No stamp is ever skipped — every stamped send pays
+  full PoW. `s.lxmf.auto_ticket` is read by nothing.
 - **PROPAGATED mode** (`0x03`) and running as a propagation node — no
-  store-and-forward, no `lxmf.propagation` destination, no prop-node `/get`.
+  store-and-forward, no `lxmf.propagation` destination, no prop-node `/get`
+  (upstream propagation-node stamps use a 1000-round workblock and peering
+  stamps 25, vs the recipient stamp's fixed 3000 — §8).
 - **PAPER mode** (`0x05`).
 - **Group conversations** (`FIELD_GROUP = 0x0B` reserved), **audio
   messages** (`FIELD_AUDIO = 0x07`; such messages display
@@ -464,6 +467,27 @@ msgs.<id>.last_error     short UI string
 `<key>` is inbound → the real `message_id`; outbound → local
 `o_<unix_ms>_<rand4>` (with `message_id` as a sidecar once packed).
 
+Each conversation subtree (`s.lxmf.id.<n>.msgs.<peer>`) is registered as its
+own **external storage file** (`storageNewTreeFile` via `ensureConvFile`,
+[spangap-core storage docs](../spangap-core/docs/storage.md)), so a chatty
+conversation rewrites only its own small file instead of growing `root.json`
+on every change. `ensureConvFile` runs on every write path — the inbound
+persist, `cmd.send` processing, and the CLI send — so a browser-composed
+draft that first landed in `root.json` self-heals: the registration on
+`cmd.send` detaches it into its own file at the next flush. Deleting a
+conversation (or the identity) via `storageDeleteTree` drops and unregisters
+the file. This only changes *where the bytes flush*: the subtree is still
+fully resident in the in-RAM tree and still syncs to the browser (§13's
+retention pitfall stands).
+
+Two alternatives to the per-contact layout are settled. Having firmware scan
+every `msgs.*` subtree for a bare `<key>` (so `cmd.*` values could omit the
+peer) is rejected — it reintroduces exactly the O(all-messages) walk the
+layout exists to avoid, which is why `cmd.{send,cancel,delete}` values carry
+`<peer>/<key>`. Unifying `contacts.<peer>` and `msgs.<peer>` under a single
+`peer.<peer>.*` tree (destroying a contact would drop their messages in one
+op) is a real option but a wider blast radius — considered and deferred.
+
 ### Secrets / ephemeral
 
 ```
@@ -482,6 +506,18 @@ window), and `components/lxmf/` (`PeerAvatar`, `ConversationList`,
 `ContactCard`, `MessageBubble`, `Composer`, `AnnouncesView`,
 `ConversationThread`). `MessageBubble.vue` renders the stage glyph and shows
 `last_error` as its tooltip.
+
+The frontend write contract (`modules/lxmf.ts`, `CmdQueue`): a record write
+plus its `cmd` sentinel must go as **one** `sendJson` nested patch — the
+queue `deepAssign`s the record data and the sentinel into a single patch —
+never two separate `set()` calls. Command serialization is **per `cmd` key**
+(one queue per full sentinel path, so per identity too), not global:
+different cmd kinds never block each other; only same-kind writes queue.
+Completion is settled on the record's firmware-owned *effect* (e.g.
+`message_id` appearing, or a `failed` stage) — never on the sentinel
+disappearing, because ephemeral `lxmf.*` deletions are not propagated back
+over the storage DataChannel, so "sentinel gone" is unobservable and using
+it produced false send failures.
 
 **On-device LCD app** (`esp-idf/conditional/spangap-lcd/src/lxmf_lcd.cpp`):
 the **LXMF** app — `class LxmfApp : public LcdApp`, constructed
@@ -554,5 +590,8 @@ both on the lcd task.
 6. `transient_id ≠ message_id`.
 7. The stamp workblock is 768 KB over a fixed 3000 HKDF rounds — do not
    change the round count.
-8. Resource test payloads must be incompressible — bz2 is disabled in this
-   build, so a compressible inbound Resource is correctly dropped.
+8. bz2 in the Resource path is live — bzip2 1.0.8 is vendored in the µR
+   component ([rns](../rns) §10, `Resource.cpp`), so a compressible inbound
+   Resource decompresses and delivers, and outbound Resource payloads are
+   compressed whenever that shrinks them (every Reticulum/NomadNet client
+   speaks bz2 here).
