@@ -17,13 +17,19 @@ import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useMenuStore } from 'spangap-browser/stores/menu'
 import LxmfPanel from '../panels/LxmfPanel.vue'
 import { registerApp } from 'spangap-browser/lib/apps'
+import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
+/* Import cycle with the wrapper panel (it reads the per-identity records and
+ * useLxmf from here) — benign: both sides only touch the other's bindings
+ * from inside functions, never at module-eval time. */
+import MessagesWindows from '../panels/MessagesWindows.vue'
 
 /* ── Composition-layer wiring (pattern mirrors modules/rnsd.ts) ──────── */
 
 /** Each usable identity gets its own Messages window (no in-window identity
- *  picker). These maps are keyed by identity slot `n`; MainLayout renders one
- *  window per usable identity (or a single FALLBACK_ID window when there are
- *  none, so the "create an identity" guidance is still reachable). */
+ *  picker). These maps are keyed by identity slot `n`; the MessagesWindows
+ *  wrapper (registered as a window mount below) renders one window per usable
+ *  identity (or a single FALLBACK_ID window when there are none, so the
+ *  "create an identity" guidance is still reachable). */
 export const FALLBACK_ID = -1
 export const messagesVisibleById = reactive<Record<number, boolean>>({})
 export const messagesFocusById = reactive<Record<number, number>>({})
@@ -707,10 +713,10 @@ export function registerLxmf() {
   registerApp({ id: 'lxmf', label: 'LXMF', icon: 'lxmf', placement: 5,
                 open: () => {
                   /* Open the active identity's window (or the first usable one);
-                   * MainLayout only mounts a window per usable identity, so
-                   * defaulting to FALLBACK_ID would target an unmounted window
-                   * when identities exist. showMessages bumps the focus token,
-                   * which raises an already-open window to the front. */
+                   * MessagesWindows only mounts a window per usable identity,
+                   * so defaulting to FALLBACK_ID would target an unmounted
+                   * window when identities exist. showMessages bumps the focus
+                   * token, which raises an already-open window to the front. */
                   const usable = lx.usableIdentities.value
                   const active = lx.activeIdentity.value
                   const n = usable.length
@@ -719,4 +725,8 @@ export function registerLxmf() {
                   showMessages(n)
                 },
                 isOpen: () => Object.values(messagesVisibleById).some(Boolean) })
+
+  /* The windows themselves: a bare mount — MessagesWindows owns its own v-for
+   * over usable identities and the per-identity visible/focus records. */
+  registerWindowMount({ id: 'lxmf-messages', component: MessagesWindows })
 }
