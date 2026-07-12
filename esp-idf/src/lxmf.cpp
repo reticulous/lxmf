@@ -1372,11 +1372,18 @@ static bool sendFrame(lxmf_id_t& id, const uint8_t* frame, size_t n)
 
 /* ── announce ── */
 
-/* Build LXMF announce app_data as msgpack `[display_name_bytes, stamp_cost]`
- * (the [b] shape parseLxmfAnnounce accepts). Modern clients also prefix
- * a 32-byte ratchet pubkey; we don't emit one yet — it becomes
- * meaningful alongside the stamps machinery, when ratchet rotation
- * matters. */
+/* Build LXMF announce app_data as msgpack `[display_name_bytes, stamp_cost]`.
+ * NOTE: the ratchet is NOT part of app_data — upstream LXMF app_data is just
+ * msgpack([display_name, stamp_cost, supported_functionality]). The ratchet
+ * is a separate field in the RNS announce packet (public_key · name_hash ·
+ * random_hash · [ratchet] · signature · app_data), its presence signalled by
+ * the packet context_flag (FLAG_SET) and covered by the announce signature,
+ * handled at the RNS/Identity layer (LXMF just calls enable_ratchets). We do
+ * not advertise a ratchet: RNS-layer ratchets are not implemented here, and
+ * advertising one without also implementing ratchet-based decryption would
+ * make peers encrypt to a key we cannot read. Without one, senders fall back
+ * to our static identity key (no forward secrecy, but delivery is unaffected).
+ * The earlier "prefix a 32-byte ratchet to app_data" note was wrong. */
 static std::vector<uint8_t> buildAnnounceAppData(int id_n)
 {
     std::string name = storageGetStr(idPath(id_n, "display_name").c_str(), "");
