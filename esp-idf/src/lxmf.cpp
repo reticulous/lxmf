@@ -957,9 +957,10 @@ static outbound_t* outboundAlloc(lxmf_id_t& id)
  * subscription. All storage writes happen here, on our task — the rnsd
  * task only memcpys the announce into one ITS packet and forwards.
  *
- * Path: `lxmf.announces.<dest_hex>.{hash,display_name,stamp_cost,ratchet,
- *        hops,last_announce_s}`. Pruning is left to a future cron job —
- * for now entries simply accumulate. */
+ * One packed leaf per dest at `lxmf.announces.<dest_hex>` (value format
+ * documented at buildAnnounceValue below) — there is no per-field subtree.
+ * Bounded by `s.lxmf.max_announces`; a new dest at the cap evicts the
+ * oldest by last_s. */
 
 static bool isOwnDest(const uint8_t dh[LXMF_DEST_HASH_LEN])
 {
@@ -1028,6 +1029,23 @@ static bool parseAnnounceValue(const char* val, AnnounceEntry* out)
     out->ratchet.assign(pos[2] + 1, pos[3] - pos[2] - 1);
     out->name   = pos[3] + 1;
     return true;
+}
+
+/* Display name last heard for `peer_hex` in the cross-identity announce
+ * catalogue, or "" if we've never heard them announce (or the announce
+ * carried no name). The catalogue is one packed leaf per dest
+ * (`lxmf.announces.<hex>` = "<last_s>|<cost>|<hops>|<ratchet>|<name>"), so
+ * the name has to be parsed out of that value — there is no nested
+ * `.display_name` subkey. Used to seed `contacts.<peer>.display_name` on
+ * both the inbound and outbound first-contact paths, and as the CLI's
+ * contact-name fallback. */
+static std::string announceName(const std::string& peer_hex)
+{
+    std::string av = storageGetStr(("lxmf.announces." + peer_hex).c_str(), "");
+    if (av.empty()) return "";
+    AnnounceEntry ae;
+    if (!parseAnnounceValue(av.c_str(), &ae)) return "";
+    return ae.name;
 }
 
 /* ── announce-catalogue size cap + LRU-by-announce-time eviction ──
@@ -1596,6 +1614,18 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
        next flush detaches it into this file). */
     ensureConvFile(id.index, peer_hex);
 
+    /* Stub the contact on first outbound too, mirroring the inbound persist:
+     * messaging a peer we've only heard announce (never received from) must
+     * still land their name in `contacts.<peer>.display_name`, else every
+     * frontend shows a bare hash for someone we just picked off the mesh. */
+    if (!storageExists(contactPath(id.index, peer_hex, "hash").c_str())) {
+        storageSet(contactPath(id.index, peer_hex, "hash").c_str(),  peer_hex.c_str());
+        storageSet(contactPath(id.index, peer_hex, "trust").c_str(), 0);
+        std::string nm = announceName(peer_hex);
+        if (!nm.empty())
+            storageSet(contactPath(id.index, peer_hex, "display_name").c_str(), nm.c_str());
+    }
+
     if (!idEnabled(id.index)) {
         warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
         storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
@@ -2023,9 +2053,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     if (!storageExists(contactPath(id.index, sh_hex, "hash").c_str())) {
         storageSet(contactPath(id.index, sh_hex, "hash").c_str(),  sh_hex.c_str());
         storageSet(contactPath(id.index, sh_hex, "trust").c_str(), 0);
-        char annKey[120];
-        std::snprintf(annKey, sizeof(annKey), "lxmf.announces.%s.display_name", sh_hex.c_str());
-        std::string peer_name = storageGetStr(annKey, "");
+        std::string peer_name = announceName(sh_hex);
         if (!peer_name.empty())
             storageSet(contactPath(id.index, sh_hex, "display_name").c_str(), peer_name.c_str());
     }
@@ -3215,12 +3243,8 @@ static bool isStageWord(const std::string& s)
 static std::string peerDisplayName(int sel, const std::string& peer)
 {
     std::string nm = storageGetStr(contactPath(sel, peer, "display_name").c_str(), "");
-    if (nm.empty()) {
-        char annKey[120];
-        std::snprintf(annKey, sizeof(annKey),
-                      "lxmf.announces.%s.display_name", peer.c_str());
-        nm = storageGetStr(annKey, "");
-    }
+    if (nm.empty())
+        nm = announceName(peer);
     return nm;
 }
 
