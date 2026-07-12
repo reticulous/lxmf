@@ -8,14 +8,18 @@
  *     the list — the web spawns one Messages window per identity; on a single
  *     launcher tile we pick up front instead. One usable identity skips it;
  *     none falls through to the list's "create an identity" guidance.
- *   - List: a search box on top (focused on entry so a hardware keyboard types
- *     straight into it) over two sections, mirroring the web rail —
- *       Contacts:    peers you've messaged, name + last-message preview.
- *       On the Mesh:  announced peers you haven't talked to yet. The announce
- *                     catalogue can hold thousands, so the column is sorted by
- *                     recency and capped (MESH_ROW_CAP); a footer notes the
- *                     remainder and the search box narrows it. A bare 32-hex
- *                     query offers "message this address".
+ *   - List: two tabs, each with its own search box on top (focused on entry so
+ *     a hardware keyboard types straight into it). Contacts is selected first.
+ *       Contacts:    peers you've messaged, newest-comms first; name +
+ *                     last-message preview, a last-heard-announce age badge at
+ *                     the right, and a phone-style swipe-left-to-delete (reveals
+ *                     a red trashcan; the tap writes the delete sentinel). A
+ *                     bare 32-hex query offers "message this address".
+ *       On the Mesh:  every dest heard announcing within s.lxmf.on_mesh_expire
+ *                     seconds (default 3600; 0 = all), newest first, age-badged.
+ *                     No dedup with Contacts. The announce catalogue can hold
+ *                     thousands, so it's capped (MESH_ROW_CAP) with a footer
+ *                     noting the remainder; the search box narrows it.
  *   - Thread:   a back chevron + peer name + scroll-to-bottom chevron (top
  *     bar), the message bubbles (in left / out right), and a compose row
  *     (textarea + Send) at the end of the chat. The compose field is focused
@@ -144,16 +148,24 @@ std::vector<std::string> g_rowPeers;    /* peer per clickable list row (click in
 std::vector<std::string> g_nomadTargets;/* "<hash>:<path>" per tappable Nomad link in the open thread */
 std::string       g_curPeer;            /* peer of the open thread */
 std::string       g_pendingOpenPeer;    /* contact tapped in nomad, awaiting an identity pick */
-std::string       g_query;              /* current search-box text */
+std::string       g_qContacts;          /* Contacts-tab search-box text */
+std::string       g_qMesh;              /* On-the-Mesh-tab search-box text */
+int               g_activeTab = 0;      /* 0 = Contacts, 1 = On the Mesh (default Contacts) */
 bool              g_subscribed = false;
 bool              g_listRefreshPending = false;   /* a coalesced list rebuild is queued */
 lv_timer_t*       g_searchTimer = nullptr;        /* one-shot search debounce (null = idle) */
 
 lv_obj_t* s_layer    = nullptr;
 lv_obj_t* s_idpick   = nullptr;         /* identity picker (first screen, >1 ident) */
-lv_obj_t* s_contacts = nullptr;         /* list screen: search box + scroll list */
-lv_obj_t* s_search   = nullptr;         /* search textarea atop the list */
-lv_obj_t* s_list     = nullptr;         /* scroll container of rows (cleaned+rebuilt) */
+lv_obj_t* s_contacts = nullptr;         /* list screen: tab bar + two tab pages */
+lv_obj_t* s_tabBtnC  = nullptr;         /* "Contacts" tab button */
+lv_obj_t* s_tabBtnM  = nullptr;         /* "On the Mesh" tab button */
+lv_obj_t* s_tabContacts = nullptr;      /* Contacts page (search + list); shown when tab 0 */
+lv_obj_t* s_tabMesh  = nullptr;         /* On-the-Mesh page (search + list); shown when tab 1 */
+lv_obj_t* s_searchC  = nullptr;         /* search textarea atop the Contacts list */
+lv_obj_t* s_searchM  = nullptr;         /* search textarea atop the On-the-Mesh list */
+lv_obj_t* s_listC    = nullptr;         /* Contacts row container (cleaned+rebuilt) */
+lv_obj_t* s_listM    = nullptr;         /* On-the-Mesh row container (cleaned+rebuilt) */
 lv_obj_t* s_thread   = nullptr;         /* conversation screen (built once, reused) */
 lv_obj_t* s_msgList  = nullptr;         /* scroll container inside s_thread */
 lv_obj_t* s_bubbles  = nullptr;         /* bubble column (cleaned+rebuilt) inside s_msgList */
@@ -167,6 +179,7 @@ void refreshAnnounces();
 void rebuildList(bool keepScroll = false);
 void rebuildThread();
 void showContacts();
+void setActiveTab(int n);
 void openThread(const std::string& peer);
 void scheduleListRefresh();
 void maybeOpenPending();
@@ -214,17 +227,43 @@ bool qmatch(const std::string& needle, const std::string& name, const std::strin
 
 /* ---- identity ---- */
 
-/* Usable = brought up by the firmware AND announcing a dest (mirrors the web's
- * usableIdentities). A config-only slot can't send/receive, so it's excluded. */
-void usableIds(std::vector<int>& out) {
+/* Loaded = the firmware has published this slot's delivery address. That happens
+ * from local crypto at boot, before the mailbox connects — so a loaded
+ * identity's stored history is viewable straight away, and only sending waits
+ * for `up`. A config-only slot (no private key) never gets a dest_hash, so it's
+ * excluded — which is exactly right, it can never come up. */
+void loadedIds(std::vector<int>& out) {
     out.clear();
     for (int n = 0; n < 4; n++) {
         char k[40];
-        snprintf(k, sizeof k, "lxmf.id.%d.up", n);
-        if (storageGetInt(k, 0) != 1) continue;
         snprintf(k, sizeof k, "lxmf.id.%d.dest_hash", n);
-        if (storageGetStr(k, "").empty()) continue;
-        out.push_back(n);
+        if (!storageGetStr(k, "").empty()) out.push_back(n);
+    }
+}
+
+/* Fully up = the firmware has connected this slot's delivery dest, so it can
+ * send/receive. Sending is gated on this even once history is already shown. */
+bool idUp(int n) {
+    if (n < 0) return false;
+    char k[40];
+    snprintf(k, sizeof k, "lxmf.id.%d.up", n);
+    return storageGetInt(k, 0) == 1;
+}
+
+/* Persistent slots that exist in config (the label survives reboot), split by
+ * whether they're enabled. Available from storage the instant we open, long
+ * before the firmware brings a mailbox up. A configured-but-not-yet-up slot is
+ * the normal post-reset state while rnsd + the mailbox come up — distinct from
+ * "no identity at all", so the empty-list guidance can say the right thing
+ * instead of falsely telling the user to create one. */
+void configuredIds(std::vector<int>& enabled, std::vector<int>& disabled) {
+    enabled.clear(); disabled.clear();
+    for (int n = 0; n < 4; n++) {
+        char k[48];
+        snprintf(k, sizeof k, "s.lxmf.id.%d.label", n);
+        if (!storageExists(k)) continue;
+        snprintf(k, sizeof k, "s.lxmf.id.%d.enabled", n);
+        (storageGetInt(k, 1) != 0 ? enabled : disabled).push_back(n);
     }
 }
 
@@ -248,6 +287,12 @@ std::string peerName(const std::string& peer) {
     snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.display_name", g_id, peer.c_str());
     std::string n = storageGetStr(k, "");
     if (!n.empty()) return printable(n, true);
+    /* No stored contact name — fall back to the name we last heard this dest
+     * announce (already parsed into g_anns for the on-the-mesh column). Covers
+     * contacts stubbed hash-only before an announce arrived, and any left over
+     * from before the send path learned to seed the name. */
+    for (auto& an : g_anns)
+        if (an.hash == peer && !an.name.empty()) return an.name;
     return peer.substr(0, 8) + "...";
 }
 
@@ -314,7 +359,7 @@ void refreshAnnounces() {
 /* ---- compose / send ---- */
 
 void sendMessage(const std::string& peer, const std::string& text) {
-    if (g_id < 0 || peer.empty() || text.empty()) return;
+    if (g_id < 0 || !idUp(g_id) || peer.empty() || text.empty()) return;
     static unsigned seq = 0;
     char key[40];
     snprintf(key, sizeof key, "o_%u_%u", (unsigned)millis(), ++seq);
@@ -362,11 +407,21 @@ void sendMessage(const std::string& peer, const std::string& text) {
 
 void onSend(lv_event_t*) {
     if (!s_compose || g_curPeer.empty()) return;
+    if (g_id < 0 || !idUp(g_id)) return;   /* mailbox not up yet — sending is held */
     const char* t = lv_textarea_get_text(s_compose);
     if (t && *t) {
         sendMessage(g_curPeer, t);
         lv_textarea_set_text(s_compose, "");
         rebuildThread();     /* draw the optimistic bubble now, not on the storage round-trip */
+        /* Paint it NOW. The Send button happens to fire in the lcd loop's input
+         * step, right before lv_timer_handler renders — the bubble shows at once.
+         * Keyboard Enter fires inside the loop's aux-drain instead, and before
+         * that drain finishes it is fed our own send's storage-change echoes
+         * (each a full refreshMsgs + rebuildThread — seconds under load), so the
+         * bubble only appeared after the storm. One inline refresh makes both
+         * paths visually identical: bubble first, then the echoes. */
+        lv_refr_now(nullptr);
+        deferFocus(s_compose);   /* keep the cursor in the entry box for the next message */
     }
 }
 
@@ -499,7 +554,7 @@ void showContacts() {
         refreshAnnounces();
         rebuildList();
         lv_obj_remove_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
-        deferFocus(s_search);               /* type-to-search on entry */
+        setActiveTab(g_activeTab);          /* re-show the last tab + focus its search */
     }
     g_curPeer.clear();
 }
@@ -534,7 +589,8 @@ void buildThreadShell() {
     lv_obj_set_ext_click_area(down, 12);
     lv_obj_add_event_cb(down, [](lv_event_t*) { scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
 
-    /* Scroll area (grows to fill): bubble column + the compose row at its end. */
+    /* Scroll area (grows to fill): the bubble column only. The compose row is a
+     * sibling below it (not a child), so it stays pinned to the bottom. */
     s_msgList = lv_obj_create(s_thread);
     lv_obj_remove_style_all(s_msgList);
     lv_obj_set_width(s_msgList, lv_pct(100));
@@ -542,7 +598,7 @@ void buildThreadShell() {
     lv_obj_set_flex_flow(s_msgList, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_hor(s_msgList, 4, 0);
     lv_obj_set_style_pad_ver(s_msgList, 1, 0);
-    lv_obj_set_style_pad_row(s_msgList, 3, 0);   /* gap between last message and the input */
+    lv_obj_set_style_pad_row(s_msgList, 1, 0);
 
     s_bubbles = lv_obj_create(s_msgList);
     lv_obj_remove_style_all(s_bubbles);
@@ -552,17 +608,28 @@ void buildThreadShell() {
     lv_obj_set_style_pad_row(s_bubbles, 1, 0);
     lv_obj_remove_flag(s_bubbles, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Compose row: textarea + Send. Last child of the scroll area, so it follows
-     * the final message and scrolls off the top rather than sticking to the bottom. */
-    lv_obj_t* comp = lv_obj_create(s_msgList);
+    /* Compose row: textarea + Send. A direct child of the thread AFTER the scroll
+     * area (not inside it), so it's pinned to the bottom of the screen and never
+     * scrolls away with the messages. A thin top border sets it off from the
+     * bubbles above (mirroring the scroll area's old pad_hor with its own). */
+    lv_obj_t* comp = lv_obj_create(s_thread);
     lv_obj_remove_style_all(comp);
     lv_obj_set_width(comp, lv_pct(100));
     lv_obj_set_height(comp, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(comp, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(comp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_ver(comp, 1, 0);
+    lv_obj_set_style_pad_ver(comp, 2, 0);
+    lv_obj_set_style_pad_hor(comp, 4, 0);
     lv_obj_set_style_pad_column(comp, 4, 0);
+    lv_obj_set_style_border_side(comp, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_width(comp, 1, 0);
+    lv_obj_set_style_border_color(comp, lv_color_hex(0x222b38), 0);
     lv_obj_remove_flag(comp, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Input and Send share one fixed height (line height + breathing room) so the
+     * button is exactly as tall as the box rather than each sizing to its own
+     * content. */
+    int32_t inH = lv_font_get_line_height(kFont) + 8;
 
     s_compose = lv_textarea_create(comp);
     lv_textarea_set_one_line(s_compose, true);
@@ -570,20 +637,37 @@ void buildThreadShell() {
     lv_obj_set_style_text_font(s_compose, kFont, 0);
     lv_obj_set_style_pad_ver(s_compose, 1, 0);
     lv_obj_set_style_pad_hor(s_compose, 4, 0);
+    lv_obj_set_height(s_compose, inH);
     lv_obj_set_flex_grow(s_compose, 1);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_compose);
-    lv_obj_add_event_cb(s_compose, onSend, LV_EVENT_READY, nullptr);                 /* Enter sends */
+    lv_obj_add_event_cb(s_compose, onSend, LV_EVENT_READY, nullptr);                 /* Enter = Send */
     lv_obj_add_event_cb(s_compose, [](lv_event_t*) { scrollThreadBottom(false); },   /* typing -> bottom */
                         LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_obj_t* send = lv_button_create(comp);
-    lv_obj_set_style_pad_ver(send, 1, 0);
-    lv_obj_set_style_pad_hor(send, 6, 0);
+    lv_obj_set_style_pad_ver(send, 0, 0);
+    lv_obj_set_style_pad_hor(send, 8, 0);
+    lv_obj_set_height(send, inH);
     lv_obj_t* sl = lv_label_create(send);
     lv_obj_set_style_text_font(sl, kFont, 0);
     lv_label_set_text(sl, "Send");
     lv_obj_center(sl);
     lv_obj_add_event_cb(send, onSend, LV_EVENT_CLICKED, nullptr);
+}
+
+/* Reflect the active identity's connection state onto the compose field. Until
+ * its mailbox is up (the post-reset window while rnsd connects), history is
+ * readable but a send would be held — so disable the field and say why, rather
+ * than take text that can't go out. Re-run whenever `up` may have flipped. */
+void composeReflectUp() {
+    if (!s_compose) return;
+    if (g_id >= 0 && idUp(g_id)) {
+        lv_obj_remove_state(s_compose, LV_STATE_DISABLED);
+        lv_textarea_set_placeholder_text(s_compose, "Message");
+    } else {
+        lv_obj_add_state(s_compose, LV_STATE_DISABLED);
+        lv_textarea_set_placeholder_text(s_compose, "Waiting for initialization…");
+    }
 }
 
 void openThread(const std::string& peer) {
@@ -596,7 +680,8 @@ void openThread(const std::string& peer) {
     lcdProgramFullscreen(true);             /* immersive chat: no status bar */
     markRead(peer);
     rebuildThread();
-    deferFocus(s_compose);                  /* type-to-reply on open */
+    composeReflectUp();
+    deferFocus(s_compose);                  /* focus always rests on the entry box */
 }
 
 void onContactClick(lv_event_t* e) {
@@ -789,18 +874,81 @@ void rebuildThread() {
     scrollThreadBottom(false);                          /* newest + compose at bottom */
 }
 
-/* ---- list rendering (search + Contacts + On the Mesh) ---- */
+/* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
 
 struct Conv { std::string peer, preview; long ts = 0; int unread = 0; };
 
-/* A two-line tappable row (name + one-line subtitle). Stacking (not inline)
- * keeps a tall, reliable tap target even when the subtitle is short. */
-void addPeerRow(const std::string& peer, const std::string& title,
-                const std::string& sub, lv_color_t titleColor) {
+/* Compact "time since" badge shown at the right of every row: how long ago we
+ * last heard this dest announce. Chat-app style — s / m(inutes) / h / d / w / y.
+ * Empty string (drawn as nothing) when we've never heard it. */
+std::string relAge(long secs) {
+    if (secs < 0) secs = 0;
+    char b[12];
+    if      (secs < 60)          snprintf(b, sizeof b, "%lds", secs);
+    else if (secs < 3600)        snprintf(b, sizeof b, "%ldm", secs / 60);
+    else if (secs < 86400)       snprintf(b, sizeof b, "%ldh", secs / 3600);
+    else if (secs < 7*86400L)    snprintf(b, sizeof b, "%ldd", secs / 86400L);
+    else if (secs < 365*86400L)  snprintf(b, sizeof b, "%ldw", secs / (7*86400L));
+    else                         snprintf(b, sizeof b, "%ldy", secs / (365*86400L));
+    return b;
+}
+
+/* Last-heard-announce timestamp for a dest (0 = never). g_anns is kept sorted by
+ * .last descending, so the first hit is the most recent. */
+long lastAnnounce(const std::string& peer) {
+    for (auto& an : g_anns) if (an.hash == peer) return an.last;
+    return 0;
+}
+
+/* Populate a row host (styled by the caller) with the two-line body + a
+ * right-aligned age badge: [ name / one-line subtitle ]········[ age ].
+ * `host` is turned into a flex row; the text stacks in a growing left column so
+ * a long subtitle ellipsizes rather than shoving the badge off-screen. */
+void fillPeerContent(lv_obj_t* host, const std::string& title, const std::string& sub,
+                     const std::string& age, lv_color_t titleColor) {
+    lv_obj_set_flex_flow(host, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(host, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t* col = lv_obj_create(host);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_flex_grow(col, 1);
+    lv_obj_set_width(col, 0);                 /* grow from 0 so the badge keeps its space */
+    lv_obj_set_height(col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 1, 0);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    /* CRITICAL: a plain lv_obj is CLICKABLE by default, and this column covers
+     * nearly the whole row — it was winning the hit-test over the row button, so
+     * taps landed here (no handler, no bubbling) and silently died; only the few
+     * uncovered padding pixels ever reached the row. Labels aren't clickable, so
+     * lists that put labels straight on the button never hit this. Make the
+     * column transparent to input so presses fall through to the row. */
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_CLICKABLE);
+
+    mkLabel(col, title, titleColor);
+
+    /* LONG_DOT ellipsizes only within the label's own size, so bound both:
+     * full column width + exactly one line tall → a long subtitle is clipped to
+     * a single "…"-terminated line instead of wrapping. */
+    lv_obj_t* pv = mkLabel(col, sub, lv_color_hex(0x8a93a0));
+    lv_label_set_long_mode(pv, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(pv, lv_pct(100));
+    lv_obj_set_height(pv, lv_font_get_line_height(kFont));
+
+    if (!age.empty()) {
+        lv_obj_t* a = mkLabel(host, age, lv_color_hex(0x6a7280));
+        lv_obj_set_style_pad_left(a, 4, 0);
+    }
+}
+
+/* A plain tappable row (On-the-Mesh + the "message this address" affordance).
+ * Uses the shared g_rowPeers click index → onContactClick → openThread. */
+void addPeerRow(lv_obj_t* list, const std::string& peer, const std::string& title,
+                const std::string& sub, const std::string& age, lv_color_t titleColor) {
     size_t idx = g_rowPeers.size();
     g_rowPeers.push_back(peer);
 
-    lv_obj_t* row = lv_button_create(s_list);
+    lv_obj_t* row = lv_button_create(list);
     lv_obj_remove_style_all(row);
     lv_obj_set_width(row, lv_pct(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
@@ -809,43 +957,153 @@ void addPeerRow(const std::string& peer, const std::string& title,
     lv_obj_set_style_radius(row, 4, 0);
     lv_obj_set_style_pad_ver(row, 1, 0);
     lv_obj_set_style_pad_hor(row, 6, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(row, 1, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(row, onContactClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
-    mkLabel(row, title, titleColor);
-
-    /* LONG_DOT ellipsizes only within the label's own size, so bound both:
-     * full row width + exactly one line tall → a long subtitle is clipped to a
-     * single "…"-terminated line instead of wrapping. */
-    lv_obj_t* pv = mkLabel(row, sub, lv_color_hex(0x8a93a0));
-    lv_label_set_long_mode(pv, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(pv, lv_pct(100));
-    lv_obj_set_height(pv, lv_font_get_line_height(kFont));
+    fillPeerContent(row, title, sub, age, titleColor);
 }
 
-void grpLabel(const char* t) {
-    lv_obj_t* l = mkLabel(s_list, t, lv_color_hex(0x6a7280));
+/* ---- contact row: a plain tappable body + a fixed trashcan ----
+ * The body is an ordinary button (opens the thread) — structurally identical to
+ * the mesh rows, which tap reliably; the earlier swipe-to-delete foreground was
+ * the one thing unique to this list and made taps miss, so it's gone. A small
+ * trashcan sits at the right edge (no background). Delete is destructive, so it's
+ * two-tap: the first tap arms (icon → red + grown, 3 s auto-disarm), the second writes the
+ * delete sentinel (the lxmf task drops the whole conversation + contact). Per-row
+ * state lives in a heap ContactDel freed on the trashcan's DELETE. */
+struct ContactDel {
+    std::string peer;
+    lv_obj_t*   icon = nullptr;
+    bool        armed = false;
+    lv_timer_t* t = nullptr;
+};
+
+void contactDelDisarm(lv_timer_t* tm) {
+    auto* d = static_cast<ContactDel*>(lv_timer_get_user_data(tm));
+    d->armed = false; d->t = nullptr;
+    if (d->icon && lv_obj_is_valid(d->icon)) {
+        lv_obj_set_style_text_color(d->icon, lv_color_hex(0x8a93a0), 0);
+        lv_obj_set_style_transform_scale(d->icon, 192, 0);
+    }
+}
+
+void onContactTrash(lv_event_t* e) {
+    auto* d = static_cast<ContactDel*>(lv_event_get_user_data(e));
+    if (g_id < 0) return;
+    if (!d->armed) {
+        d->armed = true;
+        lv_obj_set_style_text_color(d->icon, lv_color_hex(0xd9534f), 0);   /* confirm cue */
+        lv_obj_set_style_transform_scale(d->icon, 320, 0);
+        d->t = lv_timer_create(contactDelDisarm, 3000, d);
+        lv_timer_set_repeat_count(d->t, 1);
+    } else {
+        if (d->t) { lv_timer_delete(d->t); d->t = nullptr; }
+        /* Whole-conversation delete: lxmf wipes the msgs + contact subtree; the
+         * storage change rebuilds the list without this peer (and frees this). */
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.cmd.delete", g_id);
+        storageSet(k, d->peer.c_str());
+    }
+}
+
+void onContactTrashFree(lv_event_t* e) {
+    auto* d = static_cast<ContactDel*>(lv_event_get_user_data(e));
+    if (d->t) { lv_timer_delete(d->t); d->t = nullptr; }
+    delete d;
+}
+
+void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& title,
+                   const std::string& sub, const std::string& age, lv_color_t titleColor) {
+    int lineH = lv_font_get_line_height(kFont);
+
+    /* Tappable body — the same plain button the mesh tab uses (shared g_rowPeers
+     * index → onContactClick → openThread). */
+    size_t idx = g_rowPeers.size();
+    g_rowPeers.push_back(peer);
+
+    lv_obj_t* row = lv_button_create(list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(row, 4, 0);
+    lv_obj_set_style_pad_ver(row, 1, 0);
+    lv_obj_set_style_pad_hor(row, 6, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(row, onContactClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
+
+    fillPeerContent(row, title, sub, age, titleColor);   /* row → flex: [body][age] */
+
+    /* Fixed trashcan at the right edge (grey icon, no background). */
+    auto* d = new ContactDel();
+    d->peer = peer;
+    lv_obj_t* trash = lv_button_create(row);
+    lv_obj_remove_style_all(trash);
+    lv_obj_set_size(trash, lineH + 14, 2 * lineH);
+    lv_obj_set_style_bg_opa(trash, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(trash, LV_OBJ_FLAG_SCROLLABLE);
+    d->icon = mkLabel(trash, LV_SYMBOL_TRASH, lv_color_hex(0x8a93a0));
+    lv_obj_center(d->icon);
+    /* Resting icon is shrunk to 75%; arming grows it to 125% (scale is /256,
+     * pivot centered so it grows in place). */
+    lv_obj_set_style_transform_pivot_x(d->icon, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(d->icon, lv_pct(50), 0);
+    lv_obj_set_style_transform_scale(d->icon, 192, 0);
+    lv_obj_add_event_cb(trash, onContactTrash,     LV_EVENT_CLICKED, d);
+    lv_obj_add_event_cb(trash, onContactTrashFree, LV_EVENT_DELETE,  d);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), trash);
+}
+
+void grpLabel(lv_obj_t* list, const char* t) {
+    lv_obj_t* l = mkLabel(list, t, lv_color_hex(0x6a7280));
     lv_obj_set_style_pad_top(l, 3, 0);
 }
 
+/* Rebuild both tab lists from the in-RAM stores. Cheap enough to redo both on
+ * any change (contacts come from g_msgs, the mesh from the sorted g_anns); the
+ * hidden tab's rows just wait. Each list keeps its own scroll across a live
+ * refresh. */
+/* Delete every row but keep child 0 — the search box now lives inside the scroll
+ * list (so it scrolls with the rows), and must survive a rebuild with its text
+ * and focus intact. */
+void clearRows(lv_obj_t* list) {
+    for (int32_t i = (int32_t)lv_obj_get_child_count(list) - 1; i >= 1; --i)
+        lv_obj_delete(lv_obj_get_child(list, i));
+}
+
 void rebuildList(bool keepScroll) {
-    if (!s_list) return;
+    if (!s_listC || !s_listM) return;
     refreshFont();
-    int32_t savedY = keepScroll ? lv_obj_get_scroll_y(s_list) : 0;
-    lv_obj_clean(s_list);
+    int32_t syC = keepScroll ? lv_obj_get_scroll_y(s_listC) : 0;
+    int32_t syM = keepScroll ? lv_obj_get_scroll_y(s_listM) : 0;
+    clearRows(s_listC);
+    clearRows(s_listM);
     g_rowPeers.clear();
 
     if (g_id < 0) {
-        mkLabel(s_list, "No active identity.\nCreate one in Settings.", lv_color_hex(0x8a93a0));
+        /* g_id < 0 spans two very different situations. A configured slot exists
+         * in persistent storage the instant we open, but its mailbox isn't up
+         * until rnsd starts and the delivery dest connects — seconds after a
+         * reset. Only say "create one" when there is genuinely nothing to bring
+         * up; otherwise reassure that it's coming. */
+        std::vector<int> en, dis;
+        configuredIds(en, dis);
+        const char* msg =
+            !en.empty()  ? "Waiting for initialization…"                :
+            !dis.empty() ? "Identity disabled.\nEnable it in Settings." :
+                           "No active identity.\nCreate one in Settings.";
+        mkLabel(s_listC, msg, lv_color_hex(0x8a93a0));
         return;
     }
 
-    std::string needle = lower(trim(g_query));
+    long now = (long)time(nullptr);
 
-    /* Conversations (Contacts) from the message store. */
+    /* ---- Contacts tab: conversations, newest-comms first, each with a
+     * last-heard-announce badge and a swipe-to-delete. ---- */
+    std::string nC = lower(trim(g_qContacts));
     std::vector<Conv> convs;
     for (auto& m : g_msgs) {
         Conv* c = nullptr;
@@ -855,74 +1113,106 @@ void rebuildList(bool keepScroll) {
         if (m.in && !m.read) c->unread++;
     }
     std::sort(convs.begin(), convs.end(), [](const Conv& a, const Conv& b) { return a.ts > b.ts; });
-    std::set<std::string> convSet;
-    for (auto& c : convs) convSet.insert(c.peer);
 
-    /* "New": a bare 32-hex query for a peer we don't already list. */
-    if (isHex32(needle) && !convSet.count(needle)) {
-        bool heard = false;
-        for (auto& an : g_anns) if (an.hash == needle) { heard = true; break; }
-        if (!heard) {
-            grpLabel("New");
-            addPeerRow(needle, "Message this address", needle, lv_color_white());
+    int cRows = 0;
+
+    /* "New": a bare 32-hex query for a peer we don't already have a thread with. */
+    if (isHex32(nC)) {
+        bool known = false;
+        for (auto& c : convs) if (c.peer == nC) { known = true; break; }
+        if (!known) {
+            grpLabel(s_listC, "New");
+            addPeerRow(s_listC, nC, "Message this address", nC, "", lv_color_white());
+            cRows++;
         }
     }
 
-    /* Contacts (filtered). */
-    bool anyC = false;
     for (auto& c : convs) {
         std::string nm = peerName(c.peer);
-        if (!qmatch(needle, nm, c.peer)) continue;
-        if (!anyC) { grpLabel("Contacts"); anyC = true; }
+        if (!qmatch(nC, nm, c.peer)) continue;
         std::string title = nm;
         if (c.unread > 0) title += " (" + std::to_string(c.unread) + ")";
-        addPeerRow(c.peer, title, printable(c.preview, true),
-                   c.unread > 0 ? lv_color_hex(0x6cc06c) : lv_color_white());
+        long la = lastAnnounce(c.peer);
+        addContactRow(s_listC, c.peer, title, printable(c.preview, true),
+                      la > 0 ? relAge(now - la) : std::string(),
+                      c.unread > 0 ? lv_color_hex(0x6cc06c) : lv_color_white());
+        cRows++;
     }
+    if (cRows == 0)
+        mkLabel(s_listC, nC.empty() ? "No conversations yet.\nSearch the mesh tab."
+                                    : "No matches.", lv_color_hex(0x8a93a0));
 
-    /* On the Mesh: announced peers we haven't messaged, filtered + capped. */
-    bool anyM = false;
+    /* ---- On the Mesh: every dest heard within the expiry window, newest first,
+     * badged by recency. No dedup with Contacts — a peer can appear in both. ---- */
+    std::string nM = lower(trim(g_qMesh));
+    int expire = storageGetInt("s.lxmf.on_mesh_expire", 3600);   /* 0 = show all */
     int shown = 0, total = 0;
     for (auto& an : g_anns) {
-        if (convSet.count(an.hash)) continue;
+        if (expire > 0 && an.last > 0 && (now - an.last) > expire) continue;   /* too old */
         std::string nm = an.name.empty() ? peerName(an.hash) : an.name;
-        if (!qmatch(needle, nm, an.hash)) continue;
+        if (!qmatch(nM, nm, an.hash)) continue;
         total++;
         if (shown >= MESH_ROW_CAP) continue;
-        if (!anyM) { grpLabel("On the Mesh"); anyM = true; }
-        addPeerRow(an.hash, nm, an.hash, lv_color_white());
+        addPeerRow(s_listM, an.hash, nm, an.hash,
+                   an.last > 0 ? relAge(now - an.last) : std::string(), lv_color_white());
         shown++;
     }
     if (total > shown) {
         char foot[48];
         snprintf(foot, sizeof foot, "+%d more — search to narrow", total - shown);
-        grpLabel(foot);
+        grpLabel(s_listM, foot);
     }
+    if (shown == 0)
+        mkLabel(s_listM, nM.empty() ? "Nothing heard recently." : "No matches.",
+                lv_color_hex(0x8a93a0));
 
-    if (g_rowPeers.empty()) {
-        mkLabel(s_list, needle.empty() ? "No conversations yet.\nSearch the mesh above."
-                                       : "No matches.", lv_color_hex(0x8a93a0));
-    }
-
-    /* Hold the reading position across a live refresh (clamped if the list
+    /* Hold each list's reading position across a live refresh (clamped if it
      * shrank); a fresh open / new search starts at the top (keepScroll false). */
-    if (keepScroll && savedY > 0) {
-        lv_obj_update_layout(s_list);
-        lv_obj_scroll_to_y(s_list, savedY, LV_ANIM_OFF);
+    if (keepScroll) {
+        lv_obj_update_layout(s_listC);
+        lv_obj_update_layout(s_listM);
+        if (syC > 0) lv_obj_scroll_to_y(s_listC, syC, LV_ANIM_OFF);
+        if (syM > 0) lv_obj_scroll_to_y(s_listM, syM, LV_ANIM_OFF);
     }
 }
 
-/* ---- search box ---- */
+/* ---- tabs ---- */
+
+void styleTab(lv_obj_t* b, bool active) {
+    if (!b) return;
+    lv_obj_set_style_bg_color(b, active ? lv_color_hex(0x2563a0) : lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+}
+
+void setActiveTab(int n) {
+    g_activeTab = n;
+    bool c = (n == 0);
+    if (s_tabContacts) { if (c) lv_obj_remove_flag(s_tabContacts, LV_OBJ_FLAG_HIDDEN);
+                         else    lv_obj_add_flag  (s_tabContacts, LV_OBJ_FLAG_HIDDEN); }
+    if (s_tabMesh)     { if (c) lv_obj_add_flag   (s_tabMesh,     LV_OBJ_FLAG_HIDDEN);
+                         else    lv_obj_remove_flag(s_tabMesh,     LV_OBJ_FLAG_HIDDEN); }
+    styleTab(s_tabBtnC, c);
+    styleTab(s_tabBtnM, !c);
+    lv_obj_t* shown = c ? s_listC : s_listM;
+    if (shown) lv_obj_scroll_to_y(shown, 0, LV_ANIM_OFF);   /* come back to a tab at the top */
+    deferFocus(c ? s_searchC : s_searchM);   /* type-to-search on the shown tab */
+}
+
+void onTabClick(lv_event_t* e) {
+    setActiveTab((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+/* ---- search boxes (one per tab) ---- */
 
 void searchTimerCb(lv_timer_t*) {
     g_searchTimer = nullptr;   /* one-shot: LVGL deletes it after this returns */
     rebuildList();
 }
 
-void onSearchChanged(lv_event_t*) {
-    if (!s_search) return;
-    const char* t = lv_textarea_get_text(s_search);
-    g_query = t ? t : "";
+void onSearchChanged(lv_event_t* e) {
+    lv_obj_t* ta = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    const char* t = lv_textarea_get_text(ta);
+    (ta == s_searchM ? g_qMesh : g_qContacts) = t ? t : "";
     /* Postpone the rebuild to SEARCH_DEBOUNCE_MS after the last keystroke so a
      * fast typist isn't fighting a per-key rebuild (see SEARCH_DEBOUNCE_MS). */
     if (g_searchTimer) {
@@ -933,17 +1223,58 @@ void onSearchChanged(lv_event_t*) {
     }
 }
 
-void onSearchEnter(lv_event_t*) {
-    /* Enter acts on the current query — flush any pending debounce first so
-     * g_rowPeers reflects what's typed, not the last settled rebuild. */
+void onSearchEnter(lv_event_t* e) {
+    /* Enter flushes any pending debounce, then opens the thread if the query is
+     * a bare 32-hex address (start a conversation with an exact dest). */
     if (g_searchTimer) {
         lv_timer_delete(g_searchTimer);
         g_searchTimer = nullptr;
         rebuildList();
     }
-    std::string needle = lower(trim(g_query));
-    if (isHex32(needle)) { openThread(needle); return; }
-    if (g_rowPeers.size() == 1) openThread(g_rowPeers[0]);
+    lv_obj_t* ta = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    std::string needle = lower(trim(ta == s_searchM ? g_qMesh : g_qContacts));
+    if (isHex32(needle)) openThread(needle);
+}
+
+/* One tab page: a single vertical scroll list whose first child is the search
+ * box, so the search scrolls away with the rows instead of staying pinned. The
+ * page and the list are the same object; rebuildList clears only the rows
+ * (children >= 1) and leaves the search — and its text/focus — in place. */
+lv_obj_t* buildTabPage(lv_obj_t*& page, lv_obj_t*& search, const char* placeholder) {
+    page = lv_obj_create(s_contacts);           /* scrollable (default) — this IS the list */
+    lv_obj_remove_style_all(page);
+    lv_obj_set_width(page, lv_pct(100));
+    lv_obj_set_flex_grow(page, 1);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(page, 2, 0);
+
+    search = lv_textarea_create(page);          /* child 0 — scrolls with the rows */
+    lv_textarea_set_one_line(search, true);
+    lv_textarea_set_placeholder_text(search, placeholder);
+    lv_obj_set_style_text_font(search, kFont, 0);
+    lv_obj_set_style_pad_ver(search, 2, 0);
+    lv_obj_set_style_pad_hor(search, 6, 0);
+    lv_obj_set_width(search, lv_pct(100));
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), search);
+    lv_obj_add_event_cb(search, onSearchChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(search, onSearchEnter,   LV_EVENT_READY,         nullptr);
+
+    return page;   /* rows are appended after `search` */
+}
+
+lv_obj_t* mkTabButton(lv_obj_t* bar, const char* text, int idx) {
+    lv_obj_t* b = lv_button_create(bar);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_flex_grow(b, 1);
+    lv_obj_set_height(b, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(b, 4, 0);
+    lv_obj_set_style_pad_ver(b, 3, 0);
+    lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* l = mkLabel(b, text, lv_color_white());
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, onTabClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+    return b;
 }
 
 void buildContactsScreen() {
@@ -957,23 +1288,21 @@ void buildContactsScreen() {
     lv_obj_set_style_pad_ver(s_contacts, 1, 0);
     lv_obj_set_style_pad_row(s_contacts, 2, 0);
 
-    s_search = lv_textarea_create(s_contacts);
-    lv_textarea_set_one_line(s_search, true);
-    lv_textarea_set_placeholder_text(s_search, "Search or 32-hex address");
-    lv_obj_set_style_text_font(s_search, kFont, 0);
-    lv_obj_set_style_pad_ver(s_search, 2, 0);
-    lv_obj_set_style_pad_hor(s_search, 6, 0);
-    lv_obj_set_width(s_search, lv_pct(100));
-    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_search);
-    lv_obj_add_event_cb(s_search, onSearchChanged, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(s_search, onSearchEnter,   LV_EVENT_READY,         nullptr);
+    /* Tab bar: two equal buttons. */
+    lv_obj_t* bar = lv_obj_create(s_contacts);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_width(bar, lv_pct(100));
+    lv_obj_set_height(bar, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(bar, 3, 0);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    s_tabBtnC = mkTabButton(bar, "Contacts",    0);
+    s_tabBtnM = mkTabButton(bar, "On the Mesh", 1);
 
-    s_list = lv_obj_create(s_contacts);
-    lv_obj_remove_style_all(s_list);
-    lv_obj_set_width(s_list, lv_pct(100));
-    lv_obj_set_flex_grow(s_list, 1);
-    lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(s_list, 1, 0);
+    s_listC = buildTabPage(s_tabContacts, s_searchC, "Search contacts or 32-hex");
+    s_listM = buildTabPage(s_tabMesh,     s_searchM, "Search the mesh");
+
+    setActiveTab(g_activeTab);   /* Contacts by default; also styles the tab bar */
 }
 
 /* ---- identity picker ---- */
@@ -1033,11 +1362,13 @@ void showIdPicker(const std::vector<int>& ids) {
 }
 
 /* Route to the right first screen for the current identity set: picker (>1),
- * straight into the list (exactly 1), or the list's guidance (none). Called on
- * open and whenever the identity set changes while still unpicked. */
+ * straight into the list (exactly 1), or the list's guidance (none). Routes on
+ * *loaded* identities (dest hash known), not connected ones, so stored history
+ * shows the moment the identity loads — seconds before its mailbox comes up.
+ * Called on open and whenever the identity set changes while still unpicked. */
 void routeByIdentity() {
     std::vector<int> ids;
-    usableIds(ids);
+    loadedIds(ids);
     if (ids.size() > 1) {
         showIdPicker(ids);
     } else if (ids.size() == 1) {
@@ -1089,6 +1420,7 @@ void onStorageChange(const char* key, const char*) {
 
     if (s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)) {
         if (!announceOnly) rebuildThread();
+        composeReflectUp();        /* enable/label compose the instant `up` flips */
     } else if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
         scheduleListRefresh();
     }
@@ -1100,8 +1432,10 @@ void onStorageChange(const char* key, const char*) {
 void onLayerDelete(lv_event_t*) {
     /* App-layer objects only — s_newIdTa / s_importTa live in the Settings
      * program's layer and null themselves via their own DELETE handlers. */
-    s_layer = nullptr; s_idpick = nullptr; s_contacts = nullptr; s_search = nullptr;
-    s_list = nullptr; s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
+    s_layer = nullptr; s_idpick = nullptr; s_contacts = nullptr;
+    s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
+    s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
+    s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
     s_compose = nullptr; s_threadName = nullptr; g_focusTarget = nullptr;
     g_listRefreshPending = false;
     /* A queued search rebuild would touch freed widgets — drop it. */
@@ -1113,9 +1447,12 @@ void onLayerDelete(lv_event_t*) {
 void lxmfApp(void* arg) {
     refreshFont();   /* vector UI font live before any label / printable() */
     s_layer = static_cast<lv_obj_t*>(arg);
-    s_idpick = nullptr; s_contacts = nullptr; s_search = nullptr; s_list = nullptr;
+    s_idpick = nullptr; s_contacts = nullptr;
+    s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
+    s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr; s_threadName = nullptr;
-    g_curPeer.clear(); g_query.clear();
+    g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
+    g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
     g_listRefreshPending = false;
     g_searchTimer = nullptr;   /* prior layer's onLayerDelete already freed it */
@@ -1141,6 +1478,8 @@ void lxmfSettingsPane(void* arg) {
     lcdSettingSlider (p, "Re-announce interval (s)", "s.lxmf.announce_interval_s", 0, 21600);
     lcdSettingCaption(p, "0 = announce on demand only.");
     lcdSettingSlider (p, "Announce catalogue cap", "s.lxmf.max_announces", 256, 8192);
+    lcdSettingSlider (p, "On-the-mesh horizon (s)", "s.lxmf.on_mesh_expire", 0, 86400);
+    lcdSettingCaption(p, "Hide mesh peers unheard for longer; 0 = show all.");
     lcdSettingSlider (p, "Advertised stamp cost", "s.lxmf.stamp_cost", 0, 18);
     lcdSettingCaption(p, "PoW cost (bits) senders pay; 0 = none.");
     lcdSettingSwitch (p, "Generate stamps", "s.lxmf.generate_stamps");

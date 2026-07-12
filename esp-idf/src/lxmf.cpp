@@ -3994,6 +3994,13 @@ void LxmfService::onInit()
     storageDefault("s.lxmf.stamp_cost",      16);
     storageDefault("s.lxmf.generate_stamps", 1);
 
+    /* On-the-mesh view horizon (seconds): the LCD "On the Mesh" tab hides any
+     * dest whose last announce is older than this. UI-only — the announce
+     * catalogue itself is bounded by max_announces, not this. 0 = show all.
+     * Unconditional (not version-gated) so it lands on already-initialised
+     * devices too. */
+    storageDefault("s.lxmf.on_mesh_expire",  3600);
+
     /* Message-notification sound (played via the optional spangap/audio engine).
      * Default to the bundled ding shipped into /fixed; the path is a setting so
      * users can point it at their own device-rate WAV. sound_enabled is the
