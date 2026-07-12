@@ -1291,6 +1291,13 @@ static bool loadIdentityForSlot(int n)
 
     subscribePerIdCmds(n);
 
+    /* Publish the delivery address now. It's pure local crypto — no rnsd, no
+     * clock, no network — so the UI can show this identity and its stored
+     * history the instant we boot, long before connectOurDest brings the
+     * mailbox up. `up` stays unset until then, which is what gates sending. */
+    storageSet(idEphPath(n, "dest_hash").c_str(),
+               bytesToHex(slot.dest_hash, LXMF_DEST_HASH_LEN).c_str());
+
     uint8_t id_hash[RNSD_IDENT_HASH_LEN] = {};
     rnsdIdentityHash(ikey.c_str(), id_hash);
     info("id %d: loaded identity %s dest=%s", n,
@@ -1593,6 +1600,18 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
         storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
         storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "identity disabled");
+        return;
+    }
+
+    /* The identity can be loaded (dest hash published, history visible) before
+     * its delivery dest is connected — the post-reset window while rnsd comes
+     * up. A send can't be transmitted without a live handle; fail it cleanly
+     * rather than reach into rnsd with an unconnected dest. The UIs gate send
+     * on `up`, so this is a backstop for the CLI / a race. */
+    if (id.handle < 0) {
+        warn("id %d: msg %s not sent (mailbox not up yet)", id.index, mid.c_str());
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "mailbox still starting");
         return;
     }
 
@@ -3742,6 +3761,15 @@ static void lxmfTaskMain(void*)
 {
     info("[%s] task up", TAG);
 
+    /* Local bootstrap — pure crypto + storage, no rnsd/clock/network needed.
+     * Load each stored identity, compute and publish its delivery address, and
+     * install its per-id command subs. Done *before* the rns.ready barrier so a
+     * just-reset device surfaces its mailbox (and stored history) almost at
+     * once; only connecting the dest + announcing waits on rnsd below. The send
+     * path is guarded on a live dest handle, so a command arriving in this
+     * pre-connect window fails cleanly instead of touching an unconnected dest. */
+    loadAllIdentities();
+
     /* Boot barrier: stay quiet until rns.ready — clock valid, network up (if
      * configured), and the minimum settle floor elapsed. This is what stops the
      * 1970-stamped first announce: rns.ready can't fire before the clock wait
@@ -3805,12 +3833,12 @@ static void lxmfTaskMain(void*)
      * Bounded; proceeds on timeout. */
     waitForTime(0);
 
-    /* Bootstrap. rnsd should be up by the time the first events arrive;
-     * we'll just block in itsConnect if it's not. loadAllIdentities
-     * calls loadIdentityForSlot which installs per-id cmd subs. We do
-     * NOT announce here — that's driven by iface_event_seq + the
-     * periodic schedule, both checked from the 1 Hz tick. */
-    loadAllIdentities();
+    /* Connect each loaded identity's delivery dest — this is the step that
+     * actually needs rnsd. The identities themselves (keys + dest hashes) were
+     * loaded before the barrier. rnsd should be up by the time we get here; we'll
+     * just block in itsConnect if it's not. We do NOT announce here — that's
+     * driven by iface_event_seq + the periodic schedule, both checked from the
+     * 1 Hz tick. */
     for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
         if (s_ids[n].used) connectOurDest(s_ids[n]);
     }
