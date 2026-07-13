@@ -326,7 +326,7 @@ label            "main" | "imported" | user-set
 enabled          1 (default); 0 = dark
 display_name     utf-8, advertised in announces
 default_method   auto (default) | opportunistic | direct
-contacts.<peer>.{hash,nick,display_name,trust,last_seen}   address book (firmware stubs on first inbound)
+contacts.<peer>.{hash,nick,display_name,trust,last_seen}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces)
 msgs.<peer>.<key>.{dir,stage,peer,title,content,thread,method,ts,read,
                    wire,message_id,attempts,last_error}    per-conversation message records
 ```

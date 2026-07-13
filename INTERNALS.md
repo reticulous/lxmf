@@ -93,8 +93,6 @@ State these as absent, not "coming":
   per-message budget but the automatic `OUT_CANCEL` at
   `MAX_DELIVERY_ATTEMPTS` is not wired (user-initiated cancel is); a failed
   send is re-issued by the client writing `cmd.send` again.
-- **Backchannel Link reuse after a DIRECT delivery** (re-identify on the
-  same Link so the peer can reply without opening a new one).
 - **Multi-identity UX.** The schema is an array from day one
   (`LXMF_MAX_IDENTITIES = 4`); single-identity simply runs at `n = 0`. There
   is no picker / generate / import flow beyond the settings panes.
@@ -154,7 +152,7 @@ clients write — no self-notify churn.
 | `msgs.<peer>.<key>.read` | client | inbound flag; firmware ignores it |
 | `msgs.<peer>.<key>.stage` | client writes initial `draft`; firmware owns all later values | transitions only via `cmd.*` |
 | `msgs.<peer>.<key>.{wire,message_id,attempts,last_error}` | firmware | derived after pack |
-| `contacts.<m>.*` | client | firmware stubs on first inbound, then reads only |
+| `contacts.<m>.*` | client, except: firmware stubs on first inbound/outbound, refreshes `display_name` on every announce and `last_seen` on every inbound | `nick`/`trust` are purely client-owned |
 | `lxmf.cmd.*`, `lxmf.id.<n>.cmd.*` | client writes, firmware deletes | imperative actions |
 
 **Self-clearing command keys.** One-shot actions with no persistent state;
@@ -276,6 +274,23 @@ opcodes `RNSD_LINK_RESOURCE_{INBOUND_DONE,OUTBOUND_DONE,FAILED}`
 (`onResourceAux`); the inbound buffer is rnsd-owned and released via
 `rnsdResourceRelease` even on the drop path.
 
+**Backchannel identification, both directions** (mirrors upstream
+LXMRouter's `backchannel_identified`). Outbound: after the *first
+delivered* settle on a conversation Link, `directLinkSettle` sends
+`rnsdLinkIdentify(tag)` — rnsd signs a `LINKIDENTIFY` with the identity
+the link was opened with — so the peer can reuse our Link for replies
+instead of opening its own. Once per link; a lost aux merely degrades to
+the peer opening its own reply link. Inbound: when a peer identifies on
+a Link into us, rnsd validates the signature and publishes
+`rnsd.links.<tag>.remote_identity` + `.remote_dest` (the peer's dest
+hash on the link's own aspect); `inlinkPollIdentified` (1 Hz) copies
+`remote_dest` into the inlink slot, and `processReady` then prefers —
+in order — a warm conversation Link, an identified inbound Link
+(the backchannel), a fresh Link. Riding the peer's link saves a full
+LR/LRPROOF handshake, which is the expensive part over half-duplex
+LoRa. Anonymous (never-identified) inbound Links are receive-only,
+exactly as before.
+
 ## 6. Outbound lifecycle
 
 ```
@@ -297,7 +312,8 @@ processReady — method resolution (after the wire is packed, so oversize
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "direct"        → use a Link
   "opportunistic" → fail if oversize, else OUT_PACKET on the mailbox handle
-  "auto"          → use a Link if oversize OR a conversation Link to peer is already warm
+  "auto"          → use a Link if oversize OR a conversation Link to peer is already
+                    warm OR the peer has an identified inbound Link (backchannel)
   large + Link    → rnsdLinkSendResource (Resource over the Link)
 ```
 
@@ -390,6 +406,15 @@ node per entry keeps the PSRAM block count down. Bounded by
 `s.lxmf.max_announces` (default 2048; `annCountAndMaybeOldest` evicts the
 smallest `last_s` on overflow — O(N), only on a new dest at capacity).
 
+The catalogue is a bare-prefix key: RAM-only, gone on reboot. So
+`onAnnounceFromRnsd` also writes the announced name verbatim into
+`contacts.<dest>.display_name` of every slot that has that contact — the
+announce is authoritative for the name (a nameless announce clears it), and
+this write is what makes it reboot-durable. Unconditional (no read-compare —
+storage no-ops identical values); frontends therefore never need to promote
+announce names into contacts themselves, they only fall back to the live
+catalogue for non-contact peers.
+
 **Concurrency:** `AnnounceFanout::received_announce` runs on the **rnsd**
 task (inside `Transport::inbound`) but only does `memcpy + itsSend(timeout=0)`
 per subscriber; all announce-catalogue storage writes happen on the **lxmf**
@@ -448,7 +473,7 @@ size gate), documented in [rns](../rns), not here.
 
 ```
 label · enabled (1) · display_name · default_method (auto)
-contacts.<m>.{hash,nick,display_name,trust,last_seen}   (firmware stubs on first inbound)
+contacts.<m>.{hash,nick,display_name,trust,last_seen}   (firmware stubs on first inbound/outbound; display_name re-written from every announce)
 
 msgs.<id>.dir            in | out
 msgs.<id>.stage          draft(client) | queued | sending | sent | delivered | failed | cancelled | received

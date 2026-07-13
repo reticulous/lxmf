@@ -421,41 +421,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const displayName = (peer: string) =>
     nameMap.value.get(peer) ?? shortHash(peer)
 
-  /* Signal model: a peer we've exchanged messages with (any stored
-   * in/out message) automatically becomes a contact, and the contact
-   * carries the durable name in synced storage — so it survives announce
-   * churn and is coherent across frontends. We own
-   * contacts.<peer>.{hash,display_name} (firmware owns trust/last_seen,
-   * disjoint). Non-conversation peers are intentionally NOT persisted —
-   * their name may age out with the announce, which is acceptable. */
-  const convPeers = () =>
-    Object.keys(device.get(`s.lxmf.id.${activeId.value}.msgs`) ?? {})
-  watch(
-    () => convPeers().map(p =>
-      `${p}:${nameMap.value.get(p) ?? ''}:${contacts.value[p]?.displayName ?? ''}`
-    ).join('|'),
-    () => {
-      const n = activeId.value
-      const patch: Patch = {}
-      let any = false
-      for (const peer of convPeers()) {
-        const c = contacts.value[peer]
-        const name = nameMap.value.get(peer)
-        if (!c) {                                   // exchange ⇒ contact
-          deepAssign(patch, nest(`s.lxmf.id.${n}.contacts.${peer}.hash`, peer))
-          any = true
-        }
-        if (name && !(c && c.displayName)) {        // promote resolved name
-          deepAssign(patch,
-            nest(`s.lxmf.id.${n}.contacts.${peer}.display_name`, name))
-          any = true
-        }
-      }
-      if (any) device.sendJson(patch)
-    },
-    { immediate: true },
-  )
-
   const reachMap = computed<Map<string, Reachability>>(() => {
     const m = new Map<string, Reachability>()
     for (const a of announces.value) m.set(a.hash, { lastSeenS: a.lastSeen, hops: a.hops })
