@@ -395,18 +395,31 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
 
   const announces = computed<Announce[]>(() => {
     const raw = device.get('lxmf.announces') ?? {}
+    /* Announce stamps are device monotonic seconds-since-boot (an offline
+     * device has no wall clock). sys.boot_time is the wall-clock instant the
+     * device booted, so boot_time + mono = real Unix time we can age against
+     * Date.now(). 0 (unknown) until the device clock is valid; sort on the raw
+     * monotonic value so newest-first order holds even in that window. */
+    const boot = num(device.get('sys.boot_time'))
     return Object.keys(raw).map((hash) => {
       // "<last_s>|<cost>|<hops>|<ratchet>|<name>"
       const [last, cost, hops, ratchet, ...rest] = str(raw[hash]).split('|')
       return {
         hash,
-        name: rest.join('|'),
-        lastSeen: num(last),
+        mono: num(last),
         cost: num(cost),
         hops: num(hops, HOPS_UNKNOWN),
         ratchet: str(ratchet),
+        name: rest.join('|'),
       }
-    }).sort((a, b) => b.lastSeen - a.lastSeen)
+    }).sort((a, b) => b.mono - a.mono).map((a): Announce => ({
+      hash: a.hash,
+      name: a.name,
+      lastSeen: boot > 0 && a.mono > 0 ? boot + a.mono : 0,
+      cost: a.cost,
+      hops: a.hops,
+      ratchet: a.ratchet,
+    }))
   })
 
   /** Memoized snapshot-pure resolver (§3.1, §9): recomputed only when

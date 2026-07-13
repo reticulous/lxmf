@@ -52,6 +52,7 @@
 #include "mem.h"
 #include "storage.h"
 #include "compat.h"
+#include "esp_timer.h"
 
 #include <string>
 #include <string_view>
@@ -919,6 +920,13 @@ struct Conv { std::string peer, preview; long ts = 0; int unread = 0; };
 /* Compact "time since" badge shown at the right of every row: how long ago we
  * last heard this dest announce. Chat-app style — s / m(inutes) / h / d / w / y.
  * Empty string (drawn as nothing) when we've never heard it. */
+/* Monotonic seconds since boot — the domain announce stamps live in (lxmf.cpp
+ * writes them from esp_timer, not wall time, so an offline device still ages
+ * them correctly). Age math must diff against this, NOT time(nullptr): mixing a
+ * wall-clock now with a since-boot stamp yields a ~epoch-sized age, which made
+ * the on-mesh expiry filter reject every announce (empty "On the Mesh" tab). */
+long nowMonoS() { return (long)(esp_timer_get_time() / 1000000); }
+
 std::string relAge(long secs) {
     if (secs < 0) secs = 0;
     char b[12];
@@ -1101,7 +1109,7 @@ void showInfo(const std::string& peer) {
 
     long la = lastAnnounce(peer);
     if (la > 0)
-        mkLabel(body, "Heard on the mesh " + relAge((long)time(nullptr) - la) + " ago",
+        mkLabel(body, "Heard on the mesh " + relAge(nowMonoS() - la) + " ago",
                 lv_color_hex(0x8a93a0));
 
     lv_obj_t* del = lv_button_create(body);
@@ -1282,7 +1290,7 @@ void rebuildList(bool keepScroll) {
         return;
     }
 
-    long now = (long)time(nullptr);
+    long now = nowMonoS();   /* announce stamps are monotonic since-boot, not wall time */
 
     /* ---- Contacts tab: conversations, newest-comms first, each with a
      * last-heard-announce badge and a swipe-to-delete. ---- */
