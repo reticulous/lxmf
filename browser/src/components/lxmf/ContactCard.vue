@@ -23,21 +23,15 @@
 
       <div v-if="reachLine" class="reach">{{ reachLine }}</div>
 
+      <!-- Grouped in fours for eye comparison; the copy button still yields
+           the bare hex (paste targets want it unspaced). -->
       <div class="sect">Destination hash</div>
       <div class="addr">
-        <span class="addrhex">{{ peer }}</span>
+        <span class="addrhex">{{ groupedHash }}</span>
         <button class="copy" :title="copied ? 'Copied' : 'Copy'" @click="copyHash">
           <q-icon :name="copied ? matCheck : matContentCopy" size="15px" />
         </button>
       </div>
-
-      <div class="sect">Safety number</div>
-      <div class="hint">
-        Compare this with your contact through another channel to verify
-        no one is intercepting. There is no network read receipt — this
-        is the only verification this client offers.
-      </div>
-      <div class="sn">{{ groupedHash }}</div>
 
       <template v-if="ratchet">
         <div class="sect">Ratchet</div>
@@ -121,7 +115,6 @@ const reachLine = computed(() => {
   color: #aaa; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase;
   letter-spacing: 0.05em; margin: 16px 0 6px;
 }
-.hint { color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); line-height: 1.4; margin-bottom: 8px; }
 .sn {
   font-family: 'JetBrains Mono', 'Menlo', monospace; font-size: calc(13px * var(--rfs, 1));
   color: #c8d8c8; background: #232323; border-radius: 8px;
@@ -135,7 +128,7 @@ const reachLine = computed(() => {
 .addrhex {
   flex: 1; min-width: 0;
   font-family: 'JetBrains Mono', 'Menlo', monospace; font-size: calc(12px * var(--rfs, 1));
-  color: #c8d8c8; word-break: break-all; line-height: 1.5;
+  color: #c8d8c8; line-height: 1.5;
 }
 .copy {
   flex: none; background: none; border: none; color: #9a9a9a;

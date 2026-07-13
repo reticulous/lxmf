@@ -12,18 +12,24 @@
  *     a hardware keyboard types straight into it). Contacts is selected first.
  *       Contacts:    peers you've messaged, newest-comms first; name +
  *                     last-message preview, a last-heard-announce age badge at
- *                     the right, and a phone-style swipe-left-to-delete (reveals
- *                     a red trashcan; the tap writes the delete sentinel). A
+ *                     the right, and a circled-i button opening the contact
+ *                     info page (which holds the delete-conversation flow). A
  *                     bare 32-hex query offers "message this address".
  *       On the Mesh:  every dest heard announcing within s.lxmf.on_mesh_expire
  *                     seconds (default 3600; 0 = all), newest first, age-badged.
  *                     No dedup with Contacts. The announce catalogue can hold
  *                     thousands, so it's capped (MESH_ROW_CAP) with a footer
  *                     noting the remainder; the search box narrows it.
- *   - Thread:   a back chevron + peer name + scroll-to-bottom chevron (top
- *     bar), the message bubbles (in left / out right), and a compose row
- *     (textarea + Send) at the end of the chat. The compose field is focused
- *     when the thread opens. The thread runs fullscreen (no system status bar).
+ *   - Thread:   a top bar (back chevron + peer name; tapping anywhere else on
+ *     it opens the contact info page; a scroll-to-bottom chevron at the right
+ *     appears only while the view isn't already at the bottom), the message
+ *     bubbles (in left / out right), and a compose row (textarea + Send) at
+ *     the end of the chat. The compose field is focused when the thread opens.
+ *     The thread runs fullscreen (no system status bar).
+ *   - Contact info: peer name + the destination hash grouped in fours + a
+ *     last-heard line + a Delete-conversation button behind an explicit
+ *     "Are you sure?" confirm. Opened from a contact row's circled-i or the
+ *     thread top bar; its back chevron returns to whichever screen opened it.
  *
  * Layout is tuned for density: 1px vertical padding throughout, a smaller font,
  * single-line conversation summaries. Message/preview/name text is run through
@@ -70,7 +76,8 @@ namespace {
 const lv_font_t* kFont = &lv_font_montserrat_12_latin;
 void refreshFont() { kFont = lcdFont(LcdFace::UI, (int)(14 * lcdUiScale() + 0.5f)); }
 
-const int HDR_H = 20;   /* thread top bar height */
+const int HDR_H = 30;   /* thread top bar height — tall: the bar itself is the tap
+                           target that opens the contact info page */
 
 /* On-the-mesh render cap: heard announces can number in the thousands
  * (s.lxmf.max_announces defaults to 2048). One LVGL row per peer would blow the
@@ -170,6 +177,11 @@ lv_obj_t* s_thread   = nullptr;         /* conversation screen (built once, reus
 lv_obj_t* s_msgList  = nullptr;         /* scroll container inside s_thread */
 lv_obj_t* s_bubbles  = nullptr;         /* bubble column (cleaned+rebuilt) inside s_msgList */
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
+lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
+lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
+lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
+std::string g_infoPeer;                 /* peer shown on the contact info page */
+bool      g_infoFromThread = false;     /* where its back chevron returns to */
 lv_obj_t* s_compose  = nullptr;         /* compose textarea (last child of s_msgList) */
 lv_obj_t* s_newIdTa  = nullptr;         /* "Add identity" name field (settings pane) */
 lv_obj_t* s_importTa = nullptr;         /* "Import identity" hex field (settings pane) */
@@ -184,6 +196,9 @@ void openThread(const std::string& peer);
 void scheduleListRefresh();
 void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
+void showInfo(const std::string& peer);
+void closeInfo();
+void updateThreadDownVis();
 
 /* ---- deferred focus ----
  * The launcher tile (or a tapped row) is focused into the input group on
@@ -538,15 +553,28 @@ void markRead(const std::string& peer) {
 
 /* ---- scrolling ---- */
 
+/* The header down-chevron is a "there's more below" cue: shown only while the
+ * view isn't already at the bottom. Re-checked on every scroll event (including
+ * each animation frame, so an animated jump hides it as it lands). */
+void updateThreadDownVis() {
+    if (!s_threadDown || !s_msgList) return;
+    if (lv_obj_get_scroll_bottom(s_msgList) <= 2)
+        lv_obj_add_flag(s_threadDown, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_remove_flag(s_threadDown, LV_OBJ_FLAG_HIDDEN);
+}
+
 void scrollThreadBottom(bool anim) {
     if (!s_msgList) return;
     lv_obj_update_layout(s_msgList);
     lv_obj_scroll_to_y(s_msgList, LV_COORD_MAX, anim ? LV_ANIM_ON : LV_ANIM_OFF);
+    updateThreadDownVis();   /* instant jumps land now; animated ones keep updating per frame */
 }
 
 /* ---- navigation ---- */
 
 void showContacts() {
+    closeInfo();                            /* a leftover info page would sit on top */
     lcdProgramFullscreen(false);            /* status bar back for the list screen */
     if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick) lv_obj_add_flag(s_idpick, LV_OBJ_FLAG_HIDDEN);
@@ -567,12 +595,19 @@ void buildThreadShell() {
     lv_obj_set_style_bg_opa(s_thread, LV_OPA_COVER, 0);
     lv_obj_set_flex_flow(s_thread, LV_FLEX_FLOW_COLUMN);
 
-    /* Header: back chevron + peer name + scroll-to-bottom chevron. */
+    /* Header: back chevron + peer name + (conditional) scroll-to-bottom
+     * chevron. The bar itself is a tap target too — anywhere that isn't one of
+     * the clickable chevrons (they win their own hit-test) opens the contact
+     * info page, mirroring the web thread header. */
     lv_obj_t* hdr = lv_obj_create(s_thread);
     lv_obj_remove_style_all(hdr);
     lv_obj_set_size(hdr, lv_pct(100), HDR_H);
     lv_obj_set_style_bg_color(hdr, lv_color_hex(0x222b38), 0);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
+    lv_obj_add_flag(hdr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(hdr, [](lv_event_t*) {
+        if (!g_curPeer.empty()) showInfo(g_curPeer);
+    }, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* back = mkLabel(hdr, LV_SYMBOL_LEFT, lv_color_white());
     lv_obj_align(back, LV_ALIGN_LEFT_MID, 6, 0);
@@ -583,11 +618,11 @@ void buildThreadShell() {
     s_threadName = mkLabel(hdr, "", lv_color_white());
     lv_obj_align(s_threadName, LV_ALIGN_LEFT_MID, 28, 0);
 
-    lv_obj_t* down = mkLabel(hdr, LV_SYMBOL_DOWN, lv_color_hex(0xc0c8d0));
-    lv_obj_align(down, LV_ALIGN_RIGHT_MID, -6, 0);
-    lv_obj_add_flag(down, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(down, 12);
-    lv_obj_add_event_cb(down, [](lv_event_t*) { scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
+    s_threadDown = mkLabel(hdr, LV_SYMBOL_DOWN, lv_color_hex(0xc0c8d0));
+    lv_obj_align(s_threadDown, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_add_flag(s_threadDown, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_threadDown, 12);
+    lv_obj_add_event_cb(s_threadDown, [](lv_event_t*) { scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
 
     /* Scroll area (grows to fill): the bubble column only. The compose row is a
      * sibling below it (not a child), so it stays pinned to the bottom. */
@@ -599,6 +634,8 @@ void buildThreadShell() {
     lv_obj_set_style_pad_hor(s_msgList, 4, 0);
     lv_obj_set_style_pad_ver(s_msgList, 1, 0);
     lv_obj_set_style_pad_row(s_msgList, 1, 0);
+    lv_obj_add_event_cb(s_msgList, [](lv_event_t*) { updateThreadDownVis(); },
+                        LV_EVENT_SCROLL, nullptr);
 
     s_bubbles = lv_obj_create(s_msgList);
     lv_obj_remove_style_all(s_bubbles);
@@ -671,6 +708,7 @@ void composeReflectUp() {
 }
 
 void openThread(const std::string& peer) {
+    closeInfo();                            /* e.g. a nomad-link open while the info page is up */
     g_curPeer = peer;
     if (!s_thread) buildThreadShell();
     lv_label_set_text(s_threadName, peerName(peer).c_str());
@@ -900,6 +938,195 @@ long lastAnnounce(const std::string& peer) {
     return 0;
 }
 
+/* ---- contact info page (mirrors the web ContactCard) ----
+ * A full-size page on the app layer showing peer name, the destination hash
+ * grouped in fours for eye comparison, the last-heard line, and the
+ * delete-conversation flow behind an explicit confirm. The screen it covers is
+ * hidden while it's up (so keyboard focus can't reach covered widgets) and
+ * restored by the back chevron — thread or list, whichever opened it. */
+
+std::string groupHash(const std::string& h) {
+    std::string out;
+    out.reserve(h.size() + h.size() / 4);
+    for (size_t i = 0; i < h.size(); i++) {
+        if (i && i % 4 == 0) out += ' ';
+        out += h[i];
+    }
+    return out;
+}
+
+void closeInfo() {
+    if (s_info) lv_obj_delete(s_info);   /* s_confirm is a child — dies with it */
+    s_info = nullptr;
+    s_confirm = nullptr;
+    g_infoPeer.clear();
+}
+
+void closeConfirm() {
+    if (s_confirm) lv_obj_delete(s_confirm);
+    s_confirm = nullptr;
+}
+
+void infoBack() {
+    bool fromThread = g_infoFromThread;
+    closeInfo();
+    if (fromThread && s_thread && !g_curPeer.empty()) {
+        lv_obj_remove_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
+        rebuildThread();          /* pick up anything that arrived while covered */
+        composeReflectUp();
+        deferFocus(s_compose);
+    } else {
+        showContacts();           /* refreshes announces + rebuilds the rows */
+    }
+}
+
+void onConfirmDelete(lv_event_t*) {
+    if (g_id >= 0 && !g_infoPeer.empty()) {
+        /* Whole-conversation delete: lxmf wipes the msgs + contact subtree; the
+         * storage change rebuilds the list without this peer. */
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.cmd.delete", g_id);
+        storageSet(k, g_infoPeer.c_str());
+    }
+    closeInfo();
+    showContacts();               /* the conversation is gone from either origin */
+}
+
+lv_obj_t* confirmButton(lv_obj_t* parent, const char* text, lv_color_t bg) {
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_flex_grow(b, 1);
+    lv_obj_set_height(b, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(b, bg, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 4, 0);
+    lv_obj_set_style_pad_ver(b, 4, 0);
+    lv_obj_t* l = mkLabel(b, text, lv_color_white());
+    lv_obj_center(l);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+    return b;
+}
+
+void showDeleteConfirm(lv_event_t*) {
+    if (!s_info || s_confirm) return;
+
+    /* Full-page scrim absorbing taps outside the box. */
+    s_confirm = lv_obj_create(s_info);
+    lv_obj_remove_style_all(s_confirm);
+    lv_obj_set_size(s_confirm, lv_pct(100), lv_pct(100));
+    lv_obj_add_flag(s_confirm, LV_OBJ_FLAG_FLOATING);   /* opt out of the page's column flow */
+    lv_obj_set_style_bg_color(s_confirm, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_confirm, LV_OPA_50, 0);
+    lv_obj_add_flag(s_confirm, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_confirm, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* box = lv_obj_create(s_confirm);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(80));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_all(box, 10, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 8, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* msg = mkLabel(box, "Are you sure? This cannot be undone!", lv_color_white());
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, lv_pct(100));
+
+    lv_obj_t* btns = lv_obj_create(box);
+    lv_obj_remove_style_all(btns);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btns, 8, 0);
+    lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* del = confirmButton(btns, "Delete", lv_color_hex(0x5a2a2a));
+    lv_obj_add_event_cb(del, onConfirmDelete, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cnc = confirmButton(btns, "Cancel", lv_color_hex(0x2a313a));
+    lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeConfirm(); }, LV_EVENT_CLICKED, nullptr);
+    deferFocus(cnc);   /* safe default under the cursor */
+}
+
+void showInfo(const std::string& peer) {
+    refreshFont();
+    g_infoFromThread = s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
+    if (s_thread)   lv_obj_add_flag(s_thread,   LV_OBJ_FLAG_HIDDEN);
+    if (s_contacts) lv_obj_add_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
+    if (s_info) closeInfo();      /* rebuilt fresh per open — content is static */
+    g_infoPeer = peer;
+
+    s_info = lv_obj_create(s_layer);
+    lv_obj_remove_style_all(s_info);
+    lv_obj_set_size(s_info, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_info, lv_color_hex(0x10141a), 0);
+    lv_obj_set_style_bg_opa(s_info, LV_OPA_COVER, 0);
+    lv_obj_set_flex_flow(s_info, LV_FLEX_FLOW_COLUMN);
+
+    /* Header: back chevron + peer name (same bar as the thread's). */
+    lv_obj_t* hdr = lv_obj_create(s_info);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_size(hdr, lv_pct(100), HDR_H);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x222b38), 0);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
+
+    lv_obj_t* back = mkLabel(hdr, LV_SYMBOL_LEFT, lv_color_white());
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(back, 12);
+    lv_obj_add_event_cb(back, [](lv_event_t*) { infoBack(); }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), back);
+
+    lv_obj_t* title = mkLabel(hdr, peerName(peer), lv_color_white());
+    lv_obj_align(title, LV_ALIGN_LEFT_MID, 28, 0);
+
+    /* Body: scrollable column. */
+    lv_obj_t* body = lv_obj_create(s_info);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(body, 8, 0);
+    lv_obj_set_style_pad_ver(body, 6, 0);
+    lv_obj_set_style_pad_row(body, 4, 0);
+
+    mkLabel(body, "Destination hash", lv_color_hex(0x8a93a0));
+    lv_obj_t* hash = mkLabel(body, groupHash(peer), lv_color_hex(0xc8d8c8));
+    lv_label_set_long_mode(hash, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hash, lv_pct(100));
+
+    long la = lastAnnounce(peer);
+    if (la > 0)
+        mkLabel(body, "Heard on the mesh " + relAge((long)time(nullptr) - la) + " ago",
+                lv_color_hex(0x8a93a0));
+
+    lv_obj_t* del = lv_button_create(body);
+    lv_obj_remove_style_all(del);
+    lv_obj_set_width(del, lv_pct(100));
+    lv_obj_set_height(del, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(del, lv_color_hex(0x5a2a2a), 0);
+    lv_obj_set_style_bg_opa(del, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(del, 4, 0);
+    lv_obj_set_style_pad_ver(del, 4, 0);
+    lv_obj_set_style_margin_top(del, 10, 0);
+    lv_obj_t* dl = mkLabel(del, "Delete conversation", lv_color_white());
+    lv_obj_center(dl);
+    lv_obj_add_event_cb(del, showDeleteConfirm, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), del);
+
+    deferFocus(back);
+}
+
+/* Contact row circled-i tap: open the info page for that row's peer. */
+void onContactInfo(lv_event_t* e) {
+    size_t idx = (size_t)(intptr_t)lv_event_get_user_data(e);
+    if (idx < g_rowPeers.size()) showInfo(g_rowPeers[idx]);
+}
+
 /* Populate a row host (styled by the caller) with the two-line body + a
  * right-aligned age badge: [ name / one-line subtitle ]········[ age ].
  * `host` is turned into a flex row; the text stacks in a growing left column so
@@ -964,55 +1191,12 @@ void addPeerRow(lv_obj_t* list, const std::string& peer, const std::string& titl
     fillPeerContent(row, title, sub, age, titleColor);
 }
 
-/* ---- contact row: a plain tappable body + a fixed trashcan ----
+/* ---- contact row: a plain tappable body + a fixed circled-i ----
  * The body is an ordinary button (opens the thread) — structurally identical to
  * the mesh rows, which tap reliably; the earlier swipe-to-delete foreground was
  * the one thing unique to this list and made taps miss, so it's gone. A small
- * trashcan sits at the right edge (no background). Delete is destructive, so it's
- * two-tap: the first tap arms (icon → red + grown, 3 s auto-disarm), the second writes the
- * delete sentinel (the lxmf task drops the whole conversation + contact). Per-row
- * state lives in a heap ContactDel freed on the trashcan's DELETE. */
-struct ContactDel {
-    std::string peer;
-    lv_obj_t*   icon = nullptr;
-    bool        armed = false;
-    lv_timer_t* t = nullptr;
-};
-
-void contactDelDisarm(lv_timer_t* tm) {
-    auto* d = static_cast<ContactDel*>(lv_timer_get_user_data(tm));
-    d->armed = false; d->t = nullptr;
-    if (d->icon && lv_obj_is_valid(d->icon)) {
-        lv_obj_set_style_text_color(d->icon, lv_color_hex(0x8a93a0), 0);
-        lv_obj_set_style_transform_scale(d->icon, 192, 0);
-    }
-}
-
-void onContactTrash(lv_event_t* e) {
-    auto* d = static_cast<ContactDel*>(lv_event_get_user_data(e));
-    if (g_id < 0) return;
-    if (!d->armed) {
-        d->armed = true;
-        lv_obj_set_style_text_color(d->icon, lv_color_hex(0xd9534f), 0);   /* confirm cue */
-        lv_obj_set_style_transform_scale(d->icon, 320, 0);
-        d->t = lv_timer_create(contactDelDisarm, 3000, d);
-        lv_timer_set_repeat_count(d->t, 1);
-    } else {
-        if (d->t) { lv_timer_delete(d->t); d->t = nullptr; }
-        /* Whole-conversation delete: lxmf wipes the msgs + contact subtree; the
-         * storage change rebuilds the list without this peer (and frees this). */
-        char k[48];
-        snprintf(k, sizeof k, "lxmf.id.%d.cmd.delete", g_id);
-        storageSet(k, d->peer.c_str());
-    }
-}
-
-void onContactTrashFree(lv_event_t* e) {
-    auto* d = static_cast<ContactDel*>(lv_event_get_user_data(e));
-    if (d->t) { lv_timer_delete(d->t); d->t = nullptr; }
-    delete d;
-}
-
+ * circled-i sits at the right edge (no background) and opens the contact info
+ * page, which holds the delete-conversation flow behind an explicit confirm. */
 void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& title,
                    const std::string& sub, const std::string& age, lv_color_t titleColor) {
     int lineH = lv_font_get_line_height(kFont);
@@ -1037,24 +1221,23 @@ void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& t
 
     fillPeerContent(row, title, sub, age, titleColor);   /* row → flex: [body][age] */
 
-    /* Fixed trashcan at the right edge (grey icon, no background). */
-    auto* d = new ContactDel();
-    d->peer = peer;
-    lv_obj_t* trash = lv_button_create(row);
-    lv_obj_remove_style_all(trash);
-    lv_obj_set_size(trash, lineH + 14, 2 * lineH);
-    lv_obj_set_style_bg_opa(trash, LV_OPA_TRANSP, 0);
-    lv_obj_remove_flag(trash, LV_OBJ_FLAG_SCROLLABLE);
-    d->icon = mkLabel(trash, LV_SYMBOL_TRASH, lv_color_hex(0x8a93a0));
-    lv_obj_center(d->icon);
-    /* Resting icon is shrunk to 75%; arming grows it to 125% (scale is /256,
-     * pivot centered so it grows in place). */
-    lv_obj_set_style_transform_pivot_x(d->icon, lv_pct(50), 0);
-    lv_obj_set_style_transform_pivot_y(d->icon, lv_pct(50), 0);
-    lv_obj_set_style_transform_scale(d->icon, 192, 0);
-    lv_obj_add_event_cb(trash, onContactTrash,     LV_EVENT_CLICKED, d);
-    lv_obj_add_event_cb(trash, onContactTrashFree, LV_EVENT_DELETE,  d);
-    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), trash);
+    /* Fixed circled-i at the right edge (grey, no background) → info page.
+     * LVGL's symbol set has no info glyph, so it's a bordered-circle label. */
+    lv_obj_t* info = lv_button_create(row);
+    lv_obj_remove_style_all(info);
+    lv_obj_set_size(info, lineH + 14, 2 * lineH);
+    lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* ic = mkLabel(info, "i", lv_color_hex(0x8a93a0));
+    lv_obj_set_size(ic, lineH + 2, lineH + 2);
+    lv_obj_set_style_text_align(ic, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_pad_top(ic, 1, 0);
+    lv_obj_set_style_radius(ic, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(ic, 1, 0);
+    lv_obj_set_style_border_color(ic, lv_color_hex(0x8a93a0), 0);
+    lv_obj_center(ic);
+    lv_obj_add_event_cb(info, onContactInfo, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), info);
 }
 
 void grpLabel(lv_obj_t* list, const char* t) {
@@ -1436,7 +1619,9 @@ void onLayerDelete(lv_event_t*) {
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
-    s_compose = nullptr; s_threadName = nullptr; g_focusTarget = nullptr;
+    s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr;
+    s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear();
+    g_focusTarget = nullptr;
     g_listRefreshPending = false;
     /* A queued search rebuild would touch freed widgets — drop it. */
     if (g_searchTimer) { lv_timer_delete(g_searchTimer); g_searchTimer = nullptr; }
@@ -1450,7 +1635,9 @@ void lxmfApp(void* arg) {
     s_idpick = nullptr; s_contacts = nullptr;
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
-    s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr; s_threadName = nullptr;
+    s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
+    s_threadName = nullptr; s_threadDown = nullptr;
+    s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();

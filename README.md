@@ -390,6 +390,14 @@ under `conditional/spangap-lcd/` and is compiled and registered only when
 the [spangap-lcd](../spangap-lcd) straddle is in the build (the
 `lxmfLcdRegister` init hook is `when:`-gated) — no `#if` anywhere.
 
+Both frontends share the contact-info pattern: clicking anywhere on a
+conversation's header (or, on the LCD, a contact row's circled-i — the info
+icon is a cue, not the sole target) opens a per-peer info page showing the
+destination hash grouped in fours for eye comparison (the web copy button
+still yields the bare unspaced hex) and holding the delete-conversation
+flow behind an explicit "Are you sure?" confirm. The page's back chevron
+returns to whichever screen opened it — contact overview or message view.
+
 ## What it owns
 
 ```

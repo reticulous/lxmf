@@ -4,8 +4,10 @@
      silently nothing if never heard. Never a presence dot. -->
 <template>
   <div class="thread">
-    <div class="thead">
-      <button class="back" :class="{ 'back--shown': showBack }" title="Back" @click="emit('back')">
+    <!-- The whole header opens the contact card; the info icon is only the
+         visual cue. Back keeps its own handler and must not bubble. -->
+    <div class="thead" title="Contact info" @click="emit('open-contact', peer)">
+      <button class="back" :class="{ 'back--shown': showBack }" title="Back" @click.stop="emit('back')">
         <q-icon :name="matArrowBack" size="20px" />
       </button>
       <PeerAvatar :peer="peer" :name="name" :size="30" />
@@ -13,9 +15,9 @@
         <div class="name">{{ name }}</div>
         <div class="sub">{{ reachLine }}</div>
       </div>
-      <button class="info" title="Contact info" @click="emit('open-contact', peer)">
+      <span class="info">
         <q-icon :name="matInfo" size="19px" />
-      </button>
+      </span>
     </div>
 
     <div ref="scroller" class="scroll">
@@ -89,6 +91,7 @@ watch(() => props.buckets, toBottom, { deep: true, immediate: true })
   display: flex; align-items: center; gap: 10px;
   padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
   background: #1f1f1f;
+  cursor: pointer;
 }
 /* Hidden in desktop master/detail (rail always present); shown when the host
  * opts in via show-back — the on-device port and the browser's compact
@@ -102,10 +105,11 @@ watch(() => props.buckets, toBottom, { deep: true, immediate: true })
 }
 .sub { font-size: calc(11px * var(--rfs, 1)); color: #8a8a8a; height: 13px; }
 .info, .back {
+  display: inline-flex; align-items: center;
   background: none; border: none; color: #9a9a9a; cursor: pointer;
   padding: 2px; border-radius: 5px;
 }
-.info:hover { background: rgba(255,255,255,0.08); color: #cfcfcf; }
+.thead:hover .info { background: rgba(255,255,255,0.08); color: #cfcfcf; }
 .scroll { flex: 1; overflow-y: auto; padding: 8px 10px; }
 .empty { color: #888; font-style: italic; text-align: center; padding: 20px; font-size: calc(13px * var(--rfs, 1)); }
 .daysep { text-align: center; margin: 10px 0 6px; }
