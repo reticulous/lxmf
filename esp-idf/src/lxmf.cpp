@@ -2547,7 +2547,7 @@ static void onLinkInboxDisconnect(int ref)
 static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
 {
     if (len < sizeof(rnsd_link_resource_done_t)) {
-        warn("resaux: short frame %zu", len);
+        warn("resource-aux: short frame %zu", len);
         return;
     }
     rnsd_link_resource_done_t d;
@@ -2560,9 +2560,36 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                 std::memcmp(s_ids[n].dest_hash, d.local_dest_hash,
                             LXMF_DEST_HASH_LEN) == 0) { idx = n; break; }
         }
+        if (idx < 0 && d.buf && d.len >= LXMF_DEST_HASH_LEN) {
+            /* A resource can also land on a conv link WE opened (the peer
+             * replies over our link instead of opening its own). rnsd's aux
+             * then carries the REMOTE dest in local_dest_hash — an outbound
+             * link has no local landing dest — so nothing matches above.
+             * The wire saves us: DIRECT LXMs are the full packed message
+             * including the leading 16-byte destination (see
+             * onLinkInboxRecv), so recover the identity from the payload;
+             * onInboundLxm re-validates that hash anyway. */
+            const uint8_t* wire_dest = (const uint8_t*)d.buf;
+            for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+                if (s_ids[n].used &&
+                    std::memcmp(s_ids[n].dest_hash, wire_dest,
+                                LXMF_DEST_HASH_LEN) == 0) { idx = n; break; }
+            }
+        }
         if (idx < 0) {
-            warn("resaux: inbound resource for unknown dest %s — dropping",
+            /* rnsd routed a concluded resource to our aux port, so the
+             * link's local destination is one WE registered — yet no loaded
+             * identity slot claims it. Dump what we do have loaded so the
+             * mismatch is diagnosable from the log alone. */
+            warn("resource-aux: inbound resource (%uB, link %s) for unknown dest %s — dropping",
+                 (unsigned)d.len,
+                 bytesToHex(d.link_id, 16).c_str(),
                  bytesToHex(d.local_dest_hash, LXMF_DEST_HASH_LEN).c_str());
+            for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+                if (s_ids[n].used)
+                    warn("resource-aux: loaded id %d dest %s", n,
+                         bytesToHex(s_ids[n].dest_hash, LXMF_DEST_HASH_LEN).c_str());
+            }
         } else if (d.buf && d.len > 0) {
             info("id %d: inbound resource %uB → onInboundLxm",
                  idx, (unsigned)d.len);
@@ -2615,7 +2642,7 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
         return;
     }
 
-    warn("resaux: unknown opcode %u", d.opcode);
+    warn("resource-aux: unknown opcode %u", d.opcode);
 }
 
 /* Resolve outbound DIRECT sends from the 1 Hz tick by watching the

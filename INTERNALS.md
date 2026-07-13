@@ -272,7 +272,13 @@ accepted inbound Link to that port, feeding bytes into the shared
 `LXMF_LINK_RESOURCE_AUX_PORT = 101` with `rnsd_link_resource_done_t`
 opcodes `RNSD_LINK_RESOURCE_{INBOUND_DONE,OUTBOUND_DONE,FAILED}`
 (`onResourceAux`); the inbound buffer is rnsd-owned and released via
-`rnsdResourceRelease` even on the drop path.
+`rnsdResourceRelease` even on the drop path. An inbound resource can
+also conclude on a conversation link *we* opened (an identified peer
+replying over our link instead of opening its own); the aux's
+`local_dest_hash` then carries the *remote* dest — an outbound link has
+no local landing dest — so `onResourceAux` falls back to recovering the
+owning identity from the packed LXM's leading 16-byte destination hash
+(re-validated in `onInboundLxm`).
 
 **Backchannel identification, both directions** (mirrors upstream
 LXMRouter's `backchannel_identified`). Outbound: after the *first
