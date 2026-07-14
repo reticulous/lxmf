@@ -143,7 +143,7 @@ lv_obj_t* mkLabel(lv_obj_t* parent, const std::string& txt, lv_color_t color) {
 struct Msg {
     std::string peer, key, content, stage;
     long ts = 0;
-    bool in = false, read = false;
+    bool in = false;
 };
 
 struct Ann { std::string hash, name; long last = 0; };   /* a heard announce */
@@ -160,7 +160,9 @@ std::string       g_qContacts;          /* Contacts-tab search-box text */
 std::string       g_qMesh;              /* On-the-Mesh-tab search-box text */
 int               g_activeTab = 0;      /* 0 = Contacts, 1 = On the Mesh (default Contacts) */
 bool              g_subscribed = false;
-bool              g_listRefreshPending = false;   /* a coalesced list rebuild is queued */
+bool              g_refreshPending = false;   /* a coalesced view rebuild is queued */
+bool              g_refreshMsgs    = false;   /* pending changes dirtied the msgs walk */
+bool              g_refreshAnns    = false;   /* pending changes dirtied the announce walk */
 lv_timer_t*       g_searchTimer = nullptr;        /* one-shot search debounce (null = idle) */
 
 lv_obj_t* s_layer    = nullptr;
@@ -194,7 +196,7 @@ void rebuildThread();
 void showContacts();
 void setActiveTab(int n);
 void openThread(const std::string& peer);
-void scheduleListRefresh();
+void scheduleRefresh();
 void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
@@ -335,7 +337,6 @@ void msgCb(const char* key, const char* val) {
     if      (!strcmp(field, "dir"))     m->in   = (val && !strcmp(val, "in"));
     else if (!strcmp(field, "content")) m->content = val ? val : "";
     else if (!strcmp(field, "ts"))      m->ts   = val ? atol(val) : 0;
-    else if (!strcmp(field, "read"))    m->read = (val && atoi(val) != 0);
     else if (!strcmp(field, "stage"))   m->stage = val ? val : "";
 }
 
@@ -417,7 +418,7 @@ void sendMessage(const std::string& peer, const std::string& text) {
        on peer+key, so this entry is replaced in place rather than doubled. */
     Msg m;
     m.peer = peer; m.key = key; m.content = text; m.stage = "queued";
-    m.ts = ts; m.in = false; m.read = false;
+    m.ts = ts; m.in = false;
     g_msgs.push_back(std::move(m));
 }
 
@@ -542,14 +543,16 @@ void lxmfIdentityBlock(lv_obj_t* p, int n, const char* destKey, const char* enKe
 }
 
 void markRead(const std::string& peer) {
-    for (auto& m : g_msgs) {
-        if (m.peer == peer && m.in && !m.read) {
-            char k[200];
-            snprintf(k, sizeof k, "s.lxmf.id.%d.msgs.%s.%s.read", g_id, peer.c_str(), m.key.c_str());
-            storageSet(k, 1);
-            m.read = true;
-        }
-    }
+    /* One per-conversation watermark instead of a read-flag per message: record
+       the newest message ts as "read up to here". Turns the old O(messages)
+       write burst (which broke liveness) into a single write. */
+    long newest = 0;
+    for (auto& m : g_msgs)
+        if (m.peer == peer && m.ts > newest) newest = m.ts;
+    if (newest <= 0) return;
+    char k[160];
+    snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.read_ts", g_id, peer.c_str());
+    if (storageGetInt(k, 0) < (int)newest) storageSet(k, (int)newest);
 }
 
 /* ---- scrolling ---- */
@@ -915,7 +918,7 @@ void rebuildThread() {
 
 /* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
 
-struct Conv { std::string peer, preview; long ts = 0; int unread = 0; };
+struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; };
 
 /* Compact "time since" badge shown at the right of every row: how long ago we
  * last heard this dest announce. Chat-app style — s / m(inutes) / h / d / w / y.
@@ -1299,9 +1302,14 @@ void rebuildList(bool keepScroll) {
     for (auto& m : g_msgs) {
         Conv* c = nullptr;
         for (auto& x : convs) if (x.peer == m.peer) { c = &x; break; }
-        if (!c) { convs.push_back({ m.peer, "", 0, 0 }); c = &convs.back(); }
+        if (!c) {
+            convs.push_back({ m.peer, "", 0, 0 }); c = &convs.back();
+            char rk[160];
+            snprintf(rk, sizeof rk, "s.lxmf.id.%d.contacts.%s.read_ts", g_id, m.peer.c_str());
+            c->read_ts = storageGetInt(rk, 0);
+        }
         if (m.ts >= c->ts) { c->ts = m.ts; c->preview = (m.in ? "" : "You: ") + m.content; }
-        if (m.in && !m.read) c->unread++;
+        if (m.in && m.ts > c->read_ts) c->unread++;
     }
     std::sort(convs.begin(), convs.end(), [](const Conv& a, const Conv& b) { return a.ts > b.ts; });
 
@@ -1579,17 +1587,31 @@ void routeByIdentity() {
  * second, and each rebuild walks the announce catalogue + clears the list (which
  * resets the scroll). Schedule at most one rebuild per window; rebuildList keeps
  * the scroll position across it so a live update never snaps you to the top. */
-void listRefreshTimerCb(lv_timer_t*) {
-    g_listRefreshPending = false;
-    if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
-        refreshAnnounces();
+/* Coalesced view refresh. A single message's queued→sending→sent→delivered
+ * walk, a markRead sweep, or the announce firehose each fires many change
+ * notifications in a burst; running a full refreshMsgs (O(msgs²)) + rebuild
+ * INLINE on every one — as the thread view used to, uncoalesced — melts the
+ * LCD task. Fold the burst into one debounced pass that runs only the walks
+ * the pending changes actually dirtied. (The optimistic send bubble is drawn
+ * directly in the send handler, so this delay never affects your own send.) */
+void refreshTimerCb(lv_timer_t*) {
+    g_refreshPending = false;
+    bool nm = g_refreshMsgs, na = g_refreshAnns;
+    g_refreshMsgs = g_refreshAnns = false;
+    if (g_id < 0) return;
+    if (s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)) {
+        if (nm) { refreshMsgs(); rebuildThread(); }
+        composeReflectUp();        /* enable/label compose the instant `up` flips */
+    } else if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
+        if (nm) refreshMsgs();
+        if (na) refreshAnnounces();
         rebuildList(true);
     }
 }
-void scheduleListRefresh() {
-    if (g_listRefreshPending) return;
-    g_listRefreshPending = true;
-    lv_timer_t* t = lv_timer_create(listRefreshTimerCb, 700, nullptr);
+void scheduleRefresh() {
+    if (g_refreshPending) return;
+    g_refreshPending = true;
+    lv_timer_t* t = lv_timer_create(refreshTimerCb, 200, nullptr);
     lv_timer_set_repeat_count(t, 1);
 }
 
@@ -1603,18 +1625,12 @@ void onStorageChange(const char* key, const char*) {
             routeByIdentity();
         return;
     }
-    /* Announce-only churn touches neither messages nor the open thread — only the
-     * on-the-mesh column. Skip the msg walk + thread rebuild, and always route the
-     * list through the coalescing scheduler so the firehose can't stall it. */
-    bool announceOnly = key && strncmp(key, "lxmf.announces", 14) == 0;
-    if (!announceOnly) refreshMsgs();
-
-    if (s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)) {
-        if (!announceOnly) rebuildThread();
-        composeReflectUp();        /* enable/label compose the instant `up` flips */
-    } else if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
-        scheduleListRefresh();
-    }
+    /* Flag which walk the change dirtied and coalesce; refreshTimerCb does the
+       expensive work once per window. Announce churn touches only the mesh
+       column, never the msg walk or the open thread. */
+    if (key && strncmp(key, "lxmf.announces", 14) == 0) g_refreshAnns = true;
+    else                                                g_refreshMsgs = true;
+    scheduleRefresh();
 }
 
 /* Layer eviction frees every widget; null our handles so a storage change
@@ -1630,7 +1646,7 @@ void onLayerDelete(lv_event_t*) {
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
-    g_listRefreshPending = false;
+    g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
     /* A queued search rebuild would touch freed widgets — drop it. */
     if (g_searchTimer) { lv_timer_delete(g_searchTimer); g_searchTimer = nullptr; }
 }
@@ -1649,7 +1665,7 @@ void lxmfApp(void* arg) {
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
-    g_listRefreshPending = false;
+    g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
     g_searchTimer = nullptr;   /* prior layer's onLayerDelete already freed it */
 
     lv_obj_add_event_cb(s_layer, onLayerDelete, LV_EVENT_DELETE, nullptr);

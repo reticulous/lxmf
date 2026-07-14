@@ -239,6 +239,22 @@ static std::string msgPath(int n, const std::string& peer,
     return buf;
 }
 
+/* Move a message to <stage> with <err>: the two keys commit as one op-list
+ * so subscribers (frontends) see a single, atomic transition instead of two
+ * back-to-back notifies. */
+static void msgStage(int n, const std::string& peer, const std::string& mid,
+                     const char* stage, const char* err)
+{
+    storageBegin();
+    storageSet(msgPath(n, peer, mid, "stage").c_str(),      stage);
+    storageSet(msgPath(n, peer, mid, "last_error").c_str(), err);
+    storageEnd();
+}
+
+/* Common case: mark an outbound message failed with a reason. */
+static void msgFail(int n, const std::string& peer, const std::string& mid,
+                    const char* why) { msgStage(n, peer, mid, "failed", why); }
+
 /* Prefix of one conversation's subtree (key empty) or one message's
  * subtree — for storageForEach / storageDeleteTree. */
 static std::string msgPrefix(int n, const std::string& peer,
@@ -272,6 +288,23 @@ static std::string contactPath(int n, const std::string& peer_hex, const char* f
     char buf[120];
     snprintf(buf, sizeof(buf), "s.lxmf.id.%d.contacts.%s.%s", n, peer_hex.c_str(), field);
     return buf;
+}
+
+/* Per-conversation read watermark: the ts (seconds) up to and including which
+ * the conversation is read; unread = inbound messages with a later ts. One
+ * scalar per conversation replaces a `read` flag on every message — marking a
+ * conversation read used to be an O(messages) write burst (and O(messages^2) to
+ * apply on the flat msgs tree, the LCD/browser liveness break). Kept under
+ * contacts (small, stays in cJSON) so it survives messages moving to a record
+ * store. */
+static int convReadTs(int n, const std::string& peer)
+{
+    return storageGetInt(contactPath(n, peer, "read_ts").c_str(), 0);
+}
+static void convMarkRead(int n, const std::string& peer, int upto_ts)
+{
+    if (upto_ts > convReadTs(n, peer))
+        storageSet(contactPath(n, peer, "read_ts").c_str(), upto_ts);
 }
 
 static uint64_t nowUnixMs(void)
@@ -1227,9 +1260,11 @@ static bool connectOurDest(lxmf_id_t& id)
     if (!rnsdDestListenLinks(h, LXMF_LINK_INBOX_PORT))
         warn("id %d: rnsdDestListenLinks failed", id.index);
 
+    storageBegin();
     storageSet(idEphPath(id.index, "up").c_str(), 1);
     storageSet(idEphPath(id.index, "dest_hash").c_str(),
                bytesToHex(id.dest_hash, LXMF_DEST_HASH_LEN).c_str());
+    storageEnd();
     return true;
 }
 
@@ -1347,9 +1382,11 @@ static void destroyIdentity(int n)
     /* secrets.lxmf.id.<n>.privkey via rnsd's identity API, plus any
      * other secrets under the subtree. */
     rnsdIdentityErase(secretsPath(n, "privkey").c_str());
+    storageBegin();
     storageDeleteTree(secretsPath(n, "").c_str());
     storageDeleteTree(idPath(n, "").c_str());
     storageDeleteTree(idEphPath(n, "").c_str());
+    storageEnd();
     *slot = lxmf_id_t{};
     info("id %d: destroyed", n);
 }
@@ -1722,8 +1759,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh)) {
         warn("id %d: msg %s ready but peer is malformed (\"%s\")",
              id.index, mid.c_str(), peer_hex.c_str());
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "bad peer");
+        msgFail(id.index, peer_hex, mid, "bad peer");
         return;
     }
 
@@ -1737,17 +1773,18 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * still land their name in `contacts.<peer>.display_name`, else every
      * frontend shows a bare hash for someone we just picked off the mesh. */
     if (!storageExists(contactPath(id.index, peer_hex, "hash").c_str())) {
+        std::string nm = announceName(peer_hex);
+        storageBegin();
         storageSet(contactPath(id.index, peer_hex, "hash").c_str(),  peer_hex.c_str());
         storageSet(contactPath(id.index, peer_hex, "trust").c_str(), 0);
-        std::string nm = announceName(peer_hex);
         if (!nm.empty())
             storageSet(contactPath(id.index, peer_hex, "display_name").c_str(), nm.c_str());
+        storageEnd();
     }
 
     if (!idEnabled(id.index)) {
         warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "identity disabled");
+        msgFail(id.index, peer_hex, mid, "identity disabled");
         return;
     }
 
@@ -1758,8 +1795,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * on `up`, so this is a backstop for the CLI / a race. */
     if (id.handle < 0) {
         warn("id %d: msg %s not sent (mailbox not up yet)", id.index, mid.c_str());
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "mailbox still starting");
+        msgFail(id.index, peer_hex, mid, "mailbox still starting");
         return;
     }
 
@@ -1800,8 +1836,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                                              stamp_cost, mid_raw);
     if (wire.empty()) {
         err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "pack/sign failed");
+        msgFail(id.index, peer_hex, mid, "pack/sign failed");
         return;
     }
 
@@ -1827,9 +1862,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         if (oversize) {
             warn("id %d: msg %s exceeds opportunistic budget (wire %zu B)",
                  id.index, mid.c_str(), wire.size());
-            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "failed");
-            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
-                       "too large for opportunistic");
+            msgFail(id.index, peer_hex, mid, "too large for opportunistic");
             return;
         }
         use_direct = false;
@@ -1847,8 +1880,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     outbound_t* o = outboundAlloc(id);
     if (!o) {
         warn("id %d: outbox full", id.index);
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "outbox full");
+        msgFail(id.index, peer_hex, mid, "outbox full");
         return;
     }
     o->used    = true;
@@ -1894,8 +1926,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         if (!cl && !bc) cl = convGet(id, peer_hex, dh);
         if (!cl && !bc) {
             o->used = false;
-            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "link open failed");
+            msgFail(id.index, peer_hex, mid, "link open failed");
             return;
         }
         const std::string ltag    = cl ? cl->tag    : bc->tag;
@@ -1918,8 +1949,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             void* rbuf = gp_alloc(wire.size());
             if (!rbuf) {
                 o->used = false;
-                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "resource malloc failed");
+                msgFail(id.index, peer_hex, mid, "resource malloc failed");
                 return;
             }
             memcpy(rbuf, wire.data(), wire.size());
@@ -1928,8 +1958,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             if (!rnsdLinkSendResource(ltag.c_str(), rbuf, wire.size(), o->send_id)) {
                 if (cl) convDrop(*cl); else inlinkDrop(*bc);
                 o->used = false;
-                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "resource send failed");
+                msgFail(id.index, peer_hex, mid, "resource send failed");
                 return;
             }
         } else {
@@ -1937,8 +1966,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             if (itsSend(lhandle, wire.data(), wire.size(), 0) == 0) {
                 if (cl) convDrop(*cl); else inlinkDrop(*bc);
                 o->used = false;
-                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "link send dropped");
+                msgFail(id.index, peer_hex, mid, "link send dropped");
                 return;
             }
         }
@@ -1961,9 +1989,11 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             o->proof_base_timeouts =
                 storageGetInt((base + ".proof_timeouts").c_str(), 0);
         }
+        storageBegin();
         storageSet(msgPath(id.index, peer_hex, mid, "method").c_str(),     "direct");
         storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sending");
         storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+        storageEnd();
         id.pending++;
         info("id %d: send DIRECT mid=%s peer=%s tag=%s%s wire=%zuB",
              id.index, mid.c_str(), peer_hex.c_str(), ltag.c_str(),
@@ -1981,12 +2011,13 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
     if (!sendFrame(id, frame.data(), frame.size())) {
         o->used = false;
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "OUT_PACKET send dropped");
+        msgFail(id.index, peer_hex, mid, "OUT_PACKET send dropped");
         return;
     }
+    storageBegin();
     storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sending");
     storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+    storageEnd();
     id.pending++;
     info("id %d: send mid=%s peer=%s send_id=%u wire=%zuB",
          id.index, mid.c_str(), peer_hex.c_str(),
@@ -2175,7 +2206,6 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     if (!fields.thread.empty())
         storageSet(msgPath(id.index, sh_hex, mid_hex, "thread").c_str(), fields.thread.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "ts").c_str(),         (int)(ts / 1000));
-    storageSet(msgPath(id.index, sh_hex, mid_hex, "read").c_str(),       0);
     storageSet(msgPath(id.index, sh_hex, mid_hex, "message_id").c_str(), mid_hex.c_str());
     /* Stub contact if new — copy display_name across from the cross-
      * identity announce catalogue if we've heard them announce. */
@@ -2367,8 +2397,7 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
             std::string peer = o->peer, mid = o->msg_key;
             o->used = false;
             if (id.pending) id.pending--;
-            storageSet(msgPath(id.index, peer, mid, "stage").c_str(),      "queued");
-            storageSet(msgPath(id.index, peer, mid, "last_error").c_str(), "rnsd busy — queued");
+            msgStage(id.index, peer, mid, "queued", "rnsd busy — queued");
             s_deferred.push_back({ id.index, peer, mid });
             verb("id %d: send_id=%u held (rnsd queue full), requeued %s",
                  id.index, (unsigned)send_id, mid.c_str());
@@ -2384,9 +2413,11 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
                 else
                     std::snprintf(buf, sizeof(buf), "retry %u (reason 0x%02x)",
                                   (unsigned)tail[0], (unsigned)tail[1]);
+                storageBegin();
                 storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), buf);
                 storageSet(msgPath(id.index, o->peer, o->msg_key, "attempts").c_str(),
                            (int)tail[0]);
+                storageEnd();
                 return;
             }
             note = "retry";
@@ -2613,15 +2644,12 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                 if (ok) {
                     /* The resource transfer ACK is proof-grade: the peer
                      * reassembled and acknowledged the full wire. */
-                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "delivered");
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+                    msgStage(id.index, peer_hex, mid, "delivered", "");
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
-                               "resource transfer failed");
+                    msgFail(id.index, peer_hex, mid, "resource transfer failed");
                     id.failed++;
                     warn("id %d: DIRECT resource failed mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
@@ -2704,14 +2732,12 @@ static void resolveDirectSends(void)
                 if (ok) {
                     /* resource.state "sent" = the transfer ACK arrived —
                      * proof-grade, same as the OUTBOUND_DONE fast path. */
-                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "delivered");
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+                    msgStage(id.index, peer_hex, mid, "delivered", "");
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), err.c_str());
+                    msgFail(id.index, peer_hex, mid, err.c_str());
                     id.failed++;
                     warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
                          id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
@@ -2733,8 +2759,7 @@ static void resolveDirectSends(void)
                 int proven = storageGetInt((base + ".tx_proven").c_str(), 0);
                 int touts  = storageGetInt((base + ".proof_timeouts").c_str(), 0);
                 if (proven > o.proof_base_proven) {
-                    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "delivered");
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+                    msgStage(id.index, peer_hex, mid, "delivered", "");
                     info("id %d: DIRECT delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                     directLinkSettle(o.link_tag, true, now_s);
@@ -2775,8 +2800,7 @@ static void resolveDirectSends(void)
                  * and switch to proof-watching: rnsd keeps the packet
                  * receipt and bumps tx_proven / proof_timeouts when the
                  * link-packet proof lands or times out. */
-                storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sent");
-                storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+                msgStage(id.index, peer_hex, mid, "sent", "");
                 id.sent++;
                 if (id.pending > 0) id.pending--;
                 info("id %d: DIRECT sent mid=%s tag=%s (awaiting proof)",
@@ -2791,8 +2815,7 @@ static void resolveDirectSends(void)
                 continue;                       /* slot stays — proof phase */
             }
 
-            storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "failed");
-            storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), err.c_str());
+            msgFail(id.index, peer_hex, mid, err.c_str());
             id.failed++;
             warn("id %d: DIRECT failed mid=%s tag=%s (%s)",
                  id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
@@ -3401,7 +3424,7 @@ static MsgRow readMsgRow(int sel, const std::string& peer, const std::string& ke
     r.stage = storageGetStr(msgPath(sel, peer, key, "stage").c_str(), "");
     r.title = storageGetStr(msgPath(sel, peer, key, "title").c_str(), "");
     r.ts    = storageGetInt(msgPath(sel, peer, key, "ts").c_str(),    0);
-    r.read  = storageGetInt(msgPath(sel, peer, key, "read").c_str(),  0);
+    r.read  = (r.ts <= convReadTs(sel, peer)) ? 1 : 0;   /* per-conversation watermark */
     return r;
 }
 
@@ -3451,11 +3474,12 @@ static void cliChats(int sel)
         ChatRow c;
         c.peer = peer;
         c.name = peerDisplayName(sel, peer);
+        int read_ts = convReadTs(sel, peer);
         for (const auto& key : collectTokens(msgPrefix(sel, peer))) {
             c.count++;
             int ts  = storageGetInt(msgPath(sel, peer, key, "ts").c_str(), 0);
-            if (storageGetStr(msgPath(sel, peer, key, "dir").c_str(), "") == "in" &&
-                storageGetInt(msgPath(sel, peer, key, "read").c_str(), 0) == 0)
+            if (ts > read_ts &&
+                storageGetStr(msgPath(sel, peer, key, "dir").c_str(), "") == "in")
                 c.unread++;
             if (ts >= c.last_ts) {
                 c.last_ts    = ts;
@@ -3562,10 +3586,7 @@ static void cliRead(const char* rest)
     if (!title.empty())  cliPrintf("title:  %s\n", title.c_str());
     cliPrintf("\n%s\n", content.c_str());
 
-    if (dir == "in" &&
-        storageGetInt(msgPath(sel, peer, mid, "read").c_str(), 0) == 0) {
-        storageSet(msgPath(sel, peer, mid, "read").c_str(), 1);
-    }
+    if (dir == "in") convMarkRead(sel, peer, ts);   /* watermark up to this msg */
 }
 
 /* ── `lxmf contacts` ── */
@@ -4129,6 +4150,7 @@ void LxmfService::onInit()
      *  - stamp_cost: the single advertised proof-of-work cost (0 = none).
      *  - generate_stamps: pay a peer's advertised cost when sending.
      * Whether we *require* inbound stamps is the enforce_stamps toggle. */
+    storageBegin();
     storageDefault("s.lxmf.stamp_cost",      16);
     storageDefault("s.lxmf.generate_stamps", 1);
 
@@ -4146,6 +4168,7 @@ void LxmfService::onInit()
      * behind the version gate) so they land on already-initialised devices. */
     storageDefault("s.lxmf.sound",         "/fixed/lxmf/ding.wav");
     storageDefault("s.lxmf.sound_enabled", 1);
+    storageEnd();
 
     s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;
 

@@ -76,7 +76,6 @@ export interface Message {
   content: string
   thread: string
   ts: number
-  read: boolean
   attempts: number
   lastError: string
   messageId: string
@@ -450,7 +449,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       content: str(r.content),
       thread: str(r.thread),
       ts: num(r.ts),
-      read: num(r.read) === 1,
       attempts: num(r.attempts),
       lastError: str(r.last_error),
       messageId: str(r.message_id),
@@ -462,13 +460,15 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const out: Conversation[] = []
     for (const peer of Object.keys(msgs)) {
       const thread = msgs[peer] ?? {}
+      // Per-conversation read watermark (ts up to which read); unread = later inbound.
+      const readTs = num(device.get(`s.lxmf.id.${activeId.value}.contacts.${peer}.read_ts`) ?? 0)
       let last: Message | null = null
       let unread = 0, count = 0
       for (const key of Object.keys(thread)) {
         const m = readMsg(peer, key, thread[key] ?? {})
         if (m.stage === 'draft') continue // never rendered (§4/§6)
         count++
-        if (m.dir === 'in' && !m.read) unread++
+        if (m.dir === 'in' && m.ts > readTs) unread++
         if (!last || m.ts >= last.ts) last = m
       }
       if (count === 0) continue
@@ -580,21 +580,19 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   }
   const announceNow = () => sendQ('announce').enqueue('1')
 
-  /** Local-only, no sentinel: one patch flipping every inbound-unread
-   *  key in the thread (§3.2 — never a set() per message). */
+  /** One per-conversation watermark write, never a set() per message: record
+   *  the newest message ts as "read up to here". Unread is derived from it. */
   function markConversationRead(peer: string) {
     const n = activeId.value
     const thread = device.get(`s.lxmf.id.${n}.msgs.${peer}`) ?? {}
-    const patch: Patch = {}
-    let any = false
+    let newest = 0
     for (const key of Object.keys(thread)) {
       const r = thread[key] ?? {}
-      if (str(r.dir) === 'in' && num(r.read) !== 1) {
-        deepAssign(patch, nest(`s.lxmf.id.${n}.msgs.${peer}.${key}.read`, 1))
-        any = true
-      }
+      if (num(r.ts) > newest) newest = num(r.ts)
     }
-    if (any) device.sendJson(patch)
+    if (newest <= 0) return
+    const cur = num(device.get(`s.lxmf.id.${n}.contacts.${peer}.read_ts`) ?? 0)
+    if (newest > cur) device.sendJson(nest(`s.lxmf.id.${n}.contacts.${peer}.read_ts`, newest))
   }
 
   const createIdentity = (label: string) =>
