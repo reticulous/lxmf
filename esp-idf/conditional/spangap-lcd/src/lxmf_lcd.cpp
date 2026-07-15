@@ -95,6 +95,15 @@ const int MESH_ROW_CAP = 48;
  * they go missing. So coalesce: rebuild once the typing pauses this long. */
 const int SEARCH_DEBOUNCE_MS = 300;
 
+/* On-the-Mesh live-refresh throttle. While that column is the visible tab it's
+ * fed by the announce firehose (several writes a second on a busy mesh). Even
+ * coalesced, rebuilding the sorted catalogue that often burns the lcd task and
+ * fights the reader, so: rebuild at most once per MESH_MIN_REBUILD_MS, and hold
+ * off entirely until the list has been still (no user scroll) for
+ * MESH_SCROLL_QUIET_MS — never re-render under a moving finger. */
+const uint32_t MESH_MIN_REBUILD_MS  = 2000;
+const uint32_t MESH_SCROLL_QUIET_MS = 5000;
+
 /* Keep only what the UI font can actually draw: strip C0/C1 control bytes and any
  * codepoint with no glyph (emoji, CJK, …). Valid UTF-8 multibyte sequences whose
  * glyph the font carries (accented Latin, if present) pass through unchanged.
@@ -173,13 +182,18 @@ bool              g_subscribed = false;
 bool              g_refreshPending = false;   /* a coalesced view rebuild is queued */
 bool              g_refreshMsgs    = false;   /* pending changes dirtied the msgs walk */
 bool              g_refreshAnns    = false;   /* pending changes dirtied the announce walk */
-bool              g_listDirty      = false;   /* list rows need a rebuild (a change altered a row or
-                                                 the mesh column); survives thread-view refreshes, so
-                                                 returning from a conversation with no change never rebuilds */
+bool              g_listDirty      = false;   /* list rows need a rebuild: a contacts/msg change always
+                                                 sets it; an announce-only change sets it only while the
+                                                 mesh column is the visible tab (else it's deferred to the
+                                                 tab switch — see onStorageChange/setActiveTab). Survives
+                                                 thread-view refreshes, so returning from a conversation
+                                                 with no change never rebuilds */
 int               g_listBuiltId    = -2;      /* identity the visible list was last built for (-2 = never).
                                                  A fresh open / identity switch differs → forces one build;
                                                  a plain return from a conversation matches → no rebuild */
 lv_timer_t*       g_searchTimer = nullptr;        /* one-shot search debounce (null = idle) */
+uint32_t          g_lastMeshBuild  = 0;   /* millis() of the last rebuild while the mesh column was visible */
+uint32_t          g_lastMeshScroll = 0;   /* millis() of the last USER scroll on the mesh list (throttle gate) */
 
 lv_obj_t* s_layer    = nullptr;
 lv_obj_t* s_idpick   = nullptr;         /* identity picker (first screen, >1 ident) */
@@ -213,6 +227,7 @@ void showContacts();
 void setActiveTab(int n, bool keepScroll = false);
 void openThread(const std::string& peer);
 void scheduleRefresh();
+void scheduleRefreshIn(uint32_t ms);
 void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
@@ -1602,6 +1617,10 @@ void setActiveTab(int n, bool keepScroll) {
     } else {
         deferFocusPinScroll(search, shown);          /* keyboard ready, list stays put */
     }
+    /* Announce churn is ignored while the mesh column is hidden (see
+       onStorageChange). If any arrived meanwhile and it's now the visible tab,
+       fold them in with one coalesced rebuild. */
+    if (!c && g_refreshAnns) { g_listDirty = true; scheduleRefresh(); }
 }
 
 void onTabClick(lv_event_t* e) {
@@ -1683,6 +1702,15 @@ lv_obj_t* mkTabButton(lv_obj_t* bar, const char* text, int idx) {
     return b;
 }
 
+/* Record USER scrolls on the mesh list so the live announce-refresh backs off
+ * while you're browsing (see refreshTimerCb's MESH_SCROLL_QUIET_MS gate). A user
+ * drag is dispatched while an input device is being processed; the rebuild's own
+ * scroll-restore runs from a timer with no active indev, so it's ignored here —
+ * otherwise every rebuild would re-arm the quiet window and starve itself. */
+void onMeshScroll(lv_event_t*) {
+    if (lv_indev_active()) g_lastMeshScroll = millis();
+}
+
 void buildContactsScreen() {
     s_contacts = lv_obj_create(s_layer);
     lv_obj_remove_style_all(s_contacts);
@@ -1707,6 +1735,7 @@ void buildContactsScreen() {
 
     s_listC = buildTabPage(s_tabContacts, s_searchC, "Search contacts or 32-hex");
     s_listM = buildTabPage(s_tabMesh,     s_searchM, "Search the mesh");
+    lv_obj_add_event_cb(s_listM, onMeshScroll, LV_EVENT_SCROLL, nullptr);   /* throttle gate */
 
     setActiveTab(g_activeTab);   /* Contacts by default; also styles the tab bar */
 }
@@ -1816,18 +1845,37 @@ void refreshTimerCb(lv_timer_t*) {
          * conversation must not churn (or move the scroll). The list reads the
          * contacts directory + g_anns; it never needs the g_msgs walk. */
         if (g_listDirty) {
+            /* While the On-the-Mesh column is the visible tab, its data is the
+               announce firehose. Throttle its live rebuild: at most once per
+               MESH_MIN_REBUILD_MS, and not at all while the list has been scrolled
+               within the last MESH_SCROLL_QUIET_MS. If gated, re-arm for the
+               remaining quiet time and keep the dirty flags so the update still
+               lands once things settle. The Contacts tab isn't announce-driven
+               (see onStorageChange), so its changes stay on the fast 200 ms path. */
+            bool meshVisible = s_tabMesh && !lv_obj_has_flag(s_tabMesh, LV_OBJ_FLAG_HIDDEN);
+            if (meshVisible) {
+                uint32_t now = millis();
+                uint32_t wait = 0;
+                if (now - g_lastMeshBuild  < MESH_MIN_REBUILD_MS)
+                    wait = MESH_MIN_REBUILD_MS  - (now - g_lastMeshBuild);
+                if (now - g_lastMeshScroll < MESH_SCROLL_QUIET_MS)
+                    wait = std::max(wait, MESH_SCROLL_QUIET_MS - (now - g_lastMeshScroll));
+                if (wait > 0) { scheduleRefreshIn(wait); return; }
+                g_lastMeshBuild = now;
+            }
             rebuildList(true);   /* refreshes g_anns (mesh column) itself */
             g_refreshMsgs = g_refreshAnns = g_listDirty = false;
             g_listBuiltId = g_id;
         }
     }
 }
-void scheduleRefresh() {
+void scheduleRefreshIn(uint32_t ms) {
     if (g_refreshPending) return;
     g_refreshPending = true;
-    lv_timer_t* t = lv_timer_create(refreshTimerCb, 200, nullptr);
+    lv_timer_t* t = lv_timer_create(refreshTimerCb, ms, nullptr);
     lv_timer_set_repeat_count(t, 1);
 }
+void scheduleRefresh() { scheduleRefreshIn(200); }
 
 void onStorageChange(const char* key, const char*) {
     if (!s_layer) return;
@@ -1842,9 +1890,23 @@ void onStorageChange(const char* key, const char*) {
     /* Flag which walk the change dirtied and coalesce; refreshTimerCb does the
        expensive work once per window. Announce churn touches only the mesh
        column, never the msg walk or the open thread. */
-    if (key && strncmp(key, "lxmf.announces", 14) == 0) g_refreshAnns = true;
-    else                                                g_refreshMsgs = true;
-    g_listDirty = true;   /* a row (preview/unread) or the mesh column may have changed */
+    if (key && strncmp(key, "lxmf.announces", 14) == 0) {
+        g_refreshAnns = true;
+        /* Announce-only change: it feeds the On-the-Mesh column and nothing else.
+           A rebuild walks + sorts the whole (up to thousands) announce catalogue
+           and re-creates every row; on a busy mesh announces fire several times a
+           second, so dirtying the list on each one pegs the lcd task while you're
+           just sitting on the Contacts tab — whose rows come from the contacts
+           directory, not announces. Dirty the list only while the mesh column is
+           the visible tab; setActiveTab folds accumulated announces back in when
+           you switch to it. */
+        if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)
+            && s_tabMesh && !lv_obj_has_flag(s_tabMesh, LV_OBJ_FLAG_HIDDEN))
+            g_listDirty = true;
+    } else {
+        g_refreshMsgs = true;
+        g_listDirty = true;   /* a contact row (preview/unread) may have changed */
+    }
     scheduleRefresh();
 }
 
