@@ -376,6 +376,18 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     set: (v: string) => { _activePeerById[activeId.value] = v },
   })
 
+  /* Contacts + announces are record stores now, not cfgRoot subtrees, so they
+   * don't ride the connect dump. Fetch them whenever the stream (re)syncs — the
+   * device then live-mirrors their every change (browserMirror stores). Contacts
+   * are per-identity, so also re-fetch on a slot switch; announces are global. */
+  watch([() => device.synced, () => activeId.value], ([ok, id]) => {
+    if (ok && id != null && !Number.isNaN(id))
+      device.sendCommand({ fetch: `s.lxmf.id.${id}.contacts` })
+  }, { immediate: true })
+  watch(() => device.synced, (ok) => {
+    if (ok) device.sendCommand({ fetch: 'lxmf.announces' })
+  }, { immediate: true })
+
   const contacts = computed<Record<string, Contact>>(() => {
     const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
     const out: Record<string, Contact> = {}
@@ -401,15 +413,15 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
      * monotonic value so newest-first order holds even in that window. */
     const boot = num(device.get('sys.boot_time'))
     return Object.keys(raw).map((hash) => {
-      // "<last_s>|<cost>|<hops>|<ratchet>|<name>"
-      const [last, cost, hops, ratchet, ...rest] = str(raw[hash]).split('|')
+      /* Record store fields (mirrored as strings): last / hops / cost / ratchet / name. */
+      const r = raw[hash] ?? {}
       return {
         hash,
-        mono: num(last),
-        cost: num(cost),
-        hops: num(hops, HOPS_UNKNOWN),
-        ratchet: str(ratchet),
-        name: rest.join('|'),
+        mono: num(r.last),
+        cost: num(r.cost),
+        hops: num(r.hops, HOPS_UNKNOWN),
+        ratchet: str(r.ratchet),
+        name: str(r.name),
       }
     }).sort((a, b) => b.mono - a.mono).map((a): Announce => ({
       hash: a.hash,
@@ -456,23 +468,23 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   }
 
   const conversations = computed<Conversation[]>(() => {
-    const msgs = device.get(`s.lxmf.id.${activeId.value}.msgs`) ?? {}
+    // Message bodies now live in the device's per-conversation record store, not
+    // the mirrored config tree. The conversation LIST reads the maintained
+    // directory (contacts.<peer>.{count,last_ts,preview,unread}) — O(conversations),
+    // never walking messages. Bodies are fetched on demand when a peer is opened.
+    const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
     const out: Conversation[] = []
-    for (const peer of Object.keys(msgs)) {
-      const thread = msgs[peer] ?? {}
-      // Per-conversation read watermark (ts up to which read); unread = later inbound.
-      const readTs = num(device.get(`s.lxmf.id.${activeId.value}.contacts.${peer}.read_ts`) ?? 0)
-      let last: Message | null = null
-      let unread = 0, count = 0
-      for (const key of Object.keys(thread)) {
-        const m = readMsg(peer, key, thread[key] ?? {})
-        if (m.stage === 'draft') continue // never rendered (§4/§6)
-        count++
-        if (m.dir === 'in' && m.ts > readTs) unread++
-        if (!last || m.ts >= last.ts) last = m
+    for (const peer of Object.keys(raw)) {
+      const c = raw[peer] ?? {}
+      const count = num(c.count)
+      if (count <= 0) continue // announce-only contact, no messages exchanged
+      const lastTs = num(c.last_ts)
+      const last: Message = {
+        key: '', peer, dir: 'out', stage: 'sent',
+        title: '', content: str(c.preview), thread: '', ts: lastTs,
+        attempts: 0, lastError: '', messageId: '',
       }
-      if (count === 0) continue
-      out.push({ peer, name: displayName(peer), last, ts: last?.ts ?? 0, unread, count })
+      out.push({ peer, name: displayName(peer), last, ts: lastTs, unread: num(c.unread), count })
     }
     return out.sort((a, b) => b.ts - a.ts)
   })
@@ -481,10 +493,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const peer = activePeer.value
     if (!peer) return []
     const thread = device.get(`s.lxmf.id.${activeId.value}.msgs.${peer}`) ?? {}
+    // Order = arrival order = the device record store's arena order, which is the
+    // order the keys were shipped/merged in. We do NOT sort by ts: the ESP RTC
+    // drifts too far to order reliably, and insertion order is exactly "as
+    // received/sent".
     const msgs = Object.keys(thread)
       .map(key => readMsg(peer, key, thread[key] ?? {}))
       .filter(m => m.stage !== 'draft')
-      .sort((a, b) => a.ts - b.ts)
     const buckets: { day: string; messages: Message[] }[] = []
     for (const m of msgs) {
       const day = new Date(m.ts * 1000).toLocaleDateString(undefined,
@@ -584,15 +599,16 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
    *  the newest message ts as "read up to here". Unread is derived from it. */
   function markConversationRead(peer: string) {
     const n = activeId.value
-    const thread = device.get(`s.lxmf.id.${n}.msgs.${peer}`) ?? {}
-    let newest = 0
-    for (const key of Object.keys(thread)) {
-      const r = thread[key] ?? {}
-      if (num(r.ts) > newest) newest = num(r.ts)
-    }
-    if (newest <= 0) return
-    const cur = num(device.get(`s.lxmf.id.${n}.contacts.${peer}.read_ts`) ?? 0)
-    if (newest > cur) device.sendJson(nest(`s.lxmf.id.${n}.contacts.${peer}.read_ts`, newest))
+    const base = `s.lxmf.id.${n}.contacts.${peer}`
+    // Watermark from the maintained directory (last_ts), not the message store —
+    // works even before the conversation body has been fetched. Also clear the
+    // maintained unread counter (the firmware clears it when it marks read; the
+    // browser must do the same when it does).
+    const lastTs = num(device.get(`${base}.last_ts`) ?? 0)
+    const cur = num(device.get(`${base}.read_ts`) ?? 0)
+    const patch = nest(`${base}.unread`, 0)
+    if (lastTs > cur) deepAssign(patch, nest(`${base}.read_ts`, lastTs))
+    device.sendJson(patch)
   }
 
   const createIdentity = (label: string) =>
@@ -607,7 +623,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const setEnabled = (n: number, on: boolean) =>
     device.set(`s.lxmf.id.${n}.enabled`, on ? 1 : 0)
 
-  function openPeer(peer: string) { activePeer.value = peer }
+  function openPeer(peer: string) {
+    activePeer.value = peer
+    // Message bodies live in the device record store, not the mirror. Ask the
+    // device to ship this conversation's records (and stream its live changes)
+    // into the mirror at s.lxmf.id.<n>.msgs.<peer>, where activeConversation reads.
+    if (peer) device.sendCommand({ fetch: `s.lxmf.id.${activeId.value}.msgs.${peer}` })
+  }
   const draftFor = (peer: string) => _draftsById[activeId.value]?.[peer] ?? ''
   const setDraft = (peer: string, text: string) => {
     let d = _draftsById[activeId.value]

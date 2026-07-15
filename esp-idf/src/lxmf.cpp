@@ -15,6 +15,8 @@
 #include "lxmf.h"
 #include "lxmf_stamp.h"
 #include "mem.h"
+#include "storage.h"
+#include "storage_db.h"
 #include "spangap.h"
 #include "ports.h"
 #include "rnsd.h"     /* SHA-256, sign/verify, dest-hash, recall, request_path */
@@ -37,6 +39,7 @@
 #include <memory>
 #include <algorithm>
 #include <array>
+#include <unordered_map>
 
 static const char* TAG = "lxmf";
 
@@ -239,6 +242,17 @@ static std::string msgPath(int n, const std::string& peer,
     return buf;
 }
 
+/* RAM-only outbound wire cache ("the outbox"): the packed + signed + stamped LXM
+ * bytes for a message awaiting delivery, keyed "<peer>/<mid>". Deliberately NOT
+ * in the record store — it's transient (dead after delivery), it would double
+ * each outbound record on disk, and re-deriving it on every rnsd-busy resend
+ * would re-run the multi-second proof-of-work stamp. Dropped on the terminal
+ * transition (sent/delivered/failed/cancelled). Lost on reboot: a still-queued
+ * message is then re-packed from its stored title/content on the next attempt. */
+struct OutboxWire { std::vector<uint8_t> wire; std::string msg_id_hex; uint64_t ts_ms; };
+static std::unordered_map<std::string, OutboxWire> g_wireOutbox;
+static std::string outboxKey(const std::string& peer, const std::string& mid) { return peer + "/" + mid; }
+
 /* Move a message to <stage> with <err>: the two keys commit as one op-list
  * so subscribers (frontends) see a single, atomic transition instead of two
  * back-to-back notifies. */
@@ -249,6 +263,10 @@ static void msgStage(int n, const std::string& peer, const std::string& mid,
     storageSet(msgPath(n, peer, mid, "stage").c_str(),      stage);
     storageSet(msgPath(n, peer, mid, "last_error").c_str(), err);
     storageEnd();
+    /* Release the cached wire once the message leaves the send pipeline. */
+    if (!strcmp(stage, "sent") || !strcmp(stage, "delivered") ||
+        !strcmp(stage, "failed") || !strcmp(stage, "cancelled"))
+        g_wireOutbox.erase(outboxKey(peer, mid));
 }
 
 /* Common case: mark an outbound message failed with a reason. */
@@ -269,18 +287,73 @@ static std::string msgPrefix(int n, const std::string& peer,
     return buf;
 }
 
-/* Register the per-conversation external file before the first message write,
- * so a chatty conversation rewrites only its own small file instead of growing
- * root.json on every change (the same separate-file mechanism timezones use).
- * Idempotent and cheap once registered. No eviction yet — the subtree still
- * lives in cfgRoot and still syncs to the browser. Deleting the conversation
- * (or the identity) via storageDeleteTree drops the file automatically.
- * See storage.h storageNewTreeFile. */
-static void ensureConvFile(int n, const std::string& peer)
+/* Conversations are backed by structured record stores (storageStructuredDB,
+ * pattern "s.lxmf.id.$.msgs.$"), created lazily on the first field write — no
+ * per-conversation registration is needed here any more. Kept as a no-op so the
+ * call sites document where a conversation first materialises. */
+static void ensureConvFile(int, const std::string&) {}
+
+/* The LXMF message record schema (see storage_db.h). Mutable fields are
+ * fixed-width so a stage transition overwrites in place; title/content/thread
+ * are immutable text. The packed outbound `wire` is NOT stored — it's transient
+ * (dead after delivery) and lives in the RAM outbox (g_wireOutbox); redundant
+ * addressing (`peer`) isn't stored either (the routing layer drops it). Built
+ * once; the registration keeps the pointer.
+ *
+ * schema_ver 2 dropped the old `wire` text field. Files written by v1 load
+ * fine (hdr_size is unchanged — `wire` was the last text field, so its bytes are
+ * simply ignored trailing data and dropped on the next rewrite). */
+static const sdb_schema& lxmfMsgSchema()
 {
-    char prefix[96];
-    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.%s", n, peer.c_str());
-    storageNewTreeFile(prefix);
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 1;
+        x.schema_ver = 2;
+        x.u8("attempts")
+         .fixstr("dir", 4).fixstr("stage", 12).fixstr("method", 16).fixstr("last_error", 48)
+         .u32("ts")
+         .text("title").text("content").text("thread").text("message_id");
+        return x;
+    }();
+    return s;
+}
+
+/* Conversation directory store (schema 2): one record per peer, one file per
+ * identity slot ("lxmf/contacts/$1.db.gz"). Fields mirror the leaves written via
+ * contactPath(). The mutable scalars (counters, watermarks, last_seen, trust)
+ * are fixed-width so a new message / read / announce updates them in place; the
+ * text fields (hash sentinel, names, preview) rebuild the record when they
+ * change. `hash` stores the peer hex redundantly with the record key — it is the
+ * "contact exists" sentinel the seed/first-contact paths test via storageExists. */
+static const sdb_schema& lxmfContactSchema()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 2;
+        x.schema_ver = 1;
+        x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+         .u8("trust")
+         .text("hash").text("display_name").text("nick").text("preview");
+        return x;
+    }();
+    return s;
+}
+
+/* Heard-announce catalogue (schema 3): one global RAM-only store, capped and
+ * self-evicting (STORAGE_DB_DROP). `last` (announce time) and `hops` mutate in
+ * place on every re-announce; `cost` is a fixstr so the -1 "unknown" sentinel
+ * survives; `name` is the announced display name. The wire ratchet is not kept
+ * (it was write-only in the old packed catalogue). */
+static const sdb_schema& lxmfAnnounceSchema()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 3;
+        x.schema_ver = 1;
+        x.u32("last").u8("hops").fixstr("cost", 6).text("ratchet").text("name");
+        return x;
+    }();
+    return s;
 }
 
 static std::string contactPath(int n, const std::string& peer_hex, const char* field)
@@ -305,6 +378,117 @@ static void convMarkRead(int n, const std::string& peer, int upto_ts)
 {
     if (upto_ts > convReadTs(n, peer))
         storageSet(contactPath(n, peer, "read_ts").c_str(), upto_ts);
+    /* Directory unread counter — maintained, not derived: opening a conversation
+     * clears it (the watermark above still records the exact read point). */
+    if (storageGetInt(contactPath(n, peer, "unread").c_str(), 0) != 0)
+        storageSet(contactPath(n, peer, "unread").c_str(), 0);
+}
+
+/* The maintained conversation directory (stays in cJSON, so it rides the browser
+ * config mirror and the LCD contact list without loading any message store):
+ * per-conversation last_ts / preview / count / unread under contacts.<peer>.
+ * Bumped as messages are written so "what conversations exist, newest first,
+ * with a preview and unread badge" costs O(conversations), never O(messages).
+ * Call inside the message-write bracket. `inbound` bumps the unread counter. */
+static void bumpConvDirectory(int n, const std::string& peer, int ts_s,
+                              const std::string& preview, bool inbound)
+{
+    int count = storageGetInt(contactPath(n, peer, "count").c_str(), 0);
+    storageSet(contactPath(n, peer, "count").c_str(),   count + 1);
+    storageSet(contactPath(n, peer, "last_ts").c_str(), ts_s);
+    /* Bounded, single-line preview (control chars folded) — the list shows a
+     * snippet, never the whole body. */
+    std::string p;
+    for (char c : preview) {
+        if (p.size() >= 80) break;
+        p += (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+    }
+    storageSet(contactPath(n, peer, "preview").c_str(), p.c_str());
+    if (inbound)
+        storageSet(contactPath(n, peer, "unread").c_str(),
+                   storageGetInt(contactPath(n, peer, "unread").c_str(), 0) + 1);
+}
+
+/* One-time directory backfill. Migration moved message bodies into the record
+ * stores but did not seed the maintained directory (count/last_ts/preview/unread)
+ * for conversations that predate it — so a migrated device would show only
+ * conversations touched since. Runs once (guarded by s.lxmf.dir_seeded), after
+ * registration + migration: for every contact whose directory count is unset,
+ * aggregate its stored messages and seed the summary. Cheap on later boots (the
+ * guard skips the whole pass). */
+static std::vector<std::string> s_seedPeers;
+static void seedCollectPeer(const char* key, const char*) {
+    const char* c = strstr(key, ".contacts.");
+    if (!c) return;
+    c += sizeof(".contacts.") - 1;
+    const char* dot = strchr(c, '.');
+    if (!dot) return;
+    std::string peer(c, dot - c);
+    for (auto& p : s_seedPeers) if (p == peer) return;
+    s_seedPeers.push_back(peer);
+}
+static int         s_aggCount, s_aggUnread;
+static long        s_aggLastTs, s_aggReadTs;
+static std::string s_aggPreview;
+static std::string s_aggMid, s_aggMidStage, s_aggMidContent;   /* message being accumulated */
+static long        s_aggMidTs;
+static bool        s_aggMidIn;
+static void seedFlushMsg() {
+    if (!s_aggMid.empty() && s_aggMidStage != "draft") {
+        s_aggCount++;
+        s_aggLastTs  = s_aggMidTs;
+        s_aggPreview = s_aggMidContent;
+        if (s_aggMidIn && s_aggMidTs > s_aggReadTs) s_aggUnread++;
+    }
+    s_aggMid.clear(); s_aggMidTs = 0; s_aggMidIn = false;
+    s_aggMidStage.clear(); s_aggMidContent.clear();
+}
+static void seedMsgField(const char* key, const char* val) {
+    /* key = s.lxmf.id.N.msgs.<peer>.<mid>.<field> — take the last two segments
+     * (mid has no dots; records arrive grouped by mid in arena order). */
+    const char* d2 = strrchr(key, '.');
+    if (!d2) return;
+    std::string field(d2 + 1);
+    std::string head(key, d2 - key);
+    size_t p = head.rfind('.');
+    if (p == std::string::npos) return;
+    std::string mid = head.substr(p + 1);
+    if (mid != s_aggMid) { seedFlushMsg(); s_aggMid = mid; }
+    if      (field == "dir")     s_aggMidIn = (val && !strcmp(val, "in"));
+    else if (field == "ts")      s_aggMidTs = val ? atol(val) : 0;
+    else if (field == "stage")   s_aggMidStage = val ? val : "";
+    else if (field == "content") s_aggMidContent = val ? val : "";
+}
+static void lxmfSeedDirectory() {
+    if (storageGetInt("s.lxmf.dir_seeded", 0) != 0) return;
+    int seeded = 0;
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        s_seedPeers.clear();
+        std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
+        storageForEach(cpre.c_str(), seedCollectPeer);
+        for (auto& peer : s_seedPeers) {
+            if (storageExists(contactPath(n, peer, "count").c_str())) continue;
+            s_aggCount = 0; s_aggUnread = 0; s_aggLastTs = 0; s_aggPreview.clear();
+            s_aggReadTs = convReadTs(n, peer);
+            seedFlushMsg();   /* reset per-message accumulators */
+            std::string mp = "s.lxmf.id." + std::to_string(n) + ".msgs." + peer;
+            storageForEach(mp.c_str(), seedMsgField);
+            seedFlushMsg();   /* finalize the last message */
+            if (s_aggCount <= 0) continue;
+            std::string pv;
+            for (char c : s_aggPreview) { if (pv.size() >= 80) break;
+                pv += (c == '\n' || c == '\r' || c == '\t') ? ' ' : c; }
+            storageBegin();
+            storageSet(contactPath(n, peer, "count").c_str(),   s_aggCount);
+            storageSet(contactPath(n, peer, "last_ts").c_str(), (int)s_aggLastTs);
+            storageSet(contactPath(n, peer, "preview").c_str(), pv.c_str());
+            storageSet(contactPath(n, peer, "unread").c_str(),  s_aggUnread);
+            storageEnd();
+            seeded++;
+        }
+    }
+    storageSet("s.lxmf.dir_seeded", 1);
+    if (seeded) info("lxmf: seeded directory for %d conversation(s)", seeded);
 }
 
 static uint64_t nowUnixMs(void)
@@ -990,10 +1174,10 @@ static outbound_t* outboundAlloc(lxmf_id_t& id)
  * subscription. All storage writes happen here, on our task — the rnsd
  * task only memcpys the announce into one ITS packet and forwards.
  *
- * One packed leaf per dest at `lxmf.announces.<dest_hex>` (value format
- * documented at buildAnnounceValue below) — there is no per-field subtree.
- * Bounded by `s.lxmf.max_announces`; a new dest at the cap evicts the
- * oldest by last_s. */
+ * One record per dest in the RAM-only "lxmf_announces" store, addressed as
+ * `lxmf.announces.<dest_hex>.<field>` (schema 3: last/hops/cost/name). Bounded
+ * by `s.lxmf.max_announces` — the store self-evicts the oldest-inserted record
+ * (STORAGE_DB_DROP) when a brand-new dest would exceed the cap. */
 
 static bool isOwnDest(const uint8_t dh[LXMF_DEST_HASH_LEN])
 {
@@ -1010,121 +1194,87 @@ static int s_announce_sub_handle = -1;
 /* RNSD_PORT_ANNOUNCES frame: hops(1) | dest_hash(16) | identity_hash(16) | app_data(N) */
 constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16;
 
-/* ── lxmf.announces.<hex> packed-value format ──
+/* ── lxmf.announces.<hex> record fields (store schema 3) ──
  *
- *   <last_s>|<cost>|<hops>|<ratchet>|<name>
+ *   last    u32     announce time, nowUnixMs()/1000 (monotonic); mutates in place
+ *   hops    u8      hop count from the frame; mutates in place
+ *   cost    fixstr  decimal stamp cost, "-1" if unknown (fixstr so -1 round-trips)
+ *   ratchet text    64-hex ratchet or empty (the browser ContactCard shows it)
+ *   name    text    announced utf-8 display name (may be empty)
  *
- *   last_s   decimal unix-secish (from nowUnixMs()/1000, monotonic)
- *   cost     decimal int, -1 if unknown
- *   hops     decimal int, -1 if unknown
- *   ratchet  64-hex or empty
- *   name     utf-8, may contain '|' (no escaping — name is last)
- *
- * Packed into one value rather than a per-field subtree (6 leaves per
- * entry): one cJSON_String + the parent's child pointer per entry;
- * ~3× fewer heap blocks attributed to lxmf as the announce catalogue
- * grows.
- *
- * For eviction we only need last_s; that's the first field, so
- * atoi(value) is enough — stops at the first '|'. */
+ * AnnounceEntry is the in-RAM read shape for the device's own consumers (which
+ * don't need the ratchet — it's carried only for the browser mirror). */
 
 struct AnnounceEntry {
-    int         last_s;
-    int         cost;
-    int         hops;
-    std::string ratchet;
+    int         last_s = 0;
+    int         cost   = -1;
+    int         hops   = -1;
     std::string name;
 };
 
-static std::string buildAnnounceValue(const AnnounceEntry& e)
+/* Read one announce record's fields. Announces live in the RAM-only record
+ * store as `lxmf.announces.<hex>.<field>` (schema 3). Returns false if there is
+ * no such record. `cost` is a fixstr so it round-trips the -1 "unknown" sentinel. */
+static bool readAnnounce(const std::string& hex, AnnounceEntry* out)
 {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "%d|%d|%d|%s|",
-                  e.last_s, e.cost, e.hops, e.ratchet.c_str());
-    std::string out = buf;
-    out += e.name;   /* name may be arbitrary utf-8; append last so embedded
-                        '|' in display names doesn't break parsing. */
-    return out;
-}
-
-static bool parseAnnounceValue(const char* val, AnnounceEntry* out)
-{
-    if (!val) return false;
-    /* Find the first 4 pipes. Anything after pipe #4 is the name. */
-    const char* pos[4] = {};
-    int cnt = 0;
-    for (const char* p = val; *p && cnt < 4; ++p)
-        if (*p == '|') pos[cnt++] = p;
-    if (cnt < 4) return false;
-    out->last_s = std::atoi(val);
-    out->cost   = std::atoi(pos[0] + 1);
-    out->hops   = std::atoi(pos[1] + 1);
-    out->ratchet.assign(pos[2] + 1, pos[3] - pos[2] - 1);
-    out->name   = pos[3] + 1;
+    std::string base = "lxmf.announces." + hex;
+    if (!storageExists(base.c_str())) return false;   /* 1-seg tail → sdbHasRecord */
+    out->last_s = storageGetInt((base + ".last").c_str(), 0);
+    out->cost   = storageGetInt((base + ".cost").c_str(), -1);
+    out->hops   = storageGetInt((base + ".hops").c_str(), -1);
+    out->name   = storageGetStr((base + ".name").c_str(), "");
     return true;
 }
 
 /* Display name last heard for `peer_hex` in the cross-identity announce
- * catalogue, or "" if we've never heard them announce (or the announce
- * carried no name). The catalogue is one packed leaf per dest
- * (`lxmf.announces.<hex>` = "<last_s>|<cost>|<hops>|<ratchet>|<name>"), so
- * the name has to be parsed out of that value — there is no nested
- * `.display_name` subkey. Used to seed `contacts.<peer>.display_name` on
- * both the inbound and outbound first-contact paths, and as the CLI's
- * contact-name fallback. */
+ * catalogue, or "" if we've never heard them announce (or the announce carried
+ * no name). Used to seed `contacts.<peer>.display_name` on both first-contact
+ * paths, and as the CLI's contact-name fallback. */
 static std::string announceName(const std::string& peer_hex)
 {
-    std::string av = storageGetStr(("lxmf.announces." + peer_hex).c_str(), "");
-    if (av.empty()) return "";
-    AnnounceEntry ae;
-    if (!parseAnnounceValue(av.c_str(), &ae)) return "";
-    return ae.name;
+    return storageGetStr(("lxmf.announces." + peer_hex + ".name").c_str(), "");
 }
 
-/* ── announce-catalogue size cap + LRU-by-announce-time eviction ──
+/* Walk every announce record oldest-first, invoking cb(hex, entry) once per
+ * record. storageForEach yields a store's fields grouped per record (arena
+ * order), so we accumulate on the current hex and flush on the boundary — and
+ * once more after the walk for the final record. File-scope state because the
+ * storageForEach callback carries no ctx pointer.
  *
- * Walk `lxmf.announces.` and find the oldest entry. Used when the
- * catalogue hits `s.lxmf.max_announces` (default 2048) so a new
- * insert evicts one. Walk is O(N) under CFG_LOCK; at 2048 entries
- * ≈ 12 ms. Eviction only fires for brand-new destinations after
- * the cap is reached — re-announces from existing entries just
- * update in place. */
+ * The catalogue is no longer size-capped here: the RAM-only store enforces its
+ * own cap (STORAGE_DB_DROP) at write time, dropping the oldest-inserted record
+ * when a brand-new dest would exceed s.lxmf.max_announces. */
+static AnnounceEntry s_annAcc;
+static std::string   s_annAccHex;
+static bool          s_annAccHave = false;
+static void        (*s_annRecordCb)(const std::string&, const AnnounceEntry&) = nullptr;
 
-struct AnnounceOldestCtx {
-    int         count;
-    int         oldest_s;
-    std::string oldest_hex;
-};
-static AnnounceOldestCtx* s_ann_oldest_ctx = nullptr;
-
-static void annOldestLeaf(const char* key, const char* val)
+static void annAccLeaf(const char* key, const char* val)
 {
-    if (!s_ann_oldest_ctx || !key || !val) return;
     const char* tail = key + sizeof("lxmf.announces.") - 1;
-    /* Bare `lxmf.announces.<hex>` (no nested key). */
-    if (std::strchr(tail, '.')) return;
-    s_ann_oldest_ctx->count++;
-    int ls = std::atoi(val);
-    if (s_ann_oldest_ctx->oldest_hex.empty() ||
-        ls < s_ann_oldest_ctx->oldest_s) {
-        s_ann_oldest_ctx->oldest_s   = ls;
-        s_ann_oldest_ctx->oldest_hex = tail;
+    const char* dot  = std::strchr(tail, '.');
+    if (!dot) return;
+    std::string hex(tail, dot - tail);
+    const char* field = dot + 1;
+    if (std::strchr(field, '.')) return;   /* leaf field only */
+    if (s_annAccHave && hex != s_annAccHex) {
+        s_annRecordCb(s_annAccHex, s_annAcc);
+        s_annAcc = AnnounceEntry{};
     }
+    s_annAccHex = hex; s_annAccHave = true;
+    if      (!std::strcmp(field, "last")) s_annAcc.last_s = val ? std::atoi(val) : 0;
+    else if (!std::strcmp(field, "cost")) s_annAcc.cost   = val ? std::atoi(val) : -1;
+    else if (!std::strcmp(field, "hops")) s_annAcc.hops   = val ? std::atoi(val) : -1;
+    else if (!std::strcmp(field, "name")) s_annAcc.name   = val ? val : "";
 }
 
-/* Find (count, oldest entry). Returns count. If max_entries is non-
- * zero and count >= max_entries, sets oldest_hex_out so the caller
- * can evict. */
-static int annCountAndMaybeOldest(int max_entries, std::string* oldest_hex_out)
+static void forEachAnnounce(void (*cb)(const std::string&, const AnnounceEntry&))
 {
-    AnnounceOldestCtx ctx{};
-    s_ann_oldest_ctx = &ctx;
-    storageForEach("lxmf.announces.", annOldestLeaf);
-    s_ann_oldest_ctx = nullptr;
-    if (max_entries > 0 && ctx.count >= max_entries &&
-        !ctx.oldest_hex.empty() && oldest_hex_out)
-        *oldest_hex_out = ctx.oldest_hex;
-    return ctx.count;
+    s_annAccHave = false; s_annAcc = AnnounceEntry{}; s_annAccHex.clear();
+    s_annRecordCb = cb;
+    storageForEach("lxmf.announces.", annAccLeaf);
+    if (s_annAccHave) cb(s_annAccHex, s_annAcc);
+    s_annRecordCb = nullptr;
 }
 
 static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
@@ -1151,36 +1301,22 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     LxmfAnnounceInfo info = parseLxmfAnnounce(app_data, app_len);
     std::string dh_hex = bytesToHex(dh, LXMF_DEST_HASH_LEN);
 
-    char key[64];
-    std::snprintf(key, sizeof(key), "lxmf.announces.%s", dh_hex.c_str());
+    std::string base = "lxmf.announces." + dh_hex;
 
-    /* If this is a brand-new destination (no existing entry) and we
-     * would exceed the cap, evict the oldest entry by last_s. Re-
-     * announces from existing entries skip this scan. */
-    bool is_new = !storageExists(key);
-    if (is_new) {
-        int max_ann = storageGetInt("s.lxmf.max_announces", 2048);
-        if (max_ann > 0) {
-            std::string oldest;
-            int cur = annCountAndMaybeOldest(max_ann, &oldest);
-            if (cur >= max_ann && !oldest.empty()) {
-                char old_key[64];
-                std::snprintf(old_key, sizeof(old_key),
-                              "lxmf.announces.%s", oldest.c_str());
-                storageUnset(old_key);
-                DBG_REMOTE("announces: evicted oldest %s (cap=%d)",
-                    oldest.c_str(), max_ann);
-            }
-        }
-    }
-
-    AnnounceEntry e;
-    e.last_s  = (int)(nowUnixMs() / 1000);
-    e.cost    = info.stamp_cost;   /* -1 if unknown */
-    e.hops    = hops;
-    e.ratchet = info.ratchet_hex;  /* empty if unknown */
-    e.name    = info.name;         /* may be empty */
-    storageSet(key, buildAnnounceValue(e).c_str());
+    /* Write the record's fields. The RAM-only store self-caps
+     * (STORAGE_DB_DROP): a brand-new dest past s.lxmf.max_announces drops the
+     * oldest-inserted record; a re-announce from an existing dest mutates
+     * last/hops/cost in place — no new record, no eviction, no scan. `cost` is a
+     * fixstr so the -1 "unknown" sentinel round-trips. */
+    char cbuf[8];
+    std::snprintf(cbuf, sizeof(cbuf), "%d", info.stamp_cost);
+    storageBegin();
+    storageSet((base + ".last").c_str(), (int)(nowUnixMs() / 1000));
+    storageSet((base + ".hops").c_str(), hops);
+    storageSet((base + ".cost").c_str(), cbuf);
+    if (!info.ratchet_hex.empty()) storageSet((base + ".ratchet").c_str(), info.ratchet_hex.c_str());
+    if (!info.name.empty())        storageSet((base + ".name").c_str(),    info.name.c_str());
+    storageEnd();
 
     DBG_REMOTE("announces: %s name=\"%s\" cost=%d hops=%d",
         dh_hex.c_str(), sanitizeForLog(info.name).c_str(),
@@ -1799,45 +1935,60 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         return;
     }
 
-    std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
-    std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
-    std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
+    /* Resolve the packed wire: reuse the RAM outbox on a resend (no re-pack, no
+     * multi-second re-stamp), else pack from the stored title/content and cache
+     * it. `firstPack` gates the one-time record-persist + directory bump below —
+     * a resend must not re-bump the conversation count. */
+    std::string obk = outboxKey(peer_hex, mid);
+    std::vector<uint8_t> wire;
+    std::string msg_id_hex;
+    uint64_t ts_ms;
+    bool firstPack = false;
+    {
+        auto it = g_wireOutbox.find(obk);
+        if (it != g_wireOutbox.end()) {
+            wire = it->second.wire; msg_id_hex = it->second.msg_id_hex; ts_ms = it->second.ts_ms;
+        } else {
+            firstPack = true;
+            std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
+            std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
+            std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
 
-    LxmFields fields;
-    fields.thread = thread;
+            LxmFields fields;
+            fields.thread = thread;
 
-    /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
-     * but only when generation is enabled and they actually advertise a
-     * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case).
-     * A cost above what we're willing to grind (LXMF_STAMP_MAX_COST) is
-     * refused — send unstamped rather than freeze the task for minutes. */
-    int stamp_cost = 0;
-    if (storageGetInt("s.lxmf.generate_stamps", 1) != 0) {
-        AnnounceEntry ae;
-        std::string av = storageGetStr(("lxmf.announces." + peer_hex).c_str(), "");
-        if (!av.empty() && parseAnnounceValue(av.c_str(), &ae) && ae.cost > 0) {
-            if (ae.cost > LXMF_STAMP_MAX_COST)
-                warn("id %d: peer stamp cost %d > max %d — sending unstamped",
-                     id.index, ae.cost, LXMF_STAMP_MAX_COST);
-            else
-                stamp_cost = ae.cost;
+            /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
+             * but only when generation is enabled and they actually advertise a
+             * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case).
+             * A cost above what we're willing to grind (LXMF_STAMP_MAX_COST) is
+             * refused — send unstamped rather than freeze the task for minutes. */
+            int stamp_cost = 0;
+            if (storageGetInt("s.lxmf.generate_stamps", 1) != 0) {
+                AnnounceEntry ae;
+                if (readAnnounce(peer_hex, &ae) && ae.cost > 0) {
+                    if (ae.cost > LXMF_STAMP_MAX_COST)
+                        warn("id %d: peer stamp cost %d > max %d — sending unstamped",
+                             id.index, ae.cost, LXMF_STAMP_MAX_COST);
+                    else
+                        stamp_cost = ae.cost;
+                }
+            }
+
+            /* Pack the LXM wire so the opportunistic-vs-DIRECT decision keys off
+             * the *actual* packed size, not a content estimate that under-counts
+             * the signature, fields/thread, stamp and msgpack framing. */
+            ts_ms = wallUnixMs();
+            uint8_t mid_raw[RNSD_HASH_LEN];
+            wire = lxmPackWire(id.identity_key.c_str(), id.dest_hash, dh,
+                               ts_ms, title, content, fields, stamp_cost, mid_raw);
+            if (wire.empty()) {
+                err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
+                msgFail(id.index, peer_hex, mid, "pack/sign failed");
+                return;
+            }
+            msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
+            g_wireOutbox[obk] = { wire, msg_id_hex, ts_ms };
         }
-    }
-
-    /* Pack the LXM wire up front so the opportunistic-vs-DIRECT decision
-     * keys off the *actual* packed size, not a content estimate that
-     * under-counts the signature, fields/thread, stamp and msgpack
-     * framing. */
-    uint64_t ts_ms = wallUnixMs();
-    uint8_t  mid_raw[RNSD_HASH_LEN];
-    std::vector<uint8_t> wire = lxmPackWire(id.identity_key.c_str(),
-                                             id.dest_hash, dh,
-                                             ts_ms, title, content, fields,
-                                             stamp_cost, mid_raw);
-    if (wire.empty()) {
-        err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
-        msgFail(id.index, peer_hex, mid, "pack/sign failed");
-        return;
     }
 
     /* Delivery-method selection. Resolution order is
@@ -1874,8 +2025,6 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                   || inlinkBackchannel(id.index, peer_hex) != nullptr;
     }
 
-    std::string msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
-
     /* Reserve an outbox slot. */
     outbound_t* o = outboundAlloc(id);
     if (!o) {
@@ -1898,14 +2047,20 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     o->proof_base_proven   = 0;
     o->proof_base_timeouts = 0;
 
-    /* Persist firmware-owned fields. */
-    storageBegin();
-    storageSet(msgPath(id.index, peer_hex, mid, "wire").c_str(),       bytesToHex(wire.data(), wire.size()).c_str());
-    storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
-    storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
-    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "queued");
-    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
-    storageEnd();
+    /* Persist firmware-owned fields ONCE, on the first pack — the wire itself
+     * stays in the RAM outbox, never the store. A resend skips this so the
+     * conversation directory count isn't bumped again. */
+    if (firstPack) {
+        storageBegin();
+        storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
+        storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
+        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "queued");
+        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+        bumpConvDirectory(id.index, peer_hex, (int)(ts_ms / 1000),
+                          storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str()),
+                          /*inbound=*/false);
+        storageEnd();
+    }
 
     if (use_direct) {
         /* DIRECT: send the *full* LXM wire (incl. the 16-byte dest hash)
@@ -2035,7 +2190,13 @@ static void lxmfNotifySound()
 #if CONFIG_STRADDLE_AUDIO
     if (storageGetInt("s.lxmf.sound_enabled", 1) == 0) return;
     std::string p = storageGetStr("s.lxmf.sound", "/fixed/lxmf/ding.wav");
-    if (!p.empty()) audioPlayWav(p.c_str());
+    if (p.empty()) return;
+    /* Half volume when the LCD is present AND awake (the user is right there);
+     * full volume otherwise — asleep, or a headless node that relies on the ding
+     * to get attention. `sys.standby` exists only on a device with an LCD, and
+     * the board flips it 0/1 around wake/sleep. */
+    bool lcdAwake = storageExists("sys.standby") && storageGetInt("sys.standby", 0) == 0;
+    audioPlayWav(p.c_str(), lcdAwake ? 50 : 100);
 #endif
 }
 
@@ -2221,6 +2382,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
      * re-trigger the on-device UI rebuild. */
     setIntIfChanged(contactPath(id.index, sh_hex, "last_seen"),
                     (int)(nowUnixMs() / 60000) * 60);
+    bumpConvDirectory(id.index, sh_hex, (int)(ts / 1000), content, /*inbound=*/true);
     storageEnd();
 
     id.received++;
@@ -3168,17 +3330,10 @@ static void publishStats(void)
  * old `collectTokens` call which built a std::vector<std::string> per
  * summary tick. */
 static int s_ann_count_tmp = 0;
-static void annCountLeaf(const char* key, const char* /*val*/)
-{
-    if (!key) return;
-    const char* tail = key + sizeof("lxmf.announces.") - 1;
-    if (std::strchr(tail, '.')) return;
-    s_ann_count_tmp++;
-}
 [[maybe_unused]] static int annCount(void)
 {
     s_ann_count_tmp = 0;
-    storageForEach("lxmf.announces.", annCountLeaf);
+    forEachAnnounce([](const std::string&, const AnnounceEntry&) { s_ann_count_tmp++; });
     return s_ann_count_tmp;
 }
 
@@ -3291,16 +3446,11 @@ struct PeerNameLookupCtx {
 };
 static PeerNameLookupCtx* s_peer_name_ctx = nullptr;
 
-static void peerNameLookupLeaf(const char* key, const char* val)
+static void peerNameLookupRec(const std::string& hex, const AnnounceEntry& e)
 {
-    if (!s_peer_name_ctx || !key || !val) return;
-    /* key = "lxmf.announces.<hex>" — one packed leaf per dest. */
-    const char* tail = key + sizeof("lxmf.announces.") - 1;
-    if (std::strchr(tail, '.')) return;   /* skip stray nested keys */
-    AnnounceEntry e;
-    if (!parseAnnounceValue(val, &e)) return;
+    if (!s_peer_name_ctx) return;
     if (!nameContainsCI(e.name, s_peer_name_ctx->query)) return;
-    s_peer_name_ctx->matches.push_back({std::string(tail), e.name});
+    s_peer_name_ctx->matches.push_back({hex, e.name});
 }
 
 static std::string cliResolvePeer(const std::string& arg)
@@ -3328,7 +3478,7 @@ static std::string cliResolvePeer(const std::string& arg)
      * lookup against the cross-identity announce catalogue. */
     PeerNameLookupCtx ctx{arg, {}};
     s_peer_name_ctx = &ctx;
-    storageForEach("lxmf.announces.", peerNameLookupLeaf);
+    forEachAnnounce(peerNameLookupRec);
     s_peer_name_ctx = nullptr;
 
     if (ctx.matches.empty()) {
@@ -3620,7 +3770,7 @@ static void cliContacts(void)
             /* Fall back to the cross-identity announce-catalogue entry. */
             char annKey[120];
             std::snprintf(annKey, sizeof(annKey),
-                          "lxmf.announces.%s.display_name", h.c_str());
+                          "lxmf.announces.%s.name", h.c_str());
             r.display_name = storageGetStr(annKey, "");
         }
         r.trust     = storageGetInt(contactPath(sel, h, "trust").c_str(),     0);
@@ -3682,42 +3832,25 @@ struct AnnounceStreamState {
 static AnnounceStreamState s_ann_stream;
 static std::string         s_ann_filter;   /* empty = no filter; not 32-hex */
 
-static void annEmitRow(const char* hex, const AnnounceEntry& e)
+static void annEmitRow(const std::string& hex, const AnnounceEntry& e)
 {
     if (!nameContainsCI(e.name, s_ann_filter)) return;
     int age = (e.last_s > 0) ? (s_ann_stream.now_s - e.last_s) : -1;
     s_ann_stream.row_num++;
     s_peer_list.push_back(hex);
     cliPrintf("%-3d %-32s %-5d %-5d %-7d %s\n",
-              s_ann_stream.row_num, hex,
+              s_ann_stream.row_num, hex.c_str(),
               e.hops, e.cost, age,
               sanitizeForLog(e.name).c_str());
-}
-
-static void annStreamLeaf(const char* key, const char* val)
-{
-    if (!key || !val) return;
-    const char* tail = key + sizeof("lxmf.announces.") - 1;
-    if (std::strchr(tail, '.')) return;   /* skip stray nested keys */
-    AnnounceEntry e;
-    if (!parseAnnounceValue(val, &e)) return;
-    annEmitRow(tail, e);
 }
 
 /* Direct lookup — `lxmf announces <32-hex>`. One row, instant. */
 static void cliAnnouncesByHash(const std::string& hex)
 {
     int now_s = (int)(nowUnixMs() / 1000);
-    char k[64];
-    std::snprintf(k, sizeof(k), "lxmf.announces.%s", hex.c_str());
-    std::string val = storageGetStr(k, "");
-    if (val.empty()) {
-        cliPrintf("(no announce entry for %s)\n", hex.c_str());
-        return;
-    }
     AnnounceEntry e;
-    if (!parseAnnounceValue(val.c_str(), &e)) {
-        cliPrintf("(malformed announce entry for %s)\n", hex.c_str());
+    if (!readAnnounce(hex, &e)) {
+        cliPrintf("(no announce entry for %s)\n", hex.c_str());
         return;
     }
     int age = e.last_s > 0 ? (now_s - e.last_s) : -1;
@@ -3753,7 +3886,7 @@ static void cliAnnounces(const char* rest)
     cliPrintf("%-3s %-32s %-5s %-5s %-7s %s\n",
               "#", "destination", "hops", "cost", "age(s)", "name");
 
-    storageForEach("lxmf.announces.", annStreamLeaf);
+    forEachAnnounce(annEmitRow);
 
     if (s_ann_stream.row_num == 0) {
         if (arg.empty()) cliPrintf("(no LXMF destinations heard yet)\n");
@@ -4130,6 +4263,36 @@ static void lxmfTaskMain(void*)
 
 void LxmfService::onInit()
 {
+    /* Register the per-conversation message store and migrate any existing
+     * cfgRoot message history into it (once; guarded + crash-safe). Must run
+     * before any message read/write so routing serves the record store. */
+    {
+        storage_db_opts opts;
+        opts.persist = "lxmf/msgs/$1/$2.db.gz";   /* $1=identity slot, $2=peer hash */
+        opts.evict   = STORAGE_DB_RELOAD;
+        storageStructuredDB("lxmf_msgs", "s.lxmf.id.$.msgs.$", &lxmfMsgSchema(), opts);
+
+        /* Conversation directory: one record per peer, one file per identity. */
+        storage_db_opts copts;
+        copts.persist = "lxmf/contacts/$1.db.gz";   /* $1 = identity slot; peers = records */
+        copts.evict   = STORAGE_DB_RELOAD;
+        copts.browserMirror = true;   /* the conversation directory: browser fetches + live-mirrors */
+        storageStructuredDB("lxmf_contacts", "s.lxmf.id.$.contacts", &lxmfContactSchema(), copts);
+
+        /* Heard-announce catalogue: global, RAM-only, self-capped. No migration
+         * (ephemeral — refills from the live announce stream). */
+        storage_db_opts aopts;
+        aopts.persist = nullptr;
+        aopts.evict   = STORAGE_DB_DROP;
+        aopts.cap     = (uint32_t)storageGetInt("s.lxmf.max_announces", 2048);
+        aopts.browserMirror = true;   /* the mesh catalogue: browser fetches + live-mirrors */
+        storageStructuredDB("lxmf_announces", "lxmf.announces", &lxmfAnnounceSchema(), aopts);
+
+        storageDbMigrate();                      /* fresh device: packs msgs + contacts at once */
+        storageDbMigrateStore("lxmf_contacts");  /* already-split device: pack contacts now */
+        lxmfSeedDirectory();   /* backfill the directory for pre-migration conversations */
+    }
+
     /* Storage defaults gated on version. */
     if (storageGetInt("s.lxmf.version", 0) < LXMF_VERSION) {
         storageBegin();

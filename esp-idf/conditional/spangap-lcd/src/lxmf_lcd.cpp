@@ -58,6 +58,7 @@
 #include <string_view>
 #include <vector>
 #include <set>
+#include <unordered_map>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -150,8 +151,17 @@ struct Ann { std::string hash, name; long last = 0; };   /* a heard announce */
 
 int               g_id = -1;            /* active identity index, -1 = none/unpicked */
 std::string       g_msgsPrefix;         /* "s.lxmf.id.N.msgs" */
-std::vector<Msg>  g_msgs;               /* all non-draft messages for g_id */
+std::vector<Msg>  g_msgs;               /* non-draft messages for the open conversation */
+
+/* One entry per rendered bubble, in render order, so a live change reconciles
+ * against the existing widgets instead of clearing + rebuilding the whole
+ * thread: a stage transition updates one glyph, a new message appends one
+ * bubble, and only a structural change (delete/reorder) falls back to a full
+ * rebuild. `meta` is the bubble's meta row (timestamp + delivery glyph). */
+struct BubbleRef { std::string mid; std::string stage; lv_obj_t* meta; };
+std::vector<BubbleRef> g_bubbles;
 std::vector<Ann>  g_anns;               /* heard announces (on-the-mesh column) */
+std::unordered_map<std::string, size_t> g_annIx;   /* hash -> index in g_anns (O(1) name/last lookup) */
 std::vector<std::string> g_rowPeers;    /* peer per clickable list row (click index) */
 std::vector<std::string> g_nomadTargets;/* "<hash>:<path>" per tappable Nomad link in the open thread */
 std::string       g_curPeer;            /* peer of the open thread */
@@ -163,6 +173,12 @@ bool              g_subscribed = false;
 bool              g_refreshPending = false;   /* a coalesced view rebuild is queued */
 bool              g_refreshMsgs    = false;   /* pending changes dirtied the msgs walk */
 bool              g_refreshAnns    = false;   /* pending changes dirtied the announce walk */
+bool              g_listDirty      = false;   /* list rows need a rebuild (a change altered a row or
+                                                 the mesh column); survives thread-view refreshes, so
+                                                 returning from a conversation with no change never rebuilds */
+int               g_listBuiltId    = -2;      /* identity the visible list was last built for (-2 = never).
+                                                 A fresh open / identity switch differs → forces one build;
+                                                 a plain return from a conversation matches → no rebuild */
 lv_timer_t*       g_searchTimer = nullptr;        /* one-shot search debounce (null = idle) */
 
 lv_obj_t* s_layer    = nullptr;
@@ -194,7 +210,7 @@ void refreshAnnounces();
 void rebuildList(bool keepScroll = false);
 void rebuildThread();
 void showContacts();
-void setActiveTab(int n);
+void setActiveTab(int n, bool keepScroll = false);
 void openThread(const std::string& peer);
 void scheduleRefresh();
 void maybeOpenPending();
@@ -216,6 +232,27 @@ void deferFocus(lv_obj_t* o) {
     if (!o) return;
     g_focusTarget = o;
     lv_timer_t* ft = lv_timer_create(focusTimerCb, 40, nullptr);
+    lv_timer_set_repeat_count(ft, 1);
+}
+
+/* Deferred focus that pins a scroll position. The search box is child 0 of the
+ * scrollable list, so focusing it drags the list to the top — unwanted when
+ * returning from a conversation (the list should stay exactly where it was).
+ * Capture the scroll now and restore it right after the deferred focus lands. */
+lv_obj_t* g_pinList = nullptr;
+int32_t   g_pinScrollY = 0;
+void pinFocusCb(lv_timer_t*) {
+    if (g_focusTarget && lv_obj_is_valid(g_focusTarget) && lcdInputGroup())
+        lv_group_focus_obj(g_focusTarget);
+    if (g_pinList && lv_obj_is_valid(g_pinList))
+        lv_obj_scroll_to_y(g_pinList, g_pinScrollY, LV_ANIM_OFF);
+}
+void deferFocusPinScroll(lv_obj_t* o, lv_obj_t* list) {
+    if (!o) return;
+    g_focusTarget = o;
+    g_pinList     = list;
+    g_pinScrollY  = list ? lv_obj_get_scroll_y(list) : 0;
+    lv_timer_t* ft = lv_timer_create(pinFocusCb, 40, nullptr);
     lv_timer_set_repeat_count(ft, 1);
 }
 
@@ -309,8 +346,9 @@ std::string peerName(const std::string& peer) {
      * announce (already parsed into g_anns for the on-the-mesh column). Covers
      * contacts stubbed hash-only before an announce arrived, and any left over
      * from before the send path learned to seed the name. */
-    for (auto& an : g_anns)
-        if (an.hash == peer && !an.name.empty()) return an.name;
+    auto it = g_annIx.find(peer);
+    if (it != g_annIx.end() && !g_anns[it->second].name.empty())
+        return g_anns[it->second].name;
     return peer.substr(0, 8) + "...";
 }
 
@@ -341,29 +379,36 @@ void msgCb(const char* key, const char* val) {
 }
 
 void refreshMsgs() {
+    /* Load ONLY the open conversation's messages. Message bodies live in the
+       per-conversation record store now; walking the whole "s.lxmf.id.N.msgs"
+       prefix would load + decompress every conversation under CFG_LOCK on the
+       LCD task — stalling the storage actor (the O(all-messages) refresh the
+       structured-DB rework removes). The conversation LIST reads the maintained
+       directory (contacts.*) instead; see rebuildList. */
     g_msgs.clear();
-    if (g_id < 0) return;
-    storageForEach(g_msgsPrefix.c_str(), msgCb);
+    if (g_id < 0 || g_curPeer.empty()) return;
+    std::string prefix = g_msgsPrefix + "." + g_curPeer;
+    storageForEach(prefix.c_str(), msgCb);
     g_msgs.erase(std::remove_if(g_msgs.begin(), g_msgs.end(),
                                 [](const Msg& m) { return m.stage == "draft"; }),
                  g_msgs.end());
 }
 
-/* ---- announce catalogue: "<last>|<cost>|<hops>|<ratchet>|<name>" leaves ---- */
+/* ---- announce catalogue: per-field records "lxmf.announces.<hex>.<field>" ---- */
 
 void annCb(const char* key, const char* val) {
     const char* tail = key + (sizeof("lxmf.announces.") - 1);
-    if (strchr(tail, '.')) return;       /* bare <hex> leaf only (no nested key) */
-    Ann a;
-    a.hash = tail;
-    if (val) {
-        a.last = atol(val);              /* first field, atol stops at the '|' */
-        const char* p = val;
-        int pipes = 0;
-        while (*p && pipes < 4) { if (*p == '|') pipes++; ++p; }
-        if (pipes == 4) a.name = printable(p, true);   /* everything past pipe #4 */
-    }
-    g_anns.push_back(std::move(a));
+    const char* dot = strchr(tail, '.');
+    if (!dot) return;                    /* need <hex>.<field> */
+    std::string hash(tail, dot - tail);
+    const char* field = dot + 1;
+    if (strchr(field, '.')) return;      /* leaf field only */
+    /* Fields of one hash arrive contiguously (per-record store) → only the last
+     * accumulator can match; O(1) per leaf instead of O(N). */
+    Ann* a = (!g_anns.empty() && g_anns.back().hash == hash) ? &g_anns.back() : nullptr;
+    if (!a) { g_anns.push_back(Ann{}); a = &g_anns.back(); a->hash = hash; }
+    if      (!strcmp(field, "last")) a->last = val ? atol(val) : 0;
+    else if (!strcmp(field, "name")) a->name = val ? printable(val, true) : std::string();
 }
 
 void refreshAnnounces() {
@@ -371,6 +416,9 @@ void refreshAnnounces() {
     storageForEach("lxmf.announces.", annCb);
     std::sort(g_anns.begin(), g_anns.end(),
               [](const Ann& a, const Ann& b) { return a.last > b.last; });
+    g_annIx.clear();
+    g_annIx.reserve(g_anns.size());
+    for (size_t i = 0; i < g_anns.size(); i++) g_annIx.emplace(g_anns[i].hash, i);
 }
 
 /* ---- compose / send ---- */
@@ -422,6 +470,28 @@ void sendMessage(const std::string& peer, const std::string& text) {
     g_msgs.push_back(std::move(m));
 }
 
+/* Per-conversation compose drafts. `s_compose` is one reused textarea, so
+ * switching threads would otherwise bleed the old draft into the new peer. Hold
+ * the in-progress text in EPHEMERAL storage (lxmf.draft.<id>.<peer> — in-RAM,
+ * mirrored, never flashed) so it reappears when you come back to that
+ * conversation; the browser sees the same key for free. */
+std::string draftKey(int n, const std::string& peer) {
+    char k[96];
+    snprintf(k, sizeof k, "lxmf.draft.%d.%s", n, peer.c_str());
+    return k;
+}
+void saveDraft() {
+    if (g_id < 0 || g_curPeer.empty() || !s_compose) return;
+    const char* t = lv_textarea_get_text(s_compose);
+    if (t && *t) storageSet(draftKey(g_id, g_curPeer).c_str(), t);
+    else         storageUnset(draftKey(g_id, g_curPeer).c_str());
+}
+void loadDraft(const std::string& peer) {
+    if (!s_compose) return;
+    std::string d = (g_id >= 0) ? storageGetStr(draftKey(g_id, peer).c_str(), "") : "";
+    lv_textarea_set_text(s_compose, d.c_str());
+}
+
 void onSend(lv_event_t*) {
     if (!s_compose || g_curPeer.empty()) return;
     if (g_id < 0 || !idUp(g_id)) return;   /* mailbox not up yet — sending is held */
@@ -429,6 +499,7 @@ void onSend(lv_event_t*) {
     if (t && *t) {
         sendMessage(g_curPeer, t);
         lv_textarea_set_text(s_compose, "");
+        storageUnset(draftKey(g_id, g_curPeer).c_str());   /* draft consumed by the send */
         rebuildThread();     /* draw the optimistic bubble now, not on the storage round-trip */
         /* Paint it NOW. The Send button happens to fire in the lcd loop's input
          * step, right before lv_timer_handler renders — the bubble shows at once.
@@ -543,16 +614,19 @@ void lxmfIdentityBlock(lv_obj_t* p, int n, const char* destKey, const char* enKe
 }
 
 void markRead(const std::string& peer) {
-    /* One per-conversation watermark instead of a read-flag per message: record
-       the newest message ts as "read up to here". Turns the old O(messages)
-       write burst (which broke liveness) into a single write. */
-    long newest = 0;
-    for (auto& m : g_msgs)
-        if (m.peer == peer && m.ts > newest) newest = m.ts;
-    if (newest <= 0) return;
-    char k[160];
-    snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.read_ts", g_id, peer.c_str());
-    if (storageGetInt(k, 0) < (int)newest) storageSet(k, (int)newest);
+    /* Advance the per-conversation read watermark to the newest message and clear
+       the maintained unread counter. Reads the newest ts from the directory
+       (contacts.last_ts) rather than the message store, so it works before the
+       conversation body is loaded. One or two writes, never O(messages). */
+    char base[160];
+    snprintf(base, sizeof base, "s.lxmf.id.%d.contacts.%s", g_id, peer.c_str());
+    long newest = storageGetInt((std::string(base) + ".last_ts").c_str(), 0);
+    storageBegin();
+    if (newest > 0 && storageGetInt((std::string(base) + ".read_ts").c_str(), 0) < (int)newest)
+        storageSet((std::string(base) + ".read_ts").c_str(), (int)newest);
+    if (storageGetInt((std::string(base) + ".unread").c_str(), 0) != 0)
+        storageSet((std::string(base) + ".unread").c_str(), 0);
+    storageEnd();
 }
 
 /* ---- scrolling ---- */
@@ -566,6 +640,16 @@ void updateThreadDownVis() {
         lv_obj_add_flag(s_threadDown, LV_OBJ_FLAG_HIDDEN);
     else
         lv_obj_remove_flag(s_threadDown, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* The board flips the ephemeral sys.standby key around lcdScreenSleep/Wake. */
+bool lcdAwake()      { return storageGetInt("sys.standby", 0) == 0; }
+bool threadAtBottom(){ return s_msgList && lv_obj_get_scroll_bottom(s_msgList) <= 4; }
+/* "Actively reading": the thread is open and awake with the newest messages in
+ * view — the condition under which an arriving message stays marked read. */
+bool threadReading() {
+    return s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)
+        && !g_curPeer.empty() && lcdAwake() && threadAtBottom();
 }
 
 void scrollThreadBottom(bool anim) {
@@ -583,12 +667,22 @@ void showContacts() {
     if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick) lv_obj_add_flag(s_idpick, LV_OBJ_FLAG_HIDDEN);
     if (s_contacts) {
-        refreshAnnounces();
-        rebuildList();
+        /* Just REVEAL the list that stayed built underneath the thread — leaving a
+           conversation is an instant visibility flip, no rebuild. Anything that
+           changed while the thread was open is folded in by the deferred refresh
+           below (cheap now: the list reads the directory, not the message store),
+           so the reveal never blocks on a walk. */
         lv_obj_remove_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
-        setActiveTab(g_activeTab);          /* re-show the last tab + focus its search */
+        setActiveTab(g_activeTab, /*keepScroll=*/true);   /* returning from a conv keeps the list position */
     }
+    saveDraft();                            /* hold the in-progress text for this conversation */
     g_curPeer.clear();
+    /* Only rebuild when needed: a fresh open / identity switch (the list was built
+     * for a different identity, or never) must render; a change that arrived while
+     * away (g_listDirty) must fold in; but a plain return from a conversation is a
+     * pure visibility flip — no rebuild, no scroll change. */
+    if (g_listBuiltId != g_id) g_listDirty = true;
+    scheduleRefresh();
 }
 
 void buildThreadShell() {
@@ -713,6 +807,7 @@ void composeReflectUp() {
 
 void openThread(const std::string& peer) {
     closeInfo();                            /* e.g. a nomad-link open while the info page is up */
+    if (!g_curPeer.empty() && g_curPeer != peer) saveDraft();   /* preserve the conv we're leaving */
     g_curPeer = peer;
     if (!s_thread) buildThreadShell();
     lv_label_set_text(s_threadName, peerName(peer).c_str());
@@ -720,8 +815,11 @@ void openThread(const std::string& peer) {
     if (s_idpick)   lv_obj_add_flag(s_idpick,   LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
     lcdProgramFullscreen(true);             /* immersive chat: no status bar */
+    refreshMsgs();                          /* load this conversation's records now */
     markRead(peer);
     rebuildThread();
+    scrollThreadBottom(false);              /* opening/returning to a conversation lands at newest */
+    loadDraft(peer);                        /* restore this conversation's in-progress text */
     composeReflectUp();
     deferFocus(s_compose);                  /* focus always rests on the entry box */
 }
@@ -839,7 +937,27 @@ void addBubbleText(lv_obj_t* bub, const std::string& content) {
     addText(textStart, body.size());
 }
 
-void addBubble(const Msg& m) {
+/* Set/update the delivery glyph on a bubble's meta row in place: child 0 is the
+ * timestamp, child 1 (if any) the glyph. Drop the old glyph and re-add, so a
+ * stage transition rewrites one tiny label instead of the whole bubble. */
+void setBubbleStatus(lv_obj_t* meta, const Msg& m) {
+    while (lv_obj_get_child_count(meta) > 1)
+        lv_obj_delete(lv_obj_get_child(meta, 1));
+    if (m.in) return;
+    const char* sym = nullptr;
+    lv_color_t  col = lv_color_hex(0x8a93a0);
+    if (m.stage == "sent")           { sym = LV_SYMBOL_OK; }
+    else if (m.stage == "delivered") { sym = LV_SYMBOL_OK LV_SYMBOL_OK;
+                                       col = lv_color_hex(0x4abf6a); }
+    else if (m.stage == "failed" ||
+             m.stage == "cancelled") { sym = LV_SYMBOL_CLOSE;
+                                       col = lv_color_hex(0xd9534f); }
+    else if (m.stage == "queued" ||
+             m.stage == "sending")   { sym = "..."; }
+    if (sym) mkLabel(meta, sym, col);
+}
+
+lv_obj_t* addBubble(const Msg& m) {
     lv_obj_t* row = lv_obj_create(s_bubbles);
     lv_obj_remove_style_all(row);
     lv_obj_set_width(row, lv_pct(100));
@@ -889,36 +1007,98 @@ void addBubble(const Msg& m) {
     lv_obj_remove_flag(meta, LV_OBJ_FLAG_SCROLLABLE);
 
     mkLabel(meta, tbuf, lv_color_hex(0xc0c8d0));
-    if (!m.in) {
-        const char* sym = nullptr;
-        lv_color_t  col = lv_color_hex(0x8a93a0);
-        if (m.stage == "sent")           { sym = LV_SYMBOL_OK; }
-        else if (m.stage == "delivered") { sym = LV_SYMBOL_OK LV_SYMBOL_OK;
-                                           col = lv_color_hex(0x4abf6a); }
-        else if (m.stage == "failed" ||
-                 m.stage == "cancelled") { sym = LV_SYMBOL_CLOSE;
-                                           col = lv_color_hex(0xd9534f); }
-        else if (m.stage == "queued" ||
-                 m.stage == "sending")   { sym = "..."; }
-        if (sym) mkLabel(meta, sym, col);
-    }
+    setBubbleStatus(meta, m);
+    return meta;
 }
 
 void rebuildThread() {
     if (!s_bubbles || g_curPeer.empty()) return;
     refreshFont();
+
+    /* Order = arrival order = the record store's arena order (g_msgs is loaded in
+       that order). We deliberately do NOT sort by ts: the ESP RTC drifts too far
+       to order messages reliably, whereas insertion order is exactly "as
+       received/sent". This also keeps new messages strictly at the end, so the
+       reconcile below only ever appends. */
+    std::vector<const Msg*> ms;
+    ms.reserve(g_msgs.size());
+    for (auto& m : g_msgs) if (m.peer == g_curPeer) ms.push_back(&m);
+
+    bool wasAtBottom = threadAtBottom();   /* pinned to newest before this update? */
+
+    /* Reconcile against the rendered bubbles instead of clear+rebuild. If the
+       existing bubbles are a prefix of the current message list, update any
+       changed stage glyph in place and append the newcomers — one widget per new
+       message, not a wholesale rebuild of the (possibly huge) thread. Only a
+       structural change (delete/reorder) falls back to a full rebuild. */
+    size_t common = std::min(ms.size(), g_bubbles.size());
+    size_t matchN = 0;
+    while (matchN < common && ms[matchN]->key == g_bubbles[matchN].mid) matchN++;
+
+    if (matchN == g_bubbles.size()) {                    /* existing bubbles are a prefix */
+        for (size_t i = 0; i < g_bubbles.size(); i++)
+            if (ms[i]->stage != g_bubbles[i].stage) {
+                setBubbleStatus(g_bubbles[i].meta, *ms[i]);
+                g_bubbles[i].stage = ms[i]->stage;
+            }
+        bool appended = false;
+        for (size_t i = g_bubbles.size(); i < ms.size(); i++) {
+            lv_obj_t* meta = addBubble(*ms[i]);
+            g_bubbles.push_back({ ms[i]->key, ms[i]->stage, meta });
+            appended = true;
+        }
+        if (appended) {
+            if (wasAtBottom) {
+                scrollThreadBottom(false);               /* stay pinned to newest */
+                if (lcdAwake()) markRead(g_curPeer);     /* reading it now → keep unread at 0 */
+            } else {
+                updateThreadDownVis();                   /* scrolled up reading history — don't yank */
+            }
+        }
+        return;
+    }
+
+    /* Fallback: structural change or a different conversation — full rebuild. */
     lv_obj_clean(s_bubbles);
     g_nomadTargets.clear();          /* link widgets are gone with the cleaned bubbles */
-    std::vector<const Msg*> ms;
-    for (auto& m : g_msgs) if (m.peer == g_curPeer) ms.push_back(&m);
-    std::sort(ms.begin(), ms.end(), [](const Msg* a, const Msg* b) { return a->ts < b->ts; });
-    for (auto* m : ms) addBubble(*m);
+    g_bubbles.clear();
+    for (auto* m : ms) {
+        lv_obj_t* meta = addBubble(*m);
+        g_bubbles.push_back({ m->key, m->stage, meta });
+    }
     scrollThreadBottom(false);                          /* newest + compose at bottom */
 }
 
 /* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
 
-struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; };
+struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; int count = 0; };
+
+/* Conversation list built from the maintained directory (contacts.<peer>.*),
+   NOT by walking messages — O(conversations), and it touches only the small
+   cJSON contacts subtree, never the record store. Populated via storageForEach
+   into g_convScan (function-pointer callback, so a file-scope accumulator). */
+std::vector<Conv> g_convScan;
+void convCb(const char* key, const char* val) {
+    /* key = "s.lxmf.id.N.contacts.<peer>.<field>" */
+    const char* rest = strstr(key, ".contacts.");
+    if (!rest) return;
+    rest += sizeof(".contacts.") - 1;
+    const char* dot = strchr(rest, '.');
+    if (!dot) return;
+    std::string peer(rest, dot - rest);
+    const char* field = dot + 1;
+    if (strchr(field, '.')) return;   /* leaf field only */
+    /* Leaves of one peer arrive contiguously (per-record store / sorted walk),
+     * so only the last accumulator can match — O(1) per leaf, not O(N). */
+    Conv* c = (!g_convScan.empty() && g_convScan.back().peer == peer)
+                  ? &g_convScan.back() : nullptr;
+    if (!c) { Conv nc; nc.peer = peer; g_convScan.push_back(std::move(nc)); c = &g_convScan.back(); }
+    if      (!strcmp(field, "count"))   c->count   = val ? atoi(val) : 0;
+    else if (!strcmp(field, "last_ts")) c->ts      = val ? atol(val) : 0;
+    else if (!strcmp(field, "unread"))  c->unread  = val ? atoi(val) : 0;
+    else if (!strcmp(field, "read_ts")) c->read_ts = val ? atol(val) : 0;
+    else if (!strcmp(field, "preview")) c->preview = val ? val : "";
+}
 
 /* Compact "time since" badge shown at the right of every row: how long ago we
  * last heard this dest announce. Chat-app style — s / m(inutes) / h / d / w / y.
@@ -945,8 +1125,8 @@ std::string relAge(long secs) {
 /* Last-heard-announce timestamp for a dest (0 = never). g_anns is kept sorted by
  * .last descending, so the first hit is the most recent. */
 long lastAnnounce(const std::string& peer) {
-    for (auto& an : g_anns) if (an.hash == peer) return an.last;
-    return 0;
+    auto it = g_annIx.find(peer);
+    return it != g_annIx.end() ? g_anns[it->second].last : 0;
 }
 
 /* ---- contact info page (mirrors the web ContactCard) ----
@@ -1209,7 +1389,8 @@ void addPeerRow(lv_obj_t* list, const std::string& peer, const std::string& titl
  * circled-i sits at the right edge (no background) and opens the contact info
  * page, which holds the delete-conversation flow behind an explicit confirm. */
 void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& title,
-                   const std::string& sub, const std::string& age, lv_color_t titleColor) {
+                   const std::string& sub, const std::string& age, lv_color_t titleColor,
+                   int unread = 0) {
     int lineH = lv_font_get_line_height(kFont);
 
     /* Tappable body — the same plain button the mesh tab uses (shared g_rowPeers
@@ -1231,6 +1412,24 @@ void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& t
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
     fillPeerContent(row, title, sub, age, titleColor);   /* row → flex: [body][age] */
+
+    /* Unread badge: a blue pill with the count, between the age and the info
+     * button. Blue background per design; absent when there's nothing unread. */
+    if (unread > 0) {
+        lv_obj_t* badge = lv_obj_create(row);
+        lv_obj_remove_style_all(badge);
+        lv_obj_set_style_bg_color(badge, lv_color_hex(0x2563a0), 0);
+        lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_pad_hor(badge, 6, 0);
+        lv_obj_set_style_pad_ver(badge, 1, 0);
+        lv_obj_set_width(badge, LV_SIZE_CONTENT);
+        lv_obj_set_height(badge, LV_SIZE_CONTENT);
+        lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+        char cnt[8]; snprintf(cnt, sizeof cnt, "%d", unread > 999 ? 999 : unread);
+        lv_obj_center(mkLabel(badge, cnt, lv_color_white()));
+    }
 
     /* Fixed circled-i at the right edge (grey, no background) → info page.
      * LVGL's symbol set has no info glyph, so it's a bordered-circle label. */
@@ -1271,6 +1470,12 @@ void clearRows(lv_obj_t* list) {
 void rebuildList(bool keepScroll) {
     if (!s_listC || !s_listM) return;
     refreshFont();
+    /* Load the mesh column's data inline, mirroring how the Contacts column reads
+     * its directory below: the On-the-Mesh rows are built from g_anns, so it must
+     * be current on every rebuild regardless of what triggered it. (Gating this on
+     * an "announces changed" flag left the tab empty after any non-announce
+     * rebuild.) */
+    refreshAnnounces();
     int32_t syC = keepScroll ? lv_obj_get_scroll_y(s_listC) : 0;
     int32_t syM = keepScroll ? lv_obj_get_scroll_y(s_listM) : 0;
     clearRows(s_listC);
@@ -1298,19 +1503,15 @@ void rebuildList(bool keepScroll) {
     /* ---- Contacts tab: conversations, newest-comms first, each with a
      * last-heard-announce badge and a swipe-to-delete. ---- */
     std::string nC = lower(trim(g_qContacts));
+    /* Read the conversation list from the maintained directory — never the
+       message store. Only peers with at least one message (count>0) are
+       conversations; the rest are announce-only contacts. */
+    g_convScan.clear();
+    char cprefix[64];
+    snprintf(cprefix, sizeof cprefix, "s.lxmf.id.%d.contacts", g_id);
+    storageForEach(cprefix, convCb);
     std::vector<Conv> convs;
-    for (auto& m : g_msgs) {
-        Conv* c = nullptr;
-        for (auto& x : convs) if (x.peer == m.peer) { c = &x; break; }
-        if (!c) {
-            convs.push_back({ m.peer, "", 0, 0 }); c = &convs.back();
-            char rk[160];
-            snprintf(rk, sizeof rk, "s.lxmf.id.%d.contacts.%s.read_ts", g_id, m.peer.c_str());
-            c->read_ts = storageGetInt(rk, 0);
-        }
-        if (m.ts >= c->ts) { c->ts = m.ts; c->preview = (m.in ? "" : "You: ") + m.content; }
-        if (m.in && m.ts > c->read_ts) c->unread++;
-    }
+    for (auto& c : g_convScan) if (c.count > 0) convs.push_back(c);
     std::sort(convs.begin(), convs.end(), [](const Conv& a, const Conv& b) { return a.ts > b.ts; });
 
     int cRows = 0;
@@ -1329,12 +1530,10 @@ void rebuildList(bool keepScroll) {
     for (auto& c : convs) {
         std::string nm = peerName(c.peer);
         if (!qmatch(nC, nm, c.peer)) continue;
-        std::string title = nm;
-        if (c.unread > 0) title += " (" + std::to_string(c.unread) + ")";
         long la = lastAnnounce(c.peer);
-        addContactRow(s_listC, c.peer, title, printable(c.preview, true),
+        addContactRow(s_listC, c.peer, nm, printable(c.preview, true),
                       la > 0 ? relAge(now - la) : std::string(),
-                      c.unread > 0 ? lv_color_hex(0x6cc06c) : lv_color_white());
+                      lv_color_white(), c.unread);   /* unread shown as a blue badge, not in the title */
         cRows++;
     }
     if (cRows == 0)
@@ -1383,7 +1582,7 @@ void styleTab(lv_obj_t* b, bool active) {
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
 }
 
-void setActiveTab(int n) {
+void setActiveTab(int n, bool keepScroll) {
     g_activeTab = n;
     bool c = (n == 0);
     if (s_tabContacts) { if (c) lv_obj_remove_flag(s_tabContacts, LV_OBJ_FLAG_HIDDEN);
@@ -1392,9 +1591,17 @@ void setActiveTab(int n) {
                          else    lv_obj_remove_flag(s_tabMesh,     LV_OBJ_FLAG_HIDDEN); }
     styleTab(s_tabBtnC, c);
     styleTab(s_tabBtnM, !c);
-    lv_obj_t* shown = c ? s_listC : s_listM;
-    if (shown) lv_obj_scroll_to_y(shown, 0, LV_ANIM_OFF);   /* come back to a tab at the top */
-    deferFocus(c ? s_searchC : s_searchM);   /* type-to-search on the shown tab */
+    lv_obj_t* shown  = c ? s_listC   : s_listM;
+    lv_obj_t* search = c ? s_searchC : s_searchM;
+    /* Switching tabs / fresh open starts at the top, so focusing the search box
+     * there is harmless. Returning from a conversation (keepScroll) must stay put:
+     * pin the scroll across the focus so the search box doesn't drag it up. */
+    if (!keepScroll) {
+        if (shown) lv_obj_scroll_to_y(shown, 0, LV_ANIM_OFF);
+        deferFocus(search);                          /* type-to-search on the shown tab */
+    } else {
+        deferFocusPinScroll(search, shown);          /* keyboard ready, list stays put */
+    }
 }
 
 void onTabClick(lv_event_t* e) {
@@ -1596,16 +1803,23 @@ void routeByIdentity() {
  * directly in the send handler, so this delay never affects your own send.) */
 void refreshTimerCb(lv_timer_t*) {
     g_refreshPending = false;
-    bool nm = g_refreshMsgs, na = g_refreshAnns;
-    g_refreshMsgs = g_refreshAnns = false;
-    if (g_id < 0) return;
+    if (g_id < 0) { g_refreshMsgs = g_refreshAnns = g_listDirty = false; return; }
+    /* Flags are cleared by the branch that CONSUMES them, not up front: a change
+     * that arrives while a conversation is open updates the thread (clearing
+     * g_refreshMsgs) but must keep g_refreshAnns / g_listDirty so the list still
+     * rebuilds when you return to it. */
     if (s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)) {
-        if (nm) { refreshMsgs(); rebuildThread(); }
+        if (g_refreshMsgs) { refreshMsgs(); rebuildThread(); g_refreshMsgs = false; }
         composeReflectUp();        /* enable/label compose the instant `up` flips */
     } else if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
-        if (nm) refreshMsgs();
-        if (na) refreshAnnounces();
-        rebuildList(true);
+        /* Only rebuild when something actually changed — a plain return from a
+         * conversation must not churn (or move the scroll). The list reads the
+         * contacts directory + g_anns; it never needs the g_msgs walk. */
+        if (g_listDirty) {
+            rebuildList(true);   /* refreshes g_anns (mesh column) itself */
+            g_refreshMsgs = g_refreshAnns = g_listDirty = false;
+            g_listBuiltId = g_id;
+        }
     }
 }
 void scheduleRefresh() {
@@ -1630,7 +1844,15 @@ void onStorageChange(const char* key, const char*) {
        column, never the msg walk or the open thread. */
     if (key && strncmp(key, "lxmf.announces", 14) == 0) g_refreshAnns = true;
     else                                                g_refreshMsgs = true;
+    g_listDirty = true;   /* a row (preview/unread) or the mesh column may have changed */
     scheduleRefresh();
+}
+
+/* Screen woke: if the open thread is scrolled to the newest, the messages that
+ * arrived while asleep are now in view — clear their unread. */
+void onStandbyChange(const char* /*key*/, const char* val) {
+    if (!s_layer) return;
+    if (val && atoi(val) == 0 && threadReading()) markRead(g_curPeer);
 }
 
 /* Layer eviction frees every widget; null our handles so a storage change
@@ -1643,6 +1865,7 @@ void onLayerDelete(lv_event_t*) {
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
+    g_bubbles.clear();   /* bubble widgets went with the layer — drop dangling refs */
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
@@ -1660,6 +1883,7 @@ void lxmfApp(void* arg) {
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
+    g_bubbles.clear();
     s_threadName = nullptr; s_threadDown = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
@@ -1677,6 +1901,7 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("s.lxmf.id",      onStorageChange);   /* msgs + contacts */
         storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity up/dest edge */
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
+        storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }
 }

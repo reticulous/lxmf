@@ -400,19 +400,24 @@ Inbound: lxmf subscribes rnsd's `RNSD_PORT_ANNOUNCES` fan-out filtered to
 `lxmf.delivery`. rnsd forwards matches as
 `hops(1)|dest(16)|identity(16)|app_data(N)`; `onAnnounceFromRnsd` parses
 (`parseLxmfAnnounce` handles the shapes seen in the wild), skips own dests,
-and writes **one packed leaf per destination**:
+and writes **one record per destination** into the announce catalogue store:
 
 ```
-lxmf.announces.<dest_hex> = "<last_s>|<cost>|<hops>|<ratchet>|<name>"
+lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (schema 3)
 ```
 
-`last_s` first so `atoi(value)` recovers it for the eviction walker without
-parsing the rest; `name` last so embedded `|` need no escaping. One cJSON
-node per entry keeps the PSRAM block count down. Bounded by
-`s.lxmf.max_announces` (default 2048; `annCountAndMaybeOldest` evicts the
-smallest `last_s` on overflow — O(N), only on a new dest at capacity).
+`last`/`hops` are fixed-width and mutate in place on a re-announce (no record
+rebuild); `cost` is a `SDB_FIXSTR` so its `-1` "unknown" sentinel round-trips;
+`ratchet`/`name` are text. The store is RAM-only (`persist=null` — gone on
+reboot), browser-mirrored (the web On-the-Mesh view + ContactCard read it), and
+**self-capping**: `STORAGE_DB_DROP` with `s.lxmf.max_announces` (default 2048)
+drops the oldest-inserted record when a brand-new dest would exceed the cap — no
+walk, no manual eviction (the old `annCountAndMaybeOldest` LRU scan is gone; the
+cap is fixed at registration). Reads go through `readAnnounce()` (one dest) and
+`forEachAnnounce()` (accumulates a store's per-field callbacks back into a
+record), so no code parses a packed string anymore.
 
-The catalogue is a bare-prefix key: RAM-only, gone on reboot. So
+Because the catalogue is RAM-only, `onAnnounceFromRnsd` also writes the
 `onAnnounceFromRnsd` also writes the announced name verbatim into
 `contacts.<dest>.display_name` of every slot that has that contact — the
 announce is authoritative for the name (a nameless announce clears it), and
@@ -479,7 +484,7 @@ size gate), documented in [rns](../rns), not here.
 
 ```
 label · enabled (1) · display_name · default_method (auto)
-contacts.<m>.{hash,nick,display_name,trust,last_seen}   (firmware stubs on first inbound/outbound; display_name re-written from every announce)
+contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,unread,read_ts}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce)
 
 msgs.<id>.dir            in | out
 msgs.<id>.stage          draft(client) | queued | sending | sent | delivered | failed | cancelled | received
@@ -498,18 +503,17 @@ msgs.<id>.last_error     short UI string
 `<key>` is inbound → the real `message_id`; outbound → local
 `o_<unix_ms>_<rand4>` (with `message_id` as a sidecar once packed).
 
-Each conversation subtree (`s.lxmf.id.<n>.msgs.<peer>`) is registered as its
-own **external storage file** (`storageNewTreeFile` via `ensureConvFile`,
-[spangap-core storage docs](../spangap-core/docs/storage.md)), so a chatty
-conversation rewrites only its own small file instead of growing `root.json`
-on every change. `ensureConvFile` runs on every write path — the inbound
-persist, `cmd.send` processing, and the CLI send — so a browser-composed
-draft that first landed in `root.json` self-heals: the registration on
-`cmd.send` detaches it into its own file at the next flush. Deleting a
-conversation (or the identity) via `storageDeleteTree` drops and unregisters
-the file. This only changes *where the bytes flush*: the subtree is still
-fully resident in the in-RAM tree and still syncs to the browser (§13's
-retention pitfall stands).
+Each conversation (`s.lxmf.id.<n>.msgs.<peer>`) is a **structured record store**
+instance — one packed `lxmf/msgs/$1/$2.db.gz` file per (identity, peer), NOT a
+cfgRoot subtree ([storage-internals §0](../spangap-core/docs/storage-internals.md)).
+Callers keep using the same `s.lxmf.id.N.msgs.<peer>.<key>.<field>` key strings;
+storage routes them to the store transparently and synthesizes the same change
+notifications a cfgRoot write would. Message bodies are shipped to the browser on
+demand (`{"fetch":…}` when a conversation opens), not on the connect dump; the
+conversation *directory* (`contacts`) and the announce catalogue are separate
+browser-mirrored stores (see §9 and storage-internals §0). Deleting a
+conversation (or the identity) via `storageDeleteTree` drops the instance + its
+file.
 
 Two alternatives to the per-contact layout are settled. Having firmware scan
 every `msgs.*` subtree for a bare `<key>` (so `cmd.*` values could omit the
@@ -525,8 +529,9 @@ op) is a real option but a wider blast radius — considered and deferred.
 secrets.lxmf.id.<n>.privkey   128-hex Ed25519+X25519 (wiped by identity_destroy)
 
 lxmf.up · lxmf.id.<n>.up · lxmf.id.<n>.dest_hash · lxmf.id.<n>.last_announce_s ·
-lxmf.id.<n>.stats.{sent,received,pending,failed} ·
-lxmf.announces.<dest_hex> "<last_s>|<cost>|<hops>|<ratchet>|<name>"
+lxmf.id.<n>.stats.{sent,received,pending,failed}
+
+lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (RAM-only record store, §9 — not cfgRoot)
 ```
 
 ## 12. Frontends

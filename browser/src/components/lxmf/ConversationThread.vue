@@ -20,7 +20,7 @@
       </span>
     </div>
 
-    <div ref="scroller" class="scroll">
+    <div ref="scroller" class="scroll" @scroll="onScroll">
       <div v-if="buckets.length === 0" class="empty">
         No messages in this conversation yet.
       </div>
@@ -38,7 +38,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { matArrowBack, matInfo } from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import MessageBubble from './MessageBubble.vue'
@@ -59,6 +59,7 @@ const emit = defineEmits<{
   'msg-delete': [m: Message]
   'open-contact': [peer: string]
   back: []
+  read: [peer: string]
 }>()
 
 const reachLine = computed(() => {
@@ -75,14 +76,47 @@ const reachLine = computed(() => {
 })
 
 const scroller = ref<HTMLElement | null>(null)
+
 function toBottom() {
   nextTick(() => {
     const el = scroller.value
     if (el) el.scrollTop = el.scrollHeight
   })
 }
-watch(() => props.peer, toBottom)
-watch(() => props.buckets, toBottom, { deep: true, immediate: true })
+/* Within 48px of the bottom counts as "looking at the newest". */
+function atBottom(): boolean {
+  const el = scroller.value
+  return !el || el.scrollHeight - el.scrollTop - el.clientHeight <= 48
+}
+function reading(): boolean {
+  return atBottom() && document.visibilityState === 'visible' && document.hasFocus()
+}
+/* Reading the newest with the window focused → keep this conversation read. */
+function maybeRead() {
+  if (props.peer && reading()) emit('read', props.peer)
+}
+
+/* Opening / switching a conversation always jumps to the bottom (newest), then
+ * marks read if we're actually looking at it. */
+watch(() => props.peer, () => { toBottom(); nextTick(maybeRead) }, { immediate: true })
+
+/* A new/changed message follows to the bottom ONLY if we were already there —
+ * never yank a reader who scrolled up into history (the watcher runs pre-DOM
+ * update, so atBottom() reflects the position before the new message landed). */
+watch(() => props.buckets, () => {
+  if (atBottom()) { toBottom(); nextTick(maybeRead) }
+}, { deep: true })
+
+function onScroll() { maybeRead() }   /* scrolling down to the newest marks it read */
+
+onMounted(() => {
+  document.addEventListener('visibilitychange', maybeRead)
+  window.addEventListener('focus', maybeRead)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', maybeRead)
+  window.removeEventListener('focus', maybeRead)
+})
 </script>
 
 <style scoped>

@@ -171,7 +171,7 @@ function formatAge(epochSecs: number): string {
 .preview.mono { font-family: 'JetBrains Mono', monospace; font-size: calc(11px * var(--rfs, 1)); }
 .you { color: #7a7a7a; }
 .badge {
-  flex: none; background: #4a7d5e; color: #eaffea; font-size: calc(11px * var(--rfs, 1));
+  flex: none; background: #2563a0; color: #fff; font-size: calc(11px * var(--rfs, 1));
   min-width: 18px; height: 18px; border-radius: 9px; padding: 0 5px;
   display: flex; align-items: center; justify-content: center;
   font-variant-numeric: tabular-nums;

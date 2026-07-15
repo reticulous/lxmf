@@ -68,6 +68,7 @@
                 @msg-delete="askDeleteMsg"
                 @open-contact="showContact = true"
                 @back="lxmf.activePeer.value = ''"
+                @read="p => lxmf.markConversationRead(p)"
               />
               <Composer
                 :model-value="draft"
