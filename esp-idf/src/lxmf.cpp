@@ -1541,6 +1541,49 @@ static bool hexToDestHash(const std::string& s, uint8_t out[16])
     return true;
 }
 
+/* Best display name we can find for `peer_hex` right now, "" if none. Tries the
+ * RAM announce catalogue first, then rnsd's identity cache: it keeps the raw
+ * app_data of the last announce it heard, which the catalogue may never have
+ * recorded (nil-name guard) or have since evicted. The app_data is an LXMF
+ * announce payload, so the same parser extracts the name. */
+static std::string bestHeardName(const std::string& peer_hex)
+{
+    std::string nm = announceName(peer_hex);
+    if (!nm.empty()) return nm;
+    uint8_t dh[16];
+    if (hexToDestHash(peer_hex, dh)) {
+        uint8_t app[512];
+        size_t  len = sizeof(app);
+        if (rnsdRecallAppData(dh, app, &len)) {
+            LxmfAnnounceInfo info = parseLxmfAnnounce(app, len);
+            if (!info.name.empty()) return info.name;
+        }
+    }
+    return "";
+}
+
+/* Fill display_name for any contact still showing only a hash, pulling a name
+ * from any source we currently hold (bestHeardName) and persisting it. Because
+ * the write lands in the browser-mirrored contact record, every frontend picks
+ * it up and the recovery survives reboot. Only contacts whose display_name is
+ * empty are probed; a fully-named book costs one storageForEach per identity. */
+static void backfillContactNames()
+{
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        if (!s_ids[n].used) continue;
+        s_seedPeers.clear();
+        std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
+        storageForEach(cpre.c_str(), seedCollectPeer);
+        for (auto& peer : s_seedPeers) {
+            if (!storageGetStr(contactPath(n, peer, "display_name").c_str(), "").empty())
+                continue;
+            std::string nm = bestHeardName(peer);
+            if (!nm.empty())
+                storageSet(contactPath(n, peer, "display_name").c_str(), nm.c_str());
+        }
+    }
+}
+
 /* Push a frame to rnsd. Returns false if the buffer is full. */
 static bool sendFrame(lxmf_id_t& id, const uint8_t* frame, size_t n)
 {
@@ -1909,7 +1952,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * still land their name in `contacts.<peer>.display_name`, else every
      * frontend shows a bare hash for someone we just picked off the mesh. */
     if (!storageExists(contactPath(id.index, peer_hex, "hash").c_str())) {
-        std::string nm = announceName(peer_hex);
+        std::string nm = bestHeardName(peer_hex);
         storageBegin();
         storageSet(contactPath(id.index, peer_hex, "hash").c_str(),  peer_hex.c_str());
         storageSet(contactPath(id.index, peer_hex, "trust").c_str(), 0);
@@ -2373,7 +2416,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     if (!storageExists(contactPath(id.index, sh_hex, "hash").c_str())) {
         storageSet(contactPath(id.index, sh_hex, "hash").c_str(),  sh_hex.c_str());
         storageSet(contactPath(id.index, sh_hex, "trust").c_str(), 0);
-        std::string peer_name = announceName(sh_hex);
+        std::string peer_name = bestHeardName(sh_hex);
         if (!peer_name.empty())
             storageSet(contactPath(id.index, sh_hex, "display_name").c_str(), peer_name.c_str());
     }
@@ -3277,6 +3320,7 @@ static void unsubscribePerIdCmds(int n)
 /* ─────────────── periodic publish ─────────────── */
 
 static TickType_t s_lastPublishTick = 0;
+static TickType_t s_lastBackfillTick = 0;   /* throttles backfillContactNames() */
 #define LXMF_PUBLISH_INTERVAL_MS 1000
 
 /* When non-zero, the absolute tick at which any newly-armed announce
@@ -3561,7 +3605,7 @@ static std::string peerDisplayName(int sel, const std::string& peer)
 {
     std::string nm = storageGetStr(contactPath(sel, peer, "display_name").c_str(), "");
     if (nm.empty())
-        nm = announceName(peer);
+        nm = bestHeardName(peer);
     return nm;
 }
 
@@ -4219,6 +4263,16 @@ static void lxmfTaskMain(void*)
                 lxmf_id_t& id = s_ids[n];
                 if (id.used && !id.pending_verify.empty())
                     drainAllPendingVerify(id);
+            }
+
+            /* Recover names for hash-only contacts from whatever the announce
+             * catalogue / identity cache now holds. Throttled: the caches warm
+             * from inbound announces, so a periodic sweep catches contacts the
+             * per-announce back-fill missed (heard before the contact existed,
+             * or evicted from one cache but not the other). */
+            if (now - s_lastBackfillTick >= pdMS_TO_TICKS(60000)) {
+                s_lastBackfillTick = now;
+                backfillContactNames();
             }
 
             /* Debounced announce: fires once 10 s after the last iface
