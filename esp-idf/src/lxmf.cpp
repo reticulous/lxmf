@@ -412,10 +412,16 @@ static void bumpConvDirectory(int n, const std::string& peer, int ts_s,
 /* One-time directory backfill. Migration moved message bodies into the record
  * stores but did not seed the maintained directory (count/last_ts/preview/unread)
  * for conversations that predate it — so a migrated device would show only
- * conversations touched since. Runs once (guarded by s.lxmf.dir_seeded), after
- * registration + migration: for every contact whose directory count is unset,
+ * conversations touched since. Runs once (guarded by s.lxmf.dir_seeded2), after
+ * registration + migration: for every contact whose directory count is still 0,
  * aggregate its stored messages and seed the summary. Cheap on later boots (the
- * guard skips the whole pass). */
+ * guard skips the whole pass).
+ *
+ * The per-peer skip tests count > 0, NOT storageExists(count): count is a
+ * fixed-width record scalar, present (reading 0) in every contact record the
+ * moment the record exists, so storageExists would report every migrated contact
+ * as already seeded and skip the whole backfill. A real conversation always has
+ * count > 0; an announce-only contact has 0 and is correctly left unseeded. */
 static std::vector<std::string> s_seedPeers;
 static void seedCollectPeer(const char* key, const char*) {
     const char* c = strstr(key, ".contacts.");
@@ -460,14 +466,14 @@ static void seedMsgField(const char* key, const char* val) {
     else if (field == "content") s_aggMidContent = val ? val : "";
 }
 static void lxmfSeedDirectory() {
-    if (storageGetInt("s.lxmf.dir_seeded", 0) != 0) return;
+    if (storageGetInt("s.lxmf.dir_seeded2", 0) != 0) return;
     int seeded = 0;
     for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
         s_seedPeers.clear();
         std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
         storageForEach(cpre.c_str(), seedCollectPeer);
         for (auto& peer : s_seedPeers) {
-            if (storageExists(contactPath(n, peer, "count").c_str())) continue;
+            if (storageGetInt(contactPath(n, peer, "count").c_str(), 0) > 0) continue;
             s_aggCount = 0; s_aggUnread = 0; s_aggLastTs = 0; s_aggPreview.clear();
             s_aggReadTs = convReadTs(n, peer);
             seedFlushMsg();   /* reset per-message accumulators */
@@ -487,7 +493,7 @@ static void lxmfSeedDirectory() {
             seeded++;
         }
     }
-    storageSet("s.lxmf.dir_seeded", 1);
+    storageSet("s.lxmf.dir_seeded2", 1);
     if (seeded) info("lxmf: seeded directory for %d conversation(s)", seeded);
 }
 
