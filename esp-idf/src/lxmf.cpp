@@ -1615,7 +1615,7 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
     /* Advertised stamp cost is a single global knob (0 = advertise none).
      * Whether we *require* it on inbound is the separate enforce_stamps
      * toggle. */
-    int cost = storageGetInt("s.lxmf.stamp_cost", 16);
+    int cost = storageGetInt("s.lxmf.stamp_cost", 8);
 
     std::vector<uint8_t> out;
     mpPackArrayHeader(out, 2);
@@ -1667,7 +1667,7 @@ static void sendAnnounce(lxmf_id_t& id)
      * from parseLxmfAnnounce). rnsd will log the wire contents too, but
      * showing it here keeps each line self-contained for debugging. */
     std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
-    int cost = storageGetInt("s.lxmf.stamp_cost", 16);
+    int cost = storageGetInt("s.lxmf.stamp_cost", 8);
     info("id %d: announce sent name=\"%s\" cost=%d (%zu B app_data)",
          id.index, sanitizeForLog(name).c_str(), cost, app_data.size());
 }
@@ -2358,7 +2358,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
      * just log whether a stamp rode along. Either path runs only here,
      * for novel messages, after dedup. */
     if (storageGetInt("s.lxmf.enforce_stamps", 0) != 0) {
-        int required = storageGetInt("s.lxmf.stamp_cost", 16);
+        int required = storageGetInt("s.lxmf.stamp_cost", 8);
         if (required > 0) {
             if (lxmfStampValid(mid_hash, required,
                                stamp_bytes.data(), stamp_bytes.size(),
@@ -4368,7 +4368,7 @@ void LxmfService::onInit()
      *  - generate_stamps: pay a peer's advertised cost when sending.
      * Whether we *require* inbound stamps is the enforce_stamps toggle. */
     storageBegin();
-    storageDefault("s.lxmf.stamp_cost",      16);
+    storageDefault("s.lxmf.stamp_cost",      8);
     storageDefault("s.lxmf.generate_stamps", 1);
 
     /* On-the-mesh view horizon (seconds): the LCD "On the Mesh" tab hides any

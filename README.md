@@ -281,7 +281,7 @@ proof-of-work price (in bits; each bit doubles the work) a sender pays per
 message as spam friction. Three knobs, all surfaced in the Settings panel
 and the on-device settings pane:
 
-- **`s.lxmf.stamp_cost`** (slider 0–18, default 16): the single cost we
+- **`s.lxmf.stamp_cost`** (slider 0–18, default 8): the single cost we
   advertise to everyone. `0` advertises none. The cap of 18 keeps it
   generatable on-device; validation is cheap at any cost. This is *only*
   what we advertise.
@@ -305,7 +305,7 @@ keeps ticking.
 |---|---|---|
 | `s.lxmf.announce_interval_s` | `1800` | Periodic re-announce seconds; `0` = on demand only. |
 | `s.lxmf.max_announces` | `2048` | Announce-catalogue entry cap; `0` = no eviction. |
-| `s.lxmf.stamp_cost` | `16` | Advertised PoW cost (bits, 0–18; `0` = none). |
+| `s.lxmf.stamp_cost` | `8` | Advertised PoW cost (bits, 0–18; `0` = none). |
 | `s.lxmf.generate_stamps` | `1` | Pay a peer's advertised stamp cost when sending. |
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. |

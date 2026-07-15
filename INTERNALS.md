@@ -465,7 +465,7 @@ the conversation subtree).
 ```
 announce_interval_s  1800   periodic re-announce s (0 = on demand only)
 max_announces        2048   announce-catalogue cap (0 = no eviction)
-stamp_cost           16     advertised PoW cost (0–18; 0 = none)
+stamp_cost           8      advertised PoW cost (0–18; 0 = none)
 generate_stamps      1      pay a peer's advertised cost when sending
 enforce_stamps       0      drop inbound without a valid stamp for our cost
 auto_ticket          1      no effect (tickets unimplemented; read by nothing)
