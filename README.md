@@ -34,10 +34,13 @@ format and the per-byte deltas from upstream are in
   message history, fully siloed. **No identity is created automatically** — a
   device with none runs as a transport-only node (it relays and tracks the
   mesh but has no mailbox of its own).
-- **Automatic delivery mode.** Per message, lxmf picks a single
-  opportunistic packet for small messages, a Reticulum Link (DIRECT)
-  otherwise, and a Resource transfer for large bodies — transparently. While
-  a per-peer conversation Link is warm, even small messages ride it.
+- **Selectable delivery mode.** Per message, lxmf picks a single
+  opportunistic packet, a Reticulum Link (DIRECT), or a Resource transfer for
+  large bodies. A per-identity/global method chooses how eagerly to hold a
+  Link — from `link-always` through the default `link-if-one-exists` (ride a
+  warm Link, else opportunistic) and `link-if-big` down to
+  `opportunistic-or-fail`. The conversation header shows the live Link state
+  and toggles it open/closed on tap.
 - **Announces.** Each enabled identity periodically announces its delivery
   destination. Every inbound `lxmf.delivery` announce on the mesh is
   collected into a shared, cross-identity **announce catalogue** of everyone
@@ -151,9 +154,12 @@ Per loaded identity you can observe:
 s.lxmf.id.<n>.label          "main" | "imported" | user-set
 s.lxmf.id.<n>.enabled        1 (default) — 0 = identity dark: no announce, no send, inbound dropped
 s.lxmf.id.<n>.display_name   utf-8, advertised in announces
-s.lxmf.id.<n>.default_method  auto (default) | opportunistic | direct
+s.lxmf.id.<n>.default_method  per-identity delivery method (see below); falls
+                             back to the global s.lxmf.default_method
 lxmf.id.<n>.up               1 once the mailbox is connected
 lxmf.id.<n>.dest_hash        hex16 — this identity's lxmf.delivery address
+lxmf.id.<n>.link.<peer>      conversation-link state to <peer>, ephemeral:
+                             absent (down) | establishing | active
 ```
 
 From firmware, `lxmf.h` exposes:
@@ -200,13 +206,29 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
    `last_error` carries a short human string during the attempt
    (`requesting path`, `establishing link`, …); `attempts` counts retries.
 
-**Delivery method is automatic.** lxmf resolves
-per-message `method` → `s.lxmf.id.<n>.default_method` → `auto`. Under `auto`
-a message goes opportunistic when `title + content + ~32 B` fits one packet
-(budget ~311 B) **and** no conversation Link to that peer is already warm;
-otherwise it goes DIRECT (a Link), with a Resource transfer for large
-bodies. An explicit `method = opportunistic` that exceeds the budget fails
-with `last_error = "too large for opportunistic"`.
+**Delivery method.** lxmf resolves per-message `method` →
+`s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
+`link-if-one-exists`. The four methods form a spectrum of link eagerness:
+
+| method | behaviour |
+| --- | --- |
+| `link-always` | always a Reticulum Link. |
+| `link-if-one-exists` *(default)* | ride a warm Link to the peer if one exists (our conversation Link or the peer's identified inbound backchannel), else opportunistic. |
+| `link-if-big` | opportunistic when the wire fits one packet, a Link only when it's oversize. |
+| `opportunistic-or-fail` | never a Link; oversize hard-fails with `last_error = "too large for opportunistic"`. |
+
+A message fits opportunistic when `title + content + ~32 B` is within one
+packet (budget ~311 B). Oversize forces a Link in every mode **except**
+`opportunistic-or-fail`, and a Link carries large bodies as a Resource
+transfer. The legacy names still parse: `auto`→`link-if-one-exists`,
+`direct`→`link-always`, `opportunistic`→`opportunistic-or-fail`.
+
+**Link toggle.** The conversation header (web and LCD) shows a link icon —
+green when a Link to the peer is open, amber while establishing, grey when
+down — that tapping opens or closes on demand (`lxmf.id.<n>.cmd.link_open` /
+`cmd.link_close`, value `<peer>`; CLI `lxmf link open|close|status <peer>`).
+It reflects a Link torn down for any reason, tracking the per-second
+`lxmf.id.<n>.link.<peer>` state.
 
 There is **no automatic retry** — to re-send after `stage = failed`, write
 `cmd.send` again.
@@ -325,7 +347,8 @@ Resource and is consumed by rnsd, not lxmf — it is documented in
 label            "main" | "imported" | user-set
 enabled          1 (default); 0 = dark
 display_name     utf-8, advertised in announces
-default_method   auto (default) | opportunistic | direct
+default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
+                 (empty ⇒ inherit global s.lxmf.default_method, default link-if-one-exists)
 contacts.<peer>.{hash,nick,display_name,trust,last_seen}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces)
 msgs.<peer>.<key>.{dir,stage,peer,title,content,thread,method,ts,read,
                    wire,message_id,attempts,last_error}    per-conversation message records

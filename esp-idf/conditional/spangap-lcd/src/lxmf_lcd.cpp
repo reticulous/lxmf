@@ -211,6 +211,7 @@ lv_obj_t* s_msgList  = nullptr;         /* scroll container inside s_thread */
 lv_obj_t* s_bubbles  = nullptr;         /* bubble column (cleaned+rebuilt) inside s_msgList */
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
+lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle (green=open, amber=establishing) */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
 std::string g_infoPeer;                 /* peer shown on the contact info page */
@@ -233,6 +234,7 @@ void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
 void closeInfo();
 void updateThreadDownVis();
+void updateThreadLink();
 
 /* ---- deferred focus ----
  * The launcher tile (or a tapped row) is focused into the input group on
@@ -657,6 +659,27 @@ void updateThreadDownVis() {
         lv_obj_remove_flag(s_threadDown, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* Conversation-link state to `peer`, as published ephemerally by the lxmf
+ * task at lxmf.id.<n>.link.<peer>: "" (down), "establishing", or "active". */
+std::string linkStateOf(const std::string& peer) {
+    if (g_id < 0 || peer.empty()) return "";
+    char k[80];
+    snprintf(k, sizeof k, "lxmf.id.%d.link.%s", g_id, peer.c_str());
+    return storageGetStr(k, "");
+}
+
+/* Recolor the header link glyph for the open thread's peer. Driven from
+ * openThread and every thread refresh, so it follows a link torn down for
+ * any reason (the state key is re-derived by the lxmf task each second). */
+void updateThreadLink() {
+    if (!s_threadLink) return;
+    std::string st = linkStateOf(g_curPeer);
+    lv_color_t col = st == "active"       ? lv_color_hex(0x4abf6a)   /* green: open */
+                   : st == "establishing" ? lv_color_hex(0xd6a12a)   /* amber: opening */
+                                          : lv_color_hex(0x6a7280);  /* grey: down */
+    lv_obj_set_style_text_color(s_threadLink, col, 0);
+}
+
 /* The board flips the ephemeral sys.standby key around lcdScreenSleep/Wake. */
 bool lcdAwake()      { return storageGetInt("sys.standby", 0) == 0; }
 bool threadAtBottom(){ return s_msgList && lv_obj_get_scroll_bottom(s_msgList) <= 4; }
@@ -731,8 +754,25 @@ void buildThreadShell() {
     s_threadName = mkLabel(hdr, "", lv_color_white());
     lv_obj_align(s_threadName, LV_ALIGN_LEFT_MID, 28, 0);
 
+    /* Link indicator/toggle, pinned rightmost: green=open, amber=establishing,
+     * grey=down. Tapping opens the link when down, closes it when up (writes
+     * the cmd.link_open/link_close sentinel the lxmf task consumes). WIFI is
+     * the closest connection glyph the UI font's symbol set carries. */
+    s_threadLink = mkLabel(hdr, LV_SYMBOL_WIFI, lv_color_hex(0x6a7280));
+    lv_obj_align(s_threadLink, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_add_flag(s_threadLink, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_threadLink, 12);
+    lv_obj_add_event_cb(s_threadLink, [](lv_event_t*) {
+        if (g_id < 0 || g_curPeer.empty()) return;
+        bool up = !linkStateOf(g_curPeer).empty();
+        char sentinel[48];
+        snprintf(sentinel, sizeof sentinel, "lxmf.id.%d.cmd.%s",
+                 g_id, up ? "link_close" : "link_open");
+        storageSet(sentinel, g_curPeer.c_str());
+    }, LV_EVENT_CLICKED, nullptr);
+
     s_threadDown = mkLabel(hdr, LV_SYMBOL_DOWN, lv_color_hex(0xc0c8d0));
-    lv_obj_align(s_threadDown, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_align(s_threadDown, LV_ALIGN_RIGHT_MID, -28, 0);
     lv_obj_add_flag(s_threadDown, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(s_threadDown, 12);
     lv_obj_add_event_cb(s_threadDown, [](lv_event_t*) { scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
@@ -826,6 +866,7 @@ void openThread(const std::string& peer) {
     g_curPeer = peer;
     if (!s_thread) buildThreadShell();
     lv_label_set_text(s_threadName, peerName(peer).c_str());
+    updateThreadLink();
     if (s_contacts) lv_obj_add_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick)   lv_obj_add_flag(s_idpick,   LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
@@ -1840,6 +1881,7 @@ void refreshTimerCb(lv_timer_t*) {
     if (s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)) {
         if (g_refreshMsgs) { refreshMsgs(); rebuildThread(); g_refreshMsgs = false; }
         composeReflectUp();        /* enable/label compose the instant `up` flips */
+        updateThreadLink();        /* follow link open/close/teardown */
     } else if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
         /* Only rebuild when something actually changed — a plain return from a
          * conversation must not churn (or move the scroll). The list reads the
@@ -1928,7 +1970,7 @@ void onLayerDelete(lv_event_t*) {
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
     g_bubbles.clear();   /* bubble widgets went with the layer — drop dangling refs */
-    s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr;
+    s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
@@ -1946,7 +1988,7 @@ void lxmfApp(void* arg) {
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
     g_bubbles.clear();
-    s_threadName = nullptr; s_threadDown = nullptr;
+    s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */

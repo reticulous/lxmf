@@ -62,11 +62,13 @@
                 :name="lxmf.displayName(lxmf.activePeer.value)"
                 :buckets="lxmf.activeConversation.value"
                 :reach="lxmf.reachability(lxmf.activePeer.value)"
+                :link-state="lxmf.linkState(lxmf.activePeer.value)"
                 :show-back="compact"
                 @resend="m => lxmf.resend(m.peer, m.key)"
                 @msg-menu="m => (menuMsg = m)"
                 @msg-delete="askDeleteMsg"
                 @open-contact="showContact = true"
+                @toggle-link="p => lxmf.toggleLink(p)"
                 @back="lxmf.activePeer.value = ''"
                 @read="p => lxmf.markConversationRead(p)"
               />

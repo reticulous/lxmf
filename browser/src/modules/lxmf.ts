@@ -312,6 +312,10 @@ export interface UseLxmf {
   deleteConversation: (peer: string) => Promise<void>
   markConversationRead: (peer: string) => void
   announceNow: () => Promise<void>
+  /** Reactive conversation-link state to this peer: '' (down), 'establishing', 'active'. */
+  linkState: (peer: string) => '' | 'establishing' | 'active'
+  /** Open the link if down, close it if up. */
+  toggleLink: (peer: string) => Promise<void>
   createIdentity: (label: string) => Promise<void>
   importIdentity: (privHex: string) => Promise<void>
   destroyIdentity: (n: number) => Promise<void>
@@ -595,6 +599,24 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   }
   const announceNow = () => sendQ('announce').enqueue('1')
 
+  /* Per-peer conversation-link state, published ephemerally by the firmware
+   * at lxmf.id.<n>.link.<peer> and re-derived every second, so it follows a
+   * teardown for any reason. */
+  const linkState = (peer: string): '' | 'establishing' | 'active' => {
+    const s = str(liveTree.value[activeId.value]?.link?.[peer])
+    return s === 'active' || s === 'establishing' ? s : ''
+  }
+  /* Toggle the link: open when down, close when up. The open/close verbs
+   * ride their own sentinels; settle on the published state flipping. */
+  const toggleLink = (peer: string): Promise<void> => {
+    const n = activeId.value
+    const up = linkState(peer) !== ''
+    const verb = up ? 'link_close' : 'link_open'
+    return queue(`lxmf.id.${n}.cmd.${verb}`).enqueue(peer, {
+      settle: () => (linkState(peer) !== '') !== up,
+    })
+  }
+
   /** One per-conversation watermark write, never a set() per message: record
    *  the newest message ts as "read up to here". Unread is derived from it. */
   function markConversationRead(peer: string) {
@@ -647,7 +669,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     peerDirectory, unreadTotal,
     displayName, reachability, contactOf, draftFor, setDraft, openPeer,
     send, resend, cancel, deleteMessage, deleteConversation,
-    markConversationRead, announceNow,
+    markConversationRead, announceNow, linkState, toggleLink,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }
 }

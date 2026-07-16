@@ -15,6 +15,13 @@
         <div class="name">{{ name }}</div>
         <div class="sub">{{ reachLine }}</div>
       </div>
+      <button
+        class="link" :class="`link--${linkState || 'down'}`"
+        :title="linkState ? 'Link open — tap to close' : 'No link — tap to open'"
+        @click.stop="emit('toggle-link', peer)"
+      >
+        <q-icon :name="linkState ? matLink : matLinkOff" size="19px" />
+      </button>
       <span class="info">
         <q-icon :name="matInfo" size="19px" />
       </span>
@@ -39,7 +46,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { matArrowBack, matInfo } from '@quasar/extras/material-icons'
+import { matArrowBack, matInfo, matLink, matLinkOff } from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import MessageBubble from './MessageBubble.vue'
 import type { Message, Reachability } from '../../modules/lxmf'
@@ -49,6 +56,8 @@ const props = defineProps<{
   name: string
   buckets: { day: string; messages: Message[] }[]
   reach: Reachability | null
+  /* Conversation-link state to this peer: '' (down), 'establishing', 'active'. */
+  linkState?: '' | 'establishing' | 'active'
   /* Reveal the Back button (single-column / compact layouts). Hidden by
    * default — desktop master/detail keeps the rail permanently visible. */
   showBack?: boolean
@@ -58,6 +67,7 @@ const emit = defineEmits<{
   'msg-menu': [m: Message]
   'msg-delete': [m: Message]
   'open-contact': [peer: string]
+  'toggle-link': [peer: string]
   back: []
   read: [peer: string]
 }>()
@@ -144,6 +154,14 @@ onBeforeUnmount(() => {
   padding: 2px; border-radius: 5px;
 }
 .thead:hover .info { background: rgba(255,255,255,0.08); color: #cfcfcf; }
+.link {
+  display: inline-flex; align-items: center;
+  background: none; border: none; cursor: pointer;
+  padding: 2px; border-radius: 5px; color: #6a6a6a;
+}
+.link:hover { background: rgba(255,255,255,0.08); }
+.link--active { color: #4abf6a; }
+.link--establishing { color: #d6a12a; }
 .scroll { flex: 1; overflow-y: auto; padding: 8px 10px; }
 .empty { color: #888; font-style: italic; text-align: center; padding: 20px; font-size: calc(13px * var(--rfs, 1)); }
 .daysep { text-align: center; margin: 10px 0 6px; }

@@ -230,6 +230,33 @@ static void setIntIfChanged(const std::string& key, int v)
     if (storageGetInt(key.c_str(), INT32_MIN) != v) storageSet(key.c_str(), v);
 }
 
+/* String analogue of setIntIfChanged for the same churn reason. */
+static void setStrIfChanged(const std::string& key, const char* v)
+{
+    if (storageGetStr(key.c_str(), "").compare(v) != 0) storageSet(key.c_str(), v);
+}
+
+/* Canonicalize a delivery-method name to one of the four current values,
+ * mapping the legacy names and coercing anything unknown to the default.
+ *   link-always            always a Reticulum Link.
+ *   link-if-one-exists     ride a warm link to this peer if one exists,
+ *                          else opportunistic (oversize still opens a link).
+ *   link-if-big            opportunistic when it fits one packet, a Link
+ *                          only when the wire is oversize.
+ *   opportunistic-or-fail  never a Link; oversize hard-fails.
+ * Legacy: auto→link-if-one-exists, direct→link-always,
+ * opportunistic→opportunistic-or-fail. */
+static std::string canonMethod(const std::string& m)
+{
+    if (m == "auto")          return "link-if-one-exists";
+    if (m == "direct")        return "link-always";
+    if (m == "opportunistic") return "opportunistic-or-fail";
+    if (m == "link-always" || m == "link-if-one-exists" ||
+        m == "link-if-big"  || m == "opportunistic-or-fail")
+        return m;
+    return "link-if-one-exists";
+}
+
 /* Per-contact message store: s.lxmf.id.<n>.msgs.<peer>.<key>.<field>.
  * `peer` is a 32-hex destination (the conversation subtree); `key` is
  * the real message_id (inbound) or a local o_<ms>_<rand> (outbound). */
@@ -2040,11 +2067,16 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         }
     }
 
-    /* Delivery-method selection. Resolution order is
-     * per-message override → per-identity default → "auto". "auto"
-     * picks opportunistic when the packed wire fits a single RNS packet,
-     * else DIRECT (a Reticulum Link). Explicit "opportunistic" still
-     * hard-fails oversize; explicit "direct" always uses a Link.
+    /* Delivery-method selection. Resolution order is per-message override
+     * → per-identity default → global default → "link-if-one-exists". The
+     * four methods form a spectrum of link eagerness (see canonMethod):
+     * link-always always uses a Link; link-if-one-exists rides a warm link
+     * to this peer if one exists (our conv link or the peer's identified
+     * inbound backchannel), else opportunistic; link-if-big goes
+     * opportunistic for anything that fits one packet and only opens a Link
+     * for an oversize wire; opportunistic-or-fail never uses a Link.
+     * Oversize forces a Link in every mode except opportunistic-or-fail,
+     * which hard-fails instead — the only mode that can fail on size.
      *
      * Oversize is measured on the real opportunistic payload — the wire
      * minus the dest16 that rnsd strips and re-derives — against the RNS
@@ -2054,11 +2086,13 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     bool oversize = (wire.size() - LXMF_DEST_HASH_LEN) > LXMF_OPP_PAYLOAD_MAX;
     std::string method = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
     if (method.empty())
-        method = storageGetStr(idPath(id.index, "default_method").c_str(), "auto");
+        method = storageGetStr(idPath(id.index, "default_method").c_str(), "");
+    if (method.empty())
+        method = storageGetStr("s.lxmf.default_method", "link-if-one-exists");
+    method = canonMethod(method);
+
     bool use_direct;
-    if (method == "direct") {
-        use_direct = true;
-    } else if (method == "opportunistic") {
+    if (method == "opportunistic-or-fail") {
         if (oversize) {
             warn("id %d: msg %s exceeds opportunistic budget (wire %zu B)",
                  id.index, mid.c_str(), wire.size());
@@ -2066,10 +2100,14 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             return;
         }
         use_direct = false;
-    } else {                                  /* "auto" (default) */
-        /* Prefer the Link when one to this peer is already warm — our
-         * own conversation link or the peer's identified inbound link
-         * (backchannel) — an active chat rides a link for every message. */
+    } else if (method == "link-always") {
+        use_direct = true;
+    } else if (method == "link-if-big") {
+        use_direct = oversize;
+    } else {                                  /* link-if-one-exists (default) */
+        /* Prefer the Link when one to this peer is already warm — our own
+         * conversation link or the peer's identified inbound backchannel —
+         * an active chat rides a link for every message. */
         use_direct = oversize || convFind(id.index, peer_hex) != nullptr
                   || inlinkBackchannel(id.index, peer_hex) != nullptr;
     }
@@ -3234,6 +3272,8 @@ static void onIdentityLevelCmd(const char* key, const char* val)
  *
  * Same shape as onIdentityLevelCmd: ignore the self-unset re-entry
  * (val=""), do the work, unset the sentinel last. */
+static void publishLinks(void);   /* defined below; called for a snappy icon update */
+
 static void handleIdCmd(int n, const char* key, const char* val)
 {
     if (n < 0 || n >= LXMF_MAX_IDENTITIES) return;
@@ -3281,6 +3321,19 @@ static void handleIdCmd(int n, const char* key, const char* val)
         }
         else if (std::strcmp(verb, "delete") == 0) {
             processDelete(id, peer_hex, mid);
+        }
+        else if (std::strcmp(verb, "link_open") == 0) {
+            uint8_t dh[16];
+            if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh))
+                warn("id %d: link_open bad peer \"%s\"", n, peer_hex.c_str());
+            else if (!convGet(id, peer_hex, dh, /*open_if_missing=*/true))
+                warn("id %d: link_open to %s failed", n, peer_hex.c_str());
+            publishLinks();
+        }
+        else if (std::strcmp(verb, "link_close") == 0) {
+            if (convlink_t* c = convFind(id.index, peer_hex)) convDrop(*c);
+            else if (inlink_t* bc = inlinkBackchannel(id.index, peer_hex)) inlinkDrop(*bc);
+            publishLinks();
         }
         else {
             warn("id %d: unknown cmd %s", n, verb);
@@ -3372,6 +3425,51 @@ static void publishStats(void)
         setIntIfChanged(idEphPath(n, "stats.failed"),   (int)id.failed);
     }
     storageEnd();
+}
+
+/* Per-peer conversation-link state for the UIs, ephemeral and keyed by
+ * peer: lxmf.id.<n>.link.<peer> = "active" | "establishing". The key is
+ * UNSET when no link is open, so a link torn down for ANY reason (remote
+ * close, idle reap, failure, or a local close command) clears the header
+ * icon on the next tick — this is re-derived from the live pools every
+ * second, not event-driven. Both pools count: our conversation link and
+ * the peer's identified inbound backchannel. */
+static std::vector<std::string> s_pubLinkKeys;
+static void publishLinks(void)
+{
+    std::vector<std::string> keys, vals;
+    auto note = [&](int n, const std::string& peer, const char* state) {
+        if (peer.size() != 32) return;
+        std::string k = idEphPath(n, ("link." + peer).c_str());
+        for (size_t i = 0; i < keys.size(); ++i)
+            if (keys[i] == k) {                 /* active wins over establishing */
+                if (std::strcmp(state, "active") == 0) vals[i] = "active";
+                return;
+            }
+        keys.push_back(k);
+        vals.emplace_back(state);
+    };
+    for (auto& c : s_convlinks) {
+        if (!c.used || c.handle < 0) continue;
+        std::string st = storageGetStr(("rnsd.links." + c.tag + ".state").c_str(), "");
+        if (st == "failed" || st == "closed" || st == "closing") continue;  /* down */
+        note(c.id_index, c.peer_hex, st == "active" ? "active" : "establishing");
+    }
+    for (auto& s : s_inlinks) {
+        if (!s.used || s.handle < 0 || s.peer_hex.empty()) continue;
+        std::string st = storageGetStr(("rnsd.links." + s.tag + ".state").c_str(), "");
+        if (st == "active") note(s.id_index, s.peer_hex, "active");
+    }
+    storageBegin();
+    for (auto& old : s_pubLinkKeys) {           /* clear peers no longer open */
+        bool still = false;
+        for (auto& k : keys) if (k == old) { still = true; break; }
+        if (!still) storageUnset(old.c_str());
+    }
+    for (size_t i = 0; i < keys.size(); ++i)
+        setStrIfChanged(keys[i], vals[i].c_str());
+    storageEnd();
+    s_pubLinkKeys.swap(keys);
 }
 
 /* collectTokens is defined later (in the CLI section). */
@@ -4019,6 +4117,7 @@ static void cliLxmf(const char* args)
         cliPrintf("                      arg = 32-hex (instant lookup) or name substring\n");
         cliPrintf("lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
         cliPrintf("lxmf announce           emit a delivery announce for selected id\n");
+        cliPrintf("lxmf link <act> <peer>  open|close|status a conversation link to <32-hex peer>\n");
         return;
     }
     /* Bare `lxmf` → identity list as status. */
@@ -4090,6 +4189,30 @@ static void cliLxmf(const char* args)
         storageSet(idEphPath(sel, "cmd.announce").c_str(), 1);
         cliPrintf("announce requested for id %d (%s)\n",
                   sel, bytesToHex(id->dest_hash, LXMF_DEST_HASH_LEN).c_str());
+        return;
+    }
+    if (verb == "link") {
+        int sel = selectedId();
+        lxmf_id_t* id = idAt(sel);
+        if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
+        while (*rest == ' ') rest++;
+        const char* sp2 = std::strchr(rest, ' ');
+        std::string act = sp2 ? std::string(rest, sp2 - rest) : std::string(rest);
+        std::string peer = sp2 ? std::string(sp2 + 1) : std::string();
+        while (!peer.empty() && peer.front() == ' ') peer.erase(peer.begin());
+        if (peer.size() != 32) { cliPrintf("usage: lxmf link open|close|status <32-hex peer>\n"); return; }
+        if (act == "status") {
+            std::string st = storageGetStr(idEphPath(sel, ("link." + peer).c_str()).c_str(), "");
+            cliPrintf("link to %s: %s\n", peer.c_str(), st.empty() ? "down" : st.c_str());
+        } else if (act == "open") {
+            storageSet(idEphPath(sel, "cmd.link_open").c_str(), peer.c_str());
+            cliPrintf("link open requested to %s\n", peer.c_str());
+        } else if (act == "close") {
+            storageSet(idEphPath(sel, "cmd.link_close").c_str(), peer.c_str());
+            cliPrintf("link close requested to %s\n", peer.c_str());
+        } else {
+            cliPrintf("usage: lxmf link open|close|status <32-hex peer>\n");
+        }
         return;
     }
 
@@ -4239,6 +4362,7 @@ static void lxmfTaskMain(void*)
             resolveDirectSends();   /* settle outbound DIRECT */
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             inlinkPollIdentified(); /* map inbound links to peers as they identify */
+            publishLinks();         /* per-peer link state for the header icons */
             /* Retry sends parked on a then-busy conversation link. Skip
              * anything no longer "queued" (cancel/competing writer wins). */
             if (!s_deferred.empty()) {

@@ -314,13 +314,20 @@ handleIdCmd → split val on '/' → delete sentinel → processSend(id,peer,loc
 
 processReady — method resolution (after the wire is packed, so oversize
   is measured on the real payload, not a content estimate):
-  msgs.<id>.method → s.lxmf.id.<n>.default_method → "auto"
+  msgs.<id>.method → s.lxmf.id.<n>.default_method → s.lxmf.default_method
+                   → "link-if-one-exists"   (canonMethod maps legacy auto/direct/opportunistic)
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
-  "direct"        → use a Link
-  "opportunistic" → fail if oversize, else OUT_PACKET on the mailbox handle
-  "auto"          → use a Link if oversize OR a conversation Link to peer is already
-                    warm OR the peer has an identified inbound Link (backchannel)
+  "link-always"           → use a Link
+  "link-if-one-exists"    → use a Link if oversize OR a conversation Link to peer is already
+                            warm OR the peer has an identified inbound Link (backchannel)
+  "link-if-big"           → use a Link only if oversize, else OUT_PACKET
+  "opportunistic-or-fail" → fail if oversize, else OUT_PACKET on the mailbox handle
   large + Link    → rnsdLinkSendResource (Resource over the Link)
+
+publishLinks (1 Hz) re-derives lxmf.id.<n>.link.<peer> = active|establishing (unset =
+  down) from s_convlinks + identified s_inlinks, so a Link torn down for any reason
+  clears the header icon next tick. cmd.link_open/cmd.link_close (value <peer>) open/close
+  on demand; CLI `lxmf link open|close|status <peer>`.
 ```
 
 Local outbound key is `o_<unix_ms>_<rand4>` (the real `message_id` isn't
@@ -483,7 +490,7 @@ size gate), documented in [rns](../rns), not here.
 ### Per-identity (`s.lxmf.id.<n>.*`)
 
 ```
-label · enabled (1) · display_name · default_method (auto)
+label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-if-one-exists)
 contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,unread,read_ts}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce)
 
 msgs.<id>.dir            in | out
@@ -491,7 +498,7 @@ msgs.<id>.stage          draft(client) | queued | sending | sent | delivered | f
 msgs.<id>.peer           hex16 (redundant with the path segment, kept for indexed query)
 msgs.<id>.title / content
 msgs.<id>.thread         hex64 root message_id, "" if none
-msgs.<id>.method         opportunistic | direct | auto (hint while draft)
+msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; legacy auto/direct/opportunistic still parse)
 msgs.<id>.ts             unix s
 msgs.<id>.read           inbound only, 0 | 1
 msgs.<id>.wire           hex of the packed LXM (firmware)
