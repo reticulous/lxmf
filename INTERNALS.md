@@ -612,6 +612,16 @@ both on the lcd task.
   loop's captured `now`; an unsigned `TickType_t` subtraction underflows and
   re-fires immediately. The code casts to `int32_t` before the `>= 0` test —
   keep it.
+- **Reset the build-tracking statics on every fresh open.** The list is drawn
+  into a brand-new (empty) program layer each time the app is opened, but plain
+  file statics survive the layer teardown. `g_listBuiltId` ("the list is already
+  built for this identity — skip the rebuild") must be re-set to `-2` (and
+  `g_listDirty` to `false`) at the top of `lxmfApp()`, alongside the `g_id`
+  reset. Miss it and a reopen after the app is stopped/evicted (recents
+  swipe-up) finds the guard still matching the identity, skips the initial
+  populate, and shows an **empty conversation list until reboot** re-zeroes the
+  static. Every widget handle is reset there already; the build guard is the one
+  that also needs it.
 
 ## 14. Interop checklist (must stay true)
 

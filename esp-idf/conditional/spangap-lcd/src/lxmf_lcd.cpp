@@ -1953,6 +1953,11 @@ void lxmfApp(void* arg) {
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
     g_searchTimer = nullptr;   /* prior layer's onLayerDelete already freed it */
+    /* The list is drawn into a brand-new (empty) layer on every open, so the
+     * "already built for this identity" short-circuit must start unset — else a
+     * reopen after the app is stopped/evicted sees g_listBuiltId still matching
+     * the identity, skips the initial populate, and shows an empty list. */
+    g_listBuiltId = -2; g_listDirty = false;
 
     lv_obj_add_event_cb(s_layer, onLayerDelete, LV_EVENT_DELETE, nullptr);
 
