@@ -1,8 +1,9 @@
 <!-- Direction-aware message bubble. Outbound right, inbound left.
      The status footer is the honest-receipts surface (plan §6):
-       • TWO ticks, never three — there is no network read receipt.
-       • single-tick-forever is NORMAL for opportunistic, not "stuck".
-       • failed → "!" + last_error inline + one-tap Resend.
+       • in flight (…) until proven delivered — no reassuring single check.
+       • TWO ticks (delivered) = cryptographic proof; there is no third.
+       • no proof before the timeout is a FAILURE ("no proof received"),
+         shown with the error inline + one-tap Resend.
      Emits intent only; the composition layer decides what it does. -->
 <template>
   <div class="row" :class="m.dir === 'out' ? 'out' : 'in'">
@@ -22,45 +23,33 @@
       </div>
     </div>
 
-    <div class="bubble" :class="{ muted: m.stage === 'cancelled' }"
+    <div class="bubble" :class="{ muted: m.status === LxmfStatus.Cancelled }"
          @contextmenu.prevent="emit('menu', m)">
       <div class="content"><template v-for="(seg, i) in segments" :key="i"><a
           v-if="seg.link" class="nomad-link"
           @click.stop="openNomad(seg.link.hash, seg.link.path)"
         >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></div>
 
+      <!-- meta: ALL-CAPS status name (outbound, left, smaller) · time · glyph.
+           glyph: … in flight · ✓✓ delivered (green) · ✕ cancelled (grey) /
+           gave-up tries==255 (red). -->
       <div class="meta">
+        <span v-if="m.dir === 'out' && m.status !== LxmfStatus.Delivered"
+              class="statusName">{{ statusName }}</span>
         <span class="time">{{ clock }}</span>
-
-        <!-- status glyphs: … in flight · ✓ sent (grey) · ✓✓ delivered
-             (green) · ✕ failed/cancelled (red). lastError as tooltip. -->
         <template v-if="m.dir === 'out'">
-          <span v-if="m.stage === 'queued' || m.stage === 'sending'"
-                class="chip dots" :title="m.lastError || m.stage">…</span>
-          <span v-else-if="m.stage === 'sent'" class="chip"
-                :title="m.lastError || 'sent — no delivery proof yet'">
-            <q-icon :name="matDone" size="15px" />
-          </span>
-          <span v-else-if="m.stage === 'delivered'" class="chip ok"
+          <span v-if="m.status === LxmfStatus.Delivered" class="chip ok"
                 title="delivered — cryptographic proof received">
             <q-icon :name="matDoneAll" size="15px" />
           </span>
-          <span v-else-if="m.stage === 'failed' || m.stage === 'cancelled'"
-                class="chip bad" :title="m.lastError || m.stage">
+          <span v-else-if="m.status === LxmfStatus.Cancelled" class="chip">
             <q-icon :name="matClose" size="15px" />
           </span>
+          <span v-else-if="m.tries === LXMF_TRIES_GAVEUP" class="chip bad">
+            <q-icon :name="matClose" size="15px" />
+          </span>
+          <span v-else class="chip dots">…</span>
         </template>
-      </div>
-
-      <!-- transient sub-text while sending: "establishing link"… -->
-      <div v-if="m.stage === 'sending' && m.lastError" class="subnote">
-        {{ m.lastError }}
-      </div>
-
-      <!-- failed: error inline + one-tap resend (no auto-retry exists) -->
-      <div v-if="m.stage === 'failed'" class="failrow">
-        <span class="err">{{ m.lastError || 'send failed' }}</span>
-        <button class="resend" @click="emit('resend', m)">Resend</button>
       </div>
     </div>
   </div>
@@ -68,9 +57,10 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { matDone, matDoneAll, matClose, matMoreVert, matDelete }
+import { matDoneAll, matClose, matMoreVert, matDelete }
   from '@quasar/extras/material-icons'
-import { type Message, segmentMessage, openNomad } from '../../modules/lxmf'
+import { type Message, segmentMessage, openNomad, formatMsgTime,
+         lxmfStatusName, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 
 const props = defineProps<{ m: Message }>()
 
@@ -84,11 +74,8 @@ const emit = defineEmits<{
 
 const menuOpen = ref(false)
 
-const clock = computed(() =>
-  props.m.ts
-    ? new Date(props.m.ts * 1000).toLocaleTimeString(undefined,
-        { hour: '2-digit', minute: '2-digit' })
-    : '')
+const clock = computed(() => formatMsgTime(props.m.ts))
+const statusName = computed(() => lxmfStatusName(props.m.status))
 </script>
 
 <style scoped>
@@ -153,22 +140,18 @@ const clock = computed(() =>
   justify-content: flex-end;
   margin-top: 2px;
   font-size: calc(11px * var(--rfs, 1));
-  color: #9a9a9a;
+  color: #c2c2c2;
+}
+/* status name pushed to the left in smaller print; time + glyph stay right. */
+.statusName {
+  flex: 1 1 auto; min-width: 0;
+  font-size: calc(10px * var(--rfs, 1)); letter-spacing: 0.3px;
+  color: #b0b0b0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .time { font-variant-numeric: tabular-nums; }
 .chip { display: inline-flex; align-items: center; color: #8a93a0; }
 .chip.ok  { color: #4abf6a; }
 .chip.bad { color: #d9534f; }
 .chip.dots { font-weight: 700; line-height: 1; }
-.subnote { margin-top: 3px; font-size: calc(11px * var(--rfs, 1)); color: #8fa6c0; font-style: italic; }
-.failrow {
-  margin-top: 4px; display: flex; align-items: center; gap: 8px;
-  font-size: calc(11px * var(--rfs, 1));
-}
-.err { color: #d98a8a; }
-.resend {
-  background: none; border: 1px solid #d98a8a; color: #d98a8a;
-  border-radius: 5px; padding: 1px 8px; font-size: calc(11px * var(--rfs, 1)); cursor: pointer;
-}
-.resend:hover { background: rgba(217, 138, 138, 0.15); }
 </style>

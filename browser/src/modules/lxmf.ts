@@ -63,21 +63,34 @@ const _draftsById = reactive<Record<number, Record<string, string>>>({})
 
 /* ── Types ──────────────────────────────────────────────────────────── */
 
-export type Stage =
-  | 'draft' | 'queued' | 'sending' | 'sent'
-  | 'delivered' | 'failed' | 'cancelled' | 'received'
+/* Unified message status. The numeric VALUES are persisted in the record's u8
+ * `status` field, so this is APPEND-ONLY (never renumber/remove).
+ * MIRROR: keep in exact sync with enum LxmfStatus + lxmfStatusName in
+ * reticulous/lxmf/esp-idf/include/lxmf.h (same names, same numbers). */
+export enum LxmfStatus {
+  Draft = 0, Queued = 1, RequestingPath = 2, Sending = 3, AwaitingProof = 4,
+  RetryingDelivery = 5, RetryingLink = 6,
+  Delivered = 7, Cancelled = 8, Received = 9,
+  NoProof = 10, NoRoute = 11, TooLarge = 12, Evicted = 13, BadPeer = 14,
+  Disabled = 15, MailboxStarting = 16, PackFail = 17, OutboxFull = 18,
+  LinkOpenFail = 19, ResMalloc = 20, ResSend = 21, LinkSendDrop = 22,
+  PacketSendDrop = 23, ResTransfer = 24, LinkFail = 25, LinkClosed = 26,
+  Unknown = 27,
+}
+/* tries === 255 is the one definitive terminal marker (gave up). */
+export const LXMF_TRIES_GAVEUP = 255
 
 export interface Message {
   key: string
   peer: string
   dir: 'in' | 'out'
-  stage: Stage
+  status: LxmfStatus
+  tries: number
   title: string
   content: string
   thread: string
-  ts: number
-  attempts: number
-  lastError: string
+  ts: number           // sender's clock (display)
+  recvTs: number       // monotonic receive time (date-separator anchor)
   messageId: string
 }
 
@@ -144,6 +157,65 @@ export function peerAvatar(peer: string, name: string): { hue: number; glyph: st
 
 function num(v: unknown, d = 0): number { const n = Number(v); return Number.isFinite(n) ? n : d }
 function str(v: unknown): string { return v == null ? '' : String(v) }
+
+/* status code → its ALL-CAPS enum name for display. The only direction needed —
+ * a stored code is never parsed back from text.
+ * MIRROR: keep in sync with lxmfStatusName in lxmf.h (same names, same numbers). */
+const STATUS_NAME: Record<number, string> = {
+  [LxmfStatus.Draft]: 'DRAFT', [LxmfStatus.Queued]: 'QUEUED',
+  [LxmfStatus.RequestingPath]: 'REQUESTING_PATH', [LxmfStatus.Sending]: 'SENDING',
+  [LxmfStatus.AwaitingProof]: 'AWAITING_PROOF',
+  [LxmfStatus.RetryingDelivery]: 'RETRYING_DELIVERY', [LxmfStatus.RetryingLink]: 'RETRYING_LINK',
+  [LxmfStatus.Delivered]: 'DELIVERED', [LxmfStatus.Cancelled]: 'CANCELLED',
+  [LxmfStatus.Received]: 'RECEIVED',
+  [LxmfStatus.NoProof]: 'NO_PROOF', [LxmfStatus.NoRoute]: 'NO_ROUTE',
+  [LxmfStatus.TooLarge]: 'TOO_LARGE', [LxmfStatus.Evicted]: 'EVICTED',
+  [LxmfStatus.BadPeer]: 'BAD_PEER', [LxmfStatus.Disabled]: 'DISABLED',
+  [LxmfStatus.MailboxStarting]: 'MAILBOX_STARTING', [LxmfStatus.PackFail]: 'PACK_FAIL',
+  [LxmfStatus.OutboxFull]: 'OUTBOX_FULL', [LxmfStatus.LinkOpenFail]: 'LINK_OPEN_FAIL',
+  [LxmfStatus.ResMalloc]: 'RES_MALLOC', [LxmfStatus.ResSend]: 'RES_SEND',
+  [LxmfStatus.LinkSendDrop]: 'LINK_SEND_DROP', [LxmfStatus.PacketSendDrop]: 'PACKET_SEND_DROP',
+  [LxmfStatus.ResTransfer]: 'RES_TRANSFER', [LxmfStatus.LinkFail]: 'LINK_FAIL',
+  [LxmfStatus.LinkClosed]: 'LINK_CLOSED', [LxmfStatus.Unknown]: 'UNKNOWN',
+}
+export function lxmfStatusName(status: number): string {
+  return STATUS_NAME[status] ?? ''
+}
+
+/* Minimal strftime for the browser, covering the specifiers used by the
+ * s.lxmf.msg_time_format / s.lcd.date_format style strings. Unknown specifiers
+ * pass through verbatim. */
+function strftime(d: Date, fmt: string): string {
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  const mon  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const monF = ['January','February','March','April','May','June','July','August',
+                'September','October','November','December']
+  const day  = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+  const dayF = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
+  const h = d.getHours()
+  const map: Record<string, () => string> = {
+    H: () => p2(h),          k: () => String(h),
+    I: () => p2((h % 12) || 12), l: () => String((h % 12) || 12),
+    M: () => p2(d.getMinutes()), S: () => p2(d.getSeconds()),
+    p: () => (h < 12 ? 'AM' : 'PM'), P: () => (h < 12 ? 'am' : 'pm'),
+    d: () => p2(d.getDate()), e: () => String(d.getDate()),
+    m: () => p2(d.getMonth() + 1),
+    y: () => p2(d.getFullYear() % 100), Y: () => String(d.getFullYear()),
+    b: () => mon[d.getMonth()], B: () => monF[d.getMonth()],
+    a: () => day[d.getDay()],   A: () => dayF[d.getDay()],
+    '%': () => '%',
+  }
+  return fmt.replace(/%(.)/g, (whole, c: string) => (map[c] ? map[c]() : whole))
+}
+
+/* Format one message timestamp (unix seconds) via the s.lxmf.msg_time_format
+ * setting — honoured identically by the LCD bubbles. Reads the setting reactively
+ * (called from a computed), so a format change re-renders the thread live. */
+export function formatMsgTime(ts: number): string {
+  if (!ts) return ''
+  const fmt = str(useDeviceStore().get('s.lxmf.msg_time_format')) || '%H:%M'
+  return strftime(new Date(ts * 1000), fmt)
+}
 
 /* ── Per-sentinel command queues (§3.2) ─────────────────────────────────
  * cmd.send / cmd.cancel / cmd.delete / cmd.announce are four distinct
@@ -460,13 +532,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     return {
       key, peer,
       dir: str(r.dir) === 'in' ? 'in' : 'out',
-      stage: (str(r.stage) || 'queued') as Stage,
+      status: num(r.status, LxmfStatus.Queued) as LxmfStatus,
+      tries: num(r.tries),
       title: str(r.title),
       content: str(r.content),
       thread: str(r.thread),
       ts: num(r.ts),
-      attempts: num(r.attempts),
-      lastError: str(r.last_error),
+      recvTs: num(r.recv_ts),
       messageId: str(r.message_id),
     }
   }
@@ -484,9 +556,9 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       if (count <= 0) continue // announce-only contact, no messages exchanged
       const lastTs = num(c.last_ts)
       const last: Message = {
-        key: '', peer, dir: 'out', stage: 'sent',
-        title: '', content: str(c.preview), thread: '', ts: lastTs,
-        attempts: 0, lastError: '', messageId: '',
+        key: '', peer, dir: 'out', status: LxmfStatus.AwaitingProof, tries: 0,
+        title: '', content: str(c.preview), thread: '', ts: lastTs, recvTs: lastTs,
+        messageId: '',
       }
       out.push({ peer, name: displayName(peer), last, ts: lastTs, unread: num(c.unread), count })
     }
@@ -503,10 +575,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     // received/sent".
     const msgs = Object.keys(thread)
       .map(key => readMsg(peer, key, thread[key] ?? {}))
-      .filter(m => m.stage !== 'draft')
+      .filter(m => m.status !== LxmfStatus.Draft)
+    // Day separators anchor to recvTs (monotonic receive time), NOT the sender's
+    // ts — a message with a skewed clock can't shove a separator to the wrong day
+    // or make the date jump backward mid-thread.
     const buckets: { day: string; messages: Message[] }[] = []
     for (const m of msgs) {
-      const day = new Date(m.ts * 1000).toLocaleDateString(undefined,
+      const day = new Date((m.recvTs || m.ts) * 1000).toLocaleDateString(undefined,
         { weekday: 'long', month: 'short', day: 'numeric' })
       const tail = buckets[buckets.length - 1]
       if (tail && tail.day === day) tail.messages.push(m)
@@ -549,7 +624,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const key = `o_${Date.now()}_${rand4()}`
     const rec: Patch = {
       dir: 'out', peer, title: '', content,
-      thread: opts?.thread ?? '', stage: 'queued',
+      thread: opts?.thread ?? '', status: LxmfStatus.Queued,
       ts: Math.floor(Date.now() / 1000),
     }
     if (opts?.method) rec.method = opts.method
@@ -566,22 +641,27 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const recPath = `s.lxmf.id.${n}.msgs.${peer}.${key}`
     const processed = () =>
       !!str(device.get(`${recPath}.message_id`)) ||
-      str(device.get(`${recPath}.stage`)) === 'failed'
+      num(device.get(`${recPath}.tries`)) === LXMF_TRIES_GAVEUP
     await sendQ('send').enqueue(`${peer}/${key}`, { data, settle: processed })
   }
 
   const resend = (peer: string, key: string) => {
     const n = activeId.value
-    const stageOf = () =>
-      str(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.stage`))
+    const triesOf = () =>
+      num(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.tries`))
+    // Re-post the send; the core resets tries (< 255) as it re-attempts.
     return sendQ('send').enqueue(`${peer}/${key}`,
-      { settle: () => { const s = stageOf(); return !!s && s !== 'failed' } })
+      { settle: () => triesOf() !== LXMF_TRIES_GAVEUP })
   }
   const cancel = (peer: string, key: string) => {
     const n = activeId.value
     return sendQ('cancel').enqueue(`${peer}/${key}`, {
-      settle: () => ['cancelled', 'failed', 'sent', 'delivered'].includes(
-        str(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.stage`))),
+      settle: () => {
+        const st = num(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.status`))
+        const tr = num(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.tries`))
+        return st === LxmfStatus.Cancelled || st === LxmfStatus.Delivered ||
+               st === LxmfStatus.AwaitingProof || tr === LXMF_TRIES_GAVEUP
+      },
     })
   }
   const deleteMessage = (peer: string, key: string) => {

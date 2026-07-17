@@ -27,6 +27,10 @@
       </span>
     </div>
 
+    <!-- Floating sticky date: the day of the content at the top of the viewport,
+         shown while scrolling when no inline separator is up there; fades after 2s. -->
+    <div class="stickyday" :class="{ show: stickyShow }">{{ stickyDay }}</div>
+
     <div ref="scroller" class="scroll" @scroll="onScroll">
       <div v-if="buckets.length === 0" class="empty">
         No messages in this conversation yet.
@@ -117,20 +121,45 @@ watch(() => props.buckets, () => {
   if (atBottom()) { toBottom(); nextTick(maybeRead) }
 }, { deep: true })
 
-function onScroll() { maybeRead() }   /* scrolling down to the newest marks it read */
+/* Floating sticky date — the day of the topmost visible content, shown while
+ * scrolling unless an inline .daysep is already at the top; fades 2s after the
+ * last scroll. */
+const stickyDay = ref('')
+const stickyShow = ref(false)
+let stickyTimer: ReturnType<typeof setTimeout> | undefined
+function updateSticky() {
+  const el = scroller.value
+  if (!el) return
+  const top = el.scrollTop
+  let cur = ''
+  let sepAtTop = false
+  el.querySelectorAll<HTMLElement>('.daysep').forEach(s => {
+    const y = s.offsetTop
+    if (y <= top + 1) cur = s.textContent?.trim() ?? ''
+    if (y >= top && y <= top + 28) sepAtTop = true
+  })
+  if (!cur || sepAtTop) { stickyShow.value = false; return }
+  stickyDay.value = cur
+  stickyShow.value = true
+  if (stickyTimer) clearTimeout(stickyTimer)
+  stickyTimer = setTimeout(() => { stickyShow.value = false }, 2000)
+}
+
+function onScroll() { maybeRead(); updateSticky() }   /* + floating date */
 
 onMounted(() => {
   document.addEventListener('visibilitychange', maybeRead)
   window.addEventListener('focus', maybeRead)
 })
 onBeforeUnmount(() => {
+  if (stickyTimer) clearTimeout(stickyTimer)
   document.removeEventListener('visibilitychange', maybeRead)
   window.removeEventListener('focus', maybeRead)
 })
 </script>
 
 <style scoped>
-.thread { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.thread { display: flex; flex-direction: column; height: 100%; overflow: hidden; position: relative; }
 .thead {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08);
@@ -162,11 +191,20 @@ onBeforeUnmount(() => {
 .link:hover { background: rgba(255,255,255,0.08); }
 .link--active { color: #4abf6a; }
 .link--establishing { color: #d6a12a; }
-.scroll { flex: 1; overflow-y: auto; padding: 8px 10px; }
+.scroll { flex: 1; overflow-y: auto; padding: 8px 10px; position: relative; }
+/* Floating sticky date over the top of the scroll area; fades via opacity. */
+.stickyday {
+  position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+  z-index: 5; pointer-events: none;
+  background: #ffffcc; color: #000;
+  font-size: calc(11px * var(--rfs, 1)); padding: 2px 12px; border-radius: 6px;
+  opacity: 0; transition: opacity 0.3s;
+}
+.stickyday.show { opacity: 1; }
 .empty { color: #888; font-style: italic; text-align: center; padding: 20px; font-size: calc(13px * var(--rfs, 1)); }
 .daysep { text-align: center; margin: 10px 0 6px; }
 .daysep span {
-  background: rgba(255,255,255,0.06); color: #9a9a9a;
-  font-size: calc(11px * var(--rfs, 1)); padding: 2px 10px; border-radius: 9px;
+  background: #ffffcc; color: #000;
+  font-size: calc(11px * var(--rfs, 1)); padding: 2px 10px; border-radius: 6px;
 }
 </style>

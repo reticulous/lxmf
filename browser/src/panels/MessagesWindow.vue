@@ -97,7 +97,7 @@
           <div class="sheet" @click.stop>
             <button @click="copyMsg">Copy text</button>
             <button
-              v-if="menuMsg.dir === 'out' && (menuMsg.stage === 'queued' || menuMsg.stage === 'sending')"
+              v-if="menuMsg.dir === 'out' && (menuMsg.status === LxmfStatus.Queued || menuMsg.status === LxmfStatus.RequestingPath || menuMsg.status === LxmfStatus.Sending)"
               @click="cancelMsg">Cancel send</button>
             <button class="danger" @click="deleteMsg">Delete message</button>
             <button @click="menuMsg = null">Cancel</button>
@@ -115,7 +115,7 @@ import ConversationList from '../components/lxmf/ConversationList.vue'
 import ConversationThread from '../components/lxmf/ConversationThread.vue'
 import Composer from '../components/lxmf/Composer.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
-import { useLxmf, type Message } from '../modules/lxmf'
+import { useLxmf, type Message, LxmfStatus } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
 import { useCompact } from 'spangap-browser/lib/viewport'
 
