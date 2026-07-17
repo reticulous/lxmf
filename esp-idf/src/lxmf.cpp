@@ -280,25 +280,30 @@ struct OutboxWire { std::vector<uint8_t> wire; std::string msg_id_hex; uint64_t 
 static std::unordered_map<std::string, OutboxWire> g_wireOutbox;
 static std::string outboxKey(const std::string& peer, const std::string& mid) { return peer + "/" + mid; }
 
-/* Move a message to <stage> with <err>: the two keys commit as one op-list
- * so subscribers (frontends) see a single, atomic transition instead of two
- * back-to-back notifies. */
-static void msgStage(int n, const std::string& peer, const std::string& mid,
-                     const char* stage, const char* err)
+/* Set a message's unified status (u8 record field), overwritten in place. Also
+ * drop the cached wire once the message has egressed or terminated — nothing
+ * left to resend from the queue path. */
+static void msgSetStatus(int n, const std::string& peer, const std::string& mid,
+                         uint8_t status)
 {
-    storageBegin();
-    storageSet(msgPath(n, peer, mid, "stage").c_str(),      stage);
-    storageSet(msgPath(n, peer, mid, "last_error").c_str(), err);
-    storageEnd();
-    /* Release the cached wire once the message leaves the send pipeline. */
-    if (!strcmp(stage, "sent") || !strcmp(stage, "delivered") ||
-        !strcmp(stage, "failed") || !strcmp(stage, "cancelled"))
+    storageSet(msgPath(n, peer, mid, "status").c_str(), (int)status);
+    if (status == LXMF_ST_AWAITING_PROOF || status == LXMF_ST_DELIVERED ||
+        status == LXMF_ST_CANCELLED)
         g_wireOutbox.erase(outboxKey(peer, mid));
 }
 
-/* Common case: mark an outbound message failed with a reason. */
+/* Terminal failure: status = the gave-up reason, tries = 255 (the one definitive
+ * terminal marker). The two u8 keys commit as one op-list so frontends see a
+ * single atomic transition. */
 static void msgFail(int n, const std::string& peer, const std::string& mid,
-                    const char* why) { msgStage(n, peer, mid, "failed", why); }
+                    uint8_t reason)
+{
+    storageBegin();
+    storageSet(msgPath(n, peer, mid, "status").c_str(), (int)reason);
+    storageSet(msgPath(n, peer, mid, "tries").c_str(),  (int)LXMF_TRIES_GAVEUP);
+    storageEnd();
+    g_wireOutbox.erase(outboxKey(peer, mid));
+}
 
 /* Prefix of one conversation's subtree (key empty) or one message's
  * subtree — for storageForEach / storageDeleteTree. */
@@ -327,17 +332,22 @@ static void ensureConvFile(int, const std::string&) {}
  * addressing (`peer`) isn't stored either (the routing layer drops it). Built
  * once; the registration keeps the pointer.
  *
- * schema_ver 2 dropped the old `wire` text field. Files written by v1 load
- * fine (hdr_size is unchanged — `wire` was the last text field, so its bytes are
- * simply ignored trailing data and dropped on the next rewrite). */
+ * schema_ver 2 dropped the old `wire` text field. schema_ver 3 replaced the
+ * fixstr `stage`(12) + `last_error`(48) + `attempts`(1) with a single u8 `status`
+ * (LxmfStatus in lxmf.h) + u8 `tries` — 61 bytes of status per message down to 2,
+ * still overwritten in place. `tries == 255` is the terminal marker. The
+ * hdr_size change trips the store's header check, so v2 files would load empty;
+ * lxmfMigrateMsgs() rewrites them into this layout first (data-preserving). */
 static const sdb_schema& lxmfMsgSchema()
 {
     static const sdb_schema s = [] {
         sdb_schema x;
         x.schema_id = 1;
-        x.schema_ver = 2;
-        x.u8("attempts")
-         .fixstr("dir", 4).fixstr("stage", 12).fixstr("method", 16).fixstr("last_error", 48)
+        x.schema_ver = 3;
+        x.u8("tries").u8("status")
+         .u32("recv_ts")   /* monotonic (never-decreasing) receive time — the stable
+                            * anchor for date separators; `ts` is the sender's clock */
+         .fixstr("dir", 4).fixstr("method", 16)
          .u32("ts")
          .text("title").text("content").text("thread").text("message_id");
         return x;
@@ -416,13 +426,18 @@ static void convMarkRead(int n, const std::string& peer, int upto_ts)
  * per-conversation last_ts / preview / count / unread under contacts.<peer>.
  * Bumped as messages are written so "what conversations exist, newest first,
  * with a preview and unread badge" costs O(conversations), never O(messages).
- * Call inside the message-write bracket. `inbound` bumps the unread counter. */
-static void bumpConvDirectory(int n, const std::string& peer, int ts_s,
-                              const std::string& preview, bool inbound)
+ * Call inside the message-write bracket. `inbound` bumps the unread counter.
+ * Returns the message's monotonic recv_ts: the sender's `ts_s` clamped so it never
+ * goes below the newest already seen (last_ts is that running max), so date
+ * separators anchored to recv_ts can never jump backward on a weird timestamp. */
+static int bumpConvDirectory(int n, const std::string& peer, int ts_s,
+                             const std::string& preview, bool inbound)
 {
     int count = storageGetInt(contactPath(n, peer, "count").c_str(), 0);
     storageSet(contactPath(n, peer, "count").c_str(),   count + 1);
-    storageSet(contactPath(n, peer, "last_ts").c_str(), ts_s);
+    int prev = storageGetInt(contactPath(n, peer, "last_ts").c_str(), 0);
+    int recv = ts_s > prev ? ts_s : prev;               /* refuse to go back */
+    storageSet(contactPath(n, peer, "last_ts").c_str(), recv);
     /* Bounded, single-line preview (control chars folded) — the list shows a
      * snippet, never the whole body. */
     std::string p;
@@ -434,6 +449,7 @@ static void bumpConvDirectory(int n, const std::string& peer, int ts_s,
     if (inbound)
         storageSet(contactPath(n, peer, "unread").c_str(),
                    storageGetInt(contactPath(n, peer, "unread").c_str(), 0) + 1);
+    return recv;
 }
 
 /* One-time directory backfill. Migration moved message bodies into the record
@@ -467,7 +483,7 @@ static std::string s_aggMid, s_aggMidStage, s_aggMidContent;   /* message being 
 static long        s_aggMidTs;
 static bool        s_aggMidIn;
 static void seedFlushMsg() {
-    if (!s_aggMid.empty() && s_aggMidStage != "draft") {
+    if (!s_aggMid.empty() && atoi(s_aggMidStage.c_str()) != LXMF_ST_DRAFT) {
         s_aggCount++;
         s_aggLastTs  = s_aggMidTs;
         s_aggPreview = s_aggMidContent;
@@ -489,7 +505,7 @@ static void seedMsgField(const char* key, const char* val) {
     if (mid != s_aggMid) { seedFlushMsg(); s_aggMid = mid; }
     if      (field == "dir")     s_aggMidIn = (val && !strcmp(val, "in"));
     else if (field == "ts")      s_aggMidTs = val ? atol(val) : 0;
-    else if (field == "stage")   s_aggMidStage = val ? val : "";
+    else if (field == "status")   s_aggMidStage = val ? val : "";
     else if (field == "content") s_aggMidContent = val ? val : "";
 }
 static void lxmfSeedDirectory() {
@@ -1971,7 +1987,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh)) {
         warn("id %d: msg %s ready but peer is malformed (\"%s\")",
              id.index, mid.c_str(), peer_hex.c_str());
-        msgFail(id.index, peer_hex, mid, "bad peer");
+        msgFail(id.index, peer_hex, mid, LXMF_ST_BAD_PEER);
         return;
     }
 
@@ -1996,7 +2012,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
     if (!idEnabled(id.index)) {
         warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
-        msgFail(id.index, peer_hex, mid, "identity disabled");
+        msgFail(id.index, peer_hex, mid, LXMF_ST_DISABLED);
         return;
     }
 
@@ -2007,7 +2023,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * on `up`, so this is a backstop for the CLI / a race. */
     if (id.handle < 0) {
         warn("id %d: msg %s not sent (mailbox not up yet)", id.index, mid.c_str());
-        msgFail(id.index, peer_hex, mid, "mailbox still starting");
+        msgFail(id.index, peer_hex, mid, LXMF_ST_MAILBOX_STARTING);
         return;
     }
 
@@ -2059,7 +2075,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                                ts_ms, title, content, fields, stamp_cost, mid_raw);
             if (wire.empty()) {
                 err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
-                msgFail(id.index, peer_hex, mid, "pack/sign failed");
+                msgFail(id.index, peer_hex, mid, LXMF_ST_PACK_FAIL);
                 return;
             }
             msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
@@ -2096,7 +2112,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         if (oversize) {
             warn("id %d: msg %s exceeds opportunistic budget (wire %zu B)",
                  id.index, mid.c_str(), wire.size());
-            msgFail(id.index, peer_hex, mid, "too large for opportunistic");
+            msgFail(id.index, peer_hex, mid, LXMF_ST_TOO_LARGE);
             return;
         }
         use_direct = false;
@@ -2116,7 +2132,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     outbound_t* o = outboundAlloc(id);
     if (!o) {
         warn("id %d: outbox full", id.index);
-        msgFail(id.index, peer_hex, mid, "outbox full");
+        msgFail(id.index, peer_hex, mid, LXMF_ST_OUTBOX_FULL);
         return;
     }
     o->used    = true;
@@ -2141,11 +2157,11 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         storageBegin();
         storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
         storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "queued");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
-        bumpConvDirectory(id.index, peer_hex, (int)(ts_ms / 1000),
+        storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_QUEUED);
+        int recv = bumpConvDirectory(id.index, peer_hex, (int)(ts_ms / 1000),
                           storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str()),
                           /*inbound=*/false);
+        storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
         storageEnd();
     }
 
@@ -2168,7 +2184,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         if (!cl && !bc) cl = convGet(id, peer_hex, dh);
         if (!cl && !bc) {
             o->used = false;
-            msgFail(id.index, peer_hex, mid, "link open failed");
+            msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_OPEN_FAIL);
             return;
         }
         const std::string ltag    = cl ? cl->tag    : bc->tag;
@@ -2191,7 +2207,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             void* rbuf = gp_alloc(wire.size());
             if (!rbuf) {
                 o->used = false;
-                msgFail(id.index, peer_hex, mid, "resource malloc failed");
+                msgFail(id.index, peer_hex, mid, LXMF_ST_RES_MALLOC);
                 return;
             }
             memcpy(rbuf, wire.data(), wire.size());
@@ -2200,7 +2216,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             if (!rnsdLinkSendResource(ltag.c_str(), rbuf, wire.size(), o->send_id)) {
                 if (cl) convDrop(*cl); else inlinkDrop(*bc);
                 o->used = false;
-                msgFail(id.index, peer_hex, mid, "resource send failed");
+                msgFail(id.index, peer_hex, mid, LXMF_ST_RES_SEND);
                 return;
             }
         } else {
@@ -2208,7 +2224,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             if (itsSend(lhandle, wire.data(), wire.size(), 0) == 0) {
                 if (cl) convDrop(*cl); else inlinkDrop(*bc);
                 o->used = false;
-                msgFail(id.index, peer_hex, mid, "link send dropped");
+                msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_SEND_DROP);
                 return;
             }
         }
@@ -2233,8 +2249,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         }
         storageBegin();
         storageSet(msgPath(id.index, peer_hex, mid, "method").c_str(),     "direct");
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sending");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+        storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_SENDING);
         storageEnd();
         id.pending++;
         info("id %d: send DIRECT mid=%s peer=%s tag=%s%s wire=%zuB",
@@ -2253,12 +2268,11 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
     if (!sendFrame(id, frame.data(), frame.size())) {
         o->used = false;
-        msgFail(id.index, peer_hex, mid, "OUT_PACKET send dropped");
+        msgFail(id.index, peer_hex, mid, LXMF_ST_PACKET_SEND_DROP);
         return;
     }
     storageBegin();
-    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sending");
-    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+    storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_SENDING);
     storageEnd();
     id.pending++;
     info("id %d: send mid=%s peer=%s send_id=%u wire=%zuB",
@@ -2389,7 +2403,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     dedupAdd(mid_hex);
 
     /* Storage existence is the authoritative dedup. */
-    std::string stage_key = msgPath(id.index, sh_hex, mid_hex, "stage");
+    std::string stage_key = msgPath(id.index, sh_hex, mid_hex, "status");
     if (storageExists(stage_key.c_str())) {
         verb("id %d: inbound LXM already stored (mid=%s)", id.index, mid_hex.c_str());
         return;
@@ -2446,7 +2460,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     /* Persist. */
     ensureConvFile(id.index, sh_hex);
     storageBegin();
-    storageSet(stage_key.c_str(),                                "received");
+    storageSet(stage_key.c_str(), (int)LXMF_ST_RECEIVED);
     storageSet(msgPath(id.index, sh_hex, mid_hex, "dir").c_str(),        "in");
     storageSet(msgPath(id.index, sh_hex, mid_hex, "peer").c_str(),       sh_hex.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "title").c_str(),      title.c_str());
@@ -2469,7 +2483,8 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
      * re-trigger the on-device UI rebuild. */
     setIntIfChanged(contactPath(id.index, sh_hex, "last_seen"),
                     (int)(nowUnixMs() / 60000) * 60);
-    bumpConvDirectory(id.index, sh_hex, (int)(ts / 1000), content, /*inbound=*/true);
+    int recv = bumpConvDirectory(id.index, sh_hex, (int)(ts / 1000), content, /*inbound=*/true);
+    storageSet(msgPath(id.index, sh_hex, mid_hex, "recv_ts").c_str(), recv);
     storageEnd();
 
     id.received++;
@@ -2562,8 +2577,7 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         o->awaiting_proof   = true;
         o->proof_deadline_s = (uint32_t)(nowUnixMs() / 1000) + 90;
         storageBegin();
-        storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      "sent");
-        storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), "");
+        storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_AWAITING_PROOF);
         storageEnd();
         dbg("id %d: msg %s → sent (awaiting proof)", id.index, mid.c_str());
         return;
@@ -2576,40 +2590,38 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
      * SENT — don't move them twice. */
     if (!was_awaiting && id.pending > 0) id.pending--;
 
-    const char* next_stage = "failed";
-    const char* err_msg    = "";
+    uint8_t status_code = LXMF_ST_UNKNOWN;
+    bool    gaveup      = true;    /* terminal failure → status + tries=255 via msgFail */
     switch (status) {
         case RNSD_DEST_STATUS_DELIVERED:
-            next_stage = "delivered";
+            status_code = LXMF_ST_DELIVERED; gaveup = false;
             if (!was_awaiting) id.sent++;
             break;
         case RNSD_DEST_STATUS_PROOF_TIMEOUT:
-            /* Not a failure — the message MAY have arrived; the peer just
-             * never proved it. Stage stays "sent", surface the caveat. */
-            next_stage = "sent";
-            err_msg    = "no delivery proof";
-            if (!was_awaiting) id.sent++;
+            /* Egressed but the peer never returned delivery proof. With no retry
+             * sweep yet this is terminal (tries=255); a future sweep would leave
+             * it RETRYING_DELIVERY until the delivery budget is spent. */
+            status_code = LXMF_ST_NO_PROOF;
+            if (was_awaiting) { if (id.sent) id.sent--; }
+            id.failed++;
             break;
         case RNSD_DEST_STATUS_CANCELLED:
-            next_stage = "cancelled"; err_msg = "cancelled";
+            status_code = LXMF_ST_CANCELLED; gaveup = false;
             if (!was_awaiting) id.failed++;
             break;
         case RNSD_DEST_STATUS_EVICTED:
-            next_stage = "failed"; id.failed++; err_msg = "evicted (resource limit)"; break;
+            status_code = LXMF_ST_EVICTED;  id.failed++; break;
         case RNSD_DEST_STATUS_FAILED:
-            next_stage = "failed"; id.failed++; err_msg = "no route to recipient"; break;
+            status_code = LXMF_ST_NO_ROUTE; id.failed++; break;
         case RNSD_DEST_STATUS_TOO_LARGE:
-            next_stage = "failed"; id.failed++; err_msg = "too large for opportunistic"; break;
+            status_code = LXMF_ST_TOO_LARGE; id.failed++; break;
         default:
-            next_stage = "failed"; id.failed++; err_msg = "unknown status"; break;
+            status_code = LXMF_ST_UNKNOWN;  id.failed++; break;
     }
-    storageBegin();
-    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(),      next_stage);
-    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(), err_msg);
-    storageEnd();
-    dbg("id %d: msg %s → %s%s%s%s",
-        id.index, mid.c_str(), next_stage,
-        *err_msg ? " (" : "", err_msg, *err_msg ? ")" : "");
+    if (gaveup) msgFail(id.index, peer_hex, mid, status_code);
+    else        msgSetStatus(id.index, peer_hex, mid, status_code);
+    dbg("id %d: msg %s → %s (tries %s)", id.index, mid.c_str(),
+        lxmfStatusName(status_code), gaveup ? "255" : "n");
 }
 
 /* Human-readable RNSD_DEST_AUX_RETRY reason byte. The reason *values* are
@@ -2630,13 +2642,13 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
 {
     outbound_t* o = outboundFindBySendId(id, send_id);
     if (!o) return;
-    const char* note = nullptr;
+    uint8_t st = 0;   /* 0 = informational only, leave the status unchanged */
     switch (type) {
-        case RNSD_DEST_AUX_REQUESTING_PATH: note = "requesting path"; break;
-        case RNSD_DEST_AUX_PATH_KNOWN:      note = "path known";      break;
-        case RNSD_DEST_AUX_EGRESS_QUEUED:   note = "egress queued";   break;
-        case RNSD_DEST_AUX_LINK_ESTABLISHING: note = "establishing link"; break;
-        case RNSD_DEST_AUX_PATH_LOST:       note = "path lost";       break;
+        case RNSD_DEST_AUX_REQUESTING_PATH:   st = LXMF_ST_REQUESTING_PATH; break;
+        case RNSD_DEST_AUX_PATH_KNOWN:        st = LXMF_ST_SENDING;         break;
+        case RNSD_DEST_AUX_EGRESS_QUEUED:     st = LXMF_ST_SENDING;         break;
+        case RNSD_DEST_AUX_LINK_ESTABLISHING: st = LXMF_ST_SENDING;         break;
+        case RNSD_DEST_AUX_PATH_LOST:         st = LXMF_ST_REQUESTING_PATH; break;
         case RNSD_DEST_AUX_QUEUE_FULL: {
             /* rnsd's pending path-search table is full — it did NOT accept
              * this send. Hold the message: release the in-flight slot,
@@ -2646,35 +2658,29 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
             std::string peer = o->peer, mid = o->msg_key;
             o->used = false;
             if (id.pending) id.pending--;
-            msgStage(id.index, peer, mid, "queued", "rnsd busy — queued");
+            msgSetStatus(id.index, peer, mid, LXMF_ST_QUEUED);
             s_deferred.push_back({ id.index, peer, mid });
             verb("id %d: send_id=%u held (rnsd queue full), requeued %s",
                  id.index, (unsigned)send_id, mid.c_str());
             return;
         }
-        case RNSD_DEST_AUX_RETRY:
-            if (tail_n >= 2) {
-                char buf[64];
-                const char* rname = retryReasonName(tail[1]);
-                if (rname)
-                    std::snprintf(buf, sizeof(buf), "retry %u (%s)",
-                                  (unsigned)tail[0], rname);
-                else
-                    std::snprintf(buf, sizeof(buf), "retry %u (reason 0x%02x)",
-                                  (unsigned)tail[0], (unsigned)tail[1]);
-                storageBegin();
-                storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), buf);
-                storageSet(msgPath(id.index, o->peer, o->msg_key, "attempts").c_str(),
-                           (int)tail[0]);
-                storageEnd();
-                return;
-            }
-            note = "retry";
-            break;
-        default: note = nullptr; break;
+        case RNSD_DEST_AUX_RETRY: {
+            /* A path retry: mark REQUESTING_PATH and record the try count in
+             * `tries` (the reason is implicit in the status; log it for detail). */
+            uint8_t tries     = tail_n >= 1 ? tail[0] : 0;
+            const char* rname = tail_n >= 2 ? retryReasonName(tail[1]) : nullptr;
+            dbg("id %d: %s path retry %u (%s)", id.index, o->msg_key.c_str(),
+                (unsigned)tries, rname ? rname : "?");
+            storageBegin();
+            storageSet(msgPath(id.index, o->peer, o->msg_key, "status").c_str(),
+                       (int)LXMF_ST_REQUESTING_PATH);
+            storageSet(msgPath(id.index, o->peer, o->msg_key, "tries").c_str(), (int)tries);
+            storageEnd();
+            return;
+        }
+        default: break;
     }
-    if (note)
-        storageSet(msgPath(id.index, o->peer, o->msg_key, "last_error").c_str(), note);
+    if (st) msgSetStatus(id.index, o->peer, o->msg_key, st);
 }
 
 static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
@@ -2893,12 +2899,12 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                 if (ok) {
                     /* The resource transfer ACK is proof-grade: the peer
                      * reassembled and acknowledged the full wire. */
-                    msgStage(id.index, peer_hex, mid, "delivered", "");
+                    msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    msgFail(id.index, peer_hex, mid, "resource transfer failed");
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_RES_TRANSFER);
                     id.failed++;
                     warn("id %d: DIRECT resource failed mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
@@ -2946,8 +2952,7 @@ static void resolveDirectSends(void)
              * here so the slot frees. Stage stays "sent". */
             if (!o.direct) {
                 if (o.awaiting_proof && now_s >= o.proof_deadline_s) {
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
-                               "no delivery proof");
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_NO_PROOF);   /* no proof → error, not a silent "sent" */
                     o.used = false;
                     o.awaiting_proof = false;
                     dbg("id %d: msg %s proof backstop (no OUT_RESULT)",
@@ -2961,7 +2966,8 @@ static void resolveDirectSends(void)
             int tx           = storageGetInt((base + ".tx_packets").c_str(), 0);
 
             bool done = false, ok = false;
-            std::string err;
+            std::string err;               /* human text for the log only */
+            uint8_t code = LXMF_ST_LINK_FAIL;   /* status code stored on failure */
 
             if (o.is_resource) {
                 /* Resource sends settle on the transfer outcome, NOT on
@@ -2981,12 +2987,12 @@ static void resolveDirectSends(void)
                 if (ok) {
                     /* resource.state "sent" = the transfer ACK arrived —
                      * proof-grade, same as the OUTBOUND_DONE fast path. */
-                    msgStage(id.index, peer_hex, mid, "delivered", "");
+                    msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    msgFail(id.index, peer_hex, mid, err.c_str());
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_RES_TRANSFER);
                     id.failed++;
                     warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
                          id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
@@ -3008,7 +3014,7 @@ static void resolveDirectSends(void)
                 int proven = storageGetInt((base + ".tx_proven").c_str(), 0);
                 int touts  = storageGetInt((base + ".proof_timeouts").c_str(), 0);
                 if (proven > o.proof_base_proven) {
-                    msgStage(id.index, peer_hex, mid, "delivered", "");
+                    msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
                     info("id %d: DIRECT delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                     directLinkSettle(o.link_tag, true, now_s);
@@ -3016,12 +3022,11 @@ static void resolveDirectSends(void)
                 } else if (touts > o.proof_base_timeouts ||
                            st == "failed" || st == "closed" || st.empty() ||
                            now_s >= o.proof_deadline_s) {
-                    /* No proof (rnsd's receipt timed out, the link died,
-                     * or our backstop hit). The packet egressed and MAY
-                     * have arrived — stage stays "sent", keep the link
-                     * (a dead link reaps via its own state/disconnect). */
-                    storageSet(msgPath(id.index, peer_hex, mid, "last_error").c_str(),
-                               "no delivery proof");
+                    /* No proof (rnsd's receipt timed out, the link died, or our
+                     * backstop hit). Treated as an error the user can resend, not
+                     * a reassuring "sent" — keep the link (a dead link reaps via
+                     * its own state/disconnect). */
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_NO_PROOF);
                     dbg("id %d: DIRECT no delivery proof mid=%s tag=%s",
                         id.index, mid.c_str(), o.link_tag.c_str());
                     o.used = false; o.direct = false; o.awaiting_proof = false;
@@ -3036,7 +3041,7 @@ static void resolveDirectSends(void)
                 err  = storageGetStr((base + ".last_error").c_str(), "link failed");
             } else if (st == "closed") {
                 done = true; ok = (tx >= 1);
-                if (!ok) err = "link closed before send";
+                if (!ok) { err = "link closed before send"; code = LXMF_ST_LINK_CLOSED; }
             } else if (st.empty() && now_s >= o.direct_deadline_s) {
                 done = true; err = "direct timeout";
             } else if (now_s >= o.direct_deadline_s + 15) {
@@ -3049,7 +3054,7 @@ static void resolveDirectSends(void)
                  * and switch to proof-watching: rnsd keeps the packet
                  * receipt and bumps tx_proven / proof_timeouts when the
                  * link-packet proof lands or times out. */
-                msgStage(id.index, peer_hex, mid, "sent", "");
+                msgSetStatus(id.index, peer_hex, mid, LXMF_ST_AWAITING_PROOF);
                 id.sent++;
                 if (id.pending > 0) id.pending--;
                 info("id %d: DIRECT sent mid=%s tag=%s (awaiting proof)",
@@ -3064,7 +3069,7 @@ static void resolveDirectSends(void)
                 continue;                       /* slot stays — proof phase */
             }
 
-            msgFail(id.index, peer_hex, mid, err.c_str());
+            msgFail(id.index, peer_hex, mid, code);
             id.failed++;
             warn("id %d: DIRECT failed mid=%s tag=%s (%s)",
                  id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
@@ -3129,7 +3134,7 @@ static void processCancel(lxmf_id_t& id, const std::string& peer_hex,
     }
 
     /* Not in flight — mark cancelled directly. */
-    storageSet(msgPath(id.index, peer_hex, mid, "stage").c_str(), "cancelled");
+    storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_CANCELLED);
 }
 
 /* cmd.delete — wipe a message record (frees `wire` storage), or, when
@@ -3565,7 +3570,7 @@ static void cliEnqueueSend(int id_n, const std::string& peer_hex,
     storageSet(msgPath(id_n, peer_hex, mid, "title").c_str(),   "");
     storageSet(msgPath(id_n, peer_hex, mid, "content").c_str(), text.c_str());
     storageSet(msgPath(id_n, peer_hex, mid, "method").c_str(),  "opp");
-    storageSet(msgPath(id_n, peer_hex, mid, "stage").c_str(),   "draft");
+    storageSet(msgPath(id_n, peer_hex, mid, "status").c_str(), (int)LXMF_ST_DRAFT);
     /* cmd.send fires *last* so the record is fully present when the
      * lxmf task sees the sentinel. Value is "<peer>/<key>". */
     char send_key[40];
@@ -3719,7 +3724,7 @@ static MsgRow readMsgRow(int sel, const std::string& peer, const std::string& ke
     r.peer  = peer;
     r.key   = key;
     r.dir   = storageGetStr(msgPath(sel, peer, key, "dir").c_str(),   "");
-    r.stage = storageGetStr(msgPath(sel, peer, key, "stage").c_str(), "");
+    r.stage = lxmfStatusName((uint8_t)storageGetInt(msgPath(sel, peer, key, "status").c_str(), 0));
     r.title = storageGetStr(msgPath(sel, peer, key, "title").c_str(), "");
     r.ts    = storageGetInt(msgPath(sel, peer, key, "ts").c_str(),    0);
     r.read  = (r.ts <= convReadTs(sel, peer)) ? 1 : 0;   /* per-conversation watermark */
@@ -3865,19 +3870,17 @@ static void cliRead(const char* rest)
     const std::string& mid  = ref.key;
 
     std::string dir     = storageGetStr(msgPath(sel, peer, mid, "dir").c_str(),     "");
-    std::string stage   = storageGetStr(msgPath(sel, peer, mid, "stage").c_str(),   "");
+    uint8_t status      = (uint8_t)storageGetInt(msgPath(sel, peer, mid, "status").c_str(), 0);
+    int tries           = storageGetInt(msgPath(sel, peer, mid, "tries").c_str(),   0);
     std::string title   = storageGetStr(msgPath(sel, peer, mid, "title").c_str(),   "");
     std::string content = storageGetStr(msgPath(sel, peer, mid, "content").c_str(), "");
     std::string thread  = storageGetStr(msgPath(sel, peer, mid, "thread").c_str(),  "");
-    std::string err_msg = storageGetStr(msgPath(sel, peer, mid, "last_error").c_str(), "");
     int ts              = storageGetInt(msgPath(sel, peer, mid, "ts").c_str(),       0);
 
     cliPrintf("─── id %d  msg #%d  %s ───\n", sel, n, mid.c_str());
     cliPrintf("dir:    %s\n", dir.c_str());
-    cliPrintf("stage:  %s%s%s\n",
-              stage.c_str(),
-              err_msg.empty() ? "" : "  (",
-              err_msg.empty() ? "" : (err_msg + ")").c_str());
+    cliPrintf("status: %s  (tries %d%s)\n", lxmfStatusName(status), tries,
+              tries == LXMF_TRIES_GAVEUP ? " — gave up" : "");
     cliPrintf("peer:   %s\n", peer.c_str());
     cliPrintf("ts:     %d\n", ts);
     if (!thread.empty()) cliPrintf("thread: %s\n", thread.c_str());
@@ -4371,9 +4374,9 @@ static void lxmfTaskMain(void*)
                 for (auto& d : defer) {
                     if (d.id_index < 0 || d.id_index >= LXMF_MAX_IDENTITIES ||
                         !s_ids[d.id_index].used) continue;
-                    std::string st = storageGetStr(
-                        msgPath(d.id_index, d.peer_hex, d.mid, "stage").c_str(), "");
-                    if (st != "queued") continue;
+                    int st = storageGetInt(
+                        msgPath(d.id_index, d.peer_hex, d.mid, "status").c_str(), 0);
+                    if (st != LXMF_ST_QUEUED) continue;
                     processReady(s_ids[d.id_index], d.peer_hex, d.mid);
                 }
             }
@@ -4445,12 +4448,223 @@ static void lxmfTaskMain(void*)
     }
 }
 
+/* ── One-shot v2 → v3 message-store migration ───────────────────────────────
+ * v2 stored per-message status as fixstr `stage`(12) + `last_error`(48) + u8
+ * `attempts`; v3 packs it into u8 `status` (LxmfStatus) + u8 `tries` (255 = gave
+ * up). The engine would discard v2 files on the hdr_size mismatch, so we decode
+ * each with the retained v2 schema, translate, and rewrite as v3 in place before
+ * the v3 store is registered. Marker-gated → runs exactly once. */
+static const sdb_schema& lxmfMsgSchemaV2()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 1;
+        x.schema_ver = 2;
+        x.u8("attempts")
+         .fixstr("dir", 4).fixstr("stage", 12).fixstr("method", 16).fixstr("last_error", 48)
+         .u32("ts")
+         .text("title").text("content").text("thread").text("message_id");
+        return x;
+    }();
+    return s;
+}
+
+/* Old status text — v2 English, the interim short tokens, or a dynamic note — to
+ * an LxmfStatus code. 0 (none) when unrecognized. */
+static uint8_t migStatusFromText(const std::string& e)
+{
+    static const struct { const char* s; uint8_t c; } M[] = {
+        {"noproof", LXMF_ST_NO_PROOF}, {"no delivery proof", LXMF_ST_NO_PROOF},
+        {"noroute", LXMF_ST_NO_ROUTE}, {"no route to recipient", LXMF_ST_NO_ROUTE},
+        {"toolarge", LXMF_ST_TOO_LARGE}, {"too large for opportunistic", LXMF_ST_TOO_LARGE},
+        {"evicted", LXMF_ST_EVICTED}, {"evicted (resource limit)", LXMF_ST_EVICTED},
+        {"cancelled", LXMF_ST_CANCELLED},
+        {"badpeer", LXMF_ST_BAD_PEER}, {"bad peer", LXMF_ST_BAD_PEER},
+        {"disabled", LXMF_ST_DISABLED}, {"identity disabled", LXMF_ST_DISABLED},
+        {"mailboxstarting", LXMF_ST_MAILBOX_STARTING}, {"mailbox still starting", LXMF_ST_MAILBOX_STARTING},
+        {"packfail", LXMF_ST_PACK_FAIL}, {"pack/sign failed", LXMF_ST_PACK_FAIL},
+        {"outboxfull", LXMF_ST_OUTBOX_FULL}, {"outbox full", LXMF_ST_OUTBOX_FULL},
+        {"linkopenfail", LXMF_ST_LINK_OPEN_FAIL}, {"link open failed", LXMF_ST_LINK_OPEN_FAIL},
+        {"resmalloc", LXMF_ST_RES_MALLOC}, {"resource malloc failed", LXMF_ST_RES_MALLOC},
+        {"ressend", LXMF_ST_RES_SEND}, {"resource send failed", LXMF_ST_RES_SEND},
+        {"linksenddrop", LXMF_ST_LINK_SEND_DROP}, {"link send dropped", LXMF_ST_LINK_SEND_DROP},
+        {"packetsenddrop", LXMF_ST_PACKET_SEND_DROP}, {"OUT_PACKET send dropped", LXMF_ST_PACKET_SEND_DROP},
+        {"restransfer", LXMF_ST_RES_TRANSFER}, {"resource transfer failed", LXMF_ST_RES_TRANSFER},
+        {"link failed", LXMF_ST_LINK_FAIL},
+        {"link closed before send", LXMF_ST_LINK_CLOSED},
+        {"unknown", LXMF_ST_UNKNOWN}, {"unknown status", LXMF_ST_UNKNOWN},
+        {"rnsd busy — queued", LXMF_ST_QUEUED}, {"busy — queued", LXMF_ST_QUEUED},
+    };
+    for (auto& m : M) if (e == m.s) return m.c;
+    if (e.rfind("retry", 0) == 0) return LXMF_ST_REQUESTING_PATH;   /* any "retry …" note */
+    return 0;
+}
+
+struct MigRec {
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> byKey;
+    std::vector<std::string> order;    /* record keys in arena (arrival) order */
+};
+static void migCollect(const char* key, const char* field, const char* val, void* ctx)
+{
+    auto* m = static_cast<MigRec*>(ctx);
+    if (m->byKey.find(key) == m->byKey.end()) m->order.push_back(key);
+    m->byKey[key][field] = val ? val : "";
+}
+
+/* Returns the conversation's max recv_ts (0 if nothing migrated). */
+static long migrateMsgFile(const std::string& path)
+{
+    sdb_store in;
+    in.schema = &lxmfMsgSchemaV2();
+    in.path   = path;
+    if (!sdbLoad(&in) || sdbRecordCount(&in) == 0) { sdbEvict(&in); return 0; }  /* not v2 / empty */
+
+    MigRec rec;
+    sdbForEach(&in, migCollect, &rec);
+    sdbEvict(&in);
+
+    sdb_store out;
+    out.schema = &lxmfMsgSchema();     /* v3 */
+    out.path   = path + ".v3";
+    sdbInitEmpty(&out);
+
+    long runMax = 0;   /* running max of ts, in arena order → monotonic recv_ts */
+    for (const std::string& key : rec.order) {
+        auto& f = rec.byKey[key];
+        auto get = [&](const char* n) -> std::string {
+            auto it = f.find(n); return it != f.end() ? it->second : std::string();
+        };
+        std::string stage = get("stage");
+        uint8_t ecode = migStatusFromText(get("last_error"));
+        int attempts  = atoi(get("attempts").c_str());
+        int tri = attempts < 0 ? 0 : (attempts > 254 ? 254 : attempts);   /* keep non-terminal < 255 */
+        uint8_t status;
+        if      (stage == "failed")    { status = ecode ? ecode : (uint8_t)LXMF_ST_UNKNOWN; tri = 255; }
+        else if (stage == "cancelled")   status = LXMF_ST_CANCELLED;
+        else if (stage == "sent")      { if (ecode == LXMF_ST_NO_PROOF) { status = LXMF_ST_NO_PROOF; tri = 255; }
+                                         else                             status = LXMF_ST_AWAITING_PROOF; }
+        else if (stage == "delivered")   status = LXMF_ST_DELIVERED;
+        else if (stage == "received")  { status = LXMF_ST_RECEIVED; tri = 0; }
+        else if (stage == "sending" ||
+                 stage == "queued")      status = (ecode == LXMF_ST_REQUESTING_PATH) ? LXMF_ST_REQUESTING_PATH
+                                                : (stage == "sending" ? LXMF_ST_SENDING : LXMF_ST_QUEUED);
+        else                           { status = LXMF_ST_DRAFT; tri = 0; }   /* draft / unknown */
+
+        long ts = atol(get("ts").c_str());
+        long recv = ts > runMax ? ts : runMax;    /* monotonic in arena order */
+        runMax = recv;
+
+        sdbSetField(&out, key.c_str(), "status",  std::to_string(status).c_str());
+        sdbSetField(&out, key.c_str(), "tries",   std::to_string(tri).c_str());
+        sdbSetField(&out, key.c_str(), "recv_ts", std::to_string(recv).c_str());
+        for (const char* pf : { "dir", "method", "ts", "title", "content", "thread", "message_id" }) {
+            auto it = f.find(pf);
+            if (it != f.end()) sdbSetField(&out, key.c_str(), pf, it->second.c_str());
+        }
+    }
+    bool ok = sdbFlush(&out);
+    sdbEvict(&out);
+    if (ok) { fs_remove(path.c_str()); fs_rename((path + ".v3").c_str(), path.c_str()); }
+    else    { fs_remove((path + ".v3").c_str()); return 0; }
+    return runMax;
+}
+
+static void lxmfMigrateMsgs()
+{
+    /* Marker keyed to the current layout (hdr_size), so a future schema change
+     * gets a fresh marker and re-runs the migration instead of being locked out. */
+    uint16_t curHdr = lxmfMsgSchema().hdr_size;
+    std::string marker = fsStatePath(("/storage/migrated-lxmf-msgs-hdr"
+                                      + std::to_string(curHdr)).c_str());
+    int mh = fs_open(marker.c_str(), "rb");
+    if (mh >= 0) { fs_close(mh); return; }   /* already migrated to this layout */
+
+    int  files = 0;
+    bool clean = true;                            /* no unknown/unreadable files seen */
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        std::string dir = fsStatePath(("/lxmf/msgs/" + std::to_string(n)).c_str());
+        int dh = fs_opendir(dir.c_str());
+        if (dh < 0) continue;
+        std::vector<std::string> stems;          /* peer hashes = file stems */
+        fs_dirent_t ent;
+        while (fs_readdir(dh, &ent)) {
+            size_t nl = strlen(ent.name);
+            if (nl > 6 && strcmp(ent.name + nl - 6, ".db.gz") == 0)
+                stems.emplace_back(ent.name, nl - 6);
+        }
+        fs_closedir(dh);
+
+        std::vector<std::pair<std::string, long>> peerMax;   /* peer → max recv_ts */
+        for (auto& stem : stems) {
+            std::string path = dir + "/" + stem + ".db.gz";
+            uint16_t fid = 0, fver = 0, fhdr = 0;
+            /* Peek the on-disk header so we dispatch by the REAL layout instead of
+             * blindly loading with one schema (which would false-mismatch + skip). */
+            if (!sdbPeekHeader(path.c_str(), &fid, &fver, &fhdr)) {
+                warn("lxmf mig: id %d %s: unreadable header — left as-is\n", n, stem.c_str());
+                clean = false; continue;
+            }
+            if (fhdr == curHdr) {                 /* already the current v3 — nothing to do */
+                info("lxmf mig: id %d %s: already v3 (ver=%u hdr=%u)\n", n, stem.c_str(), fver, fhdr);
+                continue;
+            }
+            if (fid == 1 && fhdr == 88) {         /* the fixstr v2 layout → convert */
+                long mx = migrateMsgFile(path);
+                files++;
+                if (mx > 0) peerMax.emplace_back(stem, mx);
+            } else {                              /* unknown intermediate → don't guess, don't clobber */
+                warn("lxmf mig: id %d %s: UNKNOWN layout id=%u ver=%u hdr=%u — left as-is\n",
+                     n, stem.c_str(), fid, fver, fhdr);
+                clean = false;
+            }
+        }
+
+        /* Carry the running max into the conversation directory too, so the first
+         * post-migration message keeps recv_ts monotonic (last_ts is the running
+         * max the write path clamps against). */
+        if (!peerMax.empty()) {
+            sdb_store cs;
+            cs.schema = &lxmfContactSchema();
+            cs.path   = fsStatePath(("/lxmf/contacts/" + std::to_string(n) + ".db.gz").c_str());
+            if (sdbLoad(&cs)) {
+                bool dirty = false;
+                for (auto& pm : peerMax) {
+                    if (!sdbHasRecord(&cs, pm.first.c_str())) continue;
+                    std::string cur;
+                    sdbGetField(&cs, pm.first.c_str(), "last_ts", cur);
+                    if (atol(cur.c_str()) < pm.second) {
+                        sdbSetField(&cs, pm.first.c_str(), "last_ts",
+                                    std::to_string(pm.second).c_str());
+                        dirty = true;
+                    }
+                }
+                if (dirty) sdbFlush(&cs);
+            }
+            sdbEvict(&cs);
+        }
+    }
+    /* Only mark done on a clean run — leave it unmarked if any file was an unknown
+     * layout, so restoring the original state + reflashing can retry the migration
+     * (rather than being permanently locked out by a half-understood run). */
+    if (clean) {
+        int cf = fs_open(marker.c_str(), "wb");
+        if (cf >= 0) fs_close(cf);
+    } else {
+        warn("lxmf: migration left files unconverted — NOT marking done (will retry)\n");
+    }
+    if (files) info("lxmf: migrated %d conversation file(s) to status/tries (v3)\n", files);
+}
+
 void LxmfService::onInit()
 {
     /* Register the per-conversation message store and migrate any existing
      * cfgRoot message history into it (once; guarded + crash-safe). Must run
      * before any message read/write so routing serves the record store. */
     {
+        /* Convert any v2 (string stage/last_error) conversation files to the v3
+         * status/tries layout before the v3 store touches them. */
+        lxmfMigrateMsgs();
+
         storage_db_opts opts;
         opts.persist = "lxmf/msgs/$1/$2.db.gz";   /* $1=identity slot, $2=peer hash */
         opts.evict   = STORAGE_DB_RELOAD;
@@ -4515,6 +4729,9 @@ void LxmfService::onInit()
      * behind the version gate) so they land on already-initialised devices. */
     storageDefault("s.lxmf.sound",         "/fixed/lxmf/ding.wav");
     storageDefault("s.lxmf.sound_enabled", 1);
+    /* strftime format for per-message timestamps in the thread, honoured by both
+     * the LCD bubbles and the web UI (which runs a small strftime shim). */
+    storageDefault("s.lxmf.msg_time_format", "%H:%M");
     storageEnd();
 
     s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;

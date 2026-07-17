@@ -19,6 +19,91 @@
 #pragma once
 
 #include "service.h"
+#include <cstdint>
+
+/* ── Message status (stored as the u8 `status` record field) ────────────────
+ * A single unified state: lifecycle progress, terminal outcome, or gave-up
+ * reason all live here. Companion field `tries` (u8) is the try count for the
+ * current phase; tries == LXMF_TRIES_GAVEUP (255) is the ONE definitive terminal
+ * marker — while tries < 255 the message is still in play (a sweep may retry a
+ * progress status; one-shot statuses are set to 255 the moment they occur).
+ *
+ * These integer VALUES are persisted in every message record, so the list is
+ * APPEND-ONLY: add new members at the end, never renumber or remove one.
+ * MIRROR: keep in exact sync with the TS `LxmfStatus` enum + STATUS_NAME in
+ * lxmf/browser/src/modules/lxmf.ts (same names, same numbers). */
+static constexpr uint8_t LXMF_TRIES_GAVEUP = 255;
+
+enum LxmfStatus : uint8_t {
+    /* progress (tries < 255; a sweep may act) */
+    LXMF_ST_DRAFT             = 0,   /* unsent; filtered from the thread */
+    LXMF_ST_QUEUED            = 1,
+    LXMF_ST_REQUESTING_PATH   = 2,
+    LXMF_ST_SENDING           = 3,
+    LXMF_ST_AWAITING_PROOF    = 4,   /* egressed, no proof yet — shown in flight, not a check */
+    LXMF_ST_RETRYING_DELIVERY = 5,
+    LXMF_ST_RETRYING_LINK     = 6,
+    /* done */
+    LXMF_ST_DELIVERED         = 7,   /* cryptographic proof received */
+    LXMF_ST_CANCELLED         = 8,
+    LXMF_ST_RECEIVED          = 9,   /* inbound */
+    /* gave-up reasons (paired with tries == 255) */
+    LXMF_ST_NO_PROOF          = 10,
+    LXMF_ST_NO_ROUTE          = 11,
+    LXMF_ST_TOO_LARGE         = 12,
+    LXMF_ST_EVICTED           = 13,
+    LXMF_ST_BAD_PEER          = 14,
+    LXMF_ST_DISABLED          = 15,
+    LXMF_ST_MAILBOX_STARTING  = 16,
+    LXMF_ST_PACK_FAIL         = 17,
+    LXMF_ST_OUTBOX_FULL       = 18,
+    LXMF_ST_LINK_OPEN_FAIL    = 19,
+    LXMF_ST_RES_MALLOC        = 20,
+    LXMF_ST_RES_SEND          = 21,
+    LXMF_ST_LINK_SEND_DROP    = 22,
+    LXMF_ST_PACKET_SEND_DROP  = 23,
+    LXMF_ST_RES_TRANSFER      = 24,
+    LXMF_ST_LINK_FAIL         = 25,
+    LXMF_ST_LINK_CLOSED       = 26,
+    LXMF_ST_UNKNOWN           = 27,
+};
+
+/* status code → its ALL-CAPS enum name for display (meta line, CLI). This is the
+ * only direction ever needed — a stored code is never parsed back from text.
+ * MIRROR: keep in sync with STATUS_NAME in lxmf/browser/src/modules/lxmf.ts. */
+static inline const char* lxmfStatusName(uint8_t s) {
+    switch (s) {
+        case LXMF_ST_DRAFT:             return "DRAFT";
+        case LXMF_ST_QUEUED:            return "QUEUED";
+        case LXMF_ST_REQUESTING_PATH:   return "REQUESTING_PATH";
+        case LXMF_ST_SENDING:           return "SENDING";
+        case LXMF_ST_AWAITING_PROOF:    return "AWAITING_PROOF";
+        case LXMF_ST_RETRYING_DELIVERY: return "RETRYING_DELIVERY";
+        case LXMF_ST_RETRYING_LINK:     return "RETRYING_LINK";
+        case LXMF_ST_DELIVERED:         return "DELIVERED";
+        case LXMF_ST_CANCELLED:         return "CANCELLED";
+        case LXMF_ST_RECEIVED:          return "RECEIVED";
+        case LXMF_ST_NO_PROOF:          return "NO_PROOF";
+        case LXMF_ST_NO_ROUTE:          return "NO_ROUTE";
+        case LXMF_ST_TOO_LARGE:         return "TOO_LARGE";
+        case LXMF_ST_EVICTED:           return "EVICTED";
+        case LXMF_ST_BAD_PEER:          return "BAD_PEER";
+        case LXMF_ST_DISABLED:          return "DISABLED";
+        case LXMF_ST_MAILBOX_STARTING:  return "MAILBOX_STARTING";
+        case LXMF_ST_PACK_FAIL:         return "PACK_FAIL";
+        case LXMF_ST_OUTBOX_FULL:       return "OUTBOX_FULL";
+        case LXMF_ST_LINK_OPEN_FAIL:    return "LINK_OPEN_FAIL";
+        case LXMF_ST_RES_MALLOC:        return "RES_MALLOC";
+        case LXMF_ST_RES_SEND:          return "RES_SEND";
+        case LXMF_ST_LINK_SEND_DROP:    return "LINK_SEND_DROP";
+        case LXMF_ST_PACKET_SEND_DROP:  return "PACKET_SEND_DROP";
+        case LXMF_ST_RES_TRANSFER:      return "RES_TRANSFER";
+        case LXMF_ST_LINK_FAIL:         return "LINK_FAIL";
+        case LXMF_ST_LINK_CLOSED:       return "LINK_CLOSED";
+        case LXMF_ST_UNKNOWN:           return "UNKNOWN";
+        default:                        return "";
+    }
+}
 
 /** Bring up the lxmf task. The task is always started — even on a
  *  transport-only node — so the announce-fanout subscription and the

@@ -494,18 +494,29 @@ label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.
 contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,unread,read_ts}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce)
 
 msgs.<id>.dir            in | out
-msgs.<id>.stage          draft(client) | queued | sending | sent | delivered | failed | cancelled | received
+msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)
+msgs.<id>.tries          u8 attempt count; 255 is the ONLY terminal marker ("gave up")
+msgs.<id>.recv_ts        u32 monotonic received-time (never decreases); anchors date separators
 msgs.<id>.peer           hex16 (redundant with the path segment, kept for indexed query)
 msgs.<id>.title / content
 msgs.<id>.thread         hex64 root message_id, "" if none
 msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; legacy auto/direct/opportunistic still parse)
-msgs.<id>.ts             unix s
+msgs.<id>.ts             unix s (sender clock; can be wrong — recv_ts is the display anchor)
 msgs.<id>.read           inbound only, 0 | 1
 msgs.<id>.wire           hex of the packed LXM (firmware)
 msgs.<id>.message_id     hex64 SHA-256 (firmware)
-msgs.<id>.attempts       (OUT_STATUS RETRY count)
-msgs.<id>.last_error     short UI string
 ```
+
+`status` is a `uint8_t` enum (`LxmfStatus` in `lxmf.h`, mirrored numerically in
+the browser's `lxmf.ts`) — the old free-text `stage` + `last_error` merged into
+one code: lifecycle states (DRAFT…RECEIVED) then failure reasons (NO_PROOF,
+NO_ROUTE, …). It replaces the variable-length `stage`/`last_error`/`attempts`
+strings with two fixed bytes, so a retry sweep can rewrite a message's state
+in place without relocating the record. **Record-store schema is v3**
+(`u8 tries · u8 status · u32 recv_ts · fixstr dir · fixstr method · u32 ts ·
+text…`); `lxmfMigrateMsgs()` converts a v2 file (old fixstr `stage`/`last_error`)
+in place on first open, peeking each file's header (`sdbPeekHeader`) to dispatch
+convert / skip / warn, and stamps a layout-keyed marker so it runs once.
 
 `<key>` is inbound → the real `message_id`; outbound → local
 `o_<unix_ms>_<rand4>` (with `message_id` as a sidecar once packed).
