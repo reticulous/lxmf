@@ -48,7 +48,9 @@
  */
 #include "lcd.h"
 #include "lcd_app.h"   /* LcdApp + lcdInstall */
+#include "lcd_input_box.h"   /* generic auto-grow text entry + caret behaviours */
 #include "lxmf_app.h"  /* LxmfApp — this straddle's services: class */
+#include "lxmf.h"      /* LxmfStatus / lxmfStatusName — shared message-status enum */
 #include "mem.h"
 #include "storage.h"
 #include "compat.h"
@@ -76,7 +78,13 @@ namespace {
  * lcd task, so the (non-thread-safe) vector glyph lookups are safe. The bitmap
  * default only covers the pre-build window. */
 const lv_font_t* kFont = &lv_font_montserrat_12_latin;
-void refreshFont() { kFont = lcdFont(LcdFace::UI, (int)(14 * lcdUiScale() + 0.5f)); }
+const lv_font_t* kFontSmall = &lv_font_montserrat_12_latin;   /* meta time / date pills */
+const lv_font_t* kFontTiny  = &lv_font_montserrat_12_latin;   /* status name (a touch smaller) */
+void refreshFont() {
+    kFont      = lcdFont(LcdFace::UI, lcdPx(14));
+    kFontSmall = lcdFont(LcdFace::UI, lcdPx(11));
+    kFontTiny  = lcdFont(LcdFace::UI, lcdPx(9));
+}
 
 const int HDR_H = 30;   /* thread top bar height — tall: the bar itself is the tap
                            target that opens the contact info page */
@@ -94,6 +102,14 @@ const int MESH_ROW_CAP = 48;
  * the last unread key, no real FIFO) overwrites keys typed during the rebuild —
  * they go missing. So coalesce: rebuild once the typing pauses this long. */
 const int SEARCH_DEBOUNCE_MS = 300;
+
+/* Thread pagination. A long conversation renders only a window of bubbles: the
+ * newest PAGE_SIZE on open, extended by "load earlier"/"newer". PAGE_MIN is the
+ * runt-guard — a "newer" gap this small snaps straight to the full newest page
+ * instead of minting a sliver. MAXSPAN bounds the window once you page back into
+ * history (while pinned to newest it grows freely, keeping the reconcile append-
+ * only for live messages). */
+const size_t PAGE_SIZE = 40, PAGE_MIN = 12, MAXSPAN = 80;
 
 /* On-the-Mesh live-refresh throttle. While that column is the visible tab it's
  * fed by the announce firehose (several writes a second on a busy mesh). Even
@@ -151,8 +167,11 @@ lv_obj_t* mkLabel(lv_obj_t* parent, const std::string& txt, lv_color_t color) {
 /* ---- model (lcd-task-only, no locks) ---- */
 
 struct Msg {
-    std::string peer, key, content, stage;
-    long ts = 0;
+    std::string peer, key, content;
+    uint8_t status = 0;    /* LxmfStatus code */
+    uint8_t tries  = 0;    /* try count; 255 = gave up (terminal) */
+    long ts = 0;           /* sender's clock (display) */
+    long recv_ts = 0;      /* monotonic receive time (date-separator anchor) */
     bool in = false;
 };
 
@@ -167,11 +186,49 @@ std::vector<Msg>  g_msgs;               /* non-draft messages for the open conve
  * thread: a stage transition updates one glyph, a new message appends one
  * bubble, and only a structural change (delete/reorder) falls back to a full
  * rebuild. `meta` is the bubble's meta row (timestamp + delivery glyph). */
-struct BubbleRef { std::string mid; std::string stage; lv_obj_t* meta; };
+struct BubbleRef { std::string mid; uint8_t status; uint8_t tries; lv_obj_t* meta; };
 std::vector<BubbleRef> g_bubbles;
 std::vector<Ann>  g_anns;               /* heard announces (on-the-mesh column) */
 std::unordered_map<std::string, size_t> g_annIx;   /* hash -> index in g_anns (O(1) name/last lookup) */
-std::vector<std::string> g_rowPeers;    /* peer per clickable list row (click index) */
+/* ---- list rows: reconcile model (tag + patch instead of clear + rebuild) ----
+ * Each visible row of a tab list is tracked by a stable KEY (the peer hash for a
+ * conversation / mesh row; a "\x01…" sentinel for the New/footer/empty decoration
+ * rows) plus a SIGNATURE of everything it renders EXCEPT the age badge. A refresh
+ * builds the target row set as specs, then reconciles against the live widgets:
+ * an unchanged key+sig is reused untouched, a changed sig recreates that one row,
+ * a new key builds one row, a vanished key deletes one, and a final move pass
+ * reorders in place. Age is deliberately out of the sig, so time passing alone
+ * never churns a row — a badge re-ages only when its row is next legitimately
+ * rebuilt (ages were always event-driven, never a ticking clock). This mirrors
+ * the thread's bubble reconcile (g_bubbles). */
+enum RowKind { RK_CONTACT, RK_PEER, RK_GROUP, RK_EMPTY };
+struct RowSpec {
+    RowKind     kind = RK_EMPTY;
+    std::string key, sig;               /* reconcile identity + change detector */
+    std::string peer, title, sub, age;
+    lv_color_t  titleColor{};
+    int         unread = 0;
+};
+struct ListRow { std::string key, sig; lv_obj_t* obj = nullptr; };   /* one live row */
+std::vector<ListRow> g_rowsC;           /* Contacts rows in render order (search box excluded) */
+std::vector<ListRow> g_rowsM;           /* On-the-Mesh rows in render order */
+bool g_annsLoaded = false;              /* g_anns walked at least once (gate the O(N) reload) */
+
+/* A large populate (fresh open / identity switch / cleared search) is spread over
+ * several LCD-loop turns: build LIST_CHUNK rows, let the loop render + drain input,
+ * repeat. Off-screen rows draw for free, so this only ever adds responsiveness. */
+const int LIST_CHUNK = 8;
+struct ChunkJob {
+    lv_obj_t*             list;
+    std::vector<ListRow>* model;
+    std::vector<RowSpec>  target;       /* 1:1 with *model; pending slots have obj == null */
+    bool                  keepScroll;
+    int32_t               scrollY;
+    lv_timer_t*           timer;
+    ChunkJob**            slot;         /* &g_chunkC / &g_chunkM — nulled on finish */
+};
+ChunkJob* g_chunkC = nullptr;
+ChunkJob* g_chunkM = nullptr;
 std::vector<std::string> g_nomadTargets;/* "<hash>:<path>" per tappable Nomad link in the open thread */
 std::string       g_curPeer;            /* peer of the open thread */
 std::string       g_pendingOpenPeer;    /* contact tapped in nomad, awaiting an identity pick */
@@ -209,6 +266,37 @@ lv_obj_t* s_listM    = nullptr;         /* On-the-Mesh row container (cleaned+re
 lv_obj_t* s_thread   = nullptr;         /* conversation screen (built once, reused) */
 lv_obj_t* s_msgList  = nullptr;         /* scroll container inside s_thread */
 lv_obj_t* s_bubbles  = nullptr;         /* bubble column (cleaned+rebuilt) inside s_msgList */
+lv_obj_t* s_earlierBtn = nullptr;       /* "load earlier messages" (top of the scroll area) */
+lv_obj_t* s_newerBtn = nullptr;         /* "▼ N newer messages" (bottom of the scroll area) */
+lv_obj_t* s_newerLbl = nullptr;         /* label inside s_newerBtn — count is live-updated */
+lv_obj_t* s_loading  = nullptr;         /* "<loading conversation>" placeholder (floating, centered) */
+/* History overlay — a second scroll page stacked over the resident one (which
+ * stays built, always at the newest messages). "Load earlier" opens it; it pages
+ * back independently and holds no composer. Closing just hides it, so returning to
+ * the newest is instant with no re-render. */
+lv_obj_t* s_histWrap    = nullptr;      /* grow-sibling of s_msgList; shown ⇒ resident hidden */
+lv_obj_t* s_histList    = nullptr;      /* its scroll container */
+lv_obj_t* s_histBubbles = nullptr;      /* its bubble column (clean+rebuilt each page) */
+lv_obj_t* s_histEarlier = nullptr;      /* overlay "load earlier" */
+lv_obj_t* s_histNewer   = nullptr;      /* overlay "load newer" (toward the resident boundary) */
+lv_obj_t* s_histNewerLbl = nullptr;
+std::vector<std::pair<lv_obj_t*, long>> g_histDateSeps;
+size_t    h_winLo = 0, h_winHi = 0;     /* overlay window into the curPeer slice */
+/* Rendered window over the open conversation's message list (indices into the
+ * curPeer slice of g_msgs). The resident page is pinned to newest (g_atNewest
+ * stays true); older messages are browsed in the history overlay. */
+size_t    g_winLo = 0, g_winHi = 0;
+bool      g_atNewest = true;
+lv_timer_t* g_threadLoadTimer = nullptr;   /* defers the heavy load/render so the shell paints first */
+bool      g_needMsgLoad = false;           /* the pending render must refreshMsgs() first (a fresh open) */
+int       g_scrollAfter = 0;               /* 0 = to bottom, 1 = keep g_anchorMid in view */
+std::string g_anchorMid;                   /* bubble to hold steady across a paging rebuild */
+/* Inline day separators (recv_ts-anchored) + the floating sticky date that shows
+ * the current day while scrolling and fades after a pause. */
+std::vector<std::pair<lv_obj_t*, long>> g_dateSeps;   /* separator widget + its recv_ts */
+lv_obj_t* s_stickyDate = nullptr;          /* floating date pill below the header */
+lv_obj_t* s_stickyLbl  = nullptr;
+lv_timer_t* g_stickyFadeTimer = nullptr;   /* fades the sticky 2 s after the last scroll */
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
 lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle (green=open, amber=establishing) */
@@ -216,7 +304,13 @@ lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thr
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
 std::string g_infoPeer;                 /* peer shown on the contact info page */
 bool      g_infoFromThread = false;     /* where its back chevron returns to */
-lv_obj_t* s_compose  = nullptr;         /* compose textarea (last child of s_msgList) */
+lv_obj_t* s_compose  = nullptr;         /* compose entry (lcdInputBox) */
+lv_obj_t* s_comp     = nullptr;         /* the compose row — last item in the scroll stream */
+lv_obj_t* s_rc       = nullptr;         /* controls stacked at the entry's right (pill + Send) */
+lv_obj_t* s_send     = nullptr;         /* Send button — shown only once the composer is expanded */
+lv_obj_t* s_composePill = nullptr;      /* Signal-style expand/collapse pill beside the entry */
+lv_obj_t* s_pillIcon = nullptr;         /* its up/down chevron */
+bool      g_composeExpanded  = false;   /* fixed 8-line composer (vs the 1–4 line quick field) */
 lv_obj_t* s_newIdTa  = nullptr;         /* "Add identity" name field (settings pane) */
 lv_obj_t* s_importTa = nullptr;         /* "Import identity" hex field (settings pane) */
 
@@ -224,6 +318,17 @@ void refreshMsgs();
 void refreshAnnounces();
 void rebuildList(bool keepScroll = false);
 void rebuildThread();
+void threadSnapNewest();
+void applyComposeMode();
+void scrollThreadBottom(bool anim);
+void openHistory();
+void closeHistory();
+void renderHistory();
+void updateHistButtons(size_t total);
+void updatePageButtons(size_t total);
+void showLoading(bool on);
+void beginThreadLoad();
+void updateStickyDate();
 void showContacts();
 void setActiveTab(int n, bool keepScroll = false);
 void openThread(const std::string& peer);
@@ -389,10 +494,12 @@ void msgCb(const char* key, const char* val) {
     for (auto& x : g_msgs) if (x.peer == peer && x.key == mkey) { m = &x; break; }
     if (!m) { g_msgs.emplace_back(); m = &g_msgs.back(); m->peer = peer; m->key = mkey; }
 
-    if      (!strcmp(field, "dir"))     m->in   = (val && !strcmp(val, "in"));
+    if      (!strcmp(field, "dir"))     m->in     = (val && !strcmp(val, "in"));
     else if (!strcmp(field, "content")) m->content = val ? val : "";
-    else if (!strcmp(field, "ts"))      m->ts   = val ? atol(val) : 0;
-    else if (!strcmp(field, "stage"))   m->stage = val ? val : "";
+    else if (!strcmp(field, "ts"))      m->ts     = val ? atol(val) : 0;
+    else if (!strcmp(field, "recv_ts")) m->recv_ts = val ? atol(val) : 0;
+    else if (!strcmp(field, "status"))  m->status = val ? (uint8_t)atoi(val) : 0;
+    else if (!strcmp(field, "tries"))   m->tries  = val ? (uint8_t)atoi(val) : 0;
 }
 
 void refreshMsgs() {
@@ -407,7 +514,7 @@ void refreshMsgs() {
     std::string prefix = g_msgsPrefix + "." + g_curPeer;
     storageForEach(prefix.c_str(), msgCb);
     g_msgs.erase(std::remove_if(g_msgs.begin(), g_msgs.end(),
-                                [](const Msg& m) { return m.stage == "draft"; }),
+                                [](const Msg& m) { return m.status == LXMF_ST_DRAFT; }),
                  g_msgs.end());
 }
 
@@ -462,10 +569,10 @@ void sendMessage(const std::string& peer, const std::string& text) {
     setf("title", "");
     setf("content", text.c_str());
     setf("thread", "");
-    /* Optimistic stage: `queued`, not `draft`, so the bubble appears the
-       instant we send (renders as the "..." in-flight chip below). The
-       lxmf task drives it on to sent/delivered/failed. */
-    setf("stage", "queued");
+    /* Optimistic status: QUEUED (not draft) so the bubble appears the instant we
+       send (renders as the "..." in-flight chip). The lxmf task drives it on. */
+    snprintf(k, sizeof k, "%s.status", base);
+    storageSet(k, (int)LXMF_ST_QUEUED);
     snprintf(k, sizeof k, "%s.ts", base);
     storageSet(k, (int)ts);
     /* Send sentinel (ephemeral): "<peer>/<key>". The lxmf task drives the stage. */
@@ -482,7 +589,7 @@ void sendMessage(const std::string& peer, const std::string& text) {
        load. The eventual refreshMsgs() rebuilds g_msgs from storage and dedups
        on peer+key, so this entry is replaced in place rather than doubled. */
     Msg m;
-    m.peer = peer; m.key = key; m.content = text; m.stage = "queued";
+    m.peer = peer; m.key = key; m.content = text; m.status = LXMF_ST_QUEUED;
     m.ts = ts; m.in = false;
     g_msgs.push_back(std::move(m));
 }
@@ -512,7 +619,7 @@ void loadDraft(const std::string& peer) {
 void onSend(lv_event_t*) {
     if (!s_compose || g_curPeer.empty()) return;
     if (g_id < 0 || !idUp(g_id)) return;   /* mailbox not up yet — sending is held */
-    const char* t = lv_textarea_get_text(s_compose);
+    const char* t = lcdInputBoxText(s_compose);   /* trailing whitespace stripped */
     if (t && *t) {
         sendMessage(g_curPeer, t);
         lv_textarea_set_text(s_compose, "");
@@ -527,6 +634,9 @@ void onSend(lv_event_t*) {
          * paths visually identical: bubble first, then the echoes. */
         lv_refr_now(nullptr);
         deferFocus(s_compose);   /* keep the cursor in the entry box for the next message */
+        g_composeExpanded = false;               /* a send reverts to the quick field */
+        applyComposeMode();
+        scrollThreadBottom(false);               /* the shrink keeps the composer bottom at the screen bottom */
     }
 }
 
@@ -697,10 +807,20 @@ void scrollThreadBottom(bool anim) {
     updateThreadDownVis();   /* instant jumps land now; animated ones keep updating per frame */
 }
 
+/* Back to the newest, in view. The resident page is always the newest messages, so
+ * this is just: hide the history overlay (instant — the resident stayed built) and
+ * scroll to the bottom. Typing does this so a keystroke — which the always-focused
+ * compose receives even while the overlay covers it — lands the message in view. */
+void threadSnapNewest() {
+    closeHistory();
+    scrollThreadBottom(false);
+}
+
 /* ---- navigation ---- */
 
 void showContacts() {
     closeInfo();                            /* a leftover info page would sit on top */
+    closeHistory();                         /* don't leave the overlay up for the next open */
     lcdProgramFullscreen(false);            /* status bar back for the list screen */
     if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick) lv_obj_add_flag(s_idpick, LV_OBJ_FLAG_HIDDEN);
@@ -721,6 +841,129 @@ void showContacts() {
      * pure visibility flip — no rebuild, no scroll change. */
     if (g_listBuiltId != g_id) g_listDirty = true;
     scheduleRefresh();
+}
+
+/* ---- thread pagination + deferred load ---- */
+
+void showLoading(bool on) {
+    if (s_loading) { if (on) lv_obj_remove_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+                     else     lv_obj_add_flag(s_loading, LV_OBJ_FLAG_HIDDEN); }
+    if (on) {   /* the page buttons + compose never show over the placeholder */
+        if (s_earlierBtn) lv_obj_add_flag(s_earlierBtn, LV_OBJ_FLAG_HIDDEN);
+        if (s_newerBtn)   lv_obj_add_flag(s_newerBtn,   LV_OBJ_FLAG_HIDDEN);
+        if (s_comp)       lv_obj_add_flag(s_comp,       LV_OBJ_FLAG_HIDDEN);   /* re-shown by updatePageButtons after render */
+    }
+}
+
+/* Show/hide + label the earlier/newer affordances for the current window. The
+ * compose row lives at the bottom of the scroll stream and shows only on the
+ * newest page — a history page (paged back) has no composer. */
+void updatePageButtons(size_t total) {
+    if (s_comp) { if (g_atNewest) lv_obj_remove_flag(s_comp, LV_OBJ_FLAG_HIDDEN);
+                  else            lv_obj_add_flag(s_comp, LV_OBJ_FLAG_HIDDEN); }
+    if (s_earlierBtn) { if (g_winLo > 0) lv_obj_remove_flag(s_earlierBtn, LV_OBJ_FLAG_HIDDEN);
+                        else              lv_obj_add_flag(s_earlierBtn, LV_OBJ_FLAG_HIDDEN); }
+    if (s_newerBtn && s_newerLbl) {
+        if (g_winHi < total) {
+            char b[40];
+            snprintf(b, sizeof b, LV_SYMBOL_DOWN "  %u newer", (unsigned)(total - g_winHi));
+            lv_label_set_text(s_newerLbl, b);
+            lv_obj_remove_flag(s_newerBtn, LV_OBJ_FLAG_HIDDEN);
+        } else lv_obj_add_flag(s_newerBtn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Hold g_anchorMid at the top of the viewport across a paging rebuild (so
+ * "load earlier" doesn't jump you). Falls back to the bottom if it's gone. */
+void scrollToAnchor() {
+    if (!s_msgList) return;
+    for (auto& r : g_bubbles) {
+        if (r.mid != g_anchorMid || !r.meta) continue;
+        lv_obj_update_layout(s_msgList);
+        lv_obj_t* row = lv_obj_get_parent(lv_obj_get_parent(r.meta));   /* meta → bubble → row */
+        if (row) { lv_obj_scroll_to_y(s_msgList, lv_obj_get_y(s_bubbles) + lv_obj_get_y(row), LV_ANIM_OFF);
+                   updateThreadDownVis(); return; }
+    }
+    scrollThreadBottom(false);
+}
+
+void threadRenderCb(lv_timer_t*) {
+    g_threadLoadTimer = nullptr;
+    if (g_curPeer.empty()) return;
+    if (g_needMsgLoad) {
+        refreshMsgs();                 /* the heavy per-conversation record load */
+        markRead(g_curPeer);
+        g_needMsgLoad = false;
+        size_t total = 0; for (auto& m : g_msgs) if (m.peer == g_curPeer) total++;
+        g_atNewest = true;
+        g_winHi = total;
+        g_winLo = total > PAGE_SIZE ? total - PAGE_SIZE : 0;   /* newest page */
+    }
+    showLoading(false);
+    rebuildThread();                   /* renders the window + sets the page buttons */
+    if (g_scrollAfter == 1) scrollToAnchor();
+    else                    scrollThreadBottom(false);
+    g_anchorMid.clear();
+}
+
+/* Reveal the placeholder + defer the heavy load/render one loop turn so the shell
+ * paints immediately (used by open + load-earlier/newer). */
+void beginThreadLoad() {
+    if (!s_bubbles) return;
+    lv_obj_clean(s_bubbles);
+    g_bubbles.clear();
+    g_nomadTargets.clear();
+    g_dateSeps.clear();
+    if (s_stickyDate) lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
+    showLoading(true);
+    lv_refr_now(nullptr);              /* paint shell + placeholder before the heavy work */
+    if (g_threadLoadTimer) lv_timer_delete(g_threadLoadTimer);
+    g_threadLoadTimer = lv_timer_create(threadRenderCb, 20, nullptr);
+    lv_timer_set_repeat_count(g_threadLoadTimer, 1);
+}
+
+size_t threadTotal() {
+    size_t total = 0; for (auto& m : g_msgs) if (m.peer == g_curPeer) total++;
+    return total;
+}
+
+/* The resident page's "load earlier" opens the history overlay (the resident stays
+ * pinned to newest). */
+void onLoadEarlier(lv_event_t*) { openHistory(); }
+
+void onLoadNewer(lv_event_t*) {
+    size_t total = threadTotal();
+    if (g_winHi >= total) return;
+    g_anchorMid = g_bubbles.empty() ? std::string() : g_bubbles.back().mid;
+    g_winHi += PAGE_SIZE;
+    if (g_winHi >= total || total - g_winHi <= PAGE_MIN) g_winHi = total;   /* snap: no runt page */
+    g_atNewest = (g_winHi >= total);
+    if (g_winHi - g_winLo > MAXSPAN) g_winLo = g_winHi - MAXSPAN;
+    g_scrollAfter = g_atNewest ? 0 : 1;                        /* newest → bottom; else keep the join */
+    g_needMsgLoad = false;
+    beginThreadLoad();
+}
+
+/* Reflect the compose mode onto the widgets (see the expand pill). Two states:
+ *   collapsed: 1–4 line quick field, no Send button, pill ↑, Enter sends.
+ *   expanded:  fixed 8-line composer, Send button, pill ↓, Enter = newline.
+ * The pill toggles them; a send reverts to collapsed. */
+void applyComposeMode() {
+    if (!s_compose) return;
+    lcdInputBoxSetLines(s_compose, g_composeExpanded ? 8 : 1, g_composeExpanded ? 8 : 4);
+    lcdInputBoxSetSubmitOnEnter(s_compose, !g_composeExpanded);   /* expanded → Enter = newline */
+    if (s_send) {
+        if (g_composeExpanded) lv_obj_remove_flag(s_send, LV_OBJ_FLAG_HIDDEN);
+        else                   lv_obj_add_flag(s_send, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_pillIcon) lv_label_set_text(s_pillIcon, g_composeExpanded ? LV_SYMBOL_DOWN : LV_SYMBOL_UP);
+    /* Size the controls column to the entry so the bottom-aligned Send lands level
+     * with the composer's bottom; collapsed, it's just the pill (content height). */
+    if (s_rc) {
+        if (g_composeExpanded) { lv_obj_update_layout(s_compose);
+                                 lv_obj_set_height(s_rc, lv_obj_get_height(s_compose)); }
+        else                     lv_obj_set_height(s_rc, LV_SIZE_CONTENT);
+    }
 }
 
 void buildThreadShell() {
@@ -775,7 +1018,7 @@ void buildThreadShell() {
     lv_obj_align(s_threadDown, LV_ALIGN_RIGHT_MID, -28, 0);
     lv_obj_add_flag(s_threadDown, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(s_threadDown, 12);
-    lv_obj_add_event_cb(s_threadDown, [](lv_event_t*) { scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(s_threadDown, [](lv_event_t*) { closeHistory(); scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
 
     /* Scroll area (grows to fill): the bubble column only. The compose row is a
      * sibling below it (not a child), so it stays pinned to the bottom. */
@@ -787,8 +1030,43 @@ void buildThreadShell() {
     lv_obj_set_style_pad_hor(s_msgList, 4, 0);
     lv_obj_set_style_pad_ver(s_msgList, 1, 0);
     lv_obj_set_style_pad_row(s_msgList, 1, 0);
-    lv_obj_add_event_cb(s_msgList, [](lv_event_t*) { updateThreadDownVis(); },
+    lv_obj_add_event_cb(s_msgList, [](lv_event_t*) { updateThreadDownVis(); updateStickyDate(); },
                         LV_EVENT_SCROLL, nullptr);
+
+    /* Floating sticky date pill, pinned just under the header (a child of the
+     * thread, not the scroll list, so it stays put while messages scroll). Shown
+     * during scroll when no inline separator is at the top; fades after 2 s. */
+    s_stickyDate = lv_obj_create(s_thread);
+    lv_obj_remove_style_all(s_stickyDate);
+    lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(s_stickyDate, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(s_stickyDate, LV_ALIGN_TOP_MID, 0, HDR_H + 3);
+    lv_obj_set_style_bg_color(s_stickyDate, lv_color_hex(0xffffcc), 0);   /* pale yellow, distinct */
+    lv_obj_set_style_bg_opa(s_stickyDate, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_stickyDate, 4, 0);
+    lv_obj_set_style_pad_hor(s_stickyDate, 10, 0);
+    lv_obj_set_style_pad_ver(s_stickyDate, 2, 0);
+    lv_obj_remove_flag(s_stickyDate, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
+    s_stickyLbl = mkLabel(s_stickyDate, "", lv_color_black());
+    lv_obj_set_style_text_font(s_stickyLbl, kFontSmall, 0);
+
+    /* "Load earlier messages" — first child of the scroll area, above the bubbles;
+     * shown only when the window doesn't reach the oldest message. */
+    s_earlierBtn = lv_button_create(s_msgList);
+    lv_obj_remove_style_all(s_earlierBtn);
+    lv_obj_set_width(s_earlierBtn, lv_pct(100));
+    lv_obj_set_height(s_earlierBtn, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_earlierBtn, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_earlierBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_earlierBtn, 4, 0);
+    lv_obj_set_style_pad_ver(s_earlierBtn, 9, 0);
+    lv_obj_set_style_margin_ver(s_earlierBtn, 2, 0);
+    lv_obj_remove_flag(s_earlierBtn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_earlierBtn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(mkLabel(s_earlierBtn, LV_SYMBOL_UP "  Load earlier messages", lv_color_hex(0xc0c8d0)));
+    lv_obj_add_event_cb(s_earlierBtn, onLoadEarlier, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_earlierBtn);
 
     s_bubbles = lv_obj_create(s_msgList);
     lv_obj_remove_style_all(s_bubbles);
@@ -798,51 +1076,200 @@ void buildThreadShell() {
     lv_obj_set_style_pad_row(s_bubbles, 1, 0);
     lv_obj_remove_flag(s_bubbles, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Compose row: textarea + Send. A direct child of the thread AFTER the scroll
-     * area (not inside it), so it's pinned to the bottom of the screen and never
-     * scrolls away with the messages. A thin top border sets it off from the
-     * bubbles above (mirroring the scroll area's old pad_hor with its own). */
-    lv_obj_t* comp = lv_obj_create(s_thread);
+    /* "▼ N newer messages" — last child, below the bubbles; shown only while the
+     * window is paged back off the newest message. */
+    s_newerBtn = lv_button_create(s_msgList);
+    lv_obj_remove_style_all(s_newerBtn);
+    lv_obj_set_width(s_newerBtn, lv_pct(100));
+    lv_obj_set_height(s_newerBtn, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_newerBtn, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_newerBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_newerBtn, 4, 0);
+    lv_obj_set_style_pad_ver(s_newerBtn, 9, 0);
+    lv_obj_set_style_margin_ver(s_newerBtn, 2, 0);
+    lv_obj_remove_flag(s_newerBtn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_newerBtn, LV_OBJ_FLAG_HIDDEN);
+    s_newerLbl = mkLabel(s_newerBtn, LV_SYMBOL_DOWN "  newer", lv_color_hex(0xc0c8d0));
+    lv_obj_center(s_newerLbl);
+    lv_obj_add_event_cb(s_newerBtn, onLoadNewer, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_newerBtn);
+
+    /* Loading placeholder — floating (out of the flex flow), centered over the
+     * scroll area; shown while the deferred load/render runs. */
+    s_loading = mkLabel(s_msgList, "<loading conversation>", lv_color_hex(0x8a93a0));
+    lv_obj_add_flag(s_loading, LV_OBJ_FLAG_FLOATING);
+    lv_obj_center(s_loading);
+    lv_obj_add_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+
+    /* Compose row — the LAST item in the scroll stream (part of the messages, not a
+     * pinned bar), so it scrolls with them and is simply hidden on a history page
+     * (see updatePageButtons). The entry fills the width with the controls stacked
+     * to its right (vertical space is precious). Collapsed: just the expand pill
+     * beside the 1–4 line field. Expanded: the collapse pill top-aligned over a
+     * 2×-height Send, beside the 8-line composer. A thin top border sets it off from
+     * the bubbles; +3 px above and drag-bar clearance below. A click anywhere in the
+     * row focuses the entry (the whole field is the target, not just its text). */
+    s_comp = lv_obj_create(s_msgList);
+    lv_obj_t* comp = s_comp;
     lv_obj_remove_style_all(comp);
     lv_obj_set_width(comp, lv_pct(100));
     lv_obj_set_height(comp, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(comp, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(comp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_ver(comp, 2, 0);
+    lv_obj_set_flex_align(comp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_top(comp, 2 * (2 + lcdPx(3)), 0);   /* the old gap doubled — replaces the divider line */
+    lv_obj_set_style_pad_bottom(comp, lcdPx(12), 0);
     lv_obj_set_style_pad_hor(comp, 4, 0);
     lv_obj_set_style_pad_column(comp, 4, 0);
-    lv_obj_set_style_border_side(comp, LV_BORDER_SIDE_TOP, 0);
-    lv_obj_set_style_border_width(comp, 1, 0);
-    lv_obj_set_style_border_color(comp, lv_color_hex(0x222b38), 0);
     lv_obj_remove_flag(comp, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(comp, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(comp, [](lv_event_t*) { lcdInputBoxActivate(s_compose); }, LV_EVENT_CLICKED, nullptr);
 
-    /* Input and Send share one fixed height (line height + breathing room) so the
-     * button is exactly as tall as the box rather than each sizing to its own
-     * content. */
     int32_t inH = lv_font_get_line_height(kFont) + 8;
 
-    s_compose = lv_textarea_create(comp);
-    lv_textarea_set_one_line(s_compose, true);
+    /* Expand/collapse pill on the LEFT (top-aligned, level with the first line). */
+    s_composePill = lv_button_create(comp);
+    lv_obj_remove_style_all(s_composePill);
+    lv_obj_set_size(s_composePill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_composePill, lv_color_hex(0x2a313a), 0);
+    lv_obj_set_style_bg_opa(s_composePill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_composePill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_hor(s_composePill, 14, 0);
+    lv_obj_set_style_pad_ver(s_composePill, 3, 0);
+    lv_obj_set_ext_click_area(s_composePill, 8);
+    lv_obj_remove_flag(s_composePill, LV_OBJ_FLAG_SCROLLABLE);
+    s_pillIcon = mkLabel(s_composePill, LV_SYMBOL_UP, lv_color_hex(0xc0c8d0));
+    lv_obj_center(s_pillIcon);
+    lv_obj_add_event_cb(s_composePill, [](lv_event_t*) {
+        g_composeExpanded = !g_composeExpanded;   /* ↑ quick(1–4) ⇄ ↓ 8-line composer */
+        applyComposeMode();
+        scrollThreadBottom(false);                /* keep the composer's bottom at the screen bottom (no anim) */
+    }, LV_EVENT_CLICKED, nullptr);
+
+    /* Entry (middle, grows to fill the width). Device text behaviours (caret-arrow
+     * mode, double-space → ". ", trailing-trim). Keeps keypad focus for the thread's
+     * life so typing always lands here, wherever the reader scrolled. */
+    s_compose = lcdInputBoxCreate(comp, 1, 4);
     lv_textarea_set_placeholder_text(s_compose, "Message");
     lv_obj_set_style_text_font(s_compose, kFont, 0);
     lv_obj_set_style_pad_ver(s_compose, 1, 0);
     lv_obj_set_style_pad_hor(s_compose, 4, 0);
-    lv_obj_set_height(s_compose, inH);
     lv_obj_set_flex_grow(s_compose, 1);
+    /* Any click in the compose row focuses the entry: the entry bubbles its clicks
+     * up to comp (whose handler focuses), and comp catches the bare areas directly,
+     * so the WHOLE row — not just the entry's text — is the focus target. The pill
+     * and Send don't bubble, so they keep their own actions. */
+    lv_obj_add_flag(s_compose, LV_OBJ_FLAG_EVENT_BUBBLE);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_compose);
-    lv_obj_add_event_cb(s_compose, onSend, LV_EVENT_READY, nullptr);                 /* Enter = Send */
-    lv_obj_add_event_cb(s_compose, [](lv_event_t*) { scrollThreadBottom(false); },   /* typing -> bottom */
+    lv_obj_add_event_cb(s_compose, onSend, LV_EVENT_READY, nullptr);                 /* Enter = Send (quick field) */
+    lv_obj_add_event_cb(s_compose, [](lv_event_t*) { threadSnapNewest(); },          /* typing -> newest */
                         LV_EVENT_VALUE_CHANGED, nullptr);
 
-    lv_obj_t* send = lv_button_create(comp);
-    lv_obj_set_style_pad_ver(send, 0, 0);
-    lv_obj_set_style_pad_hor(send, 8, 0);
-    lv_obj_set_height(send, inH);
-    lv_obj_t* sl = lv_label_create(send);
+    /* Send on the RIGHT — shown only in the expanded composer (Enter sends in the
+     * quick field); twice the button height, bottom-aligned. Held in a column sized
+     * to the entry (applyComposeMode) so it sits at the composer's bottom. Not in
+     * the input group; the compose keeps keypad focus for the thread's life. */
+    lv_obj_t* rc = lv_obj_create(comp);
+    s_rc = rc;
+    lv_obj_remove_style_all(rc);
+    lv_obj_set_size(rc, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(rc, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(rc, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(rc, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_send = lv_button_create(rc);
+    lv_obj_set_style_pad_ver(s_send, 0, 0);
+    lv_obj_set_style_pad_hor(s_send, 8, 0);
+    lv_obj_set_height(s_send, 2 * inH);
+    lv_obj_t* sl = lv_label_create(s_send);
     lv_obj_set_style_text_font(sl, kFont, 0);
     lv_label_set_text(sl, "Send");
     lv_obj_center(sl);
-    lv_obj_add_event_cb(send, onSend, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(s_send, onSend, LV_EVENT_CLICKED, nullptr);
+
+    applyComposeMode();   /* start collapsed: quick field, no Send, pill ↑, Enter sends */
+
+    /* History overlay — a second scroll page, a grow-sibling of s_msgList. Hidden
+     * until "load earlier"; showing it hides the resident (which stays built, so
+     * closing is instant). It carries no composer. */
+    s_histWrap = lv_obj_create(s_thread);
+    lv_obj_remove_style_all(s_histWrap);
+    lv_obj_set_width(s_histWrap, lv_pct(100));
+    lv_obj_set_flex_grow(s_histWrap, 1);
+    lv_obj_set_flex_flow(s_histWrap, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_color(s_histWrap, lv_color_hex(0x10141a), 0);
+    lv_obj_set_style_bg_opa(s_histWrap, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_histWrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN);
+
+    s_histList = lv_obj_create(s_histWrap);
+    lv_obj_remove_style_all(s_histList);
+    lv_obj_set_width(s_histList, lv_pct(100));
+    lv_obj_set_flex_grow(s_histList, 1);
+    lv_obj_set_flex_flow(s_histList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(s_histList, 4, 0);
+    lv_obj_set_style_pad_ver(s_histList, 1, 0);
+    lv_obj_set_style_pad_row(s_histList, 1, 0);
+    lv_obj_add_event_cb(s_histList, [](lv_event_t*) { updateStickyDate(); }, LV_EVENT_SCROLL, nullptr);
+
+    s_histEarlier = lv_button_create(s_histList);
+    lv_obj_remove_style_all(s_histEarlier);
+    lv_obj_set_width(s_histEarlier, lv_pct(100));
+    lv_obj_set_height(s_histEarlier, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_histEarlier, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_histEarlier, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_histEarlier, 4, 0);
+    lv_obj_set_style_pad_ver(s_histEarlier, 9, 0);
+    lv_obj_set_style_margin_ver(s_histEarlier, 2, 0);
+    lv_obj_remove_flag(s_histEarlier, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(mkLabel(s_histEarlier, LV_SYMBOL_UP "  Load earlier messages", lv_color_hex(0xc0c8d0)));
+    lv_obj_add_event_cb(s_histEarlier, [](lv_event_t*) {
+        if (h_winLo == 0) return;
+        h_winLo = h_winLo > PAGE_SIZE ? h_winLo - PAGE_SIZE : 0;
+        if (h_winHi - h_winLo > MAXSPAN) h_winHi = h_winLo + MAXSPAN;
+        renderHistory();
+    }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_histEarlier);
+
+    s_histBubbles = lv_obj_create(s_histList);
+    lv_obj_remove_style_all(s_histBubbles);
+    lv_obj_set_width(s_histBubbles, lv_pct(100));
+    lv_obj_set_height(s_histBubbles, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_histBubbles, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_histBubbles, 1, 0);
+    lv_obj_remove_flag(s_histBubbles, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_histNewer = lv_button_create(s_histList);
+    lv_obj_remove_style_all(s_histNewer);
+    lv_obj_set_width(s_histNewer, lv_pct(100));
+    lv_obj_set_height(s_histNewer, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_histNewer, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_histNewer, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_histNewer, 4, 0);
+    lv_obj_set_style_pad_ver(s_histNewer, 9, 0);
+    lv_obj_set_style_margin_ver(s_histNewer, 2, 0);
+    lv_obj_remove_flag(s_histNewer, LV_OBJ_FLAG_SCROLLABLE);
+    s_histNewerLbl = mkLabel(s_histNewer, LV_SYMBOL_DOWN "  Load newer messages", lv_color_hex(0xc0c8d0));
+    lv_obj_center(s_histNewerLbl);
+    lv_obj_add_event_cb(s_histNewer, [](lv_event_t*) {
+        h_winHi += PAGE_SIZE;
+        if (h_winHi > g_winLo) h_winHi = g_winLo;               /* never into the resident page */
+        if (h_winHi - h_winLo > MAXSPAN) h_winLo = h_winHi - MAXSPAN;
+        renderHistory();
+    }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_histNewer);
+
+    /* Bottom bar: jump straight back to the newest (closes the overlay). */
+    lv_obj_t* histBack = lv_button_create(s_histWrap);
+    lv_obj_remove_style_all(histBack);
+    lv_obj_set_width(histBack, lv_pct(100));
+    lv_obj_set_height(histBack, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(histBack, lv_color_hex(0x2563a0), 0);
+    lv_obj_set_style_bg_opa(histBack, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_ver(histBack, 8, 0);
+    lv_obj_remove_flag(histBack, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(mkLabel(histBack, LV_SYMBOL_DOWN "  Back to latest", lv_color_white()));
+    lv_obj_add_event_cb(histBack, [](lv_event_t*) { threadSnapNewest(); }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), histBack);
 }
 
 /* Reflect the active identity's connection state onto the compose field. Until
@@ -865,24 +1292,26 @@ void openThread(const std::string& peer) {
     if (!g_curPeer.empty() && g_curPeer != peer) saveDraft();   /* preserve the conv we're leaving */
     g_curPeer = peer;
     if (!s_thread) buildThreadShell();
+    closeHistory();                         /* a fresh conversation opens on its newest page */
     lv_label_set_text(s_threadName, peerName(peer).c_str());
     updateThreadLink();
     if (s_contacts) lv_obj_add_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick)   lv_obj_add_flag(s_idpick,   LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
     lcdProgramFullscreen(true);             /* immersive chat: no status bar */
-    refreshMsgs();                          /* load this conversation's records now */
-    markRead(peer);
-    rebuildThread();
-    scrollThreadBottom(false);              /* opening/returning to a conversation lands at newest */
     loadDraft(peer);                        /* restore this conversation's in-progress text */
     composeReflectUp();
     deferFocus(s_compose);                  /* focus always rests on the entry box */
+    /* Paint the shell + "<loading conversation>" placeholder NOW; the heavy
+     * record load + bubble build (seconds for a long thread) is deferred so the
+     * screen never looks frozen. The window resets to the newest page. */
+    g_needMsgLoad = true;
+    g_scrollAfter = 0;                      /* land at newest once loaded */
+    beginThreadLoad();
 }
 
 void onContactClick(lv_event_t* e) {
-    size_t idx = (size_t)(intptr_t)lv_event_get_user_data(e);
-    if (idx < g_rowPeers.size()) openThread(g_rowPeers[idx]);
+    openThread(*static_cast<std::string*>(lv_event_get_user_data(e)));
 }
 
 /* A contact tapped in the nomad browser (lxmf.url_lcd) waits here until an
@@ -956,14 +1385,30 @@ void onNomadLinkClick(lv_event_t* e) {
  * stack in the bubble's column. (A label can't make a substring clickable, so
  * a link becomes its own widget — the same constraint nomad_lcd handles for
  * lxmf@ links.) */
-void addBubbleText(lv_obj_t* bub, const std::string& content) {
+/* Returns the last plain text label when the message has no Nomad links (so the
+ * inline-timestamp path can measure its last line); nullptr when it also holds
+ * link widgets. */
+lv_obj_t* addBubbleText(lv_obj_t* bub, const std::string& content) {
     std::string body = printable(content, false);   /* drop unrenderables, keep newlines */
 
-    auto addText = [&](size_t from, size_t to) {
-        if (to <= from) return;
-        lv_obj_t* l = mkLabel(bub, body.substr(from, to - from), lv_color_white());
-        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_max_width(l, 228, 0);
+    /* One label per line — a CR ends a label. A long body would otherwise be a
+     * single mega-label that LVGL re-wraps in full on every reflow; splitting it
+     * keeps each label's layout cheap. Returns the last label made in [from,to). */
+    auto addText = [&](size_t from, size_t to) -> lv_obj_t* {
+        if (to <= from) return nullptr;              /* empty run (e.g. leading/adjacent link) */
+        lv_obj_t* last = nullptr;
+        size_t s = from;
+        while (s <= to) {
+            size_t nl = body.find('\n', s);
+            size_t e = (nl == std::string::npos || nl > to) ? to : nl;
+            lv_obj_t* l = mkLabel(bub, body.substr(s, e - s), lv_color_white());
+            lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_max_width(l, 228, 0);
+            last = l;
+            if (e == to) break;
+            s = e + 1;                               /* past the CR */
+        }
+        return last;
     };
 
     size_t i = 0, textStart = 0;
@@ -989,33 +1434,164 @@ void addBubbleText(lv_obj_t* bub, const std::string& content) {
             i++;
         }
     }
-    if (!any) { addText(0, body.size()); return; }   /* unchanged: single label */
+    if (!any) return addText(0, body.size());        /* single plain label */
     addText(textStart, body.size());
+    return nullptr;                                   /* has links → not a single label */
 }
 
-/* Set/update the delivery glyph on a bubble's meta row in place: child 0 is the
- * timestamp, child 1 (if any) the glyph. Drop the old glyph and re-add, so a
- * stage transition rewrites one tiny label instead of the whole bubble. */
-void setBubbleStatus(lv_obj_t* meta, const Msg& m) {
-    while (lv_obj_get_child_count(meta) > 1)
-        lv_obj_delete(lv_obj_get_child(meta, 1));
-    if (m.in) return;
-    const char* sym = nullptr;
-    lv_color_t  col = lv_color_hex(0x8a93a0);
-    if (m.stage == "sent")           { sym = LV_SYMBOL_OK; }
-    else if (m.stage == "delivered") { sym = LV_SYMBOL_OK LV_SYMBOL_OK;
-                                       col = lv_color_hex(0x4abf6a); }
-    else if (m.stage == "failed" ||
-             m.stage == "cancelled") { sym = LV_SYMBOL_CLOSE;
-                                       col = lv_color_hex(0xd9534f); }
-    else if (m.stage == "queued" ||
-             m.stage == "sending")   { sym = "..."; }
-    if (sym) mkLabel(meta, sym, col);
+/* Fill a bubble's meta row: the ALL-CAPS status name (outbound only, left, in
+ * smaller print) at one end; the timestamp + delivery glyph at the other. Rebuilt
+ * whole on a status/tries change — three small labels, and only on an actual
+ * transition. Glyph: DELIVERED ✓✓ green · CANCELLED ✕ grey · gave-up
+ * (tries == 255) ✕ red · else … in flight. Inbound shows only the timestamp. */
+void fillMeta(lv_obj_t* meta, const Msg& m) {
+    lv_obj_clean(meta);
+
+    /* Status name (outbound, tiny) on the LEFT — SUPPRESSED for DELIVERED (the ✓✓
+     * says it), single line so a long name never stacks (DE-LIV-ER-ED). */
+    bool showStatus = !m.in && m.status != LXMF_ST_DELIVERED;
+    if (showStatus) {
+        lv_obj_t* st = lv_label_create(meta);
+        lv_obj_set_style_text_font(st, kFontTiny, 0);
+        lv_obj_set_style_text_color(st, lv_color_hex(0x8a93a0), 0);
+        lv_label_set_long_mode(st, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(st, lxmfStatusName(m.status));
+    }
+
+    /* Grow-spacer that pushes the time + glyph to the RIGHT — after the status when
+     * there is one (a 22px min-gap that also sizes short bubbles), or LEADING when
+     * there isn't (inbound / delivered), so the time is right-aligned there too. */
+    lv_obj_t* sp = lv_obj_create(meta);
+    lv_obj_remove_style_all(sp);
+    lv_obj_set_size(sp, showStatus ? 22 : 1, 1);
+    lv_obj_set_flex_grow(sp, 1);
+    lv_obj_remove_flag(sp, LV_OBJ_FLAG_SCROLLABLE);
+
+    char tbuf[64] = "";
+    if (m.ts > 0) {
+        time_t tt = m.ts;
+        struct tm tmv {};
+        localtime_r(&tt, &tmv);
+        /* Per-message time format is a user setting honoured here + in the web UI. */
+        std::string fmt = storageGetStr("s.lxmf.msg_time_format", "%H:%M");
+        strftime(tbuf, sizeof tbuf, fmt.c_str(), &tmv);
+    }
+    lv_obj_t* tl = lv_label_create(meta);        /* time (right, small) */
+    lv_obj_set_style_text_font(tl, kFontSmall, 0);
+    lv_obj_set_style_text_color(tl, lv_color_hex(0xc0c8d0), 0);
+    lv_label_set_text(tl, tbuf);
+
+    if (!m.in) {
+        const char* sym = "...";                     /* queued/requesting/sending/awaiting → in flight */
+        lv_color_t  col = lv_color_hex(0x8a93a0);
+        if (m.status == LXMF_ST_DELIVERED)      { sym = LV_SYMBOL_OK LV_SYMBOL_OK; col = lv_color_hex(0x4abf6a); }
+        else if (m.status == LXMF_ST_CANCELLED) { sym = LV_SYMBOL_CLOSE;           col = lv_color_hex(0x8a93a0); }
+        else if (m.tries == LXMF_TRIES_GAVEUP)  { sym = LV_SYMBOL_CLOSE;           col = lv_color_hex(0xd9534f); }
+        lv_obj_t* ic = lv_label_create(meta);    /* delivery glyph (small) */
+        lv_obj_set_style_text_font(ic, kFontSmall, 0);
+        lv_obj_set_style_text_color(ic, col, 0);
+        lv_label_set_text(ic, sym);
+    }
 }
 
-lv_obj_t* addBubble(const Msg& m) {
-    lv_obj_t* row = lv_obj_create(s_bubbles);
+/* Pin the time to the bubble's right at ALL widths: measure the meta line's
+ * natural width, reserve it as the bubble's min-width, then let the meta fill the
+ * bubble so its grow-spacer spreads status-left / time-right. Called after every
+ * fillMeta (bubble grows/shrinks as the status name changes). */
+void fitBubbleMeta(lv_obj_t* meta) {
+    if (!meta) return;
+    lv_obj_t* bub = lv_obj_get_parent(meta);
+    if (!bub) return;
+    lv_obj_set_width(meta, LV_SIZE_CONTENT);     /* measure the natural line width */
+    lv_obj_update_layout(meta);
+    int32_t mw = lv_obj_get_width(meta) + 12;    /* + the bubble's horizontal padding */
+    lv_obj_set_style_min_width(bub, mw > 60 ? mw : 60, 0);
+    lv_obj_set_width(meta, lv_pct(100));         /* fill the bubble → spacer spreads → time right */
+}
+
+/* WhatsApp-style inline meta: if the message's last line ends with room for the
+ * meta to its right — within the max bubble width — pin the meta to the bubble's
+ * RIGHT on that line, nudged 3px lower. The bubble widens just enough to clear the
+ * text by GAP; a single-line message grows toward max width to make room; if it
+ * still won't fit, we bail and the caller drops the meta to its own line.
+ * Returns true when inlined. `textLabel` is the message's LAST text label. */
+bool tryInlineMeta(lv_obj_t* bub, lv_obj_t* textLabel, lv_obj_t* meta) {
+    if (!bub || !textLabel || !meta) return false;
+    lv_obj_set_width(meta, LV_SIZE_CONTENT);
+    lv_obj_update_layout(bub);
+    int32_t metaW = lv_obj_get_width(meta);
+    int32_t lineH = lv_font_get_line_height(kFont);
+
+    const char* lt = lv_label_get_text(textLabel);
+    lv_point_t pos;
+    /* char_id past the end clamps to the text end → position after the last glyph.
+     * A byte count is >= the UTF-8 letter count, so it always lands there. pos is in
+     * the LABEL's own space; add the label's offset within the bubble content so a
+     * CR-split body tucks onto its last label's last line, not the first. */
+    lv_label_get_letter_pos(textLabel, (uint32_t)strlen(lt), &pos);
+    lv_area_t la, ba;
+    lv_obj_get_coords(textLabel, &la);
+    lv_obj_get_content_coords(bub, &ba);
+    int32_t labelTop = la.y1 - ba.y1;
+
+    int32_t metaH = lv_obj_get_height(meta);
+    const int32_t GAP = 12;   /* min horizontal space between the text and the meta */
+    if (pos.x + GAP + metaW > 228) return false;       /* won't fit even at max width */
+
+    lv_obj_add_flag(meta, LV_OBJ_FLAG_FLOATING);       /* out of the column flow */
+    lv_obj_set_style_margin_top(meta, 0, 0);
+    /* Widen just enough that the meta clears the last line's text by GAP — a wider
+     * line elsewhere keeps its width (this min is only a floor). */
+    int32_t need = pos.x + GAP + metaW + 12;           /* + bubble pad_hor */
+    lv_obj_set_style_min_width(bub, need > 60 ? need : 60, 0);
+    /* Pin to the bubble's RIGHT (not just after the last word). The meta font is
+     * smaller than the text, so sit it at the last line's BOTTOM, then nudge 3px
+     * lower — the balloon grows by exactly that 3px spill. */
+    int32_t off = lcdPx(3);
+    int32_t y = labelTop + pos.y + (lineH - metaH) + off;
+    lv_obj_set_style_pad_bottom(bub, off, 0);
+    lv_obj_align(meta, LV_ALIGN_TOP_RIGHT, 0, y);
+    return true;
+}
+
+/* Place the meta after a (re)fill: tuck it onto the message's last line when it
+ * fits (single text label only), else pin it right on its own line. Applies to
+ * every message — sent, delivered, inbound. Resets prior inline/own-line state
+ * first so a status transition re-lays-out cleanly both ways. */
+void layoutMeta(lv_obj_t* bub, lv_obj_t* meta, uint8_t /*status*/) {
+    if (!bub || !meta) return;
+    lv_obj_remove_flag(meta, LV_OBJ_FLAG_FLOATING);                        /* back into the column */
+    lv_obj_set_style_margin_top(meta, lv_font_get_line_height(kFont) / 3, 0);
+    lv_obj_set_style_pad_bottom(bub, 0, 0);                                /* undo any ⅓-line growth */
+    lv_obj_set_style_min_width(bub, 60, 0);
+    /* Inline onto the last text label (the child just before meta) — but only when
+     * no child is a link widget, so a floated meta never covers a tappable link. */
+    lv_obj_t* textLabel = nullptr;
+    uint32_t n = lv_obj_get_child_count(bub);
+    if (n >= 2) {
+        bool hasLink = false;
+        for (uint32_t i = 0; i + 1 < n; i++)
+            if (lv_obj_has_flag(lv_obj_get_child(bub, i), LV_OBJ_FLAG_CLICKABLE)) { hasLink = true; break; }
+        if (!hasLink) textLabel = lv_obj_get_child(bub, n - 2);
+    }
+    if (textLabel && textLabel != meta && tryInlineMeta(bub, textLabel, meta))
+        return;
+    fitBubbleMeta(meta);
+}
+
+/* Extra gap above a bubble, scaled with the UI zoom: 1px baseline between all
+ * balloons, +3px when it's more than 15 min since the previous message. */
+int bubbleTopMargin(long prevAnchor, long curAnchor) {
+    int m = lcdPx(1);
+    if (prevAnchor > 0 && curAnchor > 0 && (curAnchor - prevAnchor) > 15 * 60)
+        m += lcdPx(3);
+    return m;
+}
+
+BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) {
+    lv_obj_t* row = lv_obj_create(container ? container : s_bubbles);
     lv_obj_remove_style_all(row);
+    lv_obj_set_style_margin_top(row, topMargin, 0);
     lv_obj_set_width(row, lv_pct(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -1027,6 +1603,7 @@ lv_obj_t* addBubble(const Msg& m) {
     lv_obj_remove_style_all(bub);
     lv_obj_set_width(bub, LV_SIZE_CONTENT);
     lv_obj_set_height(bub, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_width(bub, 60, 0);           /* fit a timestamp even under a 2-char message */
     lv_obj_set_style_max_width(bub, 240, 0);          /* fixed px — a pct of a content-sized chain collapses */
     lv_obj_set_style_bg_color(bub, m.in ? lv_color_hex(0x2a313a) : lv_color_hex(0x2563a0), 0);
     lv_obj_set_style_bg_opa(bub, LV_OPA_COVER, 0);
@@ -1034,37 +1611,122 @@ lv_obj_t* addBubble(const Msg& m) {
     lv_obj_set_style_pad_ver(bub, 1, 0);
     lv_obj_set_style_pad_hor(bub, 6, 0);
     lv_obj_set_flex_flow(bub, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(bub, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_remove_flag(bub, LV_OBJ_FLAG_SCROLLABLE);
 
     addBubbleText(bub, m.content);                    /* text + tappable Nomad links, wrapped to 228 */
 
-    char tbuf[8] = "";
-    if (m.ts > 0) {
-        time_t tt = m.ts;
-        struct tm tmv {};
-        localtime_r(&tt, &tmv);
-        strftime(tbuf, sizeof tbuf, "%H:%M", &tmv);
-    }
-
-    /* Meta row: timestamp + (outbound only) a delivery-status glyph.
-     * kFont (montserrat latin) carries the LVGL symbol set:
-     *   queued/sending  "..."                 grey   (in flight)
-     *   sent            one checkmark         grey   (egressed, no proof)
-     *   delivered       two checkmarks        green  (cryptographic proof)
-     *   failed/cancelled  X                   red
-     * Stage changes re-render via the s.lxmf.id storage subscription
-     * (onStorageChange → refreshMsgs + rebuildThread). */
+    /* Meta row: status name + timestamp + delivery glyph. CONTENT-sized (not
+     * full-width) so it becomes a lower bound on the bubble width — a bubble under
+     * a tiny message ("test") grows to fit the whole line instead of clipping the
+     * time/checkmarks. Re-rendered via fillMeta on a status change. */
     lv_obj_t* meta = lv_obj_create(bub);
     lv_obj_remove_style_all(meta);
     lv_obj_set_width(meta, LV_SIZE_CONTENT);
     lv_obj_set_height(meta, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(meta, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(meta, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(meta, 4, 0);
+    lv_obj_set_style_margin_top(meta, lv_font_get_line_height(kFont) / 3, 0);   /* ~⅓-line gap above */
     lv_obj_remove_flag(meta, LV_OBJ_FLAG_SCROLLABLE);
+    fillMeta(meta, m);
+    layoutMeta(bub, meta, m.status);
 
-    mkLabel(meta, tbuf, lv_color_hex(0xc0c8d0));
-    setBubbleStatus(meta, m);
-    return meta;
+    return BubbleRef{ m.key, m.status, m.tries, meta };
+}
+
+/* ---- day separators (anchored to recv_ts) + floating sticky date ---- */
+
+bool sameLocalDay(long a, long b) {
+    if (a <= 0 || b <= 0) return a == b;
+    time_t ta = a, tb = b; struct tm x{}, y{};
+    localtime_r(&ta, &x); localtime_r(&tb, &y);
+    return x.tm_year == y.tm_year && x.tm_yday == y.tm_yday;
+}
+void dayLabel(long recv_ts, char* buf, size_t n) {
+    buf[0] = 0;
+    if (recv_ts > 0) { time_t t = recv_ts; struct tm tmv {}; localtime_r(&t, &tmv);
+                       strftime(buf, n, "%a %d %b", &tmv); }
+}
+
+/* A centered date pill in the bubble column, before the first message of a day.
+ * `anchor` is recv_ts (or ts when recv_ts is unset) — the caller guarantees > 0,
+ * so the pill is never an empty (grey-circle) label. Distinct pale-yellow look.
+ * `continued` appends " (continued)" — used on the window's top separator when
+ * earlier messages of the same date sit above the loaded window. */
+void addDateSep(long anchor, bool continued = false, lv_obj_t* container = nullptr,
+                std::vector<std::pair<lv_obj_t*, long>>* seps = nullptr) {
+    char buf[48]; dayLabel(anchor, buf, sizeof buf);
+    if (continued) { size_t n = strlen(buf); snprintf(buf + n, sizeof buf - n, " (continued)"); }
+    lv_obj_t* wrap = lv_obj_create(container ? container : s_bubbles);
+    lv_obj_remove_style_all(wrap);
+    lv_obj_set_width(wrap, lv_pct(100));
+    lv_obj_set_height(wrap, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(wrap, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wrap, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_ver(wrap, 3, 0);
+    lv_obj_remove_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* pill = lv_label_create(wrap);
+    lv_obj_set_style_text_font(pill, kFontSmall, 0);
+    lv_obj_set_style_text_color(pill, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(pill, lv_color_hex(0xffffcc), 0);   /* nearest RGB565 pale yellow */
+    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(pill, 4, 0);
+    lv_obj_set_style_pad_hor(pill, 8, 0);
+    lv_obj_set_style_pad_ver(pill, 1, 0);
+    lv_label_set_text(pill, buf);
+    (seps ? *seps : g_dateSeps).push_back({ wrap, anchor });
+}
+
+void stickyFadeCb(lv_timer_t*) {
+    g_stickyFadeTimer = nullptr;
+    if (s_stickyDate) lv_obj_fade_out(s_stickyDate, 400, 0);
+}
+
+/* On scroll: float the day of the content at the top of the viewport as a pill —
+ * always a date while scrolling, suppressed only when that day's own inline
+ * separator is itself at the top (it's already showing the date). Re-arms the 2 s
+ * fade. (The "(continued)" marker lives on the fixed top-of-window separator, not
+ * here.) Parameterized on the scrolling list / bubble column / seps so the resident
+ * page and the history overlay share one pill (s_stickyDate lives above both). */
+void updateStickyFor(lv_obj_t* list, lv_obj_t* bubbles,
+                     std::vector<std::pair<lv_obj_t*, long>>& seps) {
+    if (!s_stickyDate || !list || !bubbles) return;
+    if (seps.empty()) { lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN); return; }
+    int32_t top    = lv_obj_get_scroll_y(list);
+    int32_t bubOff = lv_obj_get_y(bubbles);
+    long    curDay = 0;
+    bool    haveCur = false, sepAtTop = false;
+    long    firstDay = 0;                                    /* oldest sep = topmost content's day */
+    for (auto& s : seps) {
+        if (!lv_obj_is_valid(s.first)) continue;
+        int32_t y = bubOff + lv_obj_get_y(s.first);
+        if (firstDay == 0) firstDay = s.second;              /* seps are oldest-first */
+        if (y <= top + 1) { curDay = s.second; haveCur = true; }   /* last day above the top */
+        if (y >= top && y <= top + 26) sepAtTop = true;      /* an inline separator is at the top */
+    }
+    if (!haveCur) curDay = firstDay;                         /* scrolled above the first separator */
+    if (curDay <= 0 || sepAtTop) {                           /* no date to show / inline sep is doing it */
+        lv_anim_del(s_stickyDate, nullptr);
+        lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);   /* instant, not a fade — no mid-scroll flicker */
+        return;
+    }
+    char buf[32]; dayLabel(curDay, buf, sizeof buf);
+    lv_label_set_text(s_stickyLbl, buf);
+    lv_anim_del(s_stickyDate, nullptr);                      /* cancel a running fade */
+    lv_obj_set_style_opa(s_stickyDate, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
+    if (g_stickyFadeTimer) lv_timer_reset(g_stickyFadeTimer);
+    else { g_stickyFadeTimer = lv_timer_create(stickyFadeCb, 2000, nullptr);
+           lv_timer_set_repeat_count(g_stickyFadeTimer, 1); }
+}
+
+/* Whichever page is on screen drives the pill (only one is visible at a time). */
+void updateStickyDate() {
+    if (s_histWrap && !lv_obj_has_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN))
+        updateStickyFor(s_histList, s_histBubbles, g_histDateSeps);
+    else
+        updateStickyFor(s_msgList, s_bubbles, g_dateSeps);
 }
 
 void rebuildThread() {
@@ -1076,9 +1738,41 @@ void rebuildThread() {
        to order messages reliably, whereas insertion order is exactly "as
        received/sent". This also keeps new messages strictly at the end, so the
        reconcile below only ever appends. */
-    std::vector<const Msg*> ms;
-    ms.reserve(g_msgs.size());
-    for (auto& m : g_msgs) if (m.peer == g_curPeer) ms.push_back(&m);
+    std::vector<const Msg*> all;
+    all.reserve(g_msgs.size());
+    for (auto& m : g_msgs) if (m.peer == g_curPeer) all.push_back(&m);
+    size_t total = all.size();
+
+    /* Only the [g_winLo, g_winHi) window is rendered. While pinned to newest the
+       bottom edge follows total, so a live arrival appends into the window (the
+       reconcile stays append-only); paging back bounds the window and freezes it
+       until you navigate. */
+    if (g_atNewest) g_winHi = total;
+    if (g_winHi > total) g_winHi = total;
+    if (g_winLo > g_winHi) g_winLo = g_winHi;
+    updatePageButtons(total);
+
+    std::vector<const Msg*> ms(all.begin() + g_winLo, all.begin() + g_winHi);
+
+    /* Date anchor = recv_ts, or ts when recv_ts is unset (an optimistic just-sent
+       bubble, or anything an older writer left at 0) — so a message never produces
+       an empty (grey-circle) separator. prevAnchor(i) is the message above ms[i]
+       (or above the window when i == 0). */
+    auto anchorOf   = [](const Msg* m) -> long { return m->recv_ts > 0 ? m->recv_ts : m->ts; };
+    auto prevAnchor = [&](size_t i) -> long {
+        if (i > 0) return anchorOf(ms[i - 1]);
+        return g_winLo > 0 ? anchorOf(all[g_winLo - 1]) : 0;
+    };
+    /* Add a date separator before ms[i] when the day changes. The window's first
+       message (i == 0) ALWAYS gets one so the top of the scroll always carries a
+       date — marked "(continued)" when the message just above the window shares
+       that date (earlier same-day messages are still off-window, load-earlier). */
+    auto maybeSep = [&](size_t i) {
+        long a = anchorOf(ms[i]);
+        if (a <= 0) return;
+        if (i == 0) addDateSep(a, g_winLo > 0 && sameLocalDay(prevAnchor(0), a));
+        else if (!sameLocalDay(prevAnchor(i), a)) addDateSep(a);
+    };
 
     bool wasAtBottom = threadAtBottom();   /* pinned to newest before this update? */
 
@@ -1093,14 +1787,16 @@ void rebuildThread() {
 
     if (matchN == g_bubbles.size()) {                    /* existing bubbles are a prefix */
         for (size_t i = 0; i < g_bubbles.size(); i++)
-            if (ms[i]->stage != g_bubbles[i].stage) {
-                setBubbleStatus(g_bubbles[i].meta, *ms[i]);
-                g_bubbles[i].stage = ms[i]->stage;
+            if (ms[i]->status != g_bubbles[i].status || ms[i]->tries != g_bubbles[i].tries) {
+                fillMeta(g_bubbles[i].meta, *ms[i]);     /* status name + glyph re-render */
+                layoutMeta(lv_obj_get_parent(g_bubbles[i].meta), g_bubbles[i].meta, ms[i]->status);
+                g_bubbles[i].status = ms[i]->status;
+                g_bubbles[i].tries  = ms[i]->tries;
             }
         bool appended = false;
         for (size_t i = g_bubbles.size(); i < ms.size(); i++) {
-            lv_obj_t* meta = addBubble(*ms[i]);
-            g_bubbles.push_back({ ms[i]->key, ms[i]->stage, meta });
+            maybeSep(i);
+            g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i]))));
             appended = true;
         }
         if (appended) {
@@ -1117,12 +1813,80 @@ void rebuildThread() {
     /* Fallback: structural change or a different conversation — full rebuild. */
     lv_obj_clean(s_bubbles);
     g_nomadTargets.clear();          /* link widgets are gone with the cleaned bubbles */
+    g_dateSeps.clear();              /* separator widgets went with the clean */
     g_bubbles.clear();
-    for (auto* m : ms) {
-        lv_obj_t* meta = addBubble(*m);
-        g_bubbles.push_back({ m->key, m->stage, meta });
+    for (size_t i = 0; i < ms.size(); i++) {
+        maybeSep(i);
+        g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i]))));
     }
     scrollThreadBottom(false);                          /* newest + compose at bottom */
+}
+
+/* ---- history overlay (older messages, browsed off the resident newest page) ---- */
+
+void updateHistButtons(size_t /*total*/) {
+    if (s_histEarlier) { if (h_winLo > 0) lv_obj_remove_flag(s_histEarlier, LV_OBJ_FLAG_HIDDEN);
+                         else              lv_obj_add_flag(s_histEarlier, LV_OBJ_FLAG_HIDDEN); }
+    /* "Load newer" shows when the window doesn't reach the resident boundary. No
+     * count — it excludes the resident's own messages, so any number would mislead. */
+    if (s_histNewer) { if (h_winHi < g_winLo) lv_obj_remove_flag(s_histNewer, LV_OBJ_FLAG_HIDDEN);
+                       else                    lv_obj_add_flag(s_histNewer, LV_OBJ_FLAG_HIDDEN); }
+}
+
+/* Render the [h_winLo, h_winHi) window into the overlay. Read-only (no reconcile):
+ * a page of history is a static snapshot, cleaned and rebuilt on each paging. The
+ * top separator gets "(continued)" when the message just above the window shares
+ * its day, exactly as the resident page does. */
+void renderHistory() {
+    if (!s_histBubbles || g_curPeer.empty()) return;
+    std::vector<const Msg*> all;
+    for (auto& m : g_msgs) if (m.peer == g_curPeer) all.push_back(&m);
+    size_t total = all.size();
+    if (h_winHi > g_winLo) h_winHi = g_winLo;   /* never overlap the resident page */
+    if (h_winHi > total)   h_winHi = total;
+    if (h_winLo > h_winHi)  h_winLo = h_winHi;
+
+    lv_obj_clean(s_histBubbles);
+    g_histDateSeps.clear();
+
+    std::vector<const Msg*> ms(all.begin() + h_winLo, all.begin() + h_winHi);
+    auto anchorOf   = [](const Msg* m) -> long { return m->recv_ts > 0 ? m->recv_ts : m->ts; };
+    auto prevAnchor = [&](size_t i) -> long {
+        if (i > 0) return anchorOf(ms[i - 1]);
+        return h_winLo > 0 ? anchorOf(all[h_winLo - 1]) : 0;
+    };
+    auto maybeSep = [&](size_t i) {
+        long a = anchorOf(ms[i]);
+        if (a <= 0) return;
+        if (i == 0) addDateSep(a, h_winLo > 0 && sameLocalDay(prevAnchor(0), a), s_histBubbles, &g_histDateSeps);
+        else if (!sameLocalDay(prevAnchor(i), a)) addDateSep(a, false, s_histBubbles, &g_histDateSeps);
+    };
+    for (size_t i = 0; i < ms.size(); i++) {
+        maybeSep(i);
+        addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i])), s_histBubbles);
+    }
+    updateHistButtons(total);
+    lv_obj_update_layout(s_histList);
+    lv_obj_scroll_to_y(s_histList, LV_COORD_MAX, LV_ANIM_OFF);   /* the join with the resident page */
+}
+
+/* Show the overlay at the page just before the resident's oldest, hiding the
+ * resident (it stays built). No-op when nothing older exists. */
+void openHistory() {
+    if (!s_histWrap || g_winLo == 0) return;
+    h_winHi = g_winLo;
+    h_winLo = h_winHi > PAGE_SIZE ? h_winHi - PAGE_SIZE : 0;
+    if (s_stickyDate) lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
+    if (s_msgList)    lv_obj_add_flag(s_msgList,    LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN);   /* show FIRST — a hidden list can't lay out */
+    renderHistory();                                      /* then render + land at the bottom */
+}
+
+/* Hide the overlay and reveal the resident newest page — instant, no re-render. */
+void closeHistory() {
+    if (!s_histWrap || lv_obj_has_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN)) return;
+    lv_obj_add_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN);
+    if (s_msgList) lv_obj_remove_flag(s_msgList, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
@@ -1368,10 +2132,21 @@ void showInfo(const std::string& peer) {
     deferFocus(back);
 }
 
+/* Each clickable list row carries its own peer string as event user-data (freed
+ * with the widget), so a row can be reused / moved during a reconcile without a
+ * shared index vector going stale. */
+void onRowDeletePeer(lv_event_t* e) {
+    delete static_cast<std::string*>(lv_event_get_user_data(e));
+}
+void bindPeer(lv_obj_t* o, lv_event_cb_t cb, const std::string& peer) {
+    auto* p = new std::string(peer);
+    lv_obj_add_event_cb(o, cb, LV_EVENT_CLICKED, p);
+    lv_obj_add_event_cb(o, onRowDeletePeer, LV_EVENT_DELETE, p);
+}
+
 /* Contact row circled-i tap: open the info page for that row's peer. */
 void onContactInfo(lv_event_t* e) {
-    size_t idx = (size_t)(intptr_t)lv_event_get_user_data(e);
-    if (idx < g_rowPeers.size()) showInfo(g_rowPeers[idx]);
+    showInfo(*static_cast<std::string*>(lv_event_get_user_data(e)));
 }
 
 /* Populate a row host (styled by the caller) with the two-line body + a
@@ -1416,12 +2191,8 @@ void fillPeerContent(lv_obj_t* host, const std::string& title, const std::string
 }
 
 /* A plain tappable row (On-the-Mesh + the "message this address" affordance).
- * Uses the shared g_rowPeers click index → onContactClick → openThread. */
-void addPeerRow(lv_obj_t* list, const std::string& peer, const std::string& title,
-                const std::string& sub, const std::string& age, lv_color_t titleColor) {
-    size_t idx = g_rowPeers.size();
-    g_rowPeers.push_back(peer);
-
+ * The peer travels on the widget (bindPeer) → onContactClick → openThread. */
+lv_obj_t* buildPeerRow(lv_obj_t* list, const RowSpec& s) {
     lv_obj_t* row = lv_button_create(list);
     lv_obj_remove_style_all(row);
     lv_obj_set_width(row, lv_pct(100));
@@ -1432,10 +2203,11 @@ void addPeerRow(lv_obj_t* list, const std::string& peer, const std::string& titl
     lv_obj_set_style_pad_ver(row, 1, 0);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(row, onContactClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    bindPeer(row, onContactClick, s.peer);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
-    fillPeerContent(row, title, sub, age, titleColor);
+    fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);
+    return row;
 }
 
 /* ---- contact row: a plain tappable body + a fixed circled-i ----
@@ -1444,16 +2216,11 @@ void addPeerRow(lv_obj_t* list, const std::string& peer, const std::string& titl
  * the one thing unique to this list and made taps miss, so it's gone. A small
  * circled-i sits at the right edge (no background) and opens the contact info
  * page, which holds the delete-conversation flow behind an explicit confirm. */
-void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& title,
-                   const std::string& sub, const std::string& age, lv_color_t titleColor,
-                   int unread = 0) {
+lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
     int lineH = lv_font_get_line_height(kFont);
 
-    /* Tappable body — the same plain button the mesh tab uses (shared g_rowPeers
-     * index → onContactClick → openThread). */
-    size_t idx = g_rowPeers.size();
-    g_rowPeers.push_back(peer);
-
+    /* Tappable body — the same plain button the mesh tab uses (peer on the
+     * widget via bindPeer → onContactClick → openThread). */
     lv_obj_t* row = lv_button_create(list);
     lv_obj_remove_style_all(row);
     lv_obj_set_width(row, lv_pct(100));
@@ -1464,14 +2231,14 @@ void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& t
     lv_obj_set_style_pad_ver(row, 1, 0);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(row, onContactClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    bindPeer(row, onContactClick, s.peer);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
-    fillPeerContent(row, title, sub, age, titleColor);   /* row → flex: [body][age] */
+    fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);   /* row → flex: [body][age] */
 
     /* Unread badge: a blue pill with the count, between the age and the info
      * button. Blue background per design; absent when there's nothing unread. */
-    if (unread > 0) {
+    if (s.unread > 0) {
         lv_obj_t* badge = lv_obj_create(row);
         lv_obj_remove_style_all(badge);
         lv_obj_set_style_bg_color(badge, lv_color_hex(0x2563a0), 0);
@@ -1483,7 +2250,8 @@ void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& t
         lv_obj_set_height(badge, LV_SIZE_CONTENT);
         lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(badge, LV_OBJ_FLAG_CLICKABLE);
-        char cnt[8]; snprintf(cnt, sizeof cnt, "%d", unread > 999 ? 999 : unread);
+        int u = s.unread < 0 ? 0 : (s.unread > 999 ? 999 : s.unread);
+        char cnt[8]; snprintf(cnt, sizeof cnt, "%d", u);
         lv_obj_center(mkLabel(badge, cnt, lv_color_white()));
     }
 
@@ -1502,41 +2270,143 @@ void addContactRow(lv_obj_t* list, const std::string& peer, const std::string& t
     lv_obj_set_style_border_width(ic, 1, 0);
     lv_obj_set_style_border_color(ic, lv_color_hex(0x8a93a0), 0);
     lv_obj_center(ic);
-    lv_obj_add_event_cb(info, onContactInfo, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    bindPeer(info, onContactInfo, s.peer);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), info);
+    return row;
 }
 
-void grpLabel(lv_obj_t* list, const char* t) {
+lv_obj_t* grpLabel(lv_obj_t* list, const char* t) {
     lv_obj_t* l = mkLabel(list, t, lv_color_hex(0x6a7280));
     lv_obj_set_style_pad_top(l, 3, 0);
+    return l;
 }
 
-/* Rebuild both tab lists from the in-RAM stores. Cheap enough to redo both on
- * any change (contacts come from g_msgs, the mesh from the sorted g_anns); the
- * hidden tab's rows just wait. Each list keeps its own scroll across a live
- * refresh. */
-/* Delete every row but keep child 0 — the search box now lives inside the scroll
- * list (so it scrolls with the rows), and must survive a rebuild with its text
- * and focus intact. */
-void clearRows(lv_obj_t* list) {
-    for (int32_t i = (int32_t)lv_obj_get_child_count(list) - 1; i >= 1; --i)
-        lv_obj_delete(lv_obj_get_child(list, i));
+/* Realize one row spec into a widget appended to `list`. */
+lv_obj_t* buildRow(lv_obj_t* list, const RowSpec& s) {
+    switch (s.kind) {
+        case RK_CONTACT: return buildContactRow(list, s);
+        case RK_PEER:    return buildPeerRow(list, s);
+        case RK_GROUP:   return grpLabel(list, s.title.c_str());
+        case RK_EMPTY:   default: return mkLabel(list, s.title, lv_color_hex(0x8a93a0));
+    }
 }
 
+/* Pack every live row into sequential child slots after the search box (child 0),
+ * so a reused-but-reordered row lands at its new position without a rebuild. */
+void reorderRows(lv_obj_t* list, std::vector<ListRow>& model) {
+    int32_t idx = 1;
+    for (auto& r : model) if (r.obj) lv_obj_move_to_index(r.obj, idx++);
+}
+
+void chunkTimerCb(lv_timer_t* t) {
+    auto* job = static_cast<ChunkJob*>(lv_timer_get_user_data(t));
+    int made = 0;
+    bool pending = false;
+    for (size_t i = 0; i < job->target.size(); i++) {
+        if ((*job->model)[i].obj) continue;
+        if (made < LIST_CHUNK) { (*job->model)[i].obj = buildRow(job->list, job->target[i]); made++; }
+        else { pending = true; break; }
+    }
+    reorderRows(job->list, *job->model);
+    if (pending) return;                         /* more next tick — the loop renders meanwhile */
+    if (job->keepScroll && job->scrollY > 0) {
+        lv_obj_update_layout(job->list);
+        lv_obj_scroll_to_y(job->list, job->scrollY, LV_ANIM_OFF);
+    }
+    *job->slot = nullptr;
+    lv_timer_delete(job->timer);
+    delete job;
+}
+
+void cancelChunk(ChunkJob*& slot) {
+    if (!slot) return;
+    if (slot->timer) lv_timer_delete(slot->timer);
+    delete slot;
+    slot = nullptr;
+}
+
+/* Reconcile `model` (live rows) to `target` (desired rows): reuse unchanged keys,
+ * recreate changed ones, build new ones, delete vanished ones, then reorder. A big
+ * batch of fresh builds (first open / identity switch / cleared search) is created
+ * LIST_CHUNK at a time off a timer so the LCD loop renders + services input between
+ * chunks; incremental updates (a new message, a stage change) touch only their one
+ * row and finish synchronously. */
+void applyRows(lv_obj_t* list, std::vector<ListRow>& model,
+               std::vector<RowSpec> target, bool keepScroll, ChunkJob*& slot) {
+    cancelChunk(slot);   /* supersede any in-flight populate for this list */
+
+    std::unordered_map<std::string, size_t> have;
+    for (size_t i = 0; i < model.size(); i++)
+        if (model[i].obj) have.emplace(model[i].key, i);   /* only rows that actually exist */
+    std::vector<char> used(model.size(), 0);
+
+    std::vector<ListRow> out;
+    out.reserve(target.size());
+    int creates = 0;
+    for (auto& t : target) {
+        lv_obj_t* obj = nullptr;
+        auto it = have.find(t.key);
+        if (it != have.end() && !used[it->second]) {
+            used[it->second] = 1;
+            ListRow& ex = model[it->second];
+            if (ex.sig == t.sig) obj = ex.obj;                /* reuse untouched */
+            else { lv_obj_delete(ex.obj); creates++; }         /* changed → recreate */
+        } else {
+            creates++;                                         /* new key → build */
+        }
+        out.push_back({ t.key, t.sig, obj });
+    }
+    for (size_t i = 0; i < model.size(); i++)
+        if (!used[i] && model[i].obj) lv_obj_delete(model[i].obj);   /* vanished */
+
+    model.swap(out);
+
+    int32_t sy = keepScroll ? lv_obj_get_scroll_y(list) : 0;
+
+    if (creates <= LIST_CHUNK) {
+        for (size_t i = 0; i < model.size(); i++)
+            if (!model[i].obj) model[i].obj = buildRow(list, target[i]);
+        reorderRows(list, model);
+        if (keepScroll && sy > 0) { lv_obj_update_layout(list); lv_obj_scroll_to_y(list, sy, LV_ANIM_OFF); }
+        return;
+    }
+
+    /* Large populate: build the first chunk now, defer the rest to a repeating
+     * timer that the LCD loop drains between renders. */
+    int made = 0;
+    for (size_t i = 0; i < model.size() && made < LIST_CHUNK; i++)
+        if (!model[i].obj) { model[i].obj = buildRow(list, target[i]); made++; }
+    reorderRows(list, model);
+
+    slot = new ChunkJob{ list, &model, std::move(target), keepScroll, sy, nullptr, &slot };
+    slot->timer = lv_timer_create(chunkTimerCb, 15, slot);
+}
+
+/* Decoration rows (New / footer / empty-state) have no peer, so they key off a
+ * 0x01-prefixed sentinel — a control byte a 32-hex peer key can never contain. The
+ * "\x01." separator keeps the byte out of the following escape (a bare "\x01e…"
+ * would fold the 'e' into the hex escape). */
+RowSpec groupSpec(const std::string& t) {
+    RowSpec s; s.kind = RK_GROUP; s.key = "\x01.g." + t; s.sig = t; s.title = t; return s;
+}
+RowSpec emptySpec(const std::string& t) {
+    RowSpec s; s.kind = RK_EMPTY; s.key = "\x01.e." + t; s.sig = t; s.title = t; return s;
+}
+
+/* Build both tabs' target row sets from the in-RAM stores and reconcile each list
+ * to it. The reconcile touches only the rows that changed, so the common live
+ * update (one new message / one announce) is one widget, not a wholesale rebuild;
+ * a full populate is chunked (see applyRows). Each list keeps its scroll. */
 void rebuildList(bool keepScroll) {
     if (!s_listC || !s_listM) return;
     refreshFont();
-    /* Load the mesh column's data inline, mirroring how the Contacts column reads
-     * its directory below: the On-the-Mesh rows are built from g_anns, so it must
-     * be current on every rebuild regardless of what triggered it. (Gating this on
-     * an "announces changed" flag left the tab empty after any non-announce
-     * rebuild.) */
-    refreshAnnounces();
-    int32_t syC = keepScroll ? lv_obj_get_scroll_y(s_listC) : 0;
-    int32_t syM = keepScroll ? lv_obj_get_scroll_y(s_listM) : 0;
-    clearRows(s_listC);
-    clearRows(s_listM);
-    g_rowPeers.clear();
+    /* The mesh column reads g_anns; reload the (up to thousands) announce catalogue
+     * only when it actually changed or has never been walked — a Contacts-only
+     * change (a new message) no longer drags the whole catalogue through a sort.
+     * refreshTimerCb clears g_refreshAnns after the rebuild it schedules. */
+    if (!g_annsLoaded || g_refreshAnns) { refreshAnnounces(); g_annsLoaded = true; }
+
+    std::vector<RowSpec> tC, tM;
 
     if (g_id < 0) {
         /* g_id < 0 spans two very different situations. A configured slot exists
@@ -1550,14 +2420,16 @@ void rebuildList(bool keepScroll) {
             !en.empty()  ? "Waiting for initialization…"                :
             !dis.empty() ? "Identity disabled.\nEnable it in Settings." :
                            "No active identity.\nCreate one in Settings.";
-        mkLabel(s_listC, msg, lv_color_hex(0x8a93a0));
+        tC.push_back(emptySpec(msg));
+        applyRows(s_listC, g_rowsC, std::move(tC), keepScroll, g_chunkC);
+        applyRows(s_listM, g_rowsM, std::move(tM), keepScroll, g_chunkM);   /* clears the mesh list */
         return;
     }
 
     long now = nowMonoS();   /* announce stamps are monotonic since-boot, not wall time */
 
     /* ---- Contacts tab: conversations, newest-comms first, each with a
-     * last-heard-announce badge and a swipe-to-delete. ---- */
+     * last-heard-announce badge. ---- */
     std::string nC = lower(trim(g_qContacts));
     /* Read the conversation list from the maintained directory — never the
        message store. Only peers with at least one message (count>0) are
@@ -1577,8 +2449,11 @@ void rebuildList(bool keepScroll) {
         bool known = false;
         for (auto& c : convs) if (c.peer == nC) { known = true; break; }
         if (!known) {
-            grpLabel(s_listC, "New");
-            addPeerRow(s_listC, nC, "Message this address", nC, "", lv_color_white());
+            tC.push_back(groupSpec("New"));
+            RowSpec s; s.kind = RK_PEER; s.key = "\x01.new"; s.peer = nC;
+            s.title = "Message this address"; s.sub = nC; s.titleColor = lv_color_white();
+            s.sig = "N|" + nC;
+            tC.push_back(std::move(s));
             cRows++;
         }
     }
@@ -1587,14 +2462,16 @@ void rebuildList(bool keepScroll) {
         std::string nm = peerName(c.peer);
         if (!qmatch(nC, nm, c.peer)) continue;
         long la = lastAnnounce(c.peer);
-        addContactRow(s_listC, c.peer, nm, printable(c.preview, true),
-                      la > 0 ? relAge(now - la) : std::string(),
-                      lv_color_white(), c.unread);   /* unread shown as a blue badge, not in the title */
+        RowSpec s; s.kind = RK_CONTACT; s.key = c.peer; s.peer = c.peer;
+        s.title = nm; s.sub = printable(c.preview, true);
+        s.age = la > 0 ? relAge(now - la) : std::string();
+        s.titleColor = lv_color_white(); s.unread = c.unread;
+        s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread);   /* age excluded on purpose */
+        tC.push_back(std::move(s));
         cRows++;
     }
     if (cRows == 0)
-        mkLabel(s_listC, nC.empty() ? "No conversations yet.\nSearch the mesh tab."
-                                    : "No matches.", lv_color_hex(0x8a93a0));
+        tC.push_back(emptySpec(nC.empty() ? "No conversations yet.\nSearch the mesh tab." : "No matches."));
 
     /* ---- On the Mesh: every dest heard within the expiry window, newest first,
      * badged by recency. No dedup with Contacts — a peer can appear in both. ---- */
@@ -1607,27 +2484,24 @@ void rebuildList(bool keepScroll) {
         if (!qmatch(nM, nm, an.hash)) continue;
         total++;
         if (shown >= MESH_ROW_CAP) continue;
-        addPeerRow(s_listM, an.hash, nm, an.hash,
-                   an.last > 0 ? relAge(now - an.last) : std::string(), lv_color_white());
+        RowSpec s; s.kind = RK_PEER; s.key = an.hash; s.peer = an.hash;
+        s.title = nm; s.sub = an.hash;
+        s.age = an.last > 0 ? relAge(now - an.last) : std::string();
+        s.titleColor = lv_color_white();
+        s.sig = "P|" + nm;                          /* age/last excluded: a re-announce reorders, no churn */
+        tM.push_back(std::move(s));
         shown++;
     }
     if (total > shown) {
         char foot[48];
         snprintf(foot, sizeof foot, "+%d more — search to narrow", total - shown);
-        grpLabel(s_listM, foot);
+        tM.push_back(groupSpec(foot));
     }
     if (shown == 0)
-        mkLabel(s_listM, nM.empty() ? "Nothing heard recently." : "No matches.",
-                lv_color_hex(0x8a93a0));
+        tM.push_back(emptySpec(nM.empty() ? "Nothing heard recently." : "No matches."));
 
-    /* Hold each list's reading position across a live refresh (clamped if it
-     * shrank); a fresh open / new search starts at the top (keepScroll false). */
-    if (keepScroll) {
-        lv_obj_update_layout(s_listC);
-        lv_obj_update_layout(s_listM);
-        if (syC > 0) lv_obj_scroll_to_y(s_listC, syC, LV_ANIM_OFF);
-        if (syM > 0) lv_obj_scroll_to_y(s_listM, syM, LV_ANIM_OFF);
-    }
+    applyRows(s_listC, g_rowsC, std::move(tC), keepScroll, g_chunkC);
+    applyRows(s_listM, g_rowsM, std::move(tM), keepScroll, g_chunkM);
 }
 
 /* ---- tabs ---- */
@@ -1969,7 +2843,22 @@ void onLayerDelete(lv_event_t*) {
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
+    s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
+    s_stickyDate = nullptr; s_stickyLbl = nullptr;
+    s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
+    s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
+    g_histDateSeps.clear();
+    s_send = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_pillIcon = nullptr;
     g_bubbles.clear();   /* bubble widgets went with the layer — drop dangling refs */
+    g_dateSeps.clear();  /* separator widgets went with the layer too */
+    /* Pending timers would touch freed widgets — drop them. */
+    if (g_threadLoadTimer) { lv_timer_delete(g_threadLoadTimer); g_threadLoadTimer = nullptr; }
+    if (g_stickyFadeTimer) { lv_timer_delete(g_stickyFadeTimer); g_stickyFadeTimer = nullptr; }
+    g_needMsgLoad = false;
+    /* A pending chunked populate would build rows into freed widgets — drop it,
+     * then forget the list-row models (their widgets went with the layer). */
+    cancelChunk(g_chunkC); cancelChunk(g_chunkM);
+    g_rowsC.clear(); g_rowsM.clear();
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
@@ -1987,13 +2876,24 @@ void lxmfApp(void* arg) {
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
-    g_bubbles.clear();
+    s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
+    s_stickyDate = nullptr; s_stickyLbl = nullptr;
+    s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
+    s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
+    s_send = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_pillIcon = nullptr;
+    g_bubbles.clear(); g_dateSeps.clear(); g_histDateSeps.clear();
+    g_threadLoadTimer = nullptr; g_stickyFadeTimer = nullptr;   /* prior onLayerDelete freed them */
+    g_needMsgLoad = false;
+    g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
     s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
     s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
+    g_rowsC.clear(); g_rowsM.clear();          /* fresh empty layer → empty row models */
+    g_chunkC = nullptr; g_chunkM = nullptr;    /* prior layer's onLayerDelete already freed them */
+    g_annsLoaded = false;                      /* reload the announce catalogue on first build */
     g_searchTimer = nullptr;   /* prior layer's onLayerDelete already freed it */
     /* The list is drawn into a brand-new (empty) layer on every open, so the
      * "already built for this identity" short-circuit must start unset — else a
