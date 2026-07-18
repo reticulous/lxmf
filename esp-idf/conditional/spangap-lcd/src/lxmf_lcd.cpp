@@ -111,6 +111,10 @@ const int SEARCH_DEBOUNCE_MS = 300;
  * only for live messages). */
 const size_t PAGE_SIZE = 40, PAGE_MIN = 12, MAXSPAN = 80;
 
+/* Resident scroll-list top pad. scrollThreadBottom grows it past this to absorb
+ * slack so the compose entry's bottom always meets the screen bottom (see there). */
+const int THREAD_PAD_TOP = 1;
+
 /* On-the-Mesh live-refresh throttle. While that column is the visible tab it's
  * fed by the announce firehose (several writes a second on a busy mesh). Even
  * coalesced, rebuilding the sorted catalogue that often burns the lcd task and
@@ -299,7 +303,7 @@ lv_obj_t* s_stickyLbl  = nullptr;
 lv_timer_t* g_stickyFadeTimer = nullptr;   /* fades the sticky 2 s after the last scroll */
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
-lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle (green=open, amber=establishing) */
+lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle image (chain=up, broken-chain=down) */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
 std::string g_infoPeer;                 /* peer shown on the contact info page */
@@ -308,8 +312,9 @@ lv_obj_t* s_compose  = nullptr;         /* compose entry (lcdInputBox) */
 lv_obj_t* s_comp     = nullptr;         /* the compose row — last item in the scroll stream */
 lv_obj_t* s_rc       = nullptr;         /* controls stacked at the entry's right (pill + Send) */
 lv_obj_t* s_send     = nullptr;         /* Send button — shown only once the composer is expanded */
-lv_obj_t* s_composePill = nullptr;      /* Signal-style expand/collapse pill beside the entry */
-lv_obj_t* s_pillIcon = nullptr;         /* its up/down chevron */
+lv_obj_t* s_sendIcon = nullptr;         /* the Send button's paper-plane image (white on blue) */
+lv_obj_t* s_composePill  = nullptr;     /* expand pill (↑), left of the entry — shown collapsed */
+lv_obj_t* s_collapsePill = nullptr;     /* collapse pill (↓), right by Send — shown expanded */
 bool      g_composeExpanded  = false;   /* fixed 8-line composer (vs the 1–4 line quick field) */
 lv_obj_t* s_newIdTa  = nullptr;         /* "Add identity" name field (settings pane) */
 lv_obj_t* s_importTa = nullptr;         /* "Import identity" hex field (settings pane) */
@@ -778,16 +783,69 @@ std::string linkStateOf(const std::string& peer) {
     return storageGetStr(k, "");
 }
 
-/* Recolor the header link glyph for the open thread's peer. Driven from
- * openThread and every thread refresh, so it follows a link torn down for
- * any reason (the state key is re-derived by the lxmf task each second). */
+/* ---- runtime SVG icons (send / link / link-off, shipped to /fixed/icons) ---- */
+
+/* Pixel sizes, scaled with the UI zoom. The link icon sits in the HDR_H header;
+ * the send plane fills its 2-line button. */
+int linkIconPx() { return lcdPx(18); }
+int sendIconPx() { return lcdPx(22); }
+
+/* Point an lv_image at a runtime-rasterized icon, tinted to `col` (the rasters
+ * are monochrome, so image-recolor at COVER paints the glyph shape any colour).
+ * The raster loads off the lcd task: if it isn't cached yet, request it and
+ * leave the slot as-is — the icon-settle timer / thread refresh re-applies once
+ * it lands. */
+void applyIcon(lv_obj_t* img, const char* base, int px, lv_color_t col) {
+    if (!img) return;
+    lv_obj_set_style_image_recolor(img, col, 0);
+    lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, 0);
+    const lv_image_dsc_t* dsc = lcdIconDsc(base, px);
+    if (dsc) lv_image_set_src(img, dsc);
+    else     lcdIconRequest(base, px);
+}
+
+/* Set the header link glyph for the open thread's peer: the chain when a link is
+ * up (green active / amber establishing), the broken chain when it's down (grey).
+ * Driven from openThread and every thread refresh, so it follows a link torn
+ * down for any reason (the state key is re-derived by the lxmf task each second). */
 void updateThreadLink() {
     if (!s_threadLink) return;
     std::string st = linkStateOf(g_curPeer);
+    bool up = !st.empty();
     lv_color_t col = st == "active"       ? lv_color_hex(0x4abf6a)   /* green: open */
                    : st == "establishing" ? lv_color_hex(0xd6a12a)   /* amber: opening */
                                           : lv_color_hex(0x6a7280);  /* grey: down */
-    lv_obj_set_style_text_color(s_threadLink, col, 0);
+    applyIcon(s_threadLink, up ? "link" : "link-off", linkIconPx(), col);
+}
+
+/* Re-apply the thread's icons (send + header link), requesting any not yet
+ * rasterized. Returns true once every icon this screen needs is cached, so the
+ * settle timer can stop. Both link variants are warmed so a toggle is instant. */
+bool applyThreadIcons() {
+    if (s_sendIcon) applyIcon(s_sendIcon, "send", sendIconPx(), lv_color_white());
+    updateThreadLink();
+    lcdIconRequest("link", linkIconPx());
+    lcdIconRequest("link-off", linkIconPx());
+    return lcdIconReady("send", sendIconPx())
+        && lcdIconReady("link", linkIconPx())
+        && lcdIconReady("link-off", linkIconPx());
+}
+
+/* Icons rasterize off-task, so they may not be ready the instant a thread opens.
+ * Tick a short settle after open, re-applying until all land (or a safety cap),
+ * then stop — no dependency on the async loader callback (launcher-owned). */
+lv_timer_t* g_iconSettle = nullptr;
+int         g_iconSettleTicks = 0;
+void iconSettleCb(lv_timer_t* t) {
+    if (applyThreadIcons() || ++g_iconSettleTicks >= 40) {   /* ~3.2 s cap */
+        lv_timer_delete(t);
+        g_iconSettle = nullptr;
+    }
+}
+void startIconSettle() {
+    if (g_iconSettle) lv_timer_delete(g_iconSettle);
+    g_iconSettleTicks = 0;
+    g_iconSettle = lv_timer_create(iconSettleCb, 80, nullptr);
 }
 
 /* The board flips the ephemeral sys.standby key around lcdScreenSleep/Wake. */
@@ -802,7 +860,26 @@ bool threadReading() {
 
 void scrollThreadBottom(bool anim) {
     if (!s_msgList) return;
+    /* Keep the compose entry pinned to the screen bottom. When the content is
+     * shorter than the viewport — a new/short thread, or a bubble that just shrank
+     * (a delivered receipt hugging its timestamp onto the last line) — scrolling
+     * alone can't pull the entry down: there's no scroll range, so it floats in
+     * mid-air. Reset any prior spacer, measure the gap between the entry's bottom
+     * and the viewport's, and absorb it with a top spacer so the two always meet.
+     * Only the newest page carries the composer; on a history page (entry hidden)
+     * we leave the base pad and just scroll. */
+    lv_obj_set_style_pad_top(s_msgList, THREAD_PAD_TOP, 0);
     lv_obj_update_layout(s_msgList);
+    if (s_comp && !lv_obj_has_flag(s_comp, LV_OBJ_FLAG_HIDDEN)) {
+        lv_area_t la, ca;
+        lv_obj_get_coords(s_msgList, &la);
+        lv_obj_get_coords(s_comp, &ca);
+        int32_t slack = la.y2 - ca.y2;   /* >0 ⇒ the entry's bottom floats above the viewport's */
+        if (slack > 0) {
+            lv_obj_set_style_pad_top(s_msgList, THREAD_PAD_TOP + slack, 0);
+            lv_obj_update_layout(s_msgList);
+        }
+    }
     lv_obj_scroll_to_y(s_msgList, LV_COORD_MAX, anim ? LV_ANIM_ON : LV_ANIM_OFF);
     updateThreadDownVis();   /* instant jumps land now; animated ones keep updating per frame */
 }
@@ -915,6 +992,9 @@ void beginThreadLoad() {
     g_nomadTargets.clear();
     g_dateSeps.clear();
     if (s_stickyDate) lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
+    /* Drop any composer-pin spacer left by the prior thread (scrollThreadBottom),
+     * else it shifts the centred "<loading conversation>" placeholder downward. */
+    if (s_msgList) lv_obj_set_style_pad_top(s_msgList, THREAD_PAD_TOP, 0);
     showLoading(true);
     lv_refr_now(nullptr);              /* paint shell + placeholder before the heavy work */
     if (g_threadLoadTimer) lv_timer_delete(g_threadLoadTimer);
@@ -944,21 +1024,27 @@ void onLoadNewer(lv_event_t*) {
     beginThreadLoad();
 }
 
-/* Reflect the compose mode onto the widgets (see the expand pill). Two states:
- *   collapsed: 1–4 line quick field, no Send button, pill ↑, Enter sends.
- *   expanded:  fixed 8-line composer, Send button, pill ↓, Enter = newline.
- * The pill toggles them; a send reverts to collapsed. */
+/* Reflect the compose mode onto the widgets. Two states:
+ *   collapsed: 1–4 line quick field, expand pill ↑ on the LEFT, Enter sends.
+ *   expanded:  fixed 8-line composer, collapse pill ↓ + Send on the RIGHT,
+ *              Enter = newline.
+ * Either pill toggles the mode; a send reverts to collapsed. */
 void applyComposeMode() {
     if (!s_compose) return;
     lcdInputBoxSetLines(s_compose, g_composeExpanded ? 8 : 1, g_composeExpanded ? 8 : 4);
     lcdInputBoxSetSubmitOnEnter(s_compose, !g_composeExpanded);   /* expanded → Enter = newline */
-    if (s_send) {
-        if (g_composeExpanded) lv_obj_remove_flag(s_send, LV_OBJ_FLAG_HIDDEN);
-        else                   lv_obj_add_flag(s_send, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (s_pillIcon) lv_label_set_text(s_pillIcon, g_composeExpanded ? LV_SYMBOL_DOWN : LV_SYMBOL_UP);
-    /* Size the controls column to the entry so the bottom-aligned Send lands level
-     * with the composer's bottom; collapsed, it's just the pill (content height). */
+    /* Left expand pill only when collapsed; right collapse pill + Send only when
+     * expanded. */
+    auto show = [](lv_obj_t* o, bool on) {
+        if (!o) return;
+        if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    };
+    show(s_composePill,  !g_composeExpanded);
+    show(s_collapsePill,  g_composeExpanded);
+    show(s_send,          g_composeExpanded);
+    /* Size the controls column to the entry so the collapse pill rides its top and
+     * the Send its bottom; collapsed, the column is empty (both hidden). */
     if (s_rc) {
         if (g_composeExpanded) { lv_obj_update_layout(s_compose);
                                  lv_obj_set_height(s_rc, lv_obj_get_height(s_compose)); }
@@ -997,11 +1083,13 @@ void buildThreadShell() {
     s_threadName = mkLabel(hdr, "", lv_color_white());
     lv_obj_align(s_threadName, LV_ALIGN_LEFT_MID, 28, 0);
 
-    /* Link indicator/toggle, pinned rightmost: green=open, amber=establishing,
-     * grey=down. Tapping opens the link when down, closes it when up (writes
-     * the cmd.link_open/link_close sentinel the lxmf task consumes). WIFI is
-     * the closest connection glyph the UI font's symbol set carries. */
-    s_threadLink = mkLabel(hdr, LV_SYMBOL_WIFI, lv_color_hex(0x6a7280));
+    /* Link indicator/toggle, pinned rightmost: the chain icon (green=open,
+     * amber=establishing) or the broken chain (grey=down), matching the web
+     * header. Tapping opens the link when down, closes it when up (writes the
+     * cmd.link_open/link_close sentinel the lxmf task consumes). The glyph is a
+     * runtime-rasterized SVG (updateThreadLink sets src + recolour). */
+    s_threadLink = lv_image_create(hdr);
+    lv_obj_set_size(s_threadLink, linkIconPx(), linkIconPx());
     lv_obj_align(s_threadLink, LV_ALIGN_RIGHT_MID, -6, 0);
     lv_obj_add_flag(s_threadLink, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(s_threadLink, 12);
@@ -1014,8 +1102,10 @@ void buildThreadShell() {
         storageSet(sentinel, g_curPeer.c_str());
     }, LV_EVENT_CLICKED, nullptr);
 
+    /* Scroll-to-bottom chevron, 20 px clear of the link icon (only shown when the
+     * view isn't already at the bottom). */
     s_threadDown = mkLabel(hdr, LV_SYMBOL_DOWN, lv_color_hex(0xc0c8d0));
-    lv_obj_align(s_threadDown, LV_ALIGN_RIGHT_MID, -28, 0);
+    lv_obj_align(s_threadDown, LV_ALIGN_RIGHT_MID, -(6 + linkIconPx() + 20), 0);
     lv_obj_add_flag(s_threadDown, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(s_threadDown, 12);
     lv_obj_add_event_cb(s_threadDown, [](lv_event_t*) { closeHistory(); scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
@@ -1105,9 +1195,9 @@ void buildThreadShell() {
      * pinned bar), so it scrolls with them and is simply hidden on a history page
      * (see updatePageButtons). The entry fills the width with the controls stacked
      * to its right (vertical space is precious). Collapsed: just the expand pill
-     * beside the 1–4 line field. Expanded: the collapse pill top-aligned over a
-     * 2×-height Send, beside the 8-line composer. A thin top border sets it off from
-     * the bubbles; +3 px above and drag-bar clearance below. A click anywhere in the
+     * right of the 1–4 line field. Expanded: the collapse pill above a 2×-height
+     * Send, both right of the 8-line composer. A little spacing sets it off from
+     * the bubbles; drag-bar clearance below. A click anywhere in the
      * row focuses the entry (the whole field is the target, not just its text). */
     s_comp = lv_obj_create(s_msgList);
     lv_obj_t* comp = s_comp;
@@ -1116,7 +1206,7 @@ void buildThreadShell() {
     lv_obj_set_height(comp, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(comp, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(comp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_top(comp, 2 * (2 + lcdPx(3)), 0);   /* the old gap doubled — replaces the divider line */
+    lv_obj_set_style_pad_top(comp, 2 * (2 + lcdPx(3)), 0);   /* a little spacing above — no divider */
     lv_obj_set_style_pad_bottom(comp, lcdPx(12), 0);
     lv_obj_set_style_pad_hor(comp, 4, 0);
     lv_obj_set_style_pad_column(comp, 4, 0);
@@ -1124,32 +1214,33 @@ void buildThreadShell() {
     lv_obj_add_flag(comp, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(comp, [](lv_event_t*) { lcdInputBoxActivate(s_compose); }, LV_EVENT_CLICKED, nullptr);
 
-    int32_t inH = lv_font_get_line_height(kFont) + 8;
+    int32_t inH  = lv_font_get_line_height(kFont) + 8;
+    int32_t btnW = lcdPx(32);   /* shared width of the expand / collapse pills and the round Send */
 
-    /* Expand/collapse pill on the LEFT (top-aligned, level with the first line). */
+    /* Expand pill on the LEFT of the entry — shown only when collapsed. Tapping it
+     * grows the quick field into the 8-line composer (whose own collapse pill then
+     * lives on the RIGHT, by Send). Content-width, level with the first line. */
     s_composePill = lv_button_create(comp);
     lv_obj_remove_style_all(s_composePill);
-    lv_obj_set_size(s_composePill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(s_composePill, btnW, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(s_composePill, lv_color_hex(0x2a313a), 0);
     lv_obj_set_style_bg_opa(s_composePill, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_composePill, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_hor(s_composePill, 14, 0);
     lv_obj_set_style_pad_ver(s_composePill, 3, 0);
     lv_obj_set_ext_click_area(s_composePill, 8);
     lv_obj_remove_flag(s_composePill, LV_OBJ_FLAG_SCROLLABLE);
-    s_pillIcon = mkLabel(s_composePill, LV_SYMBOL_UP, lv_color_hex(0xc0c8d0));
-    lv_obj_center(s_pillIcon);
+    lv_obj_center(mkLabel(s_composePill, LV_SYMBOL_UP, lv_color_hex(0xc0c8d0)));
     lv_obj_add_event_cb(s_composePill, [](lv_event_t*) {
-        g_composeExpanded = !g_composeExpanded;   /* ↑ quick(1–4) ⇄ ↓ 8-line composer */
+        g_composeExpanded = true;                 /* quick(1–4) → 8-line composer */
         applyComposeMode();
-        scrollThreadBottom(false);                /* keep the composer's bottom at the screen bottom (no anim) */
+        scrollThreadBottom(false);                /* keep the composer's bottom at the screen bottom */
     }, LV_EVENT_CLICKED, nullptr);
 
     /* Entry (middle, grows to fill the width). Device text behaviours (caret-arrow
      * mode, double-space → ". ", trailing-trim). Keeps keypad focus for the thread's
      * life so typing always lands here, wherever the reader scrolled. */
     s_compose = lcdInputBoxCreate(comp, 1, 4);
-    lv_textarea_set_placeholder_text(s_compose, "Message");
+    lv_textarea_set_placeholder_text(s_compose, "LXMF Message");
     lv_obj_set_style_text_font(s_compose, kFont, 0);
     lv_obj_set_style_pad_ver(s_compose, 1, 0);
     lv_obj_set_style_pad_hor(s_compose, 4, 0);
@@ -1161,29 +1252,56 @@ void buildThreadShell() {
     lv_obj_add_flag(s_compose, LV_OBJ_FLAG_EVENT_BUBBLE);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_compose);
     lv_obj_add_event_cb(s_compose, onSend, LV_EVENT_READY, nullptr);                 /* Enter = Send (quick field) */
-    lv_obj_add_event_cb(s_compose, [](lv_event_t*) { threadSnapNewest(); },          /* typing -> newest */
-                        LV_EVENT_VALUE_CHANGED, nullptr);
+    /* Typing snaps the view to newest. Deferred to after the input box finishes its
+     * own value-changed edit (the double-space → ". " rewrite deletes/re-adds
+     * chars): a synchronous scroll here would relayout reentrantly mid-edit. */
+    lv_obj_add_event_cb(s_compose, [](lv_event_t*) {
+        lv_async_call([](void*) { threadSnapNewest(); }, nullptr);
+    }, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    /* Send on the RIGHT — shown only in the expanded composer (Enter sends in the
-     * quick field); twice the button height, bottom-aligned. Held in a column sized
-     * to the entry (applyComposeMode) so it sits at the composer's bottom. Not in
-     * the input group; the compose keeps keypad focus for the thread's life. */
+    /* Controls column on the RIGHT — the collapse pill on top, the round Send below
+     * it, distributed top-and-bottom (SPACE_BETWEEN). Both show only when expanded
+     * (the left expand pill takes over when collapsed). The column is sized to the
+     * entry by applyComposeMode. Not in the input group; the compose keeps keypad
+     * focus for the thread's life. */
     lv_obj_t* rc = lv_obj_create(comp);
     s_rc = rc;
     lv_obj_remove_style_all(rc);
     lv_obj_set_size(rc, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(rc, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(rc, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(rc, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(rc, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* Collapse pill (↓): shrinks the 8-line composer back to the quick field. */
+    s_collapsePill = lv_button_create(rc);
+    lv_obj_remove_style_all(s_collapsePill);
+    lv_obj_set_size(s_collapsePill, btnW, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_collapsePill, lv_color_hex(0x2a313a), 0);
+    lv_obj_set_style_bg_opa(s_collapsePill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_collapsePill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_ver(s_collapsePill, 3, 0);
+    lv_obj_set_ext_click_area(s_collapsePill, 8);
+    lv_obj_remove_flag(s_collapsePill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(mkLabel(s_collapsePill, LV_SYMBOL_DOWN, lv_color_hex(0xc0c8d0)));
+    lv_obj_add_event_cb(s_collapsePill, [](lv_event_t*) {
+        g_composeExpanded = false;                /* 8-line composer → quick(1–4) */
+        applyComposeMode();
+        scrollThreadBottom(false);                /* keep the composer's bottom at the screen bottom (no anim) */
+    }, LV_EVENT_CLICKED, nullptr);
+
+    /* Send button: the white paper-plane on a blue fill (no text label), a full
+     * circle of the shared width. The icon is a runtime-rasterized SVG, set/tinted
+     * by applyThreadIcons once it lands. */
     s_send = lv_button_create(rc);
-    lv_obj_set_style_pad_ver(s_send, 0, 0);
-    lv_obj_set_style_pad_hor(s_send, 8, 0);
-    lv_obj_set_height(s_send, 2 * inH);
-    lv_obj_t* sl = lv_label_create(s_send);
-    lv_obj_set_style_text_font(sl, kFont, 0);
-    lv_label_set_text(sl, "Send");
-    lv_obj_center(sl);
+    lv_obj_set_style_pad_all(s_send, 0, 0);
+    lv_obj_set_size(s_send, btnW, btnW);                            /* round: diameter = width */
+    lv_obj_set_style_radius(s_send, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_send, lv_color_hex(0x2f80ed), 0);   /* blue */
+    lv_obj_set_style_bg_opa(s_send, LV_OPA_COVER, 0);
+    s_sendIcon = lv_image_create(s_send);
+    lv_obj_set_size(s_sendIcon, sendIconPx(), sendIconPx());
+    lv_obj_center(s_sendIcon);
+    applyIcon(s_sendIcon, "send", sendIconPx(), lv_color_white());
     lv_obj_add_event_cb(s_send, onSend, LV_EVENT_CLICKED, nullptr);
 
     applyComposeMode();   /* start collapsed: quick field, no Send, pill ↑, Enter sends */
@@ -1280,7 +1398,7 @@ void composeReflectUp() {
     if (!s_compose) return;
     if (g_id >= 0 && idUp(g_id)) {
         lv_obj_remove_state(s_compose, LV_STATE_DISABLED);
-        lv_textarea_set_placeholder_text(s_compose, "Message");
+        lv_textarea_set_placeholder_text(s_compose, "LXMF Message");
     } else {
         lv_obj_add_state(s_compose, LV_STATE_DISABLED);
         lv_textarea_set_placeholder_text(s_compose, "Waiting for initialization…");
@@ -1295,6 +1413,7 @@ void openThread(const std::string& peer) {
     closeHistory();                         /* a fresh conversation opens on its newest page */
     lv_label_set_text(s_threadName, peerName(peer).c_str());
     updateThreadLink();
+    startIconSettle();                      /* land send + link icons (they rasterize off-task) */
     if (s_contacts) lv_obj_add_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick)   lv_obj_add_flag(s_idpick,   LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
@@ -1786,12 +1905,14 @@ void rebuildThread() {
     while (matchN < common && ms[matchN]->key == g_bubbles[matchN].mid) matchN++;
 
     if (matchN == g_bubbles.size()) {                    /* existing bubbles are a prefix */
+        bool resized = false;
         for (size_t i = 0; i < g_bubbles.size(); i++)
             if (ms[i]->status != g_bubbles[i].status || ms[i]->tries != g_bubbles[i].tries) {
                 fillMeta(g_bubbles[i].meta, *ms[i]);     /* status name + glyph re-render */
                 layoutMeta(lv_obj_get_parent(g_bubbles[i].meta), g_bubbles[i].meta, ms[i]->status);
                 g_bubbles[i].status = ms[i]->status;
                 g_bubbles[i].tries  = ms[i]->tries;
+                resized = true;                          /* the hug/unhug changes bubble height */
             }
         bool appended = false;
         for (size_t i = g_bubbles.size(); i < ms.size(); i++) {
@@ -1799,14 +1920,14 @@ void rebuildThread() {
             g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i]))));
             appended = true;
         }
-        if (appended) {
-            if (wasAtBottom) {
-                scrollThreadBottom(false);               /* stay pinned to newest */
-                if (lcdAwake()) markRead(g_curPeer);     /* reading it now → keep unread at 0 */
-            } else {
-                updateThreadDownVis();                   /* scrolled up reading history — don't yank */
-            }
+        /* Re-pin the composer on ANY height change — a new bubble OR a status
+         * re-render that grows/shrinks an existing one (post-delivery hug) — else
+         * a shrink lifts the entry off the bottom. */
+        if (appended || resized) {
+            if (wasAtBottom) scrollThreadBottom(false);  /* stay pinned to newest */
+            else             updateThreadDownVis();       /* scrolled up reading history — don't yank */
         }
+        if (appended && wasAtBottom && lcdAwake()) markRead(g_curPeer);   /* new msg in view → keep unread at 0 */
         return;
     }
 
@@ -2755,7 +2876,7 @@ void refreshTimerCb(lv_timer_t*) {
     if (s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN)) {
         if (g_refreshMsgs) { refreshMsgs(); rebuildThread(); g_refreshMsgs = false; }
         composeReflectUp();        /* enable/label compose the instant `up` flips */
-        updateThreadLink();        /* follow link open/close/teardown */
+        applyThreadIcons();        /* follow link open/close/teardown; re-source icons after a zoom reset */
     } else if (s_contacts && !lv_obj_has_flag(s_contacts, LV_OBJ_FLAG_HIDDEN)) {
         /* Only rebuild when something actually changed — a plain return from a
          * conversation must not churn (or move the scroll). The list reads the
@@ -2848,12 +2969,13 @@ void onLayerDelete(lv_event_t*) {
     s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
     s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
     g_histDateSeps.clear();
-    s_send = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_pillIcon = nullptr;
+    s_send = nullptr; s_sendIcon = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_collapsePill = nullptr;
     g_bubbles.clear();   /* bubble widgets went with the layer — drop dangling refs */
     g_dateSeps.clear();  /* separator widgets went with the layer too */
     /* Pending timers would touch freed widgets — drop them. */
     if (g_threadLoadTimer) { lv_timer_delete(g_threadLoadTimer); g_threadLoadTimer = nullptr; }
     if (g_stickyFadeTimer) { lv_timer_delete(g_stickyFadeTimer); g_stickyFadeTimer = nullptr; }
+    if (g_iconSettle)      { lv_timer_delete(g_iconSettle);      g_iconSettle      = nullptr; }
     g_needMsgLoad = false;
     /* A pending chunked populate would build rows into freed widgets — drop it,
      * then forget the list-row models (their widgets went with the layer). */
@@ -2880,9 +3002,9 @@ void lxmfApp(void* arg) {
     s_stickyDate = nullptr; s_stickyLbl = nullptr;
     s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
     s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
-    s_send = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_pillIcon = nullptr;
+    s_send = nullptr; s_sendIcon = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_collapsePill = nullptr;
     g_bubbles.clear(); g_dateSeps.clear(); g_histDateSeps.clear();
-    g_threadLoadTimer = nullptr; g_stickyFadeTimer = nullptr;   /* prior onLayerDelete freed them */
+    g_threadLoadTimer = nullptr; g_stickyFadeTimer = nullptr; g_iconSettle = nullptr;   /* prior onLayerDelete freed them */
     g_needMsgLoad = false;
     g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
     s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
