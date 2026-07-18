@@ -66,6 +66,10 @@ enum LxmfStatus : uint8_t {
     LXMF_ST_LINK_FAIL         = 25,
     LXMF_ST_LINK_CLOSED       = 26,
     LXMF_ST_UNKNOWN           = 27,
+    LXMF_ST_NO_RESPONSE       = 28,  /* egressed opportunistically (no link), no delivery
+                                      * proof came back — the peer may simply be offline,
+                                      * so we can't claim it was received. Distinct from
+                                      * NO_PROOF, which is a link send that went unproven. */
 };
 
 /* status code → its ALL-CAPS enum name for display (meta line, CLI). This is the
@@ -101,6 +105,7 @@ static inline const char* lxmfStatusName(uint8_t s) {
         case LXMF_ST_LINK_FAIL:         return "LINK_FAIL";
         case LXMF_ST_LINK_CLOSED:       return "LINK_CLOSED";
         case LXMF_ST_UNKNOWN:           return "UNKNOWN";
+        case LXMF_ST_NO_RESPONSE:       return "NO_RESPONSE";
         default:                        return "";
     }
 }

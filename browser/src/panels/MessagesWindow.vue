@@ -67,6 +67,7 @@
                 @resend="m => lxmf.resend(m.peer, m.key)"
                 @msg-menu="m => (menuMsg = m)"
                 @msg-delete="askDeleteMsg"
+                @msg-open="m => (detailMsg = m)"
                 @open-contact="showContact = true"
                 @toggle-link="p => lxmf.toggleLink(p)"
                 @back="lxmf.activePeer.value = ''"
@@ -92,6 +93,14 @@
           @delete-conversation="onDeleteConversation"
         />
 
+        <MessageDetail
+          v-if="detailMsg"
+          :m="detailMsg"
+          :meta="lxmf.msgMeta(detailMsg.messageId)"
+          :peer-name="lxmf.displayName(detailMsg.peer)"
+          @close="detailMsg = null"
+        />
+
         <!-- message action sheet (Signal long-press analog) -->
         <div v-if="menuMsg" class="sheet-bg" @click="menuMsg = null">
           <div class="sheet" @click.stop>
@@ -115,6 +124,7 @@ import ConversationList from '../components/lxmf/ConversationList.vue'
 import ConversationThread from '../components/lxmf/ConversationThread.vue'
 import Composer from '../components/lxmf/Composer.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
+import MessageDetail from '../components/lxmf/MessageDetail.vue'
 import { useLxmf, type Message, LxmfStatus } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
 import { useCompact } from 'spangap-browser/lib/viewport'
@@ -154,6 +164,7 @@ function startResize(e: MouseEvent) {
 
 const showContact = ref(false)
 const menuMsg = ref<Message | null>(null)
+const detailMsg = ref<Message | null>(null)
 
 const draft = computed(() => lxmf.draftFor(lxmf.activePeer.value))
 function setDraft(v: string) { lxmf.setDraft(lxmf.activePeer.value, v) }

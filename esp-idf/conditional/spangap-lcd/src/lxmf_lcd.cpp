@@ -172,6 +172,8 @@ lv_obj_t* mkLabel(lv_obj_t* parent, const std::string& txt, lv_color_t color) {
 
 struct Msg {
     std::string peer, key, content;
+    std::string message_id;   /* SHA-256 hex64; join key into lxmf.msgmeta */
+    std::string iface;        /* beautified interface from msgmeta ("" = none recorded) */
     uint8_t status = 0;    /* LxmfStatus code */
     uint8_t tries  = 0;    /* try count; 255 = gave up (terminal) */
     long ts = 0;           /* sender's clock (display) */
@@ -305,6 +307,7 @@ lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
 lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle image (chain=up, broken-chain=down) */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
+lv_obj_t* s_msgDetail = nullptr;        /* per-message detail page (covers the thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
 std::string g_infoPeer;                 /* peer shown on the contact info page */
 bool      g_infoFromThread = false;     /* where its back chevron returns to */
@@ -323,6 +326,8 @@ void refreshMsgs();
 void refreshAnnounces();
 void rebuildList(bool keepScroll = false);
 void rebuildThread();
+void showMsgDetail(const std::string& mkey);
+void bindMsgDetail(lv_obj_t* o, const std::string& key);
 void threadSnapNewest();
 void applyComposeMode();
 void scrollThreadBottom(bool anim);
@@ -505,6 +510,7 @@ void msgCb(const char* key, const char* val) {
     else if (!strcmp(field, "recv_ts")) m->recv_ts = val ? atol(val) : 0;
     else if (!strcmp(field, "status"))  m->status = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "tries"))   m->tries  = val ? (uint8_t)atoi(val) : 0;
+    else if (!strcmp(field, "message_id")) m->message_id = val ? val : "";
 }
 
 void refreshMsgs() {
@@ -521,6 +527,12 @@ void refreshMsgs() {
     g_msgs.erase(std::remove_if(g_msgs.begin(), g_msgs.end(),
                                 [](const Msg& m) { return m.status == LXMF_ST_DRAFT; }),
                  g_msgs.end());
+    /* Join routing telemetry from the RAM-only msgmeta store (keyed by
+     * message_id) — just the interface string, for the LoRa bubble pill; the
+     * detail screen reads the rest on open. */
+    for (auto& m : g_msgs)
+        m.iface = m.message_id.empty() ? std::string()
+                : storageGetStr(("lxmf.msgmeta." + m.message_id + ".iface").c_str(), "");
 }
 
 /* ---- announce catalogue: per-field records "lxmf.announces.<hex>.<field>" ---- */
@@ -1563,6 +1575,23 @@ lv_obj_t* addBubbleText(lv_obj_t* bub, const std::string& content) {
  * whole on a status/tries change — three small labels, and only on an actual
  * transition. Glyph: DELIVERED ✓✓ green · CANCELLED ✕ grey · gave-up
  * (tries == 255) ✕ red · else … in flight. Inbound shows only the timestamp. */
+/* Yellow "L" pill — appended to a bubble's meta row (rightmost) when the
+ * message travelled a LoRa interface. Modelled on the sticky-date pill. */
+void addLoraPill(lv_obj_t* meta) {
+    lv_obj_t* pill = lv_obj_create(meta);
+    lv_obj_remove_style_all(pill);
+    lv_obj_set_size(pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(pill, lv_color_hex(0xffd400), 0);
+    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(pill, lcdPx(6), 0);
+    lv_obj_set_style_pad_hor(pill, lcdPx(3), 0);
+    lv_obj_remove_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* l = lv_label_create(pill);
+    lv_obj_set_style_text_font(l, kFontSmall, 0);
+    lv_obj_set_style_text_color(l, lv_color_black(), 0);
+    lv_label_set_text(l, "L");
+}
+
 void fillMeta(lv_obj_t* meta, const Msg& m) {
     lv_obj_clean(meta);
 
@@ -1750,6 +1779,11 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     lv_obj_remove_flag(meta, LV_OBJ_FLAG_SCROLLABLE);
     fillMeta(meta, m);
     layoutMeta(bub, meta, m.status);
+
+    /* Long-press a bubble → its detail screen. Clickable so LVGL raises the
+     * long-press; the record key rides as freed-with-widget user_data. */
+    lv_obj_add_flag(bub, LV_OBJ_FLAG_CLICKABLE);
+    bindMsgDetail(bub, m.key);
 
     return BubbleRef{ m.key, m.status, m.tries, meta };
 }
@@ -2263,6 +2297,131 @@ void bindPeer(lv_obj_t* o, lv_event_cb_t cb, const std::string& peer) {
     auto* p = new std::string(peer);
     lv_obj_add_event_cb(o, cb, LV_EVENT_CLICKED, p);
     lv_obj_add_event_cb(o, onRowDeletePeer, LV_EVENT_DELETE, p);
+}
+
+/* ---- per-message detail page (long-press a bubble) ---- */
+
+/* A grey field label + a wrapped white value beneath it, in the detail body. */
+void detailRow(lv_obj_t* body, const char* k, const std::string& v) {
+    mkLabel(body, k, lv_color_hex(0x8a93a0));
+    lv_obj_t* val = mkLabel(body, v.empty() ? "\xE2\x80\x94" : v, lv_color_hex(0xe0e0e0));  /* — */
+    lv_label_set_long_mode(val, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(val, lv_pct(100));
+}
+
+void closeMsgDetail() {
+    if (s_msgDetail) lv_obj_delete(s_msgDetail);
+    s_msgDetail = nullptr;
+}
+
+void msgDetailBack() {
+    closeMsgDetail();
+    if (s_thread && !g_curPeer.empty()) {
+        lv_obj_remove_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
+        rebuildThread();
+        composeReflectUp();
+        deferFocus(s_compose);
+    }
+}
+
+void showMsgDetail(const std::string& mkey) {
+    if (g_id < 0 || g_curPeer.empty()) return;
+    refreshFont();
+    if (s_msgDetail) closeMsgDetail();
+    if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
+
+    /* Point-read the record's leaves + the msgmeta join (keyed by message_id). */
+    std::string base = g_msgsPrefix + "." + g_curPeer + "." + mkey;
+    auto rd = [&](const char* f) { return storageGetStr((base + "." + f).c_str(), ""); };
+    bool        in      = rd("dir") == "in";
+    int         status  = storageGetInt((base + ".status").c_str(), 0);
+    int         tries   = storageGetInt((base + ".tries").c_str(), 0);
+    long        ts      = atol(rd("ts").c_str());
+    std::string title   = rd("title");
+    std::string content = rd("content");
+    std::string method  = rd("method");
+    bool        readf   = storageGetInt((base + ".read").c_str(), 0) != 0;
+    std::string reply   = rd("reply_to");
+    std::string mid     = rd("message_id");
+
+    std::string mm = "lxmf.msgmeta." + mid;
+    std::string iface = mid.empty() ? "" : storageGetStr((mm + ".iface").c_str(), "");
+    int         hops  = mid.empty() ? -1 : storageGetInt((mm + ".hops").c_str(), -1);
+    std::string fhop  = mid.empty() ? "" : storageGetStr((mm + ".first_hop").c_str(), "");
+    std::string rssi  = mid.empty() ? "" : storageGetStr((mm + ".rssi").c_str(), "");
+    std::string snr   = mid.empty() ? "" : storageGetStr((mm + ".snr").c_str(), "");
+    bool haveMeta = !iface.empty() || hops >= 0 || !fhop.empty();
+
+    s_msgDetail = lv_obj_create(s_layer);
+    lv_obj_remove_style_all(s_msgDetail);
+    lv_obj_set_size(s_msgDetail, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_msgDetail, lv_color_hex(0x10141a), 0);
+    lv_obj_set_style_bg_opa(s_msgDetail, LV_OPA_COVER, 0);
+    lv_obj_set_flex_flow(s_msgDetail, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t* hdr = lv_obj_create(s_msgDetail);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_size(hdr, lv_pct(100), HDR_H);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x222b38), 0);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
+    lv_obj_t* back = mkLabel(hdr, LV_SYMBOL_LEFT, lv_color_white());
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(back, 12);
+    lv_obj_add_event_cb(back, [](lv_event_t*) { msgDetailBack(); }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), back);
+    lv_obj_t* htitle = mkLabel(hdr, in ? "Incoming message" : "Outgoing message", lv_color_white());
+    lv_obj_align(htitle, LV_ALIGN_LEFT_MID, 28, 0);
+
+    lv_obj_t* body = lv_obj_create(s_msgDetail);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(body, 8, 0);
+    lv_obj_set_style_pad_ver(body, 6, 0);
+    lv_obj_set_style_pad_row(body, 3, 0);
+
+    detailRow(body, "Status", lxmfStatusName((uint8_t)status));
+    if (haveMeta) {
+        detailRow(body, "Interface", iface);
+        detailRow(body, "Hops", hops >= 0 ? std::to_string(hops) : std::string());
+        bool direct = fhop.empty() || fhop.find_first_not_of('0') == std::string::npos;
+        detailRow(body, "First hop", direct ? "direct (no transit node)" : groupHash(fhop));
+        if (!rssi.empty()) detailRow(body, "RSSI", rssi + " dBm");
+        if (!snr.empty())  detailRow(body, "SNR", snr + " dB");
+    } else {
+        detailRow(body, "Routing", "not recorded (DIRECT/Resource, or pre-dating)");
+    }
+    if (ts > 0) {
+        char tb[64] = "";
+        time_t tt = ts; struct tm tmv{}; localtime_r(&tt, &tmv);
+        strftime(tb, sizeof tb, "%Y-%m-%d %H:%M:%S", &tmv);
+        detailRow(body, "Time", tb);
+    }
+    if (!in) {
+        detailRow(body, "Method", method.empty() ? "auto" : method);
+        detailRow(body, "Attempts", tries == LXMF_TRIES_GAVEUP ? "gave up" : std::to_string(tries));
+    } else {
+        detailRow(body, "Read", readf ? "yes" : "no");
+    }
+    detailRow(body, "Message ID", mid.empty() ? "" : groupHash(mid));
+    if (!reply.empty() && reply.find_first_not_of('0') != std::string::npos)
+        detailRow(body, "In reply to", groupHash(reply));
+    if (!title.empty()) detailRow(body, "Title", title);
+    detailRow(body, "Content", content);
+
+    deferFocus(back);
+}
+
+void onMsgLongPress(lv_event_t* e) {
+    auto* key = static_cast<std::string*>(lv_event_get_user_data(e));
+    if (key) showMsgDetail(*key);
+}
+void bindMsgDetail(lv_obj_t* o, const std::string& key) {
+    auto* p = new std::string(key);
+    lv_obj_add_event_cb(o, onMsgLongPress, LV_EVENT_LONG_PRESSED, p);
+    lv_obj_add_event_cb(o, onRowDeletePeer, LV_EVENT_DELETE, p);   /* frees p */
 }
 
 /* Contact row circled-i tap: open the info page for that row's peer. */
@@ -2927,7 +3086,12 @@ void onStorageChange(const char* key, const char*) {
     /* Flag which walk the change dirtied and coalesce; refreshTimerCb does the
        expensive work once per window. Announce churn touches only the mesh
        column, never the msg walk or the open thread. */
-    if (key && strncmp(key, "lxmf.announces", 14) == 0) {
+    if (key && strncmp(key, "lxmf.msgmeta", 12) == 0) {
+        /* Routing telemetry for the open thread (the LoRa pill's iface). Refresh
+           the msg walk so rebuildThread re-renders pills; the contact list is
+           untouched by msgmeta, so don't dirty it. */
+        g_refreshMsgs = true;
+    } else if (key && strncmp(key, "lxmf.announces", 14) == 0) {
         g_refreshAnns = true;
         /* Announce-only change: it feeds the On-the-Mesh column and nothing else.
            A rebuild walks + sorts the whole (up to thousands) announce catalogue
@@ -2982,7 +3146,7 @@ void onLayerDelete(lv_event_t*) {
     cancelChunk(g_chunkC); cancelChunk(g_chunkM);
     g_rowsC.clear(); g_rowsM.clear();
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
-    s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear();
+    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
     /* A queued search rebuild would touch freed widgets — drop it. */
@@ -3008,7 +3172,7 @@ void lxmfApp(void* arg) {
     g_needMsgLoad = false;
     g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
     s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
-    s_info = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
+    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
@@ -3032,6 +3196,7 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("s.lxmf.id",      onStorageChange);   /* msgs + contacts */
         storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity up/dest edge */
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
+        storageSubscribeChanges("lxmf.msgmeta",   onStorageChange);   /* per-message routing (LoRa pill) */
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }

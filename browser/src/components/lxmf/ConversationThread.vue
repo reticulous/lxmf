@@ -42,6 +42,7 @@
           @resend="m2 => emit('resend', m2)"
           @menu="m2 => emit('msg-menu', m2)"
           @delete="m2 => emit('msg-delete', m2)"
+          @open="m2 => emit('msg-open', m2)"
         />
       </template>
     </div>
@@ -70,6 +71,7 @@ const emit = defineEmits<{
   resend: [m: Message]
   'msg-menu': [m: Message]
   'msg-delete': [m: Message]
+  'msg-open': [m: Message]
   'open-contact': [peer: string]
   'toggle-link': [peer: string]
   back: []

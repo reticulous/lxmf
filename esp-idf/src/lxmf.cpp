@@ -99,6 +99,8 @@ enum : int {
     LXMF_FIELD_EVENT            = 0x0D,
     LXMF_FIELD_RNR_REFS         = 0x0E,
     LXMF_FIELD_RENDERER         = 0x0F,
+    LXMF_FIELD_REPLY_TO         = 0x30,   /* Bytes, full LXMessage.hash of the replied-to message */
+    LXMF_FIELD_REPLY_QUOTE      = 0x31,   /* Bytes, quoted content (UTF-8) */
 };
 
 /* ─────────────── state ─────────────── */
@@ -148,10 +150,25 @@ struct outbound_t {
  * parks the raw wire here; drainPendingVerify replays it once the
  * announce lands. Without this, opportunistic single-packet messages
  * from a not-yet-known sender are lost — LXMF has no retransmission. */
+/* Per-inbound routing telemetry carried from rnsd's IN_PACKET frame down to the
+ * msgmeta store (interface, RNS first hop, hop count). Optional: link/resource
+ * inbound paths that lack it pass nullptr. */
+struct rx_meta_t {
+    uint8_t     hops = 0;
+    bool        have_first_hop = false;
+    uint8_t     first_hop[LXMF_DEST_HASH_LEN] = {0};
+    std::string iface;   /* raw mR name; beautified by formatIface at store time */
+    bool        have_signal = false;   /* radio RSSI/SNR present (LoRa inbound) */
+    int         rssi = 0;              /* dBm */
+    int         snr10 = 0;             /* dB * 10 */
+};
+
 struct pending_verify_t {
     uint8_t              sender[LXMF_DEST_HASH_LEN];
     std::vector<uint8_t> wire;
     uint64_t             enqueued_ms;
+    rx_meta_t            meta;      /* replayed with the wire once the sender is known */
+    bool                 have_meta = false;
 };
 
 struct lxmf_id_t {
@@ -194,7 +211,10 @@ static void unsubscribePerIdCmds(int n);
 /* Inbound pipeline + the pending-verification drain. onAnnounceFromRnsd
  * (defined above onInboundLxm) calls the drain; both run on the lxmf
  * task only. */
-static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n);
+static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
+                         const rx_meta_t* meta = nullptr);
+static void recordOutLinkMeta(lxmf_id_t& id, const std::string& peer_hex,
+                              const std::string& msg_key, const std::string& tag);
 static void drainPendingVerify(lxmf_id_t& id, const uint8_t* sender_hash);
 static void drainAllPendingVerify(lxmf_id_t& id);
 
@@ -280,15 +300,17 @@ struct OutboxWire { std::vector<uint8_t> wire; std::string msg_id_hex; uint64_t 
 static std::unordered_map<std::string, OutboxWire> g_wireOutbox;
 static std::string outboxKey(const std::string& peer, const std::string& mid) { return peer + "/" + mid; }
 
-/* Set a message's unified status (u8 record field), overwritten in place. Also
- * drop the cached wire once the message has egressed or terminated — nothing
- * left to resend from the queue path. */
+/* Set a message's unified status (u8 record field), overwritten in place. The
+ * cached wire is kept through the delivery-proof window (AWAITING_PROOF) so a
+ * timeout retry can resend the identical bytes — same message_id (the recipient
+ * still dedups), no re-pack, no re-stamp. It is dropped only once the message
+ * reaches a settled outcome (DELIVERED / CANCELLED here; terminal failure via
+ * msgFail), after which there is nothing left to resend. */
 static void msgSetStatus(int n, const std::string& peer, const std::string& mid,
                          uint8_t status)
 {
     storageSet(msgPath(n, peer, mid, "status").c_str(), (int)status);
-    if (status == LXMF_ST_AWAITING_PROOF || status == LXMF_ST_DELIVERED ||
-        status == LXMF_ST_CANCELLED)
+    if (status == LXMF_ST_DELIVERED || status == LXMF_ST_CANCELLED)
         g_wireOutbox.erase(outboxKey(peer, mid));
 }
 
@@ -326,8 +348,8 @@ static std::string msgPrefix(int n, const std::string& peer,
 static void ensureConvFile(int, const std::string&) {}
 
 /* The LXMF message record schema (see storage_db.h). Mutable fields are
- * fixed-width so a stage transition overwrites in place; title/content/thread
- * are immutable text. The packed outbound `wire` is NOT stored — it's transient
+ * fixed-width so a stage transition overwrites in place; title/content are
+ * immutable text. The packed outbound `wire` is NOT stored — it's transient
  * (dead after delivery) and lives in the RAM outbox (g_wireOutbox); redundant
  * addressing (`peer`) isn't stored either (the routing layer drops it). Built
  * once; the registration keeps the pointer.
@@ -335,21 +357,25 @@ static void ensureConvFile(int, const std::string&) {}
  * schema_ver 2 dropped the old `wire` text field. schema_ver 3 replaced the
  * fixstr `stage`(12) + `last_error`(48) + `attempts`(1) with a single u8 `status`
  * (LxmfStatus in lxmf.h) + u8 `tries` — 61 bytes of status per message down to 2,
- * still overwritten in place. `tries == 255` is the terminal marker. The
- * hdr_size change trips the store's header check, so v2 files would load empty;
- * lxmfMigrateMsgs() rewrites them into this layout first (data-preserving). */
+ * still overwritten in place. `tries == 255` is the terminal marker. schema_ver 4
+ * moved `message_id` from hex text to a raw 32-byte DATA field and replaced the
+ * hex text `thread` with a raw 32-byte DATA `reply_to` (FIELD_REPLY_TO on the
+ * wire; all-zero = not a reply). Each hdr_size change trips the store's header
+ * check, so older files load empty; lxmfMigrateMsgs() rewrites them first
+ * (data-preserving). */
 static const sdb_schema& lxmfMsgSchema()
 {
     static const sdb_schema s = [] {
         sdb_schema x;
         x.schema_id = 1;
-        x.schema_ver = 3;
+        x.schema_ver = 4;
         x.u8("tries").u8("status")
          .u32("recv_ts")   /* monotonic (never-decreasing) receive time — the stable
                             * anchor for date separators; `ts` is the sender's clock */
          .fixstr("dir", 4).fixstr("method", 16)
          .u32("ts")
-         .text("title").text("content").text("thread").text("message_id");
+         .data("message_id", 32).data("reply_to", 32)
+         .text("title").text("content");
         return x;
     }();
     return s;
@@ -359,18 +385,26 @@ static const sdb_schema& lxmfMsgSchema()
  * identity slot ("lxmf/contacts/$1.db.gz"). Fields mirror the leaves written via
  * contactPath(). The mutable scalars (counters, watermarks, last_seen, trust)
  * are fixed-width so a new message / read / announce updates them in place; the
- * text fields (hash sentinel, names, preview) rebuild the record when they
- * change. `hash` stores the peer hex redundantly with the record key — it is the
- * "contact exists" sentinel the seed/first-contact paths test via storageExists. */
+ * text fields (names, preview) rebuild the record when they change. `hash` stores
+ * the peer hash redundantly with the record key — it is the "contact exists"
+ * sentinel the seed/first-contact paths test via storageExists.
+ *
+ * schema_ver 2 moved `hash` from hex text to a raw 16-byte DATA field and added a
+ * raw 64-byte DATA `pubkey` (the contact's RNS identity public key, X25519||Ed25519).
+ * Persisting the pubkey lets link initiation survive reboot / identity-cache
+ * eviction: on comms-initiate we re-feed it to Identity::remember() when the RAM
+ * cache has dropped it. all-zero pubkey = not yet learned. The hdr_size change
+ * trips the header check; lxmfMigrateContacts() rewrites older files first. */
 static const sdb_schema& lxmfContactSchema()
 {
     static const sdb_schema s = [] {
         sdb_schema x;
         x.schema_id = 2;
-        x.schema_ver = 1;
+        x.schema_ver = 2;
         x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
          .u8("trust")
-         .text("hash").text("display_name").text("nick").text("preview");
+         .data("hash", 16).data("pubkey", 64)
+         .text("display_name").text("nick").text("preview");
         return x;
     }();
     return s;
@@ -379,15 +413,16 @@ static const sdb_schema& lxmfContactSchema()
 /* Heard-announce catalogue (schema 3): one global RAM-only store, capped and
  * self-evicting (STORAGE_DB_DROP). `last` (announce time) and `hops` mutate in
  * place on every re-announce; `cost` is a fixstr so the -1 "unknown" sentinel
- * survives; `name` is the announced display name. The wire ratchet is not kept
- * (it was write-only in the old packed catalogue). */
+ * survives; `name` is the announced display name. schema_ver 2 moved `ratchet`
+ * from hex text to a raw 32-byte DATA field. This store is RAM-only, so the
+ * schema change needs no file migration. */
 static const sdb_schema& lxmfAnnounceSchema()
 {
     static const sdb_schema s = [] {
         sdb_schema x;
         x.schema_id = 3;
-        x.schema_ver = 1;
-        x.u32("last").u8("hops").fixstr("cost", 6).text("ratchet").text("name");
+        x.schema_ver = 2;
+        x.u32("last").u8("hops").fixstr("cost", 6).data("ratchet", 32).text("name");
         return x;
     }();
     return s;
@@ -398,6 +433,156 @@ static std::string contactPath(int n, const std::string& peer_hex, const char* f
     char buf[120];
     snprintf(buf, sizeof(buf), "s.lxmf.id.%d.contacts.%s.%s", n, peer_hex.c_str(), field);
     return buf;
+}
+
+/* Per-message routing telemetry: interface, RNS first-hop transport node, and
+ * hop count for each delivered/received message. One global RAM-only record
+ * store keyed by the message_id hash (globally unique, so no per-identity
+ * namespacing) — deliberately NOT a field on the persistent message record, so
+ * the on-disk conversation DBs don't grow. Self-capping (STORAGE_DB_DROP) and
+ * gone on reboot, exactly like the announce catalogue.
+ *
+ *   lxmf.msgmeta.<message_id_hex>.{last,hops,first_hop,dir,iface}
+ *
+ * `first_hop` is the 16-byte transport-node hash (absent = received/sent with no
+ * transit node in the path); `iface` is the human-facing endpoint string from
+ * formatIface(). */
+static const sdb_schema& lxmfMsgMetaSchema()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id  = 4;
+        x.schema_ver = 1;
+        x.u32("last").u8("hops").data("first_hop", 16).fixstr("dir", 4)
+         .fixstr("rssi", 8).fixstr("snr", 8).text("iface");
+        return x;
+    }();
+    return s;
+}
+
+/* Ad-hoc pretty-printer for the raw mR interface name rnsd hands up (already
+ * unwrapped from "Interface[...]"). Reads the owning straddle's config straight
+ * off storage on the lxmf task. Kept local to lxmf for now — see msgmeta above.
+ *
+ *   tcp/<id>           → tcp_out/<host>:<port>   (host from s.tcp.peers.<id>; IP if unset)
+ *   tcp_in/<ip>#<slot> → tcp_in/<ip>             (drop the accept-slot suffix)
+ *   lora/<i>           → "LoRa <MHz> <kHz> SF<sf> 4/<cr> txpwr <dBm>"
+ *   anything else      → verbatim
+ */
+static std::string formatIface(const char* raw)
+{
+    if (!raw || !*raw) return "";
+    std::string s(raw);
+    char key[48];
+
+    if (s.rfind("tcp/", 0) == 0) {
+        int id = atoi(s.c_str() + 4);
+        snprintf(key, sizeof(key), "s.tcp.peers.%d.host", id);
+        std::string host = storageGetStr(key, "");
+        snprintf(key, sizeof(key), "s.tcp.peers.%d.port", id);
+        int port = storageGetInt(key, 0);
+        char out[128];
+        if (!host.empty()) snprintf(out, sizeof(out), "tcp_out/%s:%d", host.c_str(), port);
+        else               snprintf(out, sizeof(out), "tcp_out/%s", s.c_str() + 4);
+        return out;
+    }
+
+    if (s.rfind("tcp_in/", 0) == 0) {
+        size_t h = s.find('#');
+        return h == std::string::npos ? s : s.substr(0, h);
+    }
+
+    if (s.rfind("lora/", 0) == 0) {
+        int idx = atoi(s.c_str() + 5);
+        snprintf(key, sizeof(key), "s.lora.%d.frequency", idx);        int freq = storageGetInt(key, 0);
+        snprintf(key, sizeof(key), "s.lora.%d.bandwidth", idx);        int bw   = storageGetInt(key, 0);
+        snprintf(key, sizeof(key), "s.lora.%d.spreading_factor", idx); int sf   = storageGetInt(key, 0);
+        snprintf(key, sizeof(key), "s.lora.%d.coding_rate", idx);      int cr   = storageGetInt(key, 0);
+        snprintf(key, sizeof(key), "s.lora.%d.tx_power", idx);         int txp  = storageGetInt(key, 0);
+        if (freq <= 0) return s;   /* unconfigured — keep the raw name */
+        char out[96];
+        snprintf(out, sizeof(out), "LoRa %.3f %g SF%d 4/%d txpwr %d",
+                 freq / 1.0e6, bw / 1.0e3, sf, cr, txp);
+        return out;
+    }
+
+    return s;
+}
+
+/* Write one message's routing telemetry into the RAM-only msgmeta store, keyed
+ * by message_id hex. `first_hop` is 16 bytes or nullptr (no transit node);
+ * `iface_raw` is the raw mR name, beautified here. Low frequency (once per
+ * settled send / received message), so a record rebuild on the text `iface` is
+ * fine. */
+static std::string bytesToHex(const uint8_t* data, size_t n);   /* fwd */
+static uint64_t    nowUnixMs();                                  /* fwd */
+static void msgmetaWrite(const std::string& mid_hex, const char* dir,
+                         const char* iface_raw, const uint8_t* first_hop, uint8_t hops,
+                         bool have_signal = false, int rssi = 0, int snr10 = 0)
+{
+    if (mid_hex.empty()) return;
+    std::string base  = "lxmf.msgmeta." + mid_hex;
+    std::string iface = formatIface(iface_raw);
+    storageBegin();
+    storageSet((base + ".last").c_str(), (int)(nowUnixMs() / 1000));
+    storageSet((base + ".hops").c_str(), (int)hops);
+    storageSet((base + ".dir").c_str(),  dir);
+    if (first_hop)      storageSet((base + ".first_hop").c_str(), bytesToHex(first_hop, LXMF_DEST_HASH_LEN).c_str());
+    if (!iface.empty()) storageSet((base + ".iface").c_str(),     iface.c_str());
+    if (have_signal) {
+        char rbuf[16], sbuf[16];
+        std::snprintf(rbuf, sizeof(rbuf), "%d", rssi);
+        int sa = snr10 < 0 ? -snr10 : snr10;   /* sign handled separately so −0.x keeps its − */
+        std::snprintf(sbuf, sizeof(sbuf), "%s%d.%d", snr10 < 0 ? "-" : "", sa / 10, sa % 10);
+        storageSet((base + ".rssi").c_str(), rbuf);
+        storageSet((base + ".snr").c_str(),  sbuf);
+    }
+    storageEnd();
+    DBG_REMOTE("msgmeta: %s %s via %s hops=%u first_hop=%s rssi=%s",
+               dir, mid_hex.c_str(), iface.c_str(), (unsigned)hops,
+               first_hop ? bytesToHex(first_hop, LXMF_DEST_HASH_LEN).c_str() : "-",
+               have_signal ? std::to_string(rssi).c_str() : "-");
+}
+
+/* Contact identity persistence. rnsd's identity cache is RAM-only and self-culls,
+ * so a contact's public key is lost across a reboot (or when the cache fills with
+ * announces). We persist it in the contact record (the `pubkey` DATA field) and
+ * re-seed it on demand, so link initiation to a known contact survives without
+ * waiting for a fresh announce. */
+
+/* CAPTURE — persist the peer's public key into contact (n, peer) when rnsd has it
+ * cached and our stored copy is absent/stale. Only touches a contact that already
+ * exists (never materialises one from a bare recall). */
+static void lxmfCapturePubkey(int n, const std::string& peer_hex,
+                              const uint8_t dh[RNSD_DEST_HASH_LEN])
+{
+    uint8_t live[RNSD_PUBKEY_LEN];
+    if (!rnsdRecallPubkey(dh, live)) return;                  /* cache doesn't have it yet */
+    if (!storageExists(contactPath(n, peer_hex, "hash").c_str())) return;  /* not a contact */
+    std::string path = contactPath(n, peer_hex, "pubkey");
+    uint8_t cur[RNSD_PUBKEY_LEN]; size_t cl = sizeof(cur);
+    if (storageGetData(path.c_str(), cur, &cl) && cl == RNSD_PUBKEY_LEN
+        && std::memcmp(cur, live, RNSD_PUBKEY_LEN) == 0) return;   /* already stored, unchanged */
+    storageSetData(path.c_str(), live, RNSD_PUBKEY_LEN);
+}
+
+/* FEED — if rnsd's cache lacks the peer's identity, re-seed it from any persisted
+ * contact copy (a peer may be a contact under several local identities; the key
+ * is the same). Returns true if a key was fed. */
+static bool lxmfFeedPubkey(const std::string& peer_hex,
+                           const uint8_t dh[RNSD_DEST_HASH_LEN])
+{
+    uint8_t tmp[RNSD_PUBKEY_LEN];
+    if (rnsdRecallPubkey(dh, tmp)) return false;              /* already cached */
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        uint8_t pk[RNSD_PUBKEY_LEN]; size_t pl = sizeof(pk);
+        if (storageGetData(contactPath(n, peer_hex, "pubkey").c_str(), pk, &pl)
+            && pl == RNSD_PUBKEY_LEN) {
+            rnsdRememberPubkey(dh, pk);
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Per-conversation read watermark: the ts (seconds) up to and including which
@@ -920,13 +1105,13 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
 /* ─────────────── LXM pack / parse ─────────────── */
 
 struct LxmFields {
-    std::string thread;        /* hex64 root message_id, empty if none */
+    std::string reply_to;      /* hex64 hash of the replied-to message, empty if not a reply */
     std::string ticket;        /* raw msgpack value of FIELD_TICKET, empty if none */
     /* Future: telemetry, attachments, etc. */
 };
 
 /* Pack the msgpack payload alone (no dest/src/sig). title/content may
- * be UTF-8 strings. fields can carry FIELD_THREAD as raw 32 bytes. */
+ * be UTF-8 strings. fields can carry FIELD_REPLY_TO as raw 32 bytes. */
 static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view title,
                                             std::string_view content, const LxmFields& fields)
 {
@@ -955,19 +1140,20 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
     mpPackBin(out, reinterpret_cast<const uint8_t*>(title.data()),   title.size());
     mpPackBin(out, reinterpret_cast<const uint8_t*>(content.data()), content.size());
 
-    /* [3] fields — map of int → value. Only emit non-empty entries. */
+    /* [3] fields — map of int → value. Only emit non-empty entries, so a
+     * normal (non-reply) message carries no reply field at all. */
     size_t field_count = 0;
-    if (!fields.thread.empty()) field_count++;
+    if (!fields.reply_to.empty()) field_count++;
     mpPackMapHeader(out, field_count);
-    if (!fields.thread.empty()) {
-        mpPackInt(out, LXMF_FIELD_THREAD);
-        /* Thread roots are 32-byte SHA-256 message_ids. The plan stores
-         * them as hex64; convert back to raw 32 B for the wire. */
+    if (!fields.reply_to.empty()) {
+        mpPackInt(out, LXMF_FIELD_REPLY_TO);
+        /* FIELD_REPLY_TO is the raw 32-byte replied-to message hash. Stored
+         * as hex64; convert back to raw 32 B for the wire. */
         uint8_t raw[32] = {};
-        if (fields.thread.size() == 64) {
+        if (fields.reply_to.size() == 64) {
             for (int k = 0; k < 32; ++k) {
                 unsigned x = 0;
-                std::sscanf(fields.thread.c_str() + 2*k, "%2x", &x);
+                std::sscanf(fields.reply_to.c_str() + 2*k, "%2x", &x);
                 raw[k] = (uint8_t)x;
             }
         }
@@ -1041,14 +1227,14 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
             if (!mpScanNext(s)) return false;
             continue;
         }
-        if (key == LXMF_FIELD_THREAD) {
+        if (key == LXMF_FIELD_REPLY_TO) {
             std::string raw;
             if (!mpReadStrOrBin(s, raw)) { if (!mpScanNext(s)) return false; continue; }
             if (raw.size() == 32 && fields_out) {
                 char hex[65];
                 for (int j = 0; j < 32; ++j)
                     std::snprintf(hex + 2*j, 3, "%02x", (uint8_t)raw[j]);
-                fields_out->thread.assign(hex, 64);
+                fields_out->reply_to.assign(hex, 64);
             }
         } else if (key == LXMF_FIELD_TICKET) {
             /* Capture the raw msgpack value span regardless of its shape
@@ -1381,9 +1567,17 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     for (auto& id : s_ids) {
         if (!id.used) continue;
         drainPendingVerify(id, dh);
-        if (storageExists(contactPath(id.index, dh_hex, "hash").c_str()))
+        if (storageExists(contactPath(id.index, dh_hex, "hash").c_str())) {
             storageSet(contactPath(id.index, dh_hex, "display_name").c_str(),
                        info.name.c_str());
+            /* The announce just (re)cached this identity's public key in rnsd —
+             * persist it into the contact record now. This is the "first time we
+             * see the identity" fill: it is what puts a pubkey on contacts that
+             * predate pubkey persistence (after the v1→v2 migration they start
+             * empty) and keeps it fresh, so a link survives the next reboot
+             * without waiting to hear the peer again. */
+            lxmfCapturePubkey(id.index, dh_hex, dh);
+        }
     }
 
     /* Announces arrive in bursts (a path request makes a whole neighbourhood
@@ -1893,6 +2087,12 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
         convDrop(*c);
     }
     if (!open_if_missing) return nullptr;
+    /* Comms-initiate: make sure rnsd can recall this peer's identity for the link
+     * — re-seed a persisted copy if the live cache dropped it — then persist
+     * whatever ends up cached so the next boot starts warm. Cheap no-ops when the
+     * cache is already populated and the store already matches. */
+    lxmfFeedPubkey(peer_hex, dh);
+    lxmfCapturePubkey(id.index, peer_hex, dh);
     convlink_t* slot = nullptr;
     for (auto& s : s_convlinks) if (!s.used) { slot = &s; break; }
     if (!slot) {                          /* full: evict the LRU idle one */
@@ -1957,9 +2157,84 @@ static void directLinkSettle(const std::string& tag, bool ok, uint32_t now_s)
 }
 
 /* Sends deferred on a busy conv link; the 1 Hz tick retries them once the
- * earlier send settles (stage must still be "queued" — cancel wins). */
-struct deferred_send_t { int id_index; std::string peer_hex, mid; };
+ * earlier send settles (stage must still be "queued"/"retrying" — cancel wins).
+ * not_before_s (0 = immediate) holds a delivery-retry resend back until rnsd has
+ * processed its path drop, so the resend rediscovers a fresh route. */
+struct deferred_send_t { int id_index; std::string peer_hex, mid; uint32_t not_before_s = 0; };
 static std::vector<deferred_send_t> s_deferred;
+
+/* Per-destination delivery-retry throttle (RAM, lxmf task only). dest hex →
+ * unix-seconds of the last retry launched to it. A proof/response timeout for a
+ * dest retried within s.lxmf.retry_throttle_min minutes goes straight to
+ * terminal rather than retrying again — one retry per destination per window, so
+ * a dead node can't trigger a retry storm. Deliberately not persisted: the
+ * window is minutes, and a reboot (which also clears rnsd's paths/links) is a
+ * legitimate fresh start. Self-pruned. */
+static std::unordered_map<std::string, uint32_t> s_lastRetry;
+
+static uint32_t retryWindowSec()
+{
+    int m = storageGetInt("s.lxmf.retry_throttle_min", 5);
+    return m > 0 ? (uint32_t)m * 60 : 0;
+}
+static bool destRetriedRecently(const std::string& peer_hex, uint32_t now_s)
+{
+    uint32_t win = retryWindowSec();
+    if (s_lastRetry.size() > 256) {                  /* backstop sweep */
+        for (auto it = s_lastRetry.begin(); it != s_lastRetry.end(); ) {
+            if (now_s - it->second > win) it = s_lastRetry.erase(it);
+            else ++it;
+        }
+    }
+    auto it = s_lastRetry.find(peer_hex);
+    if (it == s_lastRetry.end()) return false;
+    if (now_s - it->second >= win) { s_lastRetry.erase(it); return false; }
+    return true;
+}
+
+/* Delay (s) before a retry resend, so rnsd has processed the async path drop
+ * before the resend rediscovers the route / relinks. */
+static constexpr uint32_t LXMF_RETRY_RESEND_DELAY_S = 2;
+
+/* Attempt a single delivery retry for a timed-out outbound. Returns true if a
+ * retry was launched (caller must NOT mark the message terminal — just free the
+ * slot); false if throttled, already retried, or the wire is gone (caller marks
+ * terminal). Tears the conversation link down if open, evicts the cached path so
+ * the resend rediscovers a fresh route, and requeues the send after a short gap.
+ * The persisted `method` field carries the delivery mode across the resend — a
+ * link send ("direct") relinks over the fresh path; an opportunistic send
+ * redelivers as a single packet. */
+static bool tryDeliveryRetry(lxmf_id_t& id, outbound_t& o, uint32_t now_s)
+{
+    const std::string peer_hex = o.peer;
+    const std::string mid      = o.msg_key;
+
+    if (storageGetInt(msgPath(id.index, peer_hex, mid, "tries").c_str(), 0) != 0)
+        return false;                                 /* one retry per message */
+    if (destRetriedRecently(peer_hex, now_s)) return false;
+    if (g_wireOutbox.find(outboxKey(peer_hex, mid)) == g_wireOutbox.end())
+        return false;                                 /* nothing left to resend */
+    uint8_t dh[LXMF_DEST_HASH_LEN];
+    if (!hexToDestHash(peer_hex, dh)) return false;
+
+    bool had_link = o.direct;
+    s_lastRetry[peer_hex] = now_s;
+
+    convlink_t* c = convFind(id.index, peer_hex);     /* tear down the link if open */
+    if (c) convDrop(*c);
+
+    dbg("id %d: delivery retry mid=%s — dropping cached path to %s",
+        id.index, mid.c_str(), peer_hex.c_str());
+    rnsdDropPath(dh);                                 /* force a fresh route */
+
+    storageBegin();
+    storageSet(msgPath(id.index, peer_hex, mid, "tries").c_str(), 1);
+    storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(),
+               (int)(had_link ? LXMF_ST_RETRYING_LINK : LXMF_ST_RETRYING_DELIVERY));
+    storageEnd();
+    s_deferred.push_back({ id.index, peer_hex, mid, now_s + LXMF_RETRY_RESEND_DELAY_S });
+    return true;
+}
 
 static void convReap(void)
 {
@@ -2044,10 +2319,10 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             firstPack = true;
             std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
             std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
-            std::string thread  = storageGetStr(msgPath(id.index, peer_hex, mid, "thread").c_str(),  "");
+            std::string reply_to = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_to").c_str(), "");
 
             LxmFields fields;
-            fields.thread = thread;
+            fields.reply_to = reply_to;
 
             /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
              * but only when generation is enabled and they actually advertise a
@@ -2068,7 +2343,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
             /* Pack the LXM wire so the opportunistic-vs-DIRECT decision keys off
              * the *actual* packed size, not a content estimate that under-counts
-             * the signature, fields/thread, stamp and msgpack framing. */
+             * the signature, fields/reply_to, stamp and msgpack framing. */
             ts_ms = wallUnixMs();
             uint8_t mid_raw[RNSD_HASH_LEN];
             wire = lxmPackWire(id.identity_key.c_str(), id.dest_hash, dh,
@@ -2314,7 +2589,8 @@ static void dedupAdd(const std::string& mid_hex)
     s_dedup_head = (s_dedup_head + 1) % LXMF_DEDUP_RING;
 }
 
-static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
+static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
+                         const rx_meta_t* meta)
 {
     if (!idEnabled(id.index)) {
         dbg("id %d: inbound LXM dropped (identity disabled)", id.index);
@@ -2363,6 +2639,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
         std::memcpy(e.sender, sh, LXMF_DEST_HASH_LEN);
         e.wire.assign(wire, wire + n);
         e.enqueued_ms = now_ms;
+        if (meta) { e.meta = *meta; e.have_meta = true; }
         q.push_back(std::move(e));
         rnsdRequestPath(sh);
         return;
@@ -2465,8 +2742,8 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     storageSet(msgPath(id.index, sh_hex, mid_hex, "peer").c_str(),       sh_hex.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "title").c_str(),      title.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "content").c_str(),    content.c_str());
-    if (!fields.thread.empty())
-        storageSet(msgPath(id.index, sh_hex, mid_hex, "thread").c_str(), fields.thread.c_str());
+    if (!fields.reply_to.empty())
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_to").c_str(), fields.reply_to.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "ts").c_str(),         (int)(ts / 1000));
     storageSet(msgPath(id.index, sh_hex, mid_hex, "message_id").c_str(), mid_hex.c_str());
     /* Stub contact if new — copy display_name across from the cross-
@@ -2486,6 +2763,17 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     int recv = bumpConvDirectory(id.index, sh_hex, (int)(ts / 1000), content, /*inbound=*/true);
     storageSet(msgPath(id.index, sh_hex, mid_hex, "recv_ts").c_str(), recv);
     storageEnd();
+
+    /* First-learn capture: we just verified this sender's signature, so their
+     * identity is in rnsd's cache, and bumpConvDirectory has materialised the
+     * contact — persist their public key so a future link survives reboot/eviction. */
+    lxmfCapturePubkey(id.index, sh_hex, sh);
+
+    /* Routing telemetry → RAM-only msgmeta store (keyed by message_id). */
+    if (meta)
+        msgmetaWrite(mid_hex, "in", meta->iface.c_str(),
+                     meta->have_first_hop ? meta->first_hop : nullptr, meta->hops,
+                     meta->have_signal, meta->rssi, meta->snr10);
 
     id.received++;
     info("id %d: recv mid=%s from=%s len=%zuB title=\"%s\"",
@@ -2512,20 +2800,20 @@ static void drainPendingVerify(lxmf_id_t& id, const uint8_t* sender_hash)
     uint8_t pk[RNSD_PUBKEY_LEN];
     if (!rnsdRecallPubkey(sender_hash, pk)) return;  /* still unknown — keep buffered */
 
-    std::vector<std::vector<uint8_t>> ready;
+    std::vector<pending_verify_t> ready;
     for (auto it = id.pending_verify.begin(); it != id.pending_verify.end(); ) {
         if (std::memcmp(it->sender, sender_hash, LXMF_DEST_HASH_LEN) == 0) {
-            ready.push_back(std::move(it->wire));
+            ready.push_back(std::move(*it));
             it = id.pending_verify.erase(it);
         } else {
             ++it;
         }
     }
-    for (auto& w : ready) {
+    for (auto& e : ready) {
         info("id %d: sender %s now known — replaying buffered LXM (%zuB)",
              id.index, bytesToHex(sender_hash, LXMF_DEST_HASH_LEN).c_str(),
-             w.size());
-        onInboundLxm(id, w.data(), w.size());
+             e.wire.size());
+        onInboundLxm(id, e.wire.data(), e.wire.size(), e.have_meta ? &e.meta : nullptr);
     }
 }
 
@@ -2555,7 +2843,8 @@ static void drainAllPendingVerify(lxmf_id_t& id)
 /* ─────────────── our-dest frame handlers ─────────────── */
 
 static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
-                           uint32_t /*rtt_ms*/, uint8_t /*hops*/)
+                           uint32_t /*rtt_ms*/, uint8_t /*hops*/,
+                           const rx_meta_t* meta = nullptr)
 {
     outbound_t* o = outboundFindBySendId(id, send_id);
     if (!o) {
@@ -2564,6 +2853,15 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
     }
     std::string mid      = o->msg_key;
     std::string peer_hex = o->peer;
+
+    /* Routing telemetry → msgmeta store, keyed by the message_id hash (the local
+     * outbox key is the mutable draft key, not the hash). Populated only on the
+     * SENT result (opportunistic egress), where rnsd knows the outgoing path. */
+    if (meta && !meta->iface.empty()) {
+        std::string mid_hex = storageGetStr(msgPath(id.index, peer_hex, mid, "message_id").c_str(), "");
+        msgmetaWrite(mid_hex, "out", meta->iface.c_str(),
+                     meta->have_first_hop ? meta->first_hop : nullptr, meta->hops);
+    }
 
     /* SENT is not terminal: rnsd keeps the packet receipt and emits
      * a second OUT_RESULT (DELIVERED / PROOF_TIMEOUT) for this send_id.
@@ -2584,6 +2882,17 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
     }
 
     bool was_awaiting = o->awaiting_proof;
+
+    /* Opportunistic proof timeout → one delivery retry (fresh path) before we
+     * give up as NO_RESPONSE. Done before the counter settle below so a retry
+     * isn't booked as a failure; the resend re-accounts on its own outcome. */
+    if (status == RNSD_DEST_STATUS_PROOF_TIMEOUT &&
+        tryDeliveryRetry(id, *o, (uint32_t)(nowUnixMs() / 1000))) {
+        o->used = false;
+        o->awaiting_proof = false;
+        return;
+    }
+
     o->used           = false;
     o->awaiting_proof = false;
     /* In the proof phase the pending/sent counters already settled at
@@ -2598,10 +2907,11 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
             if (!was_awaiting) id.sent++;
             break;
         case RNSD_DEST_STATUS_PROOF_TIMEOUT:
-            /* Egressed but the peer never returned delivery proof. With no retry
-             * sweep yet this is terminal (tries=255); a future sweep would leave
-             * it RETRYING_DELIVERY until the delivery budget is spent. */
-            status_code = LXMF_ST_NO_PROOF;
+            /* Egressed opportunistically (no link) and no delivery proof came
+             * back. The retry above was declined (throttled / already retried),
+             * so settle terminal as NO_RESPONSE — without a link we can't tell a
+             * lost proof from an offline peer. */
+            status_code = LXMF_ST_NO_RESPONSE;
             if (was_awaiting) { if (id.sent) id.sent--; }
             id.failed++;
             break;
@@ -2683,6 +2993,30 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
     if (st) msgSetStatus(id.index, o->peer, o->msg_key, st);
 }
 
+/* Parse the inbound routing/signal telemetry header rnsd prepends to a received
+ * LXM — hops(1) | rssi(2 BE) | snr(2 BE) | first_hop(16) | iface_len(1) |
+ * iface[iface_len] — into `m`. Returns the header byte count, or 0 if the buffer
+ * is too short. Used by the opportunistic IN_PACKET path (after its opcode) and
+ * the inbound-Link path (from the start). rssi == INT16_MIN ⇒ no radio signal. */
+static size_t parseRxMeta(const uint8_t* p, size_t n, rx_meta_t& m)
+{
+    if (n < 1 + 2 + 2 + LXMF_DEST_HASH_LEN + 1) return 0;
+    size_t o = 0;
+    m.hops = p[o++];
+    int16_t rssi = (int16_t)(((uint16_t)p[o] << 8) | p[o + 1]); o += 2;
+    int16_t snr  = (int16_t)(((uint16_t)p[o] << 8) | p[o + 1]); o += 2;
+    if (rssi != INT16_MIN) { m.have_signal = true; m.rssi = rssi; m.snr10 = snr; }
+    for (size_t k = 0; k < LXMF_DEST_HASH_LEN; k++)
+        if (p[o + k]) { m.have_first_hop = true; break; }
+    if (m.have_first_hop) std::memcpy(m.first_hop, p + o, LXMF_DEST_HASH_LEN);
+    o += LXMF_DEST_HASH_LEN;
+    uint8_t iface_len = p[o++];
+    if (o + iface_len > n) return 0;
+    m.iface.assign((const char*)p + o, iface_len);
+    o += iface_len;
+    return o;
+}
+
 static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
 {
     lxmf_id_t* id = idForHandle(handle);
@@ -2694,7 +3028,11 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
 
     switch (buf[0]) {
         case RNSD_DEST_IN_PACKET: {
-            onInboundLxm(*id, buf + 1, n - 1);
+            /* opcode | <telemetry header> | <lxm wire = dest(16)|src|sig|packed>. */
+            rx_meta_t m;
+            size_t h = parseRxMeta(buf + 1, n - 1, m);
+            if (h == 0) { warn("IN_PACKET short (%zu)", n); break; }
+            onInboundLxm(*id, buf + 1 + h, n - 1 - h, &m);
             break;
         }
         case RNSD_DEST_OUT_RESULT: {
@@ -2704,7 +3042,20 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             uint32_t rtt_ms = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
                             | ((uint32_t)buf[6] <<  8) |  (uint32_t)buf[7];
             uint8_t hops    = buf[8];
-            applyOutResult(*id, send_id, status, rtt_ms, hops);
+            /* Optional trailer: first_hop(16) | iface_len(1) | iface[iface_len]
+             * (present on the SENT result, where the outgoing path is known). */
+            rx_meta_t m;
+            m.hops = hops;
+            if (n >= 9 + LXMF_DEST_HASH_LEN + 1) {
+                size_t p = 9;
+                for (size_t k = 0; k < LXMF_DEST_HASH_LEN; k++)
+                    if (buf[p + k]) { m.have_first_hop = true; break; }
+                if (m.have_first_hop) std::memcpy(m.first_hop, buf + p, LXMF_DEST_HASH_LEN);
+                p += LXMF_DEST_HASH_LEN;
+                uint8_t iface_len = buf[p++];
+                if (p + iface_len <= n) m.iface.assign((const char*)buf + p, iface_len);
+            }
+            applyOutResult(*id, send_id, status, rtt_ms, hops, &m);
             break;
         }
         case RNSD_DEST_OUT_STATUS: {
@@ -2800,14 +3151,18 @@ static void onLinkInboxRecv(int handle, size_t /*bytesAvail*/)
     size_t n = itsRecv(handle, buf, sizeof(buf), 0);
     if (n == 0) return;
 
-    /* Unlike opportunistic (which strips dest16 on the wire and the
-     * receiver prepends it), a DIRECT Link packet carries the *full*
-     * LXM wire including the 16-byte destination hash — upstream
+    /* rnsd (onLinkPacketCb) prepends the routing/signal telemetry header, then
+     * the full LXM wire. Unlike opportunistic (which strips dest16 on the wire
+     * and the receiver prepends it), a DIRECT Link packet carries the *full*
+     * wire including the 16-byte destination hash — upstream
      * `LXMessage.__as_packet` DIRECT sends `self.packed` whole and
-     * `LXMRouter.delivery_packet` does `lxmf_data = data` for LINK with
-     * no prepend (LXMRouter.py:1831-1833). So hand it straight to the
-     * shared pipeline; onInboundLxm validates dh == our delivery dest. */
-    onInboundLxm(id, buf, n);
+     * `LXMRouter.delivery_packet` does `lxmf_data = data` for LINK with no
+     * prepend (LXMRouter.py:1831-1833). Parse the header, then hand the wire to
+     * the shared pipeline; onInboundLxm validates dh == our delivery dest. */
+    rx_meta_t m;
+    size_t h = parseRxMeta(buf, n, m);
+    if (h == 0) { warn("id %d: inbound Link frame short (%zu)", id.index, n); return; }
+    onInboundLxm(id, buf + h, n - h, &m);
 }
 
 static void onLinkInboxDisconnect(int ref)
@@ -2877,9 +3232,15 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                          bytesToHex(s_ids[n].dest_hash, LXMF_DEST_HASH_LEN).c_str());
             }
         } else if (d.buf && d.len > 0) {
-            info("id %d: inbound resource %uB → onInboundLxm",
-                 idx, (unsigned)d.len);
-            onInboundLxm(s_ids[idx], (const uint8_t*)d.buf, d.len);
+            info("id %d: inbound resource %uB → onInboundLxm", idx, (unsigned)d.len);
+            /* Routing telemetry for the resource: rnsd stamped the link's
+             * last-packet radio signal + interface into the aux. No hops /
+             * first_hop for a resource (no Packet at conclusion). */
+            rx_meta_t m;
+            d.iface[sizeof(d.iface) - 1] = '\0';
+            m.iface.assign(d.iface);
+            if (d.rssi != INT16_MIN) { m.have_signal = true; m.rssi = d.rssi; m.snr10 = d.snr; }
+            onInboundLxm(s_ids[idx], (const uint8_t*)d.buf, d.len, &m);
         }
         rnsdResourceRelease(d.buf);   /* we own it; release even if dropped */
         return;
@@ -2900,6 +3261,7 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                     /* The resource transfer ACK is proof-grade: the peer
                      * reassembled and acknowledged the full wire. */
                     msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
+                    recordOutLinkMeta(id, peer_hex, mid, o.link_tag);
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
@@ -2935,6 +3297,21 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
  * (egress acknowledged, mirrors opportunistic SENT semantics; true
  * proof-on-delivery would need a feedback channel — follow-up).
  * A `failed` state, or no resolution by the slot's deadline, fails it. */
+/* Record routing telemetry for an outbound send that rode a Link (DIRECT packet
+ * or Resource), from the interface rnsd published at link-active. No RSSI (TX
+ * side); no first_hop. Keyed by message_id, dir=out — lights the LoRa pill and
+ * fills the detail box for warm-link sends. */
+static void recordOutLinkMeta(lxmf_id_t& id, const std::string& peer_hex,
+                              const std::string& msg_key, const std::string& tag)
+{
+    std::string base  = "rnsd.links." + tag;
+    std::string iface = storageGetStr((base + ".iface").c_str(), "");
+    if (iface.empty()) return;
+    std::string mid_hex = storageGetStr(msgPath(id.index, peer_hex, msg_key, "message_id").c_str(), "");
+    int hops = storageGetInt((base + ".hops").c_str(), 0);
+    msgmetaWrite(mid_hex, "out", iface.c_str(), nullptr, (uint8_t)hops);
+}
+
 static void resolveDirectSends(void)
 {
     uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
@@ -2952,7 +3329,8 @@ static void resolveDirectSends(void)
              * here so the slot frees. Stage stays "sent". */
             if (!o.direct) {
                 if (o.awaiting_proof && now_s >= o.proof_deadline_s) {
-                    msgFail(id.index, peer_hex, mid, LXMF_ST_NO_PROOF);   /* no proof → error, not a silent "sent" */
+                    if (!tryDeliveryRetry(id, o, now_s))
+                        msgFail(id.index, peer_hex, mid, LXMF_ST_NO_RESPONSE);   /* opportunistic → no response */
                     o.used = false;
                     o.awaiting_proof = false;
                     dbg("id %d: msg %s proof backstop (no OUT_RESULT)",
@@ -2988,6 +3366,7 @@ static void resolveDirectSends(void)
                     /* resource.state "sent" = the transfer ACK arrived —
                      * proof-grade, same as the OUTBOUND_DONE fast path. */
                     msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
+                    recordOutLinkMeta(id, peer_hex, mid, o.link_tag);
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
@@ -3022,11 +3401,13 @@ static void resolveDirectSends(void)
                 } else if (touts > o.proof_base_timeouts ||
                            st == "failed" || st == "closed" || st.empty() ||
                            now_s >= o.proof_deadline_s) {
-                    /* No proof (rnsd's receipt timed out, the link died, or our
-                     * backstop hit). Treated as an error the user can resend, not
-                     * a reassuring "sent" — keep the link (a dead link reaps via
-                     * its own state/disconnect). */
-                    msgFail(id.index, peer_hex, mid, LXMF_ST_NO_PROOF);
+                    /* No proof on a link send (rnsd's receipt timed out, the link
+                     * died, or our backstop hit). Attempt one retry — which tears
+                     * the link down, drops the path, and relinks over a fresh
+                     * route. If declined (throttled / already retried), settle
+                     * terminal as NO_PROOF (the send did ride an open link). */
+                    if (!tryDeliveryRetry(id, o, now_s))
+                        msgFail(id.index, peer_hex, mid, LXMF_ST_NO_PROOF);
                     dbg("id %d: DIRECT no delivery proof mid=%s tag=%s",
                         id.index, mid.c_str(), o.link_tag.c_str());
                     o.used = false; o.direct = false; o.awaiting_proof = false;
@@ -3055,6 +3436,7 @@ static void resolveDirectSends(void)
                  * receipt and bumps tx_proven / proof_timeouts when the
                  * link-packet proof lands or times out. */
                 msgSetStatus(id.index, peer_hex, mid, LXMF_ST_AWAITING_PROOF);
+                recordOutLinkMeta(id, peer_hex, mid, o.link_tag);
                 id.sent++;
                 if (id.pending > 0) id.pending--;
                 info("id %d: DIRECT sent mid=%s tag=%s (awaiting proof)",
@@ -3874,7 +4256,7 @@ static void cliRead(const char* rest)
     int tries           = storageGetInt(msgPath(sel, peer, mid, "tries").c_str(),   0);
     std::string title   = storageGetStr(msgPath(sel, peer, mid, "title").c_str(),   "");
     std::string content = storageGetStr(msgPath(sel, peer, mid, "content").c_str(), "");
-    std::string thread  = storageGetStr(msgPath(sel, peer, mid, "thread").c_str(),  "");
+    std::string reply_to = storageGetStr(msgPath(sel, peer, mid, "reply_to").c_str(), "");
     int ts              = storageGetInt(msgPath(sel, peer, mid, "ts").c_str(),       0);
 
     cliPrintf("─── id %d  msg #%d  %s ───\n", sel, n, mid.c_str());
@@ -3883,7 +4265,7 @@ static void cliRead(const char* rest)
               tries == LXMF_TRIES_GAVEUP ? " — gave up" : "");
     cliPrintf("peer:   %s\n", peer.c_str());
     cliPrintf("ts:     %d\n", ts);
-    if (!thread.empty()) cliPrintf("thread: %s\n", thread.c_str());
+    if (!reply_to.empty()) cliPrintf("reply_to: %s\n", reply_to.c_str());
     if (!title.empty())  cliPrintf("title:  %s\n", title.c_str());
     cliPrintf("\n%s\n", content.c_str());
 
@@ -4366,17 +4748,25 @@ static void lxmfTaskMain(void*)
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             inlinkPollIdentified(); /* map inbound links to peers as they identify */
             publishLinks();         /* per-peer link state for the header icons */
-            /* Retry sends parked on a then-busy conversation link. Skip
-             * anything no longer "queued" (cancel/competing writer wins). */
+            /* Retry sends parked on a then-busy conversation link, plus
+             * delivery-retry resends (held back by not_before_s until rnsd has
+             * dropped the path). Skip anything no longer queued/retrying
+             * (cancel/competing writer wins). */
             if (!s_deferred.empty()) {
+                uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
                 std::vector<deferred_send_t> defer;
                 defer.swap(s_deferred);
                 for (auto& d : defer) {
                     if (d.id_index < 0 || d.id_index >= LXMF_MAX_IDENTITIES ||
                         !s_ids[d.id_index].used) continue;
+                    if (d.not_before_s && now_s < d.not_before_s) {
+                        s_deferred.push_back(d);   /* not due yet — hold for a later tick */
+                        continue;
+                    }
                     int st = storageGetInt(
                         msgPath(d.id_index, d.peer_hex, d.mid, "status").c_str(), 0);
-                    if (st != LXMF_ST_QUEUED) continue;
+                    if (st != LXMF_ST_QUEUED && st != LXMF_ST_RETRYING_DELIVERY &&
+                        st != LXMF_ST_RETRYING_LINK) continue;
                     processReady(s_ids[d.id_index], d.peer_hex, d.mid);
                 }
             }
@@ -4448,12 +4838,15 @@ static void lxmfTaskMain(void*)
     }
 }
 
-/* ── One-shot v2 → v3 message-store migration ───────────────────────────────
- * v2 stored per-message status as fixstr `stage`(12) + `last_error`(48) + u8
- * `attempts`; v3 packs it into u8 `status` (LxmfStatus) + u8 `tries` (255 = gave
- * up). The engine would discard v2 files on the hdr_size mismatch, so we decode
- * each with the retained v2 schema, translate, and rewrite as v3 in place before
- * the v3 store is registered. Marker-gated → runs exactly once. */
+/* ── One-shot message-store migrations ──────────────────────────────────────
+ * Old layouts are decoded with their retained schema, translated, and rewritten
+ * as the current layout in place before the live store is registered. Two source
+ * layouts are handled: v2 (fixstr stage/last_error/attempts) and v3 (u8
+ * status/tries with hex-text message_id + thread). Both target v4 (raw-binary
+ * DATA message_id, thread replaced by reply_to). Marker-gated → runs once per
+ * layout. v2 stored per-message status as fixstr `stage`(12) + `last_error`(48) +
+ * u8 `attempts`; v3+ packs it into u8 `status` (LxmfStatus) + u8 `tries`
+ * (255 = gave up). */
 static const sdb_schema& lxmfMsgSchemaV2()
 {
     static const sdb_schema s = [] {
@@ -4557,7 +4950,9 @@ static long migrateMsgFile(const std::string& path)
         sdbSetField(&out, key.c_str(), "status",  std::to_string(status).c_str());
         sdbSetField(&out, key.c_str(), "tries",   std::to_string(tri).c_str());
         sdbSetField(&out, key.c_str(), "recv_ts", std::to_string(recv).c_str());
-        for (const char* pf : { "dir", "method", "ts", "title", "content", "thread", "message_id" }) {
+        /* `thread` is dropped (v4 has no thread; reply_to has no v2 source).
+         * `message_id` copies as its hex string — the v4 DATA field decodes it. */
+        for (const char* pf : { "dir", "method", "ts", "title", "content", "message_id" }) {
             auto it = f.find(pf);
             if (it != f.end()) sdbSetField(&out, key.c_str(), pf, it->second.c_str());
         }
@@ -4566,6 +4961,62 @@ static long migrateMsgFile(const std::string& path)
     sdbEvict(&out);
     if (ok) { fs_remove(path.c_str()); fs_rename((path + ".v3").c_str(), path.c_str()); }
     else    { fs_remove((path + ".v3").c_str()); return 0; }
+    return runMax;
+}
+
+/* The pre-DATA v3 message schema (hdr_size 40): hex-text message_id + thread.
+ * Retained only to read old files during the v3 → v4 migration. */
+static const sdb_schema& lxmfMsgSchemaV3()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 1;
+        x.schema_ver = 3;
+        x.u8("tries").u8("status")
+         .u32("recv_ts")
+         .fixstr("dir", 4).fixstr("method", 16)
+         .u32("ts")
+         .text("title").text("content").text("thread").text("message_id");
+        return x;
+    }();
+    return s;
+}
+
+/* v3 → v4: straight field copy. Every v4 field carries over by name; `thread` is
+ * dropped, and `message_id` copies as its hex string (the v4 DATA field decodes
+ * it). Returns the conversation's max recv_ts (0 if nothing migrated). */
+static long migrateMsgFileV3toV4(const std::string& path)
+{
+    sdb_store in;
+    in.schema = &lxmfMsgSchemaV3();
+    in.path   = path;
+    if (!sdbLoad(&in) || sdbRecordCount(&in) == 0) { sdbEvict(&in); return 0; }
+
+    MigRec rec;
+    sdbForEach(&in, migCollect, &rec);
+    sdbEvict(&in);
+
+    sdb_store out;
+    out.schema = &lxmfMsgSchema();     /* v4 */
+    out.path   = path + ".v4";
+    sdbInitEmpty(&out);
+
+    long runMax = 0;
+    for (const std::string& key : rec.order) {
+        auto& f = rec.byKey[key];
+        for (const char* pf : { "tries", "status", "recv_ts", "dir", "method", "ts",
+                                "title", "content", "message_id" }) {
+            auto it = f.find(pf);
+            if (it != f.end()) sdbSetField(&out, key.c_str(), pf, it->second.c_str());
+        }
+        auto rit = f.find("recv_ts");
+        long recv = rit != f.end() ? atol(rit->second.c_str()) : 0;
+        if (recv > runMax) runMax = recv;
+    }
+    bool ok = sdbFlush(&out);
+    sdbEvict(&out);
+    if (ok) { fs_remove(path.c_str()); fs_rename((path + ".v4").c_str(), path.c_str()); }
+    else    { fs_remove((path + ".v4").c_str()); return 0; }
     return runMax;
 }
 
@@ -4604,12 +5055,16 @@ static void lxmfMigrateMsgs()
                 warn("lxmf mig: id %d %s: unreadable header — left as-is\n", n, stem.c_str());
                 clean = false; continue;
             }
-            if (fhdr == curHdr) {                 /* already the current v3 — nothing to do */
-                info("lxmf mig: id %d %s: already v3 (ver=%u hdr=%u)\n", n, stem.c_str(), fver, fhdr);
+            if (fhdr == curHdr) {                 /* already the current v4 — nothing to do */
+                info("lxmf mig: id %d %s: already current (ver=%u hdr=%u)\n", n, stem.c_str(), fver, fhdr);
                 continue;
             }
             if (fid == 1 && fhdr == 88) {         /* the fixstr v2 layout → convert */
                 long mx = migrateMsgFile(path);
+                files++;
+                if (mx > 0) peerMax.emplace_back(stem, mx);
+            } else if (fid == 1 && fhdr == 40) {  /* the hex-text v3 layout → convert */
+                long mx = migrateMsgFileV3toV4(path);
                 files++;
                 if (mx > 0) peerMax.emplace_back(stem, mx);
             } else {                              /* unknown intermediate → don't guess, don't clobber */
@@ -4617,6 +5072,11 @@ static void lxmfMigrateMsgs()
                      n, stem.c_str(), fid, fver, fhdr);
                 clean = false;
             }
+            /* A conversion is heavy (gunzip + rebuild + gzip + flash write) and
+             * runs synchronously on the init task. Yield after each file so the
+             * first-boot migration of many conversations feeds the task WDT and
+             * spreads the write/current load instead of one long stall. */
+            vTaskDelay(1);
         }
 
         /* Carry the running max into the conversation directory too, so the first
@@ -4652,7 +5112,95 @@ static void lxmfMigrateMsgs()
     } else {
         warn("lxmf: migration left files unconverted — NOT marking done (will retry)\n");
     }
-    if (files) info("lxmf: migrated %d conversation file(s) to status/tries (v3)\n", files);
+    if (files) info("lxmf: migrated %d conversation file(s) to the v4 (DATA) layout\n", files);
+}
+
+/* ── One-shot contacts v1 → v2 migration ────────────────────────────────────
+ * v1 stored `hash` as hex text and had no pubkey. v2 makes `hash` a raw 16-byte
+ * DATA field and adds a raw 64-byte `pubkey` (unset until an announce is heard).
+ * The hdr_size change (29 → 109) trips the store's header check, so v1 files load
+ * empty; decode each with the retained v1 schema and rewrite as v2 first. One
+ * file per identity slot (peers are records). Marker-gated → runs once. */
+static const sdb_schema& lxmfContactSchemaV1()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 2;
+        x.schema_ver = 1;
+        x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+         .u8("trust")
+         .text("hash").text("display_name").text("nick").text("preview");
+        return x;
+    }();
+    return s;
+}
+
+static void migrateContactFile(const std::string& path)
+{
+    sdb_store in;
+    in.schema = &lxmfContactSchemaV1();
+    in.path   = path;
+    if (!sdbLoad(&in) || sdbRecordCount(&in) == 0) { sdbEvict(&in); return; }
+
+    MigRec rec;
+    sdbForEach(&in, migCollect, &rec);
+    sdbEvict(&in);
+
+    sdb_store out;
+    out.schema = &lxmfContactSchema();     /* v2 */
+    out.path   = path + ".v2";
+    sdbInitEmpty(&out);
+
+    for (const std::string& key : rec.order) {
+        auto& f = rec.byKey[key];
+        /* `hash` copies as its hex string — the v2 DATA field decodes it. `pubkey`
+         * has no v1 source, so it stays unset (all-zero) and is learned lazily. */
+        for (const char* pf : { "count", "last_ts", "unread", "read_ts", "last_seen",
+                                "trust", "hash", "display_name", "nick", "preview" }) {
+            auto it = f.find(pf);
+            if (it != f.end()) sdbSetField(&out, key.c_str(), pf, it->second.c_str());
+        }
+    }
+    bool ok = sdbFlush(&out);
+    sdbEvict(&out);
+    if (ok) { fs_remove(path.c_str()); fs_rename((path + ".v2").c_str(), path.c_str()); }
+    else    fs_remove((path + ".v2").c_str());
+}
+
+static void lxmfMigrateContacts()
+{
+    uint16_t curHdr = lxmfContactSchema().hdr_size;
+    std::string marker = fsStatePath(("/storage/migrated-lxmf-contacts-hdr"
+                                      + std::to_string(curHdr)).c_str());
+    int mh = fs_open(marker.c_str(), "rb");
+    if (mh >= 0) { fs_close(mh); return; }   /* already migrated to this layout */
+
+    int  files = 0;
+    bool clean = true;
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        std::string path = fsStatePath(("/lxmf/contacts/" + std::to_string(n) + ".db.gz").c_str());
+        uint16_t fid = 0, fver = 0, fhdr = 0;
+        if (!sdbPeekHeader(path.c_str(), &fid, &fver, &fhdr)) continue;   /* no file yet */
+        if (fhdr == curHdr) continue;                                     /* already v2 */
+        if (fid == 2 && fhdr == 29) {                                     /* v1 hex-text layout → convert */
+            migrateContactFile(path);
+            files++;
+        } else {
+            warn("lxmf mig: contacts id %d: UNKNOWN layout id=%u ver=%u hdr=%u — left as-is\n",
+                 n, fid, fver, fhdr);
+            clean = false;
+        }
+        /* Yield after each heavy per-file conversion so the migration feeds the
+         * task WDT and doesn't stall the init task in one burst. */
+        vTaskDelay(1);
+    }
+    if (clean) {
+        int cf = fs_open(marker.c_str(), "wb");
+        if (cf >= 0) fs_close(cf);
+    } else {
+        warn("lxmf: contact migration left files unconverted — NOT marking done (will retry)\n");
+    }
+    if (files) info("lxmf: migrated %d contact file(s) to the v2 (DATA) layout\n", files);
 }
 
 void LxmfService::onInit()
@@ -4661,8 +5209,11 @@ void LxmfService::onInit()
      * cfgRoot message history into it (once; guarded + crash-safe). Must run
      * before any message read/write so routing serves the record store. */
     {
-        /* Convert any v2 (string stage/last_error) conversation files to the v3
-         * status/tries layout before the v3 store touches them. */
+        /* Convert older on-disk layouts to the current schemas before the live
+         * stores touch them. Contacts first: the msgs migration carries each
+         * conversation's max recv_ts into the contact directory, which must be at
+         * the current (v2) layout for that write to land. */
+        lxmfMigrateContacts();
         lxmfMigrateMsgs();
 
         storage_db_opts opts;
@@ -4686,6 +5237,16 @@ void LxmfService::onInit()
         aopts.browserMirror = true;   /* the mesh catalogue: browser fetches + live-mirrors */
         storageStructuredDB("lxmf_announces", "lxmf.announces", &lxmfAnnounceSchema(), aopts);
 
+        /* Per-message routing telemetry: global, RAM-only, self-capped, keyed by
+         * message_id. Ephemeral by design (keeps the persistent message DBs from
+         * growing) — no migration. */
+        storage_db_opts mmopts;
+        mmopts.persist = nullptr;
+        mmopts.evict   = STORAGE_DB_DROP;
+        mmopts.cap     = (uint32_t)storageGetInt("s.lxmf.max_msgmeta", 2048);
+        mmopts.browserMirror = true;
+        storageStructuredDB("lxmf_msgmeta", "lxmf.msgmeta", &lxmfMsgMetaSchema(), mmopts);
+
         storageDbMigrate();                      /* fresh device: packs msgs + contacts at once */
         storageDbMigrateStore("lxmf_contacts");  /* already-split device: pack contacts now */
         lxmfSeedDirectory();   /* backfill the directory for pre-migration conversations */
@@ -4698,10 +5259,16 @@ void LxmfService::onInit()
         storageDefault("s.lxmf.auto_ticket",            1);
         storageDefault("s.lxmf.announce_interval_s",    1800);  /* periodic re-announce; 0 disables */
         storageDefault("s.lxmf.max_announces",          2048);  /* announce-catalogue cap; 0 disables eviction */
+        storageDefault("s.lxmf.max_msgmeta",            2048);  /* per-message routing-telemetry cap (RAM-only) */
         storageDefault("s.lxmf.debug.only_local",       0);     /* demote announce dbg lines to verb */
         storageDefault("s.lxmf.link.idle_s",            600);   /* conv-link idle close (10 min); lxmf owns
                                                                  * the warm-hold now that rnsd never parks.
                                                                  * 0 = keep open (LRU + Reticulum STALE bound it) */
+        storageDefault("s.lxmf.retry_throttle_min",     5);     /* per-dest delivery-retry window (min);
+                                                                 * a proof/response timeout retries once,
+                                                                 * unless this dest was retried within the
+                                                                 * window. 0 = no throttle (still one retry
+                                                                 * per message) */
         storageSet("s.lxmf.version", LXMF_VERSION);
         storageEnd();
     }

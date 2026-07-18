@@ -24,6 +24,7 @@
     </div>
 
     <div class="bubble" :class="{ muted: m.status === LxmfStatus.Cancelled }"
+         @click="emit('open', m)"
          @contextmenu.prevent="emit('menu', m)">
       <div class="content"><template v-for="(seg, i) in segments" :key="i"><a
           v-if="seg.link" class="nomad-link"
@@ -50,6 +51,8 @@
           </span>
           <span v-else class="chip dots">…</span>
         </template>
+        <!-- LoRa origin/egress badge: to the right of time + checkmarks. -->
+        <span v-if="lora" class="lpill" :title="m.iface">L</span>
       </div>
     </div>
   </div>
@@ -70,12 +73,16 @@ const emit = defineEmits<{
   resend: [m: Message]
   menu: [m: Message]
   delete: [m: Message]
+  open: [m: Message]
 }>()
 
 const menuOpen = ref(false)
 
 const clock = computed(() => formatMsgTime(props.m.ts))
 const statusName = computed(() => lxmfStatusName(props.m.status))
+/* LoRa badge when this message travelled a LoRa interface (formatIface() emits
+ * a string that starts with "LoRa "). */
+const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
 </script>
 
 <style scoped>
@@ -154,4 +161,13 @@ const statusName = computed(() => lxmfStatusName(props.m.status))
 .chip.ok  { color: #4abf6a; }
 .chip.bad { color: #d9534f; }
 .chip.dots { font-weight: 700; line-height: 1; }
+.bubble { cursor: pointer; }
+/* Yellow "L" pill — message travelled a LoRa interface. */
+.lpill {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 14px; height: 14px; padding: 0 3px;
+  background: #ffd400; color: #000;
+  border-radius: 7px; font-weight: 700; line-height: 1;
+  font-size: calc(9px * var(--rfs, 1));
+}
 </style>

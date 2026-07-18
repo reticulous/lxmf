@@ -247,11 +247,46 @@ In-band frames (first byte = opcode):
 | Opcode | Dir | Payload | Handler |
 |---|---|---|---|
 | `0x01 OUT_PACKET` | lxmf→rnsd | `send_id(2) \| lxm_wire` | `processSend` |
-| `0x02 OUT_RESULT` | rnsd→lxmf | `send_id(2) \| status(1) \| rtt_ms(4 BE) \| hops(1)` | `applyOutResult` |
+| `0x02 OUT_RESULT` | rnsd→lxmf | `send_id(2) \| status(1) \| rtt_ms(4 BE) \| hops(1) [\| first_hop(16) \| iface_len(1) \| iface]` | `applyOutResult` |
 | `0x03 OUT_CANCEL` | lxmf→rnsd | `send_id(2)` | `processCancel` |
-| `0x04 IN_PACKET` | rnsd→lxmf | full LXM plaintext | `onInboundLxm` |
+| `0x04 IN_PACKET` | rnsd→lxmf | `hops(1) \| rssi(2 BE) \| snr(2 BE) \| first_hop(16) \| iface_len(1) \| iface \| full LXM plaintext` | `onInboundLxm` |
 | `0x05 OUT_STATUS` | rnsd→lxmf | `send_id(2) \| type(1) \| tail` | `applyOutStatus` |
 | `0x06 ANNOUNCE` | lxmf→rnsd | `app_data` | `sendAnnounce` |
+
+Both `OUT_RESULT` and `IN_PACKET` carry **routing telemetry** for the msgmeta
+store (§11): `hops` (RNS hop count), `first_hop` (the 16-byte transport-node
+hash this packet last transited / will next transit — all-zero = no transit
+node, i.e. a direct neighbour), and `iface` (the raw mR interface name, ≤24 B).
+The `OUT_RESULT` trailer is present only on the SENT result, where rnsd knows
+the outgoing path (`Transport::next_hop`/`next_hop_interface`); other results
+omit it and consumers read the fixed 9-byte head and ignore the rest, so
+rnprobe is unaffected. `IN_PACKET` sources hops/first-hop/iface from the
+received `RNS::Packet` (`hops()`/`transport_id()`/`receiving_interface()`).
+
+**Every path is instrumented.** Inbound: opportunistic (`IN_PACKET`), DIRECT (the
+inbound-Link forward `onLinkPacketCb` prepends the same telemetry header ahead of
+the wire, parsed by `parseRxMeta`), and Resource (fields on
+`rnsd_link_resource_done_t`). Outbound: opportunistic via the `OUT_RESULT` trailer;
+DIRECT/Resource via `rnsd.links.<tag>.{iface,hops}` — rnsd publishes the link's
+interface + hop count at link-active (`onLinkEstablishedCb`), and lxmf's
+`resolveDirectSends` reads them and writes msgmeta (`recordOutLinkMeta`) when the
+send settles. Outbound carries no `rssi` (a TX side has no receive metric) and no
+`first_hop` for the link path; inbound Resource carries no `hops`/`first_hop`
+(no `Packet` at conclusion).
+
+**Radio signal (`rssi`/`snr`).** The receive RSSI (dBm) and SNR (dB×10) ride the
+decoded `RNS::Packet`: a radio iface sets `rnsd_iface_t.rx_signal = 1` and
+**prefixes each inbound ITS data frame** with `int16 rssi | int16 snr*10`
+(iface-lora `deliverInbound`); rnsd's `onTransportRecv` strips the prefix and
+sets it on the receiving `RNS::Interface` (`r_stat_rssi/r_stat_snr`); mR's
+`Transport::inbound` copies interface→packet (`packet.rssi()/snr()`), and
+`Link.cpp` copies packet→Link — so it reaches Link and Resource callbacks, not
+just the opportunistic packet. rnsd reads `packet.rssi()` (opportunistic /
+per-link-packet) or `link.rssi()` (resource conclusion, last part) and folds it
+into the frame; `IN_PACKET` carries it as two `int16` BE fields (`rssi ==
+INT16_MIN` = none). This restores the upstream `interface.r_stat_* → packet.rssi`
+plumbing (the `Transport::inbound` copy that shipped commented-out, plus the
+missing `InterfaceImpl` members). Receive-only, LoRa-only.
 
 `OUT_RESULT.status`: `0` sent (opportunistic egress acknowledged) · `1`
 delivered (DIRECT/Resource proof) · `2` cancelled (after our `OUT_CANCEL`) ·
@@ -550,7 +585,31 @@ lxmf.up · lxmf.id.<n>.up · lxmf.id.<n>.dest_hash · lxmf.id.<n>.last_announce_
 lxmf.id.<n>.stats.{sent,received,pending,failed}
 
 lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (RAM-only record store, §9 — not cfgRoot)
+
+lxmf.msgmeta.<message_id_hex>.{last,hops,first_hop,dir,rssi,snr,iface}   (RAM-only record store — not cfgRoot)
 ```
+
+**Per-message routing telemetry (`lxmf.msgmeta`).** A global RAM-only record
+store (schema 4), keyed by the `message_id` hash (globally unique — no
+per-identity namespacing), holding the interface / RNS first-hop / hop count
+each delivered or received message travelled. Deliberately **not** a field on
+the persistent message record so the on-disk conversation DBs don't grow; it is
+ephemeral (gone on reboot), self-capping (`STORAGE_DB_DROP`,
+`s.lxmf.max_msgmeta` default 2048) and browser-mirrored — same discipline as the
+announce catalogue (§9). Written by `msgmetaWrite` for every path (§5): from
+`onInboundLxm` (inbound opportunistic / DIRECT / Resource), `applyOutResult`
+(outbound opportunistic SENT), and `recordOutLinkMeta` via `resolveDirectSends`
+(outbound DIRECT / Resource). `first_hop` is a raw 16-byte DATA field (absent =
+direct; not recorded for the Resource or outbound-link paths); `dir` is
+`in`/`out`; `iface` is the beautified endpoint string; `rssi`/`snr` (fixstr,
+radio receive only — LoRa inbound) are the signal metric strings, absent
+otherwise.
+
+`formatIface()` (lxmf-local, ad-hoc) rewrites the raw mR interface name into a
+human endpoint by reading the owning straddle's config off storage:
+`tcp/<id>` → `tcp_out/<host>:<port>` (from `s.tcp.peers.<id>`), `tcp_in/<ip>#<n>`
+→ `tcp_in/<ip>`, `lora/<i>` → `LoRa <MHz> <kHz> SF<sf> 4/<cr> txpwr <dBm>` (from
+`s.lora.<i>.*`), anything else verbatim.
 
 ## 12. Frontends
 

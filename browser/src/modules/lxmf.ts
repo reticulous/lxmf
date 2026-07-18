@@ -75,7 +75,7 @@ export enum LxmfStatus {
   Disabled = 15, MailboxStarting = 16, PackFail = 17, OutboxFull = 18,
   LinkOpenFail = 19, ResMalloc = 20, ResSend = 21, LinkSendDrop = 22,
   PacketSendDrop = 23, ResTransfer = 24, LinkFail = 25, LinkClosed = 26,
-  Unknown = 27,
+  Unknown = 27, NoResponse = 28,
 }
 /* tries === 255 is the one definitive terminal marker (gave up). */
 export const LXMF_TRIES_GAVEUP = 255
@@ -92,6 +92,25 @@ export interface Message {
   ts: number           // sender's clock (display)
   recvTs: number       // monotonic receive time (date-separator anchor)
   messageId: string
+  replyTo?: string     // FIELD_REPLY_TO hex64, '' / all-zero if not a reply
+  method?: string      // delivery method override
+  read?: number        // inbound read flag
+  // Routing telemetry, joined from the lxmf.msgmeta store by messageId. Present
+  // only for opportunistic in/out (the DIRECT/Resource paths aren't instrumented).
+  iface?: string       // beautified endpoint, e.g. "LoRa 869.475 …" / "tcp_out/host:port"
+  hops?: number
+  firstHop?: string    // RNS transport-node hash (64-hex), '' = direct
+}
+
+/* One record from the RAM-only lxmf.msgmeta store, keyed by message_id. */
+export interface MsgMeta {
+  last: number         // unix seconds the record was written
+  hops: number
+  firstHop: string     // 64-hex transport-node hash, '' = direct
+  dir: string          // 'in' | 'out'
+  iface: string
+  rssi: string         // dBm as text, '' if not a radio receive
+  snr: string          // dB as text, '' if not a radio receive
 }
 
 export interface Conversation {
@@ -177,6 +196,7 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.LinkSendDrop]: 'LINK_SEND_DROP', [LxmfStatus.PacketSendDrop]: 'PACKET_SEND_DROP',
   [LxmfStatus.ResTransfer]: 'RES_TRANSFER', [LxmfStatus.LinkFail]: 'LINK_FAIL',
   [LxmfStatus.LinkClosed]: 'LINK_CLOSED', [LxmfStatus.Unknown]: 'UNKNOWN',
+  [LxmfStatus.NoResponse]: 'NO_RESPONSE',
 }
 export function lxmfStatusName(status: number): string {
   return STATUS_NAME[status] ?? ''
@@ -383,6 +403,8 @@ export interface UseLxmf {
   deleteMessage: (peer: string, key: string) => Promise<void>
   deleteConversation: (peer: string) => Promise<void>
   markConversationRead: (peer: string) => void
+  /** Routing telemetry for a message_id (lxmf.msgmeta store), or null if none. */
+  msgMeta: (messageId: string) => MsgMeta | null
   announceNow: () => Promise<void>
   /** Reactive conversation-link state to this peer: '' (down), 'establishing', 'active'. */
   linkState: (peer: string) => '' | 'establishing' | 'active'
@@ -463,6 +485,26 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   watch(() => device.synced, (ok) => {
     if (ok) device.sendCommand({ fetch: 'lxmf.announces' })
   }, { immediate: true })
+  /* Per-message routing telemetry: global RAM-only store, same fetch-on-sync +
+   * live-mirror discipline as announces. */
+  watch(() => device.synced, (ok) => {
+    if (ok) device.sendCommand({ fetch: 'lxmf.msgmeta' })
+  }, { immediate: true })
+
+  const msgMeta = (messageId: string): MsgMeta | null => {
+    if (!messageId) return null
+    const r = device.get(`lxmf.msgmeta.${messageId}`)
+    if (!r) return null
+    return {
+      last: num(r.last),
+      hops: num(r.hops),
+      firstHop: str(r.first_hop),
+      dir: str(r.dir),
+      iface: str(r.iface),
+      rssi: str(r.rssi),
+      snr: str(r.snr),
+    }
+  }
 
   const contacts = computed<Record<string, Contact>>(() => {
     const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
@@ -540,6 +582,9 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       ts: num(r.ts),
       recvTs: num(r.recv_ts),
       messageId: str(r.message_id),
+      replyTo: str(r.reply_to),
+      method: str(r.method),
+      read: num(r.read),
     }
   }
 
@@ -574,7 +619,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     // drifts too far to order reliably, and insertion order is exactly "as
     // received/sent".
     const msgs = Object.keys(thread)
-      .map(key => readMsg(peer, key, thread[key] ?? {}))
+      .map(key => {
+        const m = readMsg(peer, key, thread[key] ?? {})
+        // Join routing telemetry (reactive: streams in after the message).
+        const meta = msgMeta(m.messageId)
+        if (meta) { m.iface = meta.iface; m.hops = meta.hops; m.firstHop = meta.firstHop }
+        return m
+      })
       .filter(m => m.status !== LxmfStatus.Draft)
     // Day separators anchor to recvTs (monotonic receive time), NOT the sender's
     // ts — a message with a skewed clock can't shove a separator to the wrong day
@@ -749,7 +800,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     peerDirectory, unreadTotal,
     displayName, reachability, contactOf, draftFor, setDraft, openPeer,
     send, resend, cancel, deleteMessage, deleteConversation,
-    markConversationRead, announceNow, linkState, toggleLink,
+    markConversationRead, msgMeta, announceNow, linkState, toggleLink,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }
 }
