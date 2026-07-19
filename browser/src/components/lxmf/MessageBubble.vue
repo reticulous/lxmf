@@ -51,8 +51,14 @@
           </span>
           <span v-else class="chip dots">…</span>
         </template>
-        <!-- LoRa origin/egress badge: to the right of time + checkmarks. -->
-        <span v-if="lora" class="lpill" :title="m.iface">L</span>
+        <!-- LoRa badge: a muted amber "L", plus link-quality bars when RSSI/SNR
+             were recorded for this hop. To the right of time + checkmarks. -->
+        <span v-if="lora" class="lora" :title="loraTitle">
+          <span class="l">L</span>
+          <span v-if="bars" class="bars" :aria-label="`signal ${bars} of 4`">
+            <i v-for="n in 4" :key="n" :class="{ on: n <= bars }"></i>
+          </span>
+        </span>
       </div>
     </div>
   </div>
@@ -63,7 +69,7 @@ import { computed, ref } from 'vue'
 import { matDoneAll, matClose, matMoreVert, matDelete }
   from '@quasar/extras/material-icons'
 import { type Message, segmentMessage, openNomad, formatMsgTime,
-         lxmfStatusName, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+         lxmfStatusName, loraBars, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 
 const props = defineProps<{ m: Message }>()
 
@@ -83,6 +89,14 @@ const statusName = computed(() => lxmfStatusName(props.m.status))
 /* LoRa badge when this message travelled a LoRa interface (formatIface() emits
  * a string that starts with "LoRa "). */
 const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
+/* 0 (no RSSI/SNR recorded) → just the "L"; 1..4 → that many lit bars. */
+const bars = computed(() => loraBars(props.m.rssi, props.m.snr))
+const loraTitle = computed(() => {
+  const parts = [props.m.iface || 'LoRa']
+  if (typeof props.m.rssi === 'number' && !Number.isNaN(props.m.rssi)) parts.push(`${props.m.rssi} dBm`)
+  if (typeof props.m.snr  === 'number' && !Number.isNaN(props.m.snr))  parts.push(`SNR ${props.m.snr} dB`)
+  return parts.join(' · ')
+})
 </script>
 
 <style scoped>
@@ -162,12 +176,23 @@ const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
 .chip.bad { color: #d9534f; }
 .chip.dots { font-weight: 700; line-height: 1; }
 .bubble { cursor: pointer; }
-/* Yellow "L" pill — message travelled a LoRa interface. */
-.lpill {
-  display: inline-flex; align-items: center; justify-content: center;
-  min-width: 14px; height: 14px; padding: 0 3px;
-  background: #ffd400; color: #000;
-  border-radius: 7px; font-weight: 700; line-height: 1;
+/* LoRa indicator — message travelled a LoRa interface. Deliberately quiet: a
+   ghost amber "L" (no solid fill), optionally trailed by 1..4 link-quality bars.
+   Yellow reads as "radio" without shouting. */
+.lora { display: inline-flex; align-items: flex-end; gap: 3px; line-height: 1; }
+.lora .l {
+  font-weight: 700; line-height: 1;
   font-size: calc(9px * var(--rfs, 1));
+  color: #e0b422;
 }
+.bars { display: inline-flex; align-items: flex-end; gap: 1px; height: 9px; }
+.bars i {
+  width: 2px; border-radius: 1px;
+  background: rgba(224, 180, 34, 0.28);   /* unlit */
+}
+.bars i.on { background: #ffd400; }        /* lit */
+.bars i:nth-child(1) { height: 3px; }
+.bars i:nth-child(2) { height: 5px; }
+.bars i:nth-child(3) { height: 7px; }
+.bars i:nth-child(4) { height: 9px; }
 </style>

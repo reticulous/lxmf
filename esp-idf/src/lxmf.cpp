@@ -4682,7 +4682,7 @@ static void lxmfTaskMain(void*)
 
     /* itsClient initialisation — one connection per identity plus the
      * shared announce-fanout subscription. */
-    itsClientInit(LXMF_MAX_IDENTITIES + 1);
+    itsClientInit(16);
 
     /* Identity-level commands (clients write `lxmf.cmd.identity_*`). All
      * per-identity command subs are added by createIdentityForSlot /

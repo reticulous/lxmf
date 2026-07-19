@@ -1226,7 +1226,6 @@ void buildThreadShell() {
     lv_obj_add_flag(comp, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(comp, [](lv_event_t*) { lcdInputBoxActivate(s_compose); }, LV_EVENT_CLICKED, nullptr);
 
-    int32_t inH  = lv_font_get_line_height(kFont) + 8;
     int32_t btnW = lcdPx(32);   /* shared width of the expand / collapse pills and the round Send */
 
     /* Expand pill on the LEFT of the entry — shown only when collapsed. Tapping it
@@ -1575,21 +1574,62 @@ lv_obj_t* addBubbleText(lv_obj_t* bub, const std::string& content) {
  * whole on a status/tries change — three small labels, and only on an actual
  * transition. Glyph: DELIVERED ✓✓ green · CANCELLED ✕ grey · gave-up
  * (tries == 255) ✕ red · else … in flight. Inbound shows only the timestamp. */
-/* Yellow "L" pill — appended to a bubble's meta row (rightmost) when the
- * message travelled a LoRa interface. Modelled on the sticky-date pill. */
-void addLoraPill(lv_obj_t* meta) {
-    lv_obj_t* pill = lv_obj_create(meta);
-    lv_obj_remove_style_all(pill);
-    lv_obj_set_size(pill, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(pill, lv_color_hex(0xffd400), 0);
-    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(pill, lcdPx(6), 0);
-    lv_obj_set_style_pad_hor(pill, lcdPx(3), 0);
-    lv_obj_remove_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* l = lv_label_create(pill);
-    lv_obj_set_style_text_font(l, kFontSmall, 0);
-    lv_obj_set_style_text_color(l, lv_color_black(), 0);
+/* Fold a LoRa hop's RSSI (dBm) + SNR (dB) into 1..4 bars; 0 = no signal data.
+ * Mirrors the web UI's loraBars(): each dimension normalised 0..1 against
+ * LoRa-relevant endpoints, link scores as its WORSE dimension. LoRa demodulates
+ * below the noise floor, hence the negative SNR floor. Endpoints are field-tunable. */
+int loraBars(bool haveRssi, double rssi, bool haveSnr, double snr) {
+    if (!haveRssi && !haveSnr) return 0;
+    auto clamp01 = [](double x) { return x < 0 ? 0.0 : (x > 1 ? 1.0 : x); };
+    double q = 1.0;
+    if (haveRssi) q = std::min(q, clamp01((rssi + 120) / 60));   // -120 … -60 dBm
+    if (haveSnr)  q = std::min(q, clamp01((snr  +  15) / 25));   //  -15 … +10 dB
+    return 1 + (int)(q * 3.999);                                 // 1..4
+}
+
+/* Quiet LoRa indicator — appended to a bubble's meta row (rightmost) when the
+ * message travelled a LoRa interface: a ghost amber "L", plus 1..4 amber
+ * link-quality bars when RSSI/SNR were recorded for the hop (joined from the
+ * RAM-only lxmf.msgmeta store by message_id). Replaces the old solid-yellow pill:
+ * same "this went over radio" signal, far less shouty. */
+void addLoraInd(lv_obj_t* meta, const std::string& mid) {
+    lv_obj_t* box = lv_obj_create(meta);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_column(box, lcdPx(2), 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* l = lv_label_create(box);
+    lv_obj_set_style_text_font(l, kFontTiny, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xe0b422), 0);
     lv_label_set_text(l, "L");
+
+    std::string mm = "lxmf.msgmeta." + mid;
+    std::string rssiS = mid.empty() ? "" : storageGetStr((mm + ".rssi").c_str(), "");
+    std::string snrS  = mid.empty() ? "" : storageGetStr((mm + ".snr").c_str(),  "");
+    int bars = loraBars(!rssiS.empty(), atof(rssiS.c_str()), !snrS.empty(), atof(snrS.c_str()));
+    if (bars <= 0) return;
+
+    lv_obj_t* barbox = lv_obj_create(box);   /* 4 ascending bars, bottom-aligned */
+    lv_obj_remove_style_all(barbox);
+    lv_obj_set_size(barbox, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(barbox, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(barbox, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_column(barbox, lcdPx(1), 0);
+    lv_obj_remove_flag(barbox, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t* b = lv_obj_create(barbox);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, lcdPx(2), lcdPx(2 + 2 * i));   /* 2,4,6,8 px tall */
+        lv_obj_set_style_radius(b, lcdPx(1), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b,
+            (i < bars) ? lv_color_hex(0xffd400)     /* lit */
+                       : lv_color_hex(0x4a441c), 0); /* dim amber (unlit) */
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    }
 }
 
 void fillMeta(lv_obj_t* meta, const Msg& m) {
@@ -1640,6 +1680,9 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
         lv_obj_set_style_text_color(ic, col, 0);
         lv_label_set_text(ic, sym);
     }
+
+    /* LoRa indicator — rightmost, after time + delivery glyph. */
+    if (m.iface.rfind("LoRa", 0) == 0) addLoraInd(meta, m.message_id);
 }
 
 /* Pin the time to the bubble's right at ALL widths: measure the meta line's

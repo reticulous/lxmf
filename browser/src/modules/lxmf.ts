@@ -100,6 +100,8 @@ export interface Message {
   iface?: string       // beautified endpoint, e.g. "LoRa 869.475 …" / "tcp_out/host:port"
   hops?: number
   firstHop?: string    // RNS transport-node hash (64-hex), '' = direct
+  rssi?: number        // dBm, NaN/undefined if not a radio receive
+  snr?: number         // dB, NaN/undefined if not a radio receive
 }
 
 /* One record from the RAM-only lxmf.msgmeta store, keyed by message_id. */
@@ -200,6 +202,24 @@ const STATUS_NAME: Record<number, string> = {
 }
 export function lxmfStatusName(status: number): string {
   return STATUS_NAME[status] ?? ''
+}
+
+/* Fold a LoRa link's RSSI (dBm) + SNR (dB) into a 1..4 bar count; 0 = no signal
+ * data. Each dimension is normalised to 0..1 against LoRa-relevant endpoints, and
+ * the link scores as its WORSE dimension (min): SNR keeps a faint-but-clean signal
+ * from reading as full bars on RSSI alone, RSSI keeps a strong-but-noisy one
+ * honest. LoRa demodulates well below the noise floor, hence the negative SNR
+ * floor. Endpoints are field-tunable, not gospel. */
+export function loraBars(rssi?: number, snr?: number): number {
+  const haveRssi = typeof rssi === 'number' && !Number.isNaN(rssi)
+  const haveSnr  = typeof snr  === 'number' && !Number.isNaN(snr)
+  if (!haveRssi && !haveSnr) return 0
+  const clamp01 = (x: number) => Math.max(0, Math.min(1, x))
+  const qs: number[] = []
+  if (haveRssi) qs.push(clamp01((rssi! + 120) / 60))   // -120 dBm … -60 dBm
+  if (haveSnr)  qs.push(clamp01((snr!  +  15) / 25))    //  -15 dB  …  +10 dB
+  const q = Math.min(...qs)
+  return 1 + Math.floor(q * 3.999)                      // 1..4
 }
 
 /* Minimal strftime for the browser, covering the specifiers used by the
@@ -623,7 +643,11 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         const m = readMsg(peer, key, thread[key] ?? {})
         // Join routing telemetry (reactive: streams in after the message).
         const meta = msgMeta(m.messageId)
-        if (meta) { m.iface = meta.iface; m.hops = meta.hops; m.firstHop = meta.firstHop }
+        if (meta) {
+          m.iface = meta.iface; m.hops = meta.hops; m.firstHop = meta.firstHop
+          if (meta.rssi !== '') m.rssi = parseFloat(meta.rssi)
+          if (meta.snr !== '')  m.snr = parseFloat(meta.snr)
+        }
         return m
       })
       .filter(m => m.status !== LxmfStatus.Draft)

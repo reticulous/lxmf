@@ -15,5 +15,9 @@
     "pinia": "^3.0.4",
     "spangap-browser": "*",
     "rns": "*"
+  },
+  "dependencies": {
+    "lxmf": "file:../../lxmf/browser",
+    "rns": "file:../../rns/browser"
   }
 }

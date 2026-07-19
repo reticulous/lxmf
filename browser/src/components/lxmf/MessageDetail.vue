@@ -14,7 +14,12 @@
       <div class="hero">
         <span class="dir" :class="m.dir">{{ m.dir === 'in' ? 'Incoming' : 'Outgoing' }}</span>
         <span class="status">{{ statusName }}</span>
-        <span v-if="lora" class="lpill" :title="m.iface">L</span>
+        <span v-if="lora" class="lora" :title="m.iface">
+          <span class="l">L</span>
+          <span v-if="bars" class="bars" :aria-label="`signal ${bars} of 4`">
+            <i v-for="n in 4" :key="n" :class="{ on: n <= bars }"></i>
+          </span>
+        </span>
       </div>
 
       <template v-if="m.title">
@@ -81,7 +86,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
-import { type Message, type MsgMeta, lxmfStatusName, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+import { type Message, type MsgMeta, lxmfStatusName, loraBars, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 
 const props = defineProps<{
   m: Message
@@ -92,6 +97,10 @@ const emit = defineEmits<{ close: [] }>()
 
 const statusName = computed(() => lxmfStatusName(props.m.status))
 const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
+const bars = computed(() => loraBars(
+  props.meta?.rssi ? parseFloat(props.meta.rssi) : undefined,
+  props.meta?.snr  ? parseFloat(props.meta.snr)  : undefined,
+))
 
 const grouped = (hex: string) => (hex.match(/.{1,4}/g) ?? []).join(' ')
 
@@ -136,12 +145,16 @@ async function copy(key: string, val: string) {
 .dir.in  { color: #9ec9ff; }
 .dir.out { color: #9fe0b0; }
 .status { color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase; letter-spacing: 0.04em; }
-.lpill {
-  display: inline-flex; align-items: center; justify-content: center;
-  min-width: 16px; height: 16px; padding: 0 4px;
-  background: #ffd400; color: #000; border-radius: 8px;
-  font-weight: 700; font-size: calc(10px * var(--rfs, 1));
-}
+/* Quiet LoRa indicator: ghost amber "L" + link-quality bars. Matches the bubble. */
+.lora { display: inline-flex; align-items: flex-end; gap: 3px; line-height: 1; }
+.lora .l { font-weight: 700; font-size: calc(10px * var(--rfs, 1)); color: #e0b422; }
+.bars { display: inline-flex; align-items: flex-end; gap: 1px; height: 10px; }
+.bars i { width: 2px; border-radius: 1px; background: rgba(224, 180, 34, 0.28); }
+.bars i.on { background: #ffd400; }
+.bars i:nth-child(1) { height: 4px; }
+.bars i:nth-child(2) { height: 6px; }
+.bars i:nth-child(3) { height: 8px; }
+.bars i:nth-child(4) { height: 10px; }
 .sect {
   color: #aaa; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase;
   letter-spacing: 0.05em; margin: 16px 0 6px;
