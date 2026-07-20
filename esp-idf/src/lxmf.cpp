@@ -161,6 +161,11 @@ struct rx_meta_t {
     bool        have_signal = false;   /* radio RSSI/SNR present (LoRa inbound) */
     int         rssi = 0;              /* dBm */
     int         snr10 = 0;             /* dB * 10 */
+    /* REMOTE signal (the peer's rx of a message WE sent), from an rx-report
+     * delivery proof — carried on the DELIVERED OUT_RESULT, applied to outbound. */
+    bool        have_remote = false;
+    int         remote_rssi = 0;       /* dBm */
+    int         remote_snr10 = 0;      /* dB * 10 */
 };
 
 struct pending_verify_t {
@@ -452,9 +457,12 @@ static const sdb_schema& lxmfMsgMetaSchema()
     static const sdb_schema s = [] {
         sdb_schema x;
         x.schema_id  = 4;
-        x.schema_ver = 1;
+        x.schema_ver = 2;
         x.u32("last").u8("hops").data("first_hop", 16).fixstr("dir", 4)
-         .fixstr("rssi", 8).fixstr("snr", 8).text("iface");
+         .fixstr("rssi", 8).fixstr("snr", 8).text("iface")
+         /* Remote signal (the peer's rx of an outbound message we sent), from an
+          * rx-report delivery proof. Empty unless the peer is reticulous. */
+         .fixstr("remote_rssi", 8).fixstr("remote_snr", 8);
         return x;
     }();
     return s;
@@ -542,6 +550,71 @@ static void msgmetaWrite(const std::string& mid_hex, const char* dir,
                dir, mid_hex.c_str(), iface.c_str(), (unsigned)hops,
                first_hop ? bytesToHex(first_hop, LXMF_DEST_HASH_LEN).c_str() : "-",
                have_signal ? std::to_string(rssi).c_str() : "-");
+}
+
+/* Update ONLY the signal fields of a msgmeta record (keeps the SENT result's
+ * iface/hops/first_hop intact). Used on the DELIVERED result of an OUTBOUND
+ * message: `local` is our rx of the delivery proof, `remote` is the peer's rx of
+ * the message we sent (from an rx-report proof; present only when the peer is
+ * reticulous). Both stored dBm/dB×10 in the same text encoding as msgmetaWrite. */
+static void msgmetaWriteSignal(const std::string& mid_hex,
+                               bool have_local,  int rssi,  int snr10,
+                               bool have_remote, int rrssi, int rsnr10)
+{
+    if (mid_hex.empty() || (!have_local && !have_remote)) return;
+    std::string base = "lxmf.msgmeta." + mid_hex;
+    auto fmt_snr = [](char* out, size_t n, int s10) {
+        int sa = s10 < 0 ? -s10 : s10;
+        std::snprintf(out, n, "%s%d.%d", s10 < 0 ? "-" : "", sa / 10, sa % 10);
+    };
+    storageBegin();
+    storageSet((base + ".last").c_str(), (int)(nowUnixMs() / 1000));
+    if (have_local) {
+        char rbuf[16], sbuf[16];
+        std::snprintf(rbuf, sizeof(rbuf), "%d", rssi);
+        fmt_snr(sbuf, sizeof(sbuf), snr10);
+        storageSet((base + ".rssi").c_str(), rbuf);
+        storageSet((base + ".snr").c_str(),  sbuf);
+    }
+    if (have_remote) {
+        char rbuf[16], sbuf[16];
+        std::snprintf(rbuf, sizeof(rbuf), "%d", rrssi);
+        fmt_snr(sbuf, sizeof(sbuf), rsnr10);
+        storageSet((base + ".remote_rssi").c_str(), rbuf);
+        storageSet((base + ".remote_snr").c_str(),  sbuf);
+    }
+    storageEnd();
+}
+
+/* Per-contact "direct signal": the RSSI/SNR seen on the last packet FROM a peer
+ * that reached us DIRECT — no transport relay, on a signal-capable (radio)
+ * interface. Held in this map (keyed by peer dest-hash hex) and mirrored to the
+ * ephemeral, browser-synced lxmf.contactsig.<peer>.{rssi,snr} keys the LCD and
+ * web read. A relayed packet, or one from a non-radio interface, means we no
+ * longer have a direct line to that peer, so the entry (and its keys) are
+ * dropped. hops is the raw RNS count, which is 1 for a directly-received packet
+ * (Transport::inbound increments it on receive) and >1 once relayed — so DIRECT
+ * is hops <= 1, not hops == 0. */
+static std::unordered_map<std::string, std::pair<int,int>> s_contactSig;   /* peer_hex → {rssi, snr10} */
+
+static void contactSigUpdate(const std::string& peer_hex, const rx_meta_t* meta)
+{
+    std::string base = "lxmf.contactsig." + peer_hex;
+    if (meta && meta->have_signal && meta->hops <= 1) {
+        s_contactSig[peer_hex] = { meta->rssi, meta->snr10 };
+        char rbuf[16], sbuf[16];
+        std::snprintf(rbuf, sizeof(rbuf), "%d", meta->rssi);
+        int sa = meta->snr10 < 0 ? -meta->snr10 : meta->snr10;   /* sign kept separately so −0.x keeps its − */
+        std::snprintf(sbuf, sizeof(sbuf), "%s%d.%d", meta->snr10 < 0 ? "-" : "", sa / 10, sa % 10);
+        storageBegin();
+        storageSet((base + ".rssi").c_str(), rbuf);
+        storageSet((base + ".snr").c_str(),  sbuf);
+        storageEnd();
+    } else if (s_contactSig.erase(peer_hex)) {
+        /* storageUnset (not storageDeleteTree) so subscribers see the clear. */
+        storageUnset((base + ".rssi").c_str());
+        storageUnset((base + ".snr").c_str());
+    }
 }
 
 /* Contact identity persistence. rnsd's identity cache is RAM-only and self-culls,
@@ -1941,70 +2014,24 @@ struct convlink_t {
     std::string tag;
     int         handle;        /* RNSD_PORT_LINK ITS handle; -1 = conn gone */
     uint32_t    last_used_s;
-    bool        identified;    /* backchannel-identified to the peer (once) */
+    bool        identified;    /* identified to the peer (once) so it can reply over our link */
 };
 static convlink_t s_convlinks[LXMF_MAX_CONV_LINKS];
 
 /* Inbound DIRECT links (peers' links into our delivery dests — accepted
  * by rnsd, forwarded to LXMF_LINK_INBOX_PORT; the handlers live in the
- * "inbound DIRECT" section below). Tracked here beside the conv pool
- * because an *identified* inbound link doubles as a backchannel: once
- * the peer backchannel-identifies (upstream LXMF does so after its
- * first delivery to us), rnsd publishes rnsd.links.<tag>.remote_dest
- * and replies to that peer can ride their link instead of opening our
- * own — saving a full LR/LRPROOF handshake, which matters on LoRa. */
+ * "inbound DIRECT" section below). We only ever RECEIVE on these — the
+ * peer delivers LXMs to us over the link it opened. We never send over
+ * one (not every client accepts that); our replies open our own
+ * conversation link (see the conv pool above). */
 #define LXMF_MAX_INLINKS 8
 struct inlink_t {
     bool        used;
     int         handle;     /* ITS handle of the forwarded Link */
     int         id_index;   /* which s_ids[] hosts the destination */
     std::string tag;        /* rnsd-generated "in.<8hex>" — keys rnsd.links.<tag>.* */
-    std::string peer_hex;   /* peer's delivery dest once identified; "" = anonymous */
 };
 static inlink_t s_inlinks[LXMF_MAX_INLINKS];
-
-/* Drop a (suspect) inbound link: closing our ITS handle tears the Link
- * down in rnsd. A locally-initiated disconnect does not fire our inbox
- * on_disconnect (same asymmetry convDrop relies on), so clear the slot
- * here. */
-static void inlinkDrop(inlink_t& s)
-{
-    if (!s.used) return;
-    if (s.handle >= 0) { itsDisconnect(s.handle); s.handle = -1; }
-    s.used = false;
-    s.tag.clear();
-    s.peer_hex.clear();
-}
-
-/* The identified inbound link from this peer, if any — the backchannel. */
-static inlink_t* inlinkBackchannel(int id_index, const std::string& peer_hex)
-{
-    if (peer_hex.empty()) return nullptr;
-    for (auto& s : s_inlinks) {
-        if (!s.used || s.handle < 0 || s.id_index != id_index) continue;
-        if (s.peer_hex != peer_hex) continue;
-        /* Liveness, same probe convGet uses on reuse. */
-        std::string st = storageGetStr(("rnsd.links." + s.tag + ".state").c_str(), "");
-        if (st == "active") return &s;
-    }
-    return nullptr;
-}
-
-/* 1 Hz: learn which peer is on each still-anonymous inbound link. rnsd
- * publishes remote_dest when the peer's LINKIDENTIFY validates — that
- * lands *after* the link-accept forward (peers identify after their
- * first delivery), hence polled rather than read at connect. */
-static void inlinkPollIdentified(void)
-{
-    for (auto& s : s_inlinks) {
-        if (!s.used || !s.peer_hex.empty() || s.tag.empty()) continue;
-        std::string rd = storageGetStr(("rnsd.links." + s.tag + ".remote_dest").c_str(), "");
-        if (rd.size() != 32) continue;
-        s.peer_hex = rd;
-        info("id %d: inbound link %s identified as peer %s — backchannel available",
-             s.id_index, s.tag.c_str(), rd.c_str());
-    }
-}
 
 static convlink_t* convFind(int id_index, const std::string& peer_hex)
 {
@@ -2057,9 +2084,9 @@ static void onConvLinkDisc(int ref)
     c.identified = false;
 }
 
-/* True while any unsettled DIRECT outbound rides the link with this tag
- * (conversation link or inbound backchannel — sends serialize per link
- * either way; rnsd holds one in-flight resource + one receipt per slot). */
+/* True while any unsettled DIRECT outbound rides the conversation link
+ * with this tag (sends serialize per link; rnsd holds one in-flight
+ * resource + one receipt per slot). */
 static bool linkTagBusy(const std::string& tag)
 {
     for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
@@ -2073,8 +2100,7 @@ static bool linkTagBusy(const std::string& tag)
 static bool convBusy(const convlink_t& c) { return linkTagBusy(c.tag); }
 
 /* Get-or-open the conversation link for (id, peer). nullptr on failure,
- * or on a miss when open_if_missing is false (probe-only — lets the
- * caller consult the backchannel pool before paying for a fresh Link). */
+ * or on a miss when open_if_missing is false (probe-only). */
 static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
                            const uint8_t dh[16], bool open_if_missing = true)
 {
@@ -2129,11 +2155,11 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
 /* Post-settle bookkeeping shared by the three DIRECT settle paths
  * (resource fast-path aux, resource tick fallback, packet proof): on a
  * delivered settle keep the link warm and — once per conversation link,
- * mirroring upstream LXMRouter's backchannel identification after the
- * first successful delivery — identify to the peer so it can reuse OUR
- * link for replies. On a failed settle drop the link (it's suspect),
- * whichever pool it lives in. No-proof packet settles ("sent", message
- * may have arrived) call neither — the link is kept, unidentified. */
+ * mirroring upstream LXMRouter's identification after the first
+ * successful delivery — identify to the peer so it can send replies back
+ * over OUR link (which we accept). On a failed settle drop the link (it's
+ * suspect). No-proof packet settles ("sent", message may have arrived)
+ * call neither — the link is kept, unidentified. */
 static void directLinkSettle(const std::string& tag, bool ok, uint32_t now_s)
 {
     for (auto& c : s_convlinks) {
@@ -2142,16 +2168,9 @@ static void directLinkSettle(const std::string& tag, bool ok, uint32_t now_s)
         c.last_used_s = now_s;
         if (!c.identified && rnsdLinkIdentify(c.tag.c_str())) {
             c.identified = true;
-            verb("id %d: conv link %s backchannel-identified",
+            verb("id %d: conv link %s identified",
                  c.id_index, c.tag.c_str());
         }
-        return;
-    }
-    /* Not a conv link — an inbound backchannel we rode. Never identify
-     * on these (µR would no-op anyway: we are not the initiator). */
-    for (auto& s : s_inlinks) {
-        if (!s.used || s.tag != tag) continue;
-        if (!ok) inlinkDrop(s);
         return;
     }
 }
@@ -2362,8 +2381,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * → per-identity default → global default → "link-if-one-exists". The
      * four methods form a spectrum of link eagerness (see canonMethod):
      * link-always always uses a Link; link-if-one-exists rides a warm link
-     * to this peer if one exists (our conv link or the peer's identified
-     * inbound backchannel), else opportunistic; link-if-big goes
+     * to this peer if one exists (our own conversation link), else
+     * opportunistic; link-if-big goes
      * opportunistic for anything that fits one packet and only opens a Link
      * for an oversize wire; opportunistic-or-fail never uses a Link.
      * Oversize forces a Link in every mode except opportunistic-or-fail,
@@ -2396,11 +2415,12 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     } else if (method == "link-if-big") {
         use_direct = oversize;
     } else {                                  /* link-if-one-exists (default) */
-        /* Prefer the Link when one to this peer is already warm — our own
-         * conversation link or the peer's identified inbound backchannel —
-         * an active chat rides a link for every message. */
-        use_direct = oversize || convFind(id.index, peer_hex) != nullptr
-                  || inlinkBackchannel(id.index, peer_hex) != nullptr;
+        /* Prefer the Link when our own conversation link to this peer is
+         * already warm — an active chat rides a link for every message.
+         * A peer's inbound link into us never counts: not every client
+         * accepts our outgoing traffic on the link it opened, so we only
+         * ride links we opened ourselves. */
+        use_direct = oversize || convFind(id.index, peer_hex) != nullptr;
     }
 
     /* Reserve an outbox slot. */
@@ -2450,20 +2470,17 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
          * outbox buffers it and flushes on establishment; the 1 Hz tick
          * watches rnsd.links.<tag>.state (RNSD_PORT_LINK has no
          * OUT_RESULT). */
-        /* Pick the Link: our own warm conversation link wins; else the
-         * peer's identified inbound link (backchannel — riding it saves
-         * the LR/LRPROOF handshake, upstream LXMF's direct_links-then-
-         * backchannel_links order); else open a fresh conv link. */
-        convlink_t* cl = convGet(id, peer_hex, dh, /*open_if_missing=*/false);
-        inlink_t*   bc = cl ? nullptr : inlinkBackchannel(id.index, peer_hex);
-        if (!cl && !bc) cl = convGet(id, peer_hex, dh);
-        if (!cl && !bc) {
+        /* Always ride a conversation link WE opened — reuse the warm one
+         * if it exists, else open a fresh one. We never send over a peer's
+         * inbound link into us: not every client accepts that. */
+        convlink_t* cl = convGet(id, peer_hex, dh);
+        if (!cl) {
             o->used = false;
             msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_OPEN_FAIL);
             return;
         }
-        const std::string ltag    = cl ? cl->tag    : bc->tag;
-        const int         lhandle = cl ? cl->handle : bc->handle;
+        const std::string ltag    = cl->tag;
+        const int         lhandle = cl->handle;
         if (linkTagBusy(ltag)) {
             /* An earlier send to this peer is still settling on the shared
              * link — park; the 1 Hz tick retries once it frees. */
@@ -2489,7 +2506,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             /* rnsd takes ownership of rbuf and frees it after the engine
              * copies it. opaque_id = send_id for OUTBOUND_DONE matching. */
             if (!rnsdLinkSendResource(ltag.c_str(), rbuf, wire.size(), o->send_id)) {
-                if (cl) convDrop(*cl); else inlinkDrop(*bc);
+                convDrop(*cl);
                 o->used = false;
                 msgFail(id.index, peer_hex, mid, LXMF_ST_RES_SEND);
                 return;
@@ -2497,13 +2514,13 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         } else {
             /* Full wire, one Link packet (no strip — DIRECT keeps dest16). */
             if (itsSend(lhandle, wire.data(), wire.size(), 0) == 0) {
-                if (cl) convDrop(*cl); else inlinkDrop(*bc);
+                convDrop(*cl);
                 o->used = false;
                 msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_SEND_DROP);
                 return;
             }
         }
-        if (cl) cl->last_used_s = (uint32_t)(nowUnixMs() / 1000);
+        cl->last_used_s = (uint32_t)(nowUnixMs() / 1000);
         o->direct            = true;
         o->is_resource       = as_resource;
         o->link_handle       = lhandle;
@@ -2527,9 +2544,9 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_SENDING);
         storageEnd();
         id.pending++;
-        info("id %d: send DIRECT mid=%s peer=%s tag=%s%s wire=%zuB",
+        info("id %d: send DIRECT mid=%s peer=%s tag=%s wire=%zuB",
              id.index, mid.c_str(), peer_hex.c_str(), ltag.c_str(),
-             bc ? " (backchannel)" : "", wire.size());
+             wire.size());
         return;
     }
 
@@ -2775,6 +2792,10 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
                      meta->have_first_hop ? meta->first_hop : nullptr, meta->hops,
                      meta->have_signal, meta->rssi, meta->snr10);
 
+    /* Per-contact direct-signal record (set on a zero-hop radio packet, else
+     * cleared) → lxmf.contactsig.<peer>.* for the contacts list + conv header. */
+    contactSigUpdate(sh_hex, meta);
+
     id.received++;
     info("id %d: recv mid=%s from=%s len=%zuB title=\"%s\"",
          id.index, mid_hex.c_str(), sh_hex.c_str(), n,
@@ -2905,6 +2926,15 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         case RNSD_DEST_STATUS_DELIVERED:
             status_code = LXMF_ST_DELIVERED; gaveup = false;
             if (!was_awaiting) id.sent++;
+            /* Signal on the proof: local = our rx of the proof packet, remote =
+             * the peer's rx of the message we sent (rx-report). Attach to the
+             * outbound message's msgmeta (keyed by its message_id hash). */
+            if (meta && (meta->have_signal || meta->have_remote)) {
+                std::string mid_hex = storageGetStr(msgPath(id.index, peer_hex, mid, "message_id").c_str(), "");
+                msgmetaWriteSignal(mid_hex,
+                                   meta->have_signal, meta->rssi, meta->snr10,
+                                   meta->have_remote, meta->remote_rssi, meta->remote_snr10);
+            }
             break;
         case RNSD_DEST_STATUS_PROOF_TIMEOUT:
             /* Egressed opportunistically (no link) and no delivery proof came
@@ -3046,7 +3076,21 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
              * (present on the SENT result, where the outgoing path is known). */
             rx_meta_t m;
             m.hops = hops;
-            if (n >= 9 + LXMF_DEST_HASH_LEN + 1) {
+            if (status == RNSD_DEST_STATUS_DELIVERED) {
+                /* DELIVERED trailer: signal(8) = local rssi|snr, remote rssi|snr
+                 * (int16 BE each; rssi INT16_MIN = absent, snr dB×10). */
+                if (n >= 9 + 8) {
+                    size_t p = 9;
+                    auto rd16 = [&](void) -> int16_t {
+                        int16_t v = (int16_t)(((uint16_t)buf[p] << 8) | buf[p + 1]); p += 2; return v; };
+                    int16_t lr = rd16(), ls = rd16(), rr = rd16(), rs = rd16();
+                    if (lr != INT16_MIN) { m.have_signal = true; m.rssi = lr; m.snr10 = ls; }
+                    if (rr != INT16_MIN) { m.have_remote = true; m.remote_rssi = rr; m.remote_snr10 = rs; }
+                }
+            }
+            else if (n >= 9 + LXMF_DEST_HASH_LEN + 1) {
+                /* SENT trailer: first_hop(16) | iface_len(1) | iface[iface_len]
+                 * (present where the outgoing path is known). */
                 size_t p = 9;
                 for (size_t k = 0; k < LXMF_DEST_HASH_LEN; k++)
                     if (buf[p + k]) { m.have_first_hop = true; break; }
@@ -3093,8 +3137,8 @@ static void onOurDestDisconnect(int handle)
  * This is what lets real-world LXMF peers (which default to DIRECT)
  * deliver to us. */
 
-/* inlink_t + s_inlinks live beside the conv-link pool above (an
- * identified inbound link doubles as a reply backchannel). */
+/* inlink_t + s_inlinks live beside the conv-link pool above; these are
+ * receive-only (we never send over a peer's inbound link). */
 static inlink_t* inlinkByHandle(int handle)
 {
     for (auto& s : s_inlinks)
@@ -3131,10 +3175,6 @@ static int onLinkInboxConnect(int handle, const void* data, size_t len)
     slot->handle   = handle;
     slot->id_index = idx;
     slot->tag      = pl.tag;
-    /* Peer identity is almost never known at accept (peers backchannel-
-     * identify after their first delivery) — inlinkPollIdentified fills
-     * peer_hex from rnsd.links.<tag>.remote_dest once it lands. */
-    slot->peer_hex.clear();
     info("id %d: inbound Link %s (tag=%s) from %s",
          idx, bytesToHex(pl.link_id, 16).c_str(), pl.tag,
          bytesToHex(pl.remote_identity_hash, 16).c_str());
@@ -3174,7 +3214,6 @@ static void onLinkInboxDisconnect(int ref)
     s.used = false;
     s.handle = -1;
     s.tag.clear();
-    s.peer_hex.clear();
 }
 
 /* ─────────────── Resource aux (rnsd → lxmf) ───────────────
@@ -3719,7 +3758,6 @@ static void handleIdCmd(int n, const char* key, const char* val)
         }
         else if (std::strcmp(verb, "link_close") == 0) {
             if (convlink_t* c = convFind(id.index, peer_hex)) convDrop(*c);
-            else if (inlink_t* bc = inlinkBackchannel(id.index, peer_hex)) inlinkDrop(*bc);
             publishLinks();
         }
         else {
@@ -3818,9 +3856,10 @@ static void publishStats(void)
  * peer: lxmf.id.<n>.link.<peer> = "active" | "establishing". The key is
  * UNSET when no link is open, so a link torn down for ANY reason (remote
  * close, idle reap, failure, or a local close command) clears the header
- * icon on the next tick — this is re-derived from the live pools every
- * second, not event-driven. Both pools count: our conversation link and
- * the peer's identified inbound backchannel. */
+ * icon on the next tick — this is re-derived from the live pool every
+ * second, not event-driven. Only outgoing conversation links (ones we
+ * opened) count — the icon never reflects a peer's inbound link into us,
+ * since we don't send over those. */
 static std::vector<std::string> s_pubLinkKeys;
 static void publishLinks(void)
 {
@@ -3841,11 +3880,6 @@ static void publishLinks(void)
         std::string st = storageGetStr(("rnsd.links." + c.tag + ".state").c_str(), "");
         if (st == "failed" || st == "closed" || st == "closing") continue;  /* down */
         note(c.id_index, c.peer_hex, st == "active" ? "active" : "establishing");
-    }
-    for (auto& s : s_inlinks) {
-        if (!s.used || s.handle < 0 || s.peer_hex.empty()) continue;
-        std::string st = storageGetStr(("rnsd.links." + s.tag + ".state").c_str(), "");
-        if (st == "active") note(s.id_index, s.peer_hex, "active");
     }
     storageBegin();
     for (auto& old : s_pubLinkKeys) {           /* clear peers no longer open */
@@ -4746,7 +4780,6 @@ static void lxmfTaskMain(void*)
             publishStats();
             resolveDirectSends();   /* settle outbound DIRECT */
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
-            inlinkPollIdentified(); /* map inbound links to peers as they identify */
             publishLinks();         /* per-peer link state for the header icons */
             /* Retry sends parked on a then-busy conversation link, plus
              * delivery-retry resends (held back by not_before_s until rnsd has

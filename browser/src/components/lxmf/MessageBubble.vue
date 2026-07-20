@@ -51,13 +51,13 @@
           </span>
           <span v-else class="chip dots">…</span>
         </template>
-        <!-- LoRa badge: a muted amber "L", plus link-quality bars when RSSI/SNR
-             were recorded for this hop. To the right of time + checkmarks. -->
-        <span v-if="lora" class="lora" :title="loraTitle">
-          <span class="l">L</span>
-          <span v-if="bars" class="bars" :aria-label="`signal ${bars} of 4`">
-            <i v-for="n in 4" :key="n" :class="{ on: n <= bars }"></i>
-          </span>
+        <!-- LoRa badge, to the right of time + checkmarks. Bars XOR "L", never
+             both: signal bars when the message reached us DIRECT (zero hops),
+             else a ghost amber "L" meaning it was relayed (so the last-hop
+             signal isn't the peer's). -->
+        <span v-if="lora && (relayed || bars || hasRemote)" class="lora" :title="loraTitle">
+          <span v-if="relayed" class="l">L</span>
+          <SignalBars v-else :local="bars" :remote="hasRemote ? remoteBars : undefined" />
         </span>
       </div>
     </div>
@@ -70,6 +70,7 @@ import { matDoneAll, matClose, matMoreVert, matDelete }
   from '@quasar/extras/material-icons'
 import { type Message, segmentMessage, openNomad, formatMsgTime,
          lxmfStatusName, loraBars, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+import SignalBars from './SignalBars.vue'
 
 const props = defineProps<{ m: Message }>()
 
@@ -89,8 +90,15 @@ const statusName = computed(() => lxmfStatusName(props.m.status))
 /* LoRa badge when this message travelled a LoRa interface (formatIface() emits
  * a string that starts with "LoRa "). */
 const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
-/* 0 (no RSSI/SNR recorded) → just the "L"; 1..4 → that many lit bars. */
+/* 0 (no RSSI/SNR recorded) → no bars; 1..4 → that many lit bars. */
 const bars = computed(() => loraBars(props.m.rssi, props.m.snr))
+/* Remote reading (a reticulous peer's rx of our outbound message) → the second,
+ * descending set of the valley. Present only on outbound msgs to a reticulous peer. */
+const hasRemote = computed(() => typeof props.m.remoteRssi === 'number' || typeof props.m.remoteSnr === 'number')
+const remoteBars = computed(() => loraBars(props.m.remoteRssi, props.m.remoteSnr))
+/* hops is the raw RNS count — 1 for a directly-received packet (incremented on
+ * receive) and >1 once relayed — so relayed ⇒ "L" (hops > 1), direct ⇒ bars. */
+const relayed = computed(() => (props.m.hops ?? 0) > 1)
 const loraTitle = computed(() => {
   const parts = [props.m.iface || 'LoRa']
   if (typeof props.m.rssi === 'number' && !Number.isNaN(props.m.rssi)) parts.push(`${props.m.rssi} dBm`)

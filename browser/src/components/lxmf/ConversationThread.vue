@@ -15,6 +15,9 @@
         <div class="name">{{ name }}</div>
         <div class="sub">{{ reachLine }}</div>
       </div>
+      <!-- Conversation signal: the peer's own direct bars, falling back to the
+           gateway signal — the contact's signal overrules the gateway one. -->
+      <ContactSignal :peer="peer" fallback-gw class="hdrsig" />
       <button
         class="link" :class="`link--${linkState || 'down'}`"
         :title="linkState ? 'Link open — tap to close' : 'No link — tap to open'"
@@ -54,6 +57,7 @@ import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { matArrowBack, matInfo, matLink, matLinkOff } from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import MessageBubble from './MessageBubble.vue'
+import ContactSignal from './ContactSignal.vue'
 import type { Message, Reachability } from '../../modules/lxmf'
 
 const props = defineProps<{
@@ -185,6 +189,7 @@ onBeforeUnmount(() => {
   padding: 2px; border-radius: 5px;
 }
 .thead:hover .info { background: rgba(255,255,255,0.08); color: #cfcfcf; }
+.hdrsig { margin-right: 6px; flex: none; }
 .link {
   display: inline-flex; align-items: center;
   background: none; border: none; cursor: pointer;

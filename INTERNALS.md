@@ -247,7 +247,7 @@ In-band frames (first byte = opcode):
 | Opcode | Dir | Payload | Handler |
 |---|---|---|---|
 | `0x01 OUT_PACKET` | lxmf→rnsd | `send_id(2) \| lxm_wire` | `processSend` |
-| `0x02 OUT_RESULT` | rnsd→lxmf | `send_id(2) \| status(1) \| rtt_ms(4 BE) \| hops(1) [\| first_hop(16) \| iface_len(1) \| iface]` | `applyOutResult` |
+| `0x02 OUT_RESULT` | rnsd→lxmf | `send_id(2) \| status(1) \| rtt_ms(4 BE) \| hops(1)` + a status-specific trailer: SENT `[\| first_hop(16) \| iface_len(1) \| iface]`; DELIVERED `[\| local_rssi(2) \| local_snr(2) \| remote_rssi(2) \| remote_snr(2)]` (int16 BE, `INT16_MIN` = absent) | `applyOutResult` |
 | `0x03 OUT_CANCEL` | lxmf→rnsd | `send_id(2)` | `processCancel` |
 | `0x04 IN_PACKET` | rnsd→lxmf | `hops(1) \| rssi(2 BE) \| snr(2 BE) \| first_hop(16) \| iface_len(1) \| iface \| full LXM plaintext` | `onInboundLxm` |
 | `0x05 OUT_STATUS` | rnsd→lxmf | `send_id(2) \| type(1) \| tail` | `applyOutStatus` |
@@ -288,6 +288,21 @@ INT16_MIN` = none). This restores the upstream `interface.r_stat_* → packet.rs
 plumbing (the `Transport::inbound` copy that shipped commented-out, plus the
 missing `InterfaceImpl` members). Receive-only, LoRa-only.
 
+**Remote signal & per-contact signal.** For an outbound message, the DELIVERED
+`OUT_RESULT` trailer carries two readings rnsd took at proof time: `local` (our
+rx of the delivery proof) and `remote` (the peer's rx of *our* message, decoded
+from the reticulous rx-report proof — see [rns §5.7](../rns/INTERNALS.md)).
+`applyOutResult` writes both into the message's msgmeta record
+(`msgmetaWriteSignal`, signal-only so it never clobbers the SENT iface/hops);
+`remote_*` is present only for a reticulous peer. Separately, `contactSigUpdate`
+(in `onInboundLxm`, the single inbound choke point) maintains an in-RAM
+`std::map` of each peer's *direct* signal — set from a zero-hop radio packet,
+deleted on a relayed/non-radio one — mirrored to `lxmf.contactsig.<peer>.{rssi,
+snr}` for the contacts list and conversation header. `hops` is the raw RNS count
+(1 = direct, since `Transport::inbound` increments on receive), so "direct" is
+`hops ≤ 1` everywhere the UI decides bars-vs-"L". The msgmeta schema
+(`lxmfMsgMetaSchema`) gained `remote_rssi`/`remote_snr` (schema_ver 2).
+
 `OUT_RESULT.status`: `0` sent (opportunistic egress acknowledged) · `1`
 delivered (DIRECT/Resource proof) · `2` cancelled (after our `OUT_CANCEL`) ·
 `3` evicted (rnsd resource limit). **There is no `failed` status** — rnsd
@@ -315,22 +330,21 @@ no local landing dest — so `onResourceAux` falls back to recovering the
 owning identity from the packed LXM's leading 16-byte destination hash
 (re-validated in `onInboundLxm`).
 
-**Backchannel identification, both directions** (mirrors upstream
-LXMRouter's `backchannel_identified`). Outbound: after the *first
-delivered* settle on a conversation Link, `directLinkSettle` sends
-`rnsdLinkIdentify(tag)` — rnsd signs a `LINKIDENTIFY` with the identity
-the link was opened with — so the peer can reuse our Link for replies
-instead of opening its own. Once per link; a lost aux merely degrades to
-the peer opening its own reply link. Inbound: when a peer identifies on
-a Link into us, rnsd validates the signature and publishes
-`rnsd.links.<tag>.remote_identity` + `.remote_dest` (the peer's dest
-hash on the link's own aspect); `inlinkPollIdentified` (1 Hz) copies
-`remote_dest` into the inlink slot, and `processReady` then prefers —
-in order — a warm conversation Link, an identified inbound Link
-(the backchannel), a fresh Link. Riding the peer's link saves a full
-LR/LRPROOF handshake, which is the expensive part over half-duplex
-LoRa. Anonymous (never-identified) inbound Links are receive-only,
-exactly as before.
+**Link identification.** After the *first delivered* settle on a
+conversation Link, `directLinkSettle` sends `rnsdLinkIdentify(tag)` —
+rnsd signs a `LINKIDENTIFY` with the identity the link was opened with —
+so the peer can send its replies back over *our* Link (which we accept)
+instead of paying for its own. Once per link; a lost aux merely degrades
+to the peer opening its own reply link.
+
+We do **not** send over a peer's inbound Link into us. Not every LXMF
+client accepts traffic on the Link it opened, so outgoing sends always
+ride a conversation Link *we* opened (reusing the warm one if present,
+else opening a fresh one — `processReady` → `convGet`). Inbound Links are
+strictly receive-only: rnsd forwards the peer's LXMs on them into the
+shared `onInboundLxm`, and that is all they carry. Consequently the
+per-peer link icon (`publishLinks`) reflects only outgoing conversation
+Links — never a peer's inbound Link into us.
 
 ## 6. Outbound lifecycle
 
@@ -353,15 +367,15 @@ processReady — method resolution (after the wire is packed, so oversize
                    → "link-if-one-exists"   (canonMethod maps legacy auto/direct/opportunistic)
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "link-always"           → use a Link
-  "link-if-one-exists"    → use a Link if oversize OR a conversation Link to peer is already
-                            warm OR the peer has an identified inbound Link (backchannel)
+  "link-if-one-exists"    → use a Link if oversize OR our own conversation Link to peer is
+                            already warm (a peer's inbound Link into us never counts)
   "link-if-big"           → use a Link only if oversize, else OUT_PACKET
   "opportunistic-or-fail" → fail if oversize, else OUT_PACKET on the mailbox handle
   large + Link    → rnsdLinkSendResource (Resource over the Link)
 
 publishLinks (1 Hz) re-derives lxmf.id.<n>.link.<peer> = active|establishing (unset =
-  down) from s_convlinks + identified s_inlinks, so a Link torn down for any reason
-  clears the header icon next tick. cmd.link_open/cmd.link_close (value <peer>) open/close
+  down) from s_convlinks only (outgoing Links we opened), so a Link torn down for any
+  reason clears the header icon next tick. cmd.link_open/cmd.link_close (value <peer>) open/close
   on demand; CLI `lxmf link open|close|status <peer>`.
 ```
 

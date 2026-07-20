@@ -306,6 +306,8 @@ lv_timer_t* g_stickyFadeTimer = nullptr;   /* fades the sticky 2 s after the las
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
 lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle image (chain=up, broken-chain=down) */
+lv_obj_t* s_threadSig  = nullptr;       /* header signal bars (contact rssi/snr, falling back to gw) */
+lv_obj_t* s_gwBars     = nullptr;       /* system status-bar signal bars (rnsd.gw.*), created once */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_msgDetail = nullptr;        /* per-message detail page (covers the thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
@@ -344,6 +346,11 @@ void setActiveTab(int n, bool keepScroll = false);
 void openThread(const std::string& peer);
 void scheduleRefresh();
 void scheduleRefreshIn(uint32_t ms);
+void updateThreadSignal();
+lv_obj_t* makeSignalBars(lv_obj_t* parent);
+void setSignalBars(lv_obj_t* box, int local, int remote = -1, int heightPct = 100);
+int signalBarsAt(const std::string& prefix);
+int signalRemoteBarsAt(const std::string& prefix);
 void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
@@ -1122,6 +1129,14 @@ void buildThreadShell() {
     lv_obj_set_ext_click_area(s_threadDown, 12);
     lv_obj_add_event_cb(s_threadDown, [](lv_event_t*) { closeHistory(); scrollThreadBottom(true); }, LV_EVENT_CLICKED, nullptr);
 
+    /* Signal bars for this conversation, left of the scroll-down chevron: the
+     * peer's own direct signal when we've seen one, else the gateway signal.
+     * Hidden until updateThreadSignal() finds a sample. */
+    s_threadSig = makeSignalBars(hdr);
+    lv_obj_align(s_threadSig, LV_ALIGN_RIGHT_MID, -(6 + linkIconPx() + 20 + 24), 0);
+    lv_obj_add_flag(s_threadSig, LV_OBJ_FLAG_HIDDEN);
+    updateThreadSignal();
+
     /* Scroll area (grows to fill): the bubble column only. The compose row is a
      * sibling below it (not a child), so it stays pinned to the bottom. */
     s_msgList = lv_obj_create(s_thread);
@@ -1424,6 +1439,7 @@ void openThread(const std::string& peer) {
     closeHistory();                         /* a fresh conversation opens on its newest page */
     lv_label_set_text(s_threadName, peerName(peer).c_str());
     updateThreadLink();
+    updateThreadSignal();                   /* peer's direct signal, else the gateway signal */
     startIconSettle();                      /* land send + link icons (they rasterize off-task) */
     if (s_contacts) lv_obj_add_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
     if (s_idpick)   lv_obj_add_flag(s_idpick,   LV_OBJ_FLAG_HIDDEN);
@@ -1587,48 +1603,141 @@ int loraBars(bool haveRssi, double rssi, bool haveSnr, double snr) {
     return 1 + (int)(q * 3.999);                                 // 1..4
 }
 
-/* Quiet LoRa indicator — appended to a bubble's meta row (rightmost) when the
- * message travelled a LoRa interface: a ghost amber "L", plus 1..4 amber
- * link-quality bars when RSSI/SNR were recorded for the hop (joined from the
- * RAM-only lxmf.msgmeta store by message_id). Replaces the old solid-yellow pill:
- * same "this went over radio" signal, far less shouty. */
-void addLoraInd(lv_obj_t* meta, const std::string& mid) {
-    lv_obj_t* box = lv_obj_create(meta);
+/* Build a row of 4 ascending amber link-quality bars into `parent` (caller
+ * parents/positions it). All bars start dim; recolour with setSignalBars(). */
+/* An amber link-quality bars widget: give it a parent (and it inherits the bar
+ * heights below); it sizes its own WIDTH from how many bars setSignalBars puts
+ * in it. Returns an empty content-width flex row — the bars themselves are
+ * (re)built by setSignalBars so the same box switches between one and two sets. */
+lv_obj_t* makeSignalBars(lv_obj_t* parent) {
+    lv_obj_t* box = lv_obj_create(parent);
     lv_obj_remove_style_all(box);
     lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-    lv_obj_set_style_pad_column(box, lcdPx(2), 0);
+    lv_obj_set_style_pad_column(box, lcdPx(1), 0);
     lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    return box;
+}
 
-    lv_obj_t* l = lv_label_create(box);
-    lv_obj_set_style_text_font(l, kFontTiny, 0);
-    lv_obj_set_style_text_color(l, lv_color_hex(0xe0b422), 0);
-    lv_label_set_text(l, "L");
-
-    std::string mm = "lxmf.msgmeta." + mid;
-    std::string rssiS = mid.empty() ? "" : storageGetStr((mm + ".rssi").c_str(), "");
-    std::string snrS  = mid.empty() ? "" : storageGetStr((mm + ".snr").c_str(),  "");
-    int bars = loraBars(!rssiS.empty(), atof(rssiS.c_str()), !snrS.empty(), atof(snrS.c_str()));
-    if (bars <= 0) return;
-
-    lv_obj_t* barbox = lv_obj_create(box);   /* 4 ascending bars, bottom-aligned */
-    lv_obj_remove_style_all(barbox);
-    lv_obj_set_size(barbox, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(barbox, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(barbox, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-    lv_obj_set_style_pad_column(barbox, lcdPx(1), 0);
-    lv_obj_remove_flag(barbox, LV_OBJ_FLAG_SCROLLABLE);
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t* b = lv_obj_create(barbox);
+/* (Re)build the bars in `box`. `local` (1..4) renders as an ascending set
+ * (2,4,6,8 px). When `remote` >= 0 a mirrored DESCENDING set (8,6,4,2 px) is
+ * drawn first, so a link with both readings shows as a valley — remote
+ * down-staircase, then local up. Lit amber = strength, dim amber = unlit.
+ * local<=0 && remote<0 hides the whole widget. */
+void setSignalBars(lv_obj_t* box, int local, int remote /* = -1 */, int heightPct /* = 100 */) {
+    if (!box) return;
+    lv_obj_clean(box);
+    if (local <= 0 && remote < 0) { lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN); return; }
+    auto addBar = [&](int steps, bool lit) {
+        lv_obj_t* b = lv_obj_create(box);
         lv_obj_remove_style_all(b);
-        lv_obj_set_size(b, lcdPx(2), lcdPx(2 + 2 * i));   /* 2,4,6,8 px tall */
+        lv_obj_set_size(b, lcdPx(2), lcdPx(steps * heightPct / 100));
         lv_obj_set_style_radius(b, lcdPx(1), 0);
         lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(b,
-            (i < bars) ? lv_color_hex(0xffd400)     /* lit */
-                       : lv_color_hex(0x4a441c), 0); /* dim amber (unlit) */
+        lv_obj_set_style_bg_color(b, lit ? lv_color_hex(0xffd400) : lv_color_hex(0x4a441c), 0);
         lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    };
+    if (remote >= 0)                                       /* remote: descending 8,6,4,2 */
+        for (int j = 0; j < 4; j++) addBar(8 - 2 * j, j < remote);
+    for (int i = 0; i < 4; i++) addBar(2 + 2 * i, i < local);   /* local: ascending 2,4,6,8 */
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Local bars for a signal record at <prefix>.{rssi,snr} (dBm / dB), 0 when
+ * neither field is present. Shared by the gw, per-contact and per-message
+ * surfaces so a link scores identically everywhere. */
+int signalBarsAt(const std::string& prefix) {
+    std::string r = storageGetStr((prefix + ".rssi").c_str(), "");
+    std::string s = storageGetStr((prefix + ".snr").c_str(),  "");
+    if (r.empty() && s.empty()) return 0;
+    return loraBars(!r.empty(), atof(r.c_str()), !s.empty(), atof(s.c_str()));
+}
+
+/* Remote bars for <prefix>.{remote_rssi,remote_snr}; -1 when no remote reading
+ * is present (so setSignalBars renders a single, local-only set). */
+int signalRemoteBarsAt(const std::string& prefix) {
+    std::string r = storageGetStr((prefix + ".remote_rssi").c_str(), "");
+    std::string s = storageGetStr((prefix + ".remote_snr").c_str(),  "");
+    if (r.empty() && s.empty()) return -1;
+    return loraBars(!r.empty(), atof(r.c_str()), !s.empty(), atof(s.c_str()));
+}
+
+/* Per-message radio indicator, appended rightmost to a bubble's meta row when
+ * the message travelled a LoRa interface. Bars XOR "L", never both: signal bars
+ * when the message reached us / was proved DIRECT, else a ghost amber "L"
+ * meaning it was relayed. When a remote reading is present (a reticulous peer
+ * reported its own rx), the bars render as the two-set valley. hops is the raw
+ * RNS count (1 = direct), so RELAYED is hops > 1, DIRECT is hops <= 1. */
+void addLoraInd(lv_obj_t* meta, const std::string& mid) {
+    std::string mm     = "lxmf.msgmeta." + mid;
+    int hops   = mid.empty() ? 0 : storageGetInt((mm + ".hops").c_str(), 0);
+    int local  = mid.empty() ? 0 : signalBarsAt(mm);
+    int remote = mid.empty() ? -1 : signalRemoteBarsAt(mm);
+
+    if (hops > 1) {
+        lv_obj_t* l = lv_label_create(meta);
+        lv_obj_set_style_text_font(l, kFontTiny, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(0xe0b422), 0);
+        lv_label_set_text(l, "L");
+    } else if (local > 0 || remote >= 0) {
+        setSignalBars(makeSignalBars(meta), local, remote);
+    }
+}
+
+/* Age-fade for the gateway bars: full opacity fresh, linearly to 0 over 30 min
+ * from rnsd.gw.timestamp (unix s, device clock — same domain as time()). 255 =
+ * opaque; 0 = fully faded (caller hides). No timestamp / no clock ⇒ no fade. */
+int gwOpa() {
+    int ts = storageGetInt("rnsd.gw.timestamp", 0);
+    if (ts <= 0) return 255;
+    time_t now = time(nullptr);
+    if (now <= 0) return 255;
+    long age = (long)now - ts;
+    const long FADE_S = 30 * 60;
+    if (age <= 0)      return 255;
+    if (age >= FADE_S) return 0;
+    return (int)(255 - (age * 255 / FADE_S));
+}
+
+/* System status-bar bars: the gateway/infrastructure signal (rnsd.gw.*) — the
+ * received quality of the transport node that last relayed a packet to us,
+ * faded by age. s_gwBars lives in the shell status bar (created once in
+ * appInit), so it persists across app opens; a null handle (status bar not up)
+ * no-ops. */
+void gwSignalUpdate(const char* = nullptr, const char* = nullptr) {
+    int bars = signalBarsAt("rnsd.gw");
+    int opa  = gwOpa();
+    if (bars <= 0 || opa <= 0) { setSignalBars(s_gwBars, 0); return; }
+    setSignalBars(s_gwBars, bars, -1, /*heightPct=*/150);   /* taller in the status line */
+    if (s_gwBars) lv_obj_set_style_opa(s_gwBars, (lv_opa_t)opa, 0);
+}
+
+/* Conversation-header bars: the open peer's own last-seen direct signal
+ * (lxmf.contactsig.<peer>), which OVERRULES the gateway signal; when we have no
+ * direct sample for them, fall back to the (age-faded) gateway signal. The
+ * contact's own signal never fades — it's dropped outright when it goes stale. */
+void updateThreadSignal() {
+    if (!s_threadSig) return;
+    int bars = 0, opa = 255;
+    if (!g_curPeer.empty()) {
+        bars = signalBarsAt("lxmf.contactsig." + g_curPeer);
+        if (bars <= 0) { bars = signalBarsAt("rnsd.gw"); opa = gwOpa(); }
+    }
+    if (bars <= 0 || opa <= 0) { setSignalBars(s_threadSig, 0); return; }
+    setSignalBars(s_threadSig, bars);
+    lv_obj_set_style_opa(s_threadSig, (lv_opa_t)opa, 0);
+}
+
+/* A gw or per-contact signal record changed: refresh the status-bar bars and the
+ * open thread's header, and (for a contact record) mark the contact list dirty so
+ * its per-row bars redraw. Registered on the lcd task so it may touch LVGL. */
+void onSignalChange(const char* key, const char*) {
+    gwSignalUpdate();
+    updateThreadSignal();
+    if (s_layer && key && strncmp(key, "lxmf.contactsig", 15) == 0) {
+        g_listDirty = true;
+        scheduleRefresh();
     }
 }
 
@@ -2393,7 +2502,9 @@ void showMsgDetail(const std::string& mkey) {
     std::string fhop  = mid.empty() ? "" : storageGetStr((mm + ".first_hop").c_str(), "");
     std::string rssi  = mid.empty() ? "" : storageGetStr((mm + ".rssi").c_str(), "");
     std::string snr   = mid.empty() ? "" : storageGetStr((mm + ".snr").c_str(), "");
-    bool haveMeta = !iface.empty() || hops >= 0 || !fhop.empty();
+    std::string rrssi = mid.empty() ? "" : storageGetStr((mm + ".remote_rssi").c_str(), "");
+    std::string rsnr  = mid.empty() ? "" : storageGetStr((mm + ".remote_snr").c_str(), "");
+    bool haveMeta = !iface.empty() || hops >= 0 || !fhop.empty() || !rrssi.empty();
 
     s_msgDetail = lv_obj_create(s_layer);
     lv_obj_remove_style_all(s_msgDetail);
@@ -2431,8 +2542,12 @@ void showMsgDetail(const std::string& mkey) {
         detailRow(body, "Hops", hops >= 0 ? std::to_string(hops) : std::string());
         bool direct = fhop.empty() || fhop.find_first_not_of('0') == std::string::npos;
         detailRow(body, "First hop", direct ? "direct (no transit node)" : groupHash(fhop));
-        if (!rssi.empty()) detailRow(body, "RSSI", rssi + " dBm");
-        if (!snr.empty())  detailRow(body, "SNR", snr + " dB");
+        if (!rssi.empty()) detailRow(body, in ? "RSSI" : "RSSI (proof)", rssi + " dBm");
+        if (!snr.empty())  detailRow(body, in ? "SNR"  : "SNR (proof)",  snr + " dB");
+        /* Remote reading: the peer's own rx of the message WE sent (rx-report
+         * proof); outbound only, and only when the peer is reticulous. */
+        if (!rrssi.empty()) detailRow(body, "Remote RSSI", rrssi + " dBm");
+        if (!rsnr.empty())  detailRow(body, "Remote SNR",  rsnr + " dB");
     } else {
         detailRow(body, "Routing", "not recorded (DIRECT/Resource, or pre-dating)");
     }
@@ -2558,6 +2673,15 @@ lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
     fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);   /* row → flex: [body][age] */
+
+    /* Per-contact signal bars, shown when we've seen this peer DIRECT (a
+     * lxmf.contactsig.<peer> record exists, i.e. a zero-hop radio packet). */
+    int cbars = signalBarsAt("lxmf.contactsig." + s.peer);
+    if (cbars > 0) {
+        lv_obj_t* sig = makeSignalBars(row);
+        lv_obj_set_style_pad_left(sig, 4, 0);
+        setSignalBars(sig, cbars);
+    }
 
     /* Unread badge: a blue pill with the count, between the age and the info
      * button. Blue background per design; absent when there's nothing unread. */
@@ -3188,7 +3312,7 @@ void onLayerDelete(lv_event_t*) {
      * then forget the list-row models (their widgets went with the layer). */
     cancelChunk(g_chunkC); cancelChunk(g_chunkM);
     g_rowsC.clear(); g_rowsM.clear();
-    s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
+    s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
     s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
@@ -3214,7 +3338,7 @@ void lxmfApp(void* arg) {
     g_threadLoadTimer = nullptr; g_stickyFadeTimer = nullptr; g_iconSettle = nullptr;   /* prior onLayerDelete freed them */
     g_needMsgLoad = false;
     g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
-    s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr;
+    s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
     s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
@@ -3365,4 +3489,25 @@ void LxmfApp::appInit() {
      * delivered there and may touch LVGL directly — and register here at init,
      * not in lxmfApp, so the trigger works even if LXMF was never opened. */
     lcdRun([](void*) { storageSubscribeChanges("lxmf.url_lcd", onLcdOpenUrl); });
+
+    /* Gateway/infrastructure signal bars in the system status bar (left of the
+     * battery), plus the subscriptions that keep the status bar, the open thread's
+     * header and the contact-list rows in step with the gw and per-contact signal
+     * records. Registered ON the lcd task so the callbacks may touch LVGL, and here
+     * at init (not in lxmfApp) so the status-bar bars work even if LXMF is never
+     * opened. The bars widget lives in the shell status bar and outlives every app
+     * layer, so it is never nulled by onLayerDelete. */
+    lcdRun([](void*) {
+        lv_obj_t* slot = lcdStatusbarAddIndicator();
+        s_gwBars = slot ? makeSignalBars(slot) : nullptr;
+        setSignalBars(s_gwBars, 0);                       /* hidden until a sample lands */
+        storageSubscribeChanges("rnsd.gw",         onSignalChange);
+        storageSubscribeChanges("lxmf.contactsig", onSignalChange);
+        gwSignalUpdate();
+        /* Drive the age-fade between packets: re-evaluate the gw bars' opacity
+         * every 20 s (≈90 steps across the 30-min fade), which also drops them
+         * once fully faded. Cheap; the storage callbacks handle value changes. */
+        lv_timer_create([](lv_timer_t*) { gwSignalUpdate(); updateThreadSignal(); },
+                        20000, nullptr);
+    });
 }

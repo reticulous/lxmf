@@ -213,7 +213,7 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
 | method | behaviour |
 | --- | --- |
 | `link-always` | always a Reticulum Link. |
-| `link-if-one-exists` *(default)* | ride a warm Link to the peer if one exists (our conversation Link or the peer's identified inbound backchannel), else opportunistic. |
+| `link-if-one-exists` *(default)* | ride our own warm conversation Link to the peer if one exists, else opportunistic. A peer's inbound Link into us never counts — we only ride Links we opened. |
 | `link-if-big` | opportunistic when the wire fits one packet, a Link only when it's oversize. |
 | `opportunistic-or-fail` | never a Link; oversize hard-fails with `last_error = "too large for opportunistic"`. |
 
@@ -363,7 +363,23 @@ lxmf.id.<n>.dest_hash            hex16 lxmf.delivery address
 lxmf.id.<n>.last_announce_s      unix seconds of last announce
 lxmf.id.<n>.stats.{sent,received,pending,failed}
 lxmf.announces.<dest_hex>        "<last_s>|<cost>|<hops>|<ratchet>|<name>"
+lxmf.msgmeta.<message_id>.{last,hops,first_hop,dir,iface,rssi,snr,remote_rssi,remote_snr}
+                                 per-message routing + radio-signal telemetry (RAM, browser-mirrored).
+                                 rssi/snr = our rx — of the message (inbound) or of its delivery proof
+                                 (outbound). remote_rssi/remote_snr = the peer's rx of an outbound
+                                 message we sent, from its rx-report proof (reticulous peers only).
+lxmf.contactsig.<peer>.{rssi,snr}   per-contact direct signal: our rx of the last zero-hop radio packet
+                                 from that peer; deleted when a relayed or non-radio packet supersedes it.
 ```
+
+**Signal display.** A received message shows either its radio signal (amber bars)
+when it reached us direct, or an "L" when it was relayed — never both. When a
+reticulous peer has reported its own rx of an outbound message (via the rx-report
+proof), the bars render as a two-set "valley" (remote descending, then local
+ascending). The contacts list and conversation header show the per-contact
+direct signal (`lxmf.contactsig.*`), the header falling back to the gateway
+signal (`rnsd.gw.*`) when there's no direct sample. The message-info page lists
+the numeric rssi/snr (and remote rssi/snr when present).
 
 ### Secrets
 

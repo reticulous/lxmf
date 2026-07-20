@@ -33,6 +33,7 @@
           <div class="mid">
             <div class="line1">
               <span class="name">{{ c.name }}</span>
+              <ContactSignal :peer="c.peer" />
               <span v-if="c.conv" class="time">{{ formatAge(c.conv.ts) }}</span>
             </div>
             <div class="line2">
@@ -72,6 +73,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import PeerAvatar from './PeerAvatar.vue'
+import ContactSignal from './ContactSignal.vue'
 import type { Conversation } from '../../modules/lxmf'
 
 const props = defineProps<{

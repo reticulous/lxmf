@@ -100,8 +100,12 @@ export interface Message {
   iface?: string       // beautified endpoint, e.g. "LoRa 869.475 …" / "tcp_out/host:port"
   hops?: number
   firstHop?: string    // RNS transport-node hash (64-hex), '' = direct
-  rssi?: number        // dBm, NaN/undefined if not a radio receive
+  rssi?: number        // dBm, NaN/undefined if not a radio receive (inbound: msg rx; outbound: proof rx)
   snr?: number         // dB, NaN/undefined if not a radio receive
+  // REMOTE reading: the peer's own rx of an outbound message we sent, reported in
+  // its rx-report delivery proof. Present only on outbound msgs to a reticulous peer.
+  remoteRssi?: number  // dBm
+  remoteSnr?: number   // dB
 }
 
 /* One record from the RAM-only lxmf.msgmeta store, keyed by message_id. */
@@ -113,6 +117,8 @@ export interface MsgMeta {
   iface: string
   rssi: string         // dBm as text, '' if not a radio receive
   snr: string          // dB as text, '' if not a radio receive
+  remoteRssi: string   // dBm as text, '' if the peer didn't report (non-reticulous)
+  remoteSnr: string    // dB as text, '' if the peer didn't report
 }
 
 export interface Conversation {
@@ -523,6 +529,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       iface: str(r.iface),
       rssi: str(r.rssi),
       snr: str(r.snr),
+      remoteRssi: str(r.remote_rssi),
+      remoteSnr: str(r.remote_snr),
     }
   }
 
@@ -647,6 +655,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
           m.iface = meta.iface; m.hops = meta.hops; m.firstHop = meta.firstHop
           if (meta.rssi !== '') m.rssi = parseFloat(meta.rssi)
           if (meta.snr !== '')  m.snr = parseFloat(meta.snr)
+          if (meta.remoteRssi !== '') m.remoteRssi = parseFloat(meta.remoteRssi)
+          if (meta.remoteSnr !== '')  m.remoteSnr = parseFloat(meta.remoteSnr)
         }
         return m
       })

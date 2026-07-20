@@ -14,11 +14,11 @@
       <div class="hero">
         <span class="dir" :class="m.dir">{{ m.dir === 'in' ? 'Incoming' : 'Outgoing' }}</span>
         <span class="status">{{ statusName }}</span>
-        <span v-if="lora" class="lora" :title="m.iface">
-          <span class="l">L</span>
-          <span v-if="bars" class="bars" :aria-label="`signal ${bars} of 4`">
-            <i v-for="n in 4" :key="n" :class="{ on: n <= bars }"></i>
-          </span>
+        <!-- Bars XOR "L": direct → signal bars (valley when the peer reported a
+             remote reading); relayed → "L". -->
+        <span v-if="lora && (relayed || bars || hasRemote)" class="lora" :title="m.iface">
+          <span v-if="relayed" class="l">L</span>
+          <SignalBars v-else :local="bars" :remote="hasRemote ? remoteBars : undefined" />
         </span>
       </div>
 
@@ -38,10 +38,18 @@
         <div class="k">First hop</div>
         <div class="v mono">{{ firstHop }}</div>
         <template v-if="meta.rssi">
-          <div class="k">RSSI</div><div class="v">{{ meta.rssi }} dBm</div>
+          <div class="k">{{ m.dir === 'in' ? 'RSSI' : 'RSSI (proof)' }}</div><div class="v">{{ meta.rssi }} dBm</div>
         </template>
         <template v-if="meta.snr">
-          <div class="k">SNR</div><div class="v">{{ meta.snr }} dB</div>
+          <div class="k">{{ m.dir === 'in' ? 'SNR' : 'SNR (proof)' }}</div><div class="v">{{ meta.snr }} dB</div>
+        </template>
+        <!-- Remote reading: the peer's own rx of the message we sent (rx-report
+             proof); outbound only, and only when the peer is reticulous. -->
+        <template v-if="meta.remoteRssi">
+          <div class="k">Remote RSSI</div><div class="v">{{ meta.remoteRssi }} dBm</div>
+        </template>
+        <template v-if="meta.remoteSnr">
+          <div class="k">Remote SNR</div><div class="v">{{ meta.remoteSnr }} dB</div>
         </template>
       </div>
       <div v-else class="sn small">No routing data recorded (DIRECT/Resource, or pre-dating this message).</div>
@@ -87,6 +95,7 @@
 import { computed, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
 import { type Message, type MsgMeta, lxmfStatusName, loraBars, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+import SignalBars from './SignalBars.vue'
 
 const props = defineProps<{
   m: Message
@@ -101,6 +110,16 @@ const bars = computed(() => loraBars(
   props.meta?.rssi ? parseFloat(props.meta.rssi) : undefined,
   props.meta?.snr  ? parseFloat(props.meta.snr)  : undefined,
 ))
+/* Remote reading (peer's rx of our outbound message, from an rx-report proof):
+ * the second, descending set of the valley. Present only for a reticulous peer. */
+const hasRemote = computed(() => !!(props.meta?.remoteRssi || props.meta?.remoteSnr))
+const remoteBars = computed(() => loraBars(
+  props.meta?.remoteRssi ? parseFloat(props.meta.remoteRssi) : undefined,
+  props.meta?.remoteSnr  ? parseFloat(props.meta.remoteSnr)  : undefined,
+))
+/* hops is the raw RNS count (1 = directly received, >1 = relayed): "L" for
+ * relayed, bars for direct. */
+const relayed = computed(() => (props.meta?.hops ?? props.m.hops ?? 0) > 1)
 
 const grouped = (hex: string) => (hex.match(/.{1,4}/g) ?? []).join(' ')
 
