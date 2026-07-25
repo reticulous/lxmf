@@ -20,7 +20,7 @@ requires:
   - reticulous/rns
 # The message-notification sound (s.lxmf.sound) plays through the optional
 # spangap/audio engine, but lxmf does NOT stage it — audio is board hardware,
-# staged by boards that have it (e.g. hw-tdeck additional-installs it). Every
+# staged by boards that have it (e.g. hw-lilygo-tdeck additional-installs it). Every
 # call site is gated on CONFIG_STRADDLE_AUDIO, so a build without audio still
 # links (just no notification sound) — that's how heltec/generic reticulous
 # builds stay audio-free while the T-Deck gets the ping.
