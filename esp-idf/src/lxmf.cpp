@@ -6847,6 +6847,59 @@ static const sdb_schema& lxmfContactSchemaV2a()
     return s;
 }
 
+/* The three contact layouts that a device could have written while the RLPG
+ * fields were being appended one at a time, before the self-describing on-disk
+ * descriptor existed: rlpg (hdr 125), + rlpg_svc (141), + rlpg_active (142). The
+ * final field (caps) makes the current hdr 143. Every RLPG field is appended, so
+ * these share the whole v2a fixed prefix and the auto-migrator (which maps by
+ * field name) lands each value in the current record and defaults the fields the
+ * file predates. Without these hints a descriptor-less contacts file at any of
+ * these sizes is an unknown (schema_id, hdr_size) and the loader starts it empty
+ * — i.e. silently drops the conversation directory. */
+static const sdb_schema& lxmfContactSchemaV2b()   /* + rlpg (hdr 125) */
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 2;
+        x.schema_ver = 2;
+        x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+         .u8("trust")
+         .data("hash", 16).data("pubkey", 64).data("rlpg", 16)
+         .text("display_name").text("nick").text("preview");
+        return x;
+    }();
+    return s;
+}
+static const sdb_schema& lxmfContactSchemaV2c()   /* + rlpg_svc (hdr 141) */
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 2;
+        x.schema_ver = 2;
+        x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+         .u8("trust")
+         .data("hash", 16).data("pubkey", 64).data("rlpg", 16).data("rlpg_svc", 16)
+         .text("display_name").text("nick").text("preview");
+        return x;
+    }();
+    return s;
+}
+static const sdb_schema& lxmfContactSchemaV2d()   /* + rlpg_active (hdr 142) */
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 2;
+        x.schema_ver = 2;
+        x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+         .u8("trust")
+         .data("hash", 16).data("pubkey", 64).data("rlpg", 16).data("rlpg_svc", 16)
+         .u8("rlpg_active")
+         .text("display_name").text("nick").text("preview");
+        return x;
+    }();
+    return s;
+}
+
 /* Register the retired on-disk layouts so the store's generic auto-migrator can
  * decode format_ver-1 files (which carry no embedded descriptor). Every layout
  * that may still be on flash needs an entry, keyed by (schema_id, hdr_size); the
@@ -6860,6 +6913,9 @@ static void lxmfRegisterLegacyLayouts()
     sdbRegisterLegacyLayout(&lxmfMsgSchemaV4a());       /* messages hdr 104 */
     sdbRegisterLegacyLayout(&lxmfContactSchemaV1());    /* contacts hdr 29  */
     sdbRegisterLegacyLayout(&lxmfContactSchemaV2a());   /* contacts hdr 109 */
+    sdbRegisterLegacyLayout(&lxmfContactSchemaV2b());   /* contacts hdr 125 */
+    sdbRegisterLegacyLayout(&lxmfContactSchemaV2c());   /* contacts hdr 141 */
+    sdbRegisterLegacyLayout(&lxmfContactSchemaV2d());   /* contacts hdr 142 */
 }
 
 /* Upgrade each identity's contact file to the current layout. Purely structural
