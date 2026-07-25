@@ -399,29 +399,43 @@ function rand4(): string {
  * write the var, nomad reacts. */
 const NOMAD_HASH_RE = /^[0-9a-f]{32}$/
 
-export interface MsgSegment { text: string; link: { hash: string; path: string } | null }
+export interface MsgSegment {
+  text: string
+  link: { hash: string; path: string } | null   // Nomad page link → nomad browser
+  web: string | null                             // http(s) URL → opens in a new tab
+}
 
-/** Split message content into plain-text runs and Nomad-link runs. A link is a
- *  32-hex node hash + ":" + a "/"-rooted page path. Trailing sentence
- *  punctuation is kept outside the link. */
+/** Split message content into plain-text runs, Nomad-link runs, and http(s)
+ *  web-link runs. A Nomad link is a 32-hex node hash + ":" + a "/"-rooted page
+ *  path; a web link is an http:// or https:// URL. Trailing sentence
+ *  punctuation is kept outside either link. */
 export function segmentMessage(content: string): MsgSegment[] {
-  const re = /([0-9a-fA-F]{32}):(\/\S+)/g
+  const re = /(https?:\/\/\S+)|([0-9a-fA-F]{32}):(\/\S+)/g
   const out: MsgSegment[] = []
+  const trailing = /[.,;:!?)\]}'"]+$/
   let last = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(content))) {
-    // Don't match inside a longer hex run (e.g. a 64-hex id).
-    if (m.index > 0 && /[0-9a-fA-F]/.test(content[m.index - 1]!)) continue
-    const path = m[2]!.replace(/[.,;:!?)\]}'"]+$/, '')
-    if (!path) continue
-    const start = m.index
-    const end = start + 33 + path.length          // 32 hex + ':' + path
-    if (start > last) out.push({ text: content.slice(last, start), link: null })
-    out.push({ text: content.slice(start, end), link: { hash: m[1]!.toLowerCase(), path } })
+    let end: number, seg: MsgSegment
+    if (m[1]) {                                   // http(s) URL
+      const url = m[1].replace(trailing, '')
+      if (!url) continue
+      end = m.index + url.length
+      seg = { text: url, link: null, web: url }
+    } else {                                      // Nomad page link
+      // Don't match inside a longer hex run (e.g. a 64-hex id).
+      if (m.index > 0 && /[0-9a-fA-F]/.test(content[m.index - 1]!)) continue
+      const path = m[3]!.replace(trailing, '')
+      if (!path) continue
+      end = m.index + 33 + path.length            // 32 hex + ':' + path
+      seg = { text: content.slice(m.index, end), link: { hash: m[2]!.toLowerCase(), path }, web: null }
+    }
+    if (m.index > last) out.push({ text: content.slice(last, m.index), link: null, web: null })
+    out.push(seg)
     last = end
     re.lastIndex = end
   }
-  if (last < content.length) out.push({ text: content.slice(last), link: null })
+  if (last < content.length) out.push({ text: content.slice(last), link: null, web: null })
   return out
 }
 

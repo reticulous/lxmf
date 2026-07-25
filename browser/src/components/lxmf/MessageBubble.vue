@@ -29,6 +29,9 @@
       <div class="content"><template v-for="(seg, i) in segments" :key="i"><a
           v-if="seg.link" class="nomad-link"
           @click.stop="openNomad(seg.link.hash, seg.link.path)"
+        >{{ seg.text }}</a><a
+          v-else-if="seg.web" class="nomad-link"
+          :href="seg.web" target="_blank" rel="noopener noreferrer" @click.stop
         >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></div>
 
       <!-- meta: ALL-CAPS status name (outbound, left, smaller) · time · glyph.
