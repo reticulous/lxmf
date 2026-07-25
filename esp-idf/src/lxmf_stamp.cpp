@@ -177,12 +177,15 @@ struct Yielder {
 constexpr int    WORKBLOCK_EXPAND_ROUNDS = 3000;
 constexpr size_t WORKBLOCK_LEN = (size_t)WORKBLOCK_EXPAND_ROUNDS * 256;
 
-/* Expand message_id into the 768 KB workblock (caller frees with gp_free).
- * Yields ~every 500 ms — this build is the bulk of the ~4 s. */
-uint8_t* build_workblock(const uint8_t message_id[32], Yielder& y)
+/* Absorb the workblock expansion of message_id straight into `s` — the
+ * rounds are derived independently (message_id + round index) and hashed
+ * strictly in order, so the 768 KB block never needs to exist in memory:
+ * each 256-byte round goes through a stack buffer into the running hash.
+ * The workblock's only consumers are SHA-256 passes (the validation
+ * digest and the generation midstate), both sequential. Yields ~every
+ * 500 ms — this expansion is the bulk of the ~4 s. */
+void absorbWorkblock(Sha256& s, const uint8_t message_id[32], Yielder& y)
 {
-    uint8_t* wb = (uint8_t*)gp_alloc(WORKBLOCK_LEN);
-    if (!wb) return nullptr;
     for (int n = 0; n < WORKBLOCK_EXPAND_ROUNDS; ++n) {
         uint8_t pb[3];
         size_t  pbl = packb_uint(n, pb);
@@ -192,10 +195,11 @@ uint8_t* build_workblock(const uint8_t message_id[32], Yielder& y)
         std::memcpy(saltbuf + 32, pb, pbl);
         uint8_t salt[32];
         sha256(saltbuf, 32 + pbl, salt);
-        hkdf256(message_id, 32, salt, 32, wb + (size_t)n * 256);
+        uint8_t chunk[256];
+        hkdf256(message_id, 32, salt, 32, chunk);
+        sha256_update(s, chunk, sizeof(chunk));
         y.tick();
     }
-    return wb;
 }
 
 /* True iff `digest` (big-endian 256-bit) <= 2^(256 - cost), matching the
@@ -220,15 +224,12 @@ bool lxmfStampValid(const uint8_t message_id[32], int target_cost,
     if (!stamp || stamp_len == 0) return false;
     Yielder y{yield, now_ms, 0};
     y.reset();
-    uint8_t* wb = build_workblock(message_id, y);
-    if (!wb) return false;
     Sha256 s;
     sha256_init(s);
-    sha256_update(s, wb, WORKBLOCK_LEN);
+    absorbWorkblock(s, message_id, y);
     sha256_update(s, stamp, stamp_len);
     uint8_t d[32];
     sha256_final(s, d);
-    gp_free(wb);
     return hash_meets_cost(d, target_cost);
 }
 
@@ -239,16 +240,12 @@ bool lxmfStampGenerate(const uint8_t message_id[32], int target_cost,
     if (target_cost <= 0) return false;
     Yielder y{yield, now_ms, 0};
     y.reset();
-    uint8_t* wb = build_workblock(message_id, y);
-    if (!wb) return false;
-
-    /* Absorb the whole (block-aligned) workblock once; `base` now holds
-     * the midstate with an empty buffer. Each attempt clones it and
+    /* Absorb the (block-aligned) workblock once; `base` then holds the
+     * midstate with an empty buffer. Each attempt clones it and
      * compresses only the final block holding the 32-byte stamp. */
     Sha256 base;
     sha256_init(base);
-    sha256_update(base, wb, WORKBLOCK_LEN);
-    gp_free(wb);
+    absorbWorkblock(base, message_id, y);
 
     uint8_t  stamp[LXMF_STAMP_LEN] = {0};
     uint64_t counter = 0;
