@@ -33,6 +33,19 @@
         </button>
       </div>
 
+      <!-- RLPG: what the peer's announces told us — capability first, then the
+           stored mailbox dest (line omitted while none is known). -->
+      <div class="sect">Accepts long messages (double-encrypted)</div>
+      <div class="capval">{{ capsText }}</div>
+
+      <template v-if="mailbox">
+        <div class="sect">RLPG mailbox</div>
+        <div class="addr" title="Peer has an RLPG store-and-forward mailbox">
+          <span class="mbicon"><RlpgIcon /></span>
+          <span class="addrhex">{{ groupedRlpg }}</span>
+        </div>
+      </template>
+
       <template v-if="ratchet">
         <div class="sect">Ratchet</div>
         <div class="sn small">{{ ratchet }}</div>
@@ -50,7 +63,8 @@ import { computed, ref } from 'vue'
 import { matArrowBack, matVerifiedUser, matContentCopy, matCheck }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
-import type { Contact, Reachability } from '../../modules/lxmf'
+import RlpgIcon from './RlpgIcon.vue'
+import { hasRlpg, type Contact, type Reachability } from '../../modules/lxmf'
 
 const props = defineProps<{
   peer: string
@@ -65,6 +79,14 @@ const emit = defineEmits<{
 }>()
 
 const verified = computed(() => (props.contact?.trust ?? 0) >= 1)
+const mailbox = computed(() => hasRlpg(props.contact?.rlpg ?? ''))
+
+/* caps bit0 = the peer accepts double-encrypted payloads; -1 (no caps leaf on
+ * the contact record — pre-caps peer or no announce yet) = unknown. */
+const capsText = computed(() => {
+  const caps = props.contact?.caps ?? -1
+  return caps < 0 ? 'unknown' : (caps & 1) ? 'yes' : 'no'
+})
 
 const copied = ref(false)
 let copiedTimer: ReturnType<typeof setTimeout> | undefined
@@ -77,6 +99,8 @@ async function copyHash() {
 
 const groupedHash = computed(() =>
   (props.peer.match(/.{1,4}/g) ?? []).join(' '))
+const groupedRlpg = computed(() =>
+  ((props.contact?.rlpg ?? '').match(/.{1,4}/g) ?? []).join(' '))
 
 const reachLine = computed(() => {
   const r = props.reach
@@ -110,6 +134,8 @@ const reachLine = computed(() => {
   color: #6fb98f; font-size: calc(12px * var(--rfs, 1));
 }
 .unverified { color: #888; font-size: calc(12px * var(--rfs, 1)); }
+.capval { color: #b8c0b8; font-size: calc(13px * var(--rfs, 1)); }
+.mbicon { flex: none; display: inline-flex; color: #8a93a0; }
 .reach { text-align: center; color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); margin-bottom: 12px; }
 .sect {
   color: #aaa; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase;

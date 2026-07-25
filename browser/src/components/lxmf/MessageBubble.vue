@@ -32,16 +32,24 @@
         >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></div>
 
       <!-- meta: ALL-CAPS status name (outbound, left, smaller) · time · glyph.
-           glyph: … in flight · ✓✓ delivered (green) · ✕ cancelled (grey) /
-           gave-up tries==255 (red). -->
+           glyph: … in flight · ✓✓ delivered (green) · ✓ at a mailbox (grey,
+           REMOTE/OUR_RLPG) · ✕ cancelled (grey) / gave-up tries==255 (red). -->
       <div class="meta">
         <span v-if="m.dir === 'out' && m.status !== LxmfStatus.Delivered"
               class="statusName">{{ statusName }}</span>
         <span class="time">{{ clock }}</span>
         <template v-if="m.dir === 'out'">
-          <span v-if="m.status === LxmfStatus.Delivered" class="chip ok"
+          <span v-if="m.status === LxmfStatus.Delivered" class="chip ticks"
                 title="delivered — cryptographic proof received">
-            <q-icon :name="matDoneAll" size="15px" />
+            <DeliveryTicks variant="delivered" />
+          </span>
+          <!-- Parked at a mailbox (own/remote RLPG): one open circle + check —
+               reached a mailbox, awaiting pickup. Before the gave-up test,
+               since these carry tries==255. FULL/ERR/EXPIRED fall through ✕. -->
+          <span v-else-if="m.status === LxmfStatus.RemoteRlpg ||
+                           m.status === LxmfStatus.OurRlpg" class="chip ticks"
+                title="stored at a mailbox — awaiting pickup">
+            <DeliveryTicks variant="sent" />
           </span>
           <span v-else-if="m.status === LxmfStatus.Cancelled" class="chip">
             <q-icon :name="matClose" size="15px" />
@@ -66,8 +74,9 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { matDoneAll, matClose, matMoreVert, matDelete }
+import { matClose, matMoreVert, matDelete }
   from '@quasar/extras/material-icons'
+import DeliveryTicks from './DeliveryTicks.vue'
 import { type Message, segmentMessage, openNomad, formatMsgTime,
          lxmfStatusName, loraBars, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 import SignalBars from './SignalBars.vue'
@@ -182,6 +191,9 @@ const loraTitle = computed(() => {
 .chip { display: inline-flex; align-items: center; color: #8a93a0; }
 .chip.ok  { color: #4abf6a; }
 .chip.bad { color: #d9534f; }
+/* delivery ticks inherit the bubble's own text colour (white on the blue
+   outbound bubble); the glyph occludes itself with the bubble background. */
+.chip.ticks { color: inherit; }
 .chip.dots { font-weight: 700; line-height: 1; }
 .bubble { cursor: pointer; }
 /* LoRa indicator — message travelled a LoRa interface. Deliberately quiet: a

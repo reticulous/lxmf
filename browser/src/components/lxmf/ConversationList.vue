@@ -33,6 +33,7 @@
           <div class="mid">
             <div class="line1">
               <span class="name">{{ c.name }}</span>
+              <span v-if="c.rlpg" class="rlpg" title="Peer has an RLPG mailbox"><RlpgIcon /></span>
               <ContactSignal :peer="c.peer" />
               <span v-if="c.conv" class="time">{{ formatAge(c.conv.ts) }}</span>
             </div>
@@ -74,11 +75,12 @@
 import { computed, ref } from 'vue'
 import PeerAvatar from './PeerAvatar.vue'
 import ContactSignal from './ContactSignal.vue'
+import RlpgIcon from './RlpgIcon.vue'
 import type { Conversation } from '../../modules/lxmf'
 
 const props = defineProps<{
   conversations: Conversation[]
-  directory: { peer: string; name: string; known: boolean }[]
+  directory: { peer: string; name: string; known: boolean; rlpg: boolean }[]
   activePeer: string
 }>()
 const emit = defineEmits<{ 'open-peer': [peer: string] }>()
@@ -166,6 +168,7 @@ function formatAge(epochSecs: number): string {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .time { color: #888; font-size: calc(11px * var(--rfs, 1)); flex: none; }
+.rlpg { color: #8a93a0; flex: none; display: inline-flex; align-self: center; }
 .preview {
   flex: 1; min-width: 0; color: #9a9a9a; font-size: calc(12px * var(--rfs, 1));
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

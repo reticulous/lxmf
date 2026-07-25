@@ -16,8 +16,10 @@ import { ref, reactive, computed, watch,
 import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useMenuStore } from 'spangap-browser/stores/menu'
 import LxmfPanel from '../panels/LxmfPanel.vue'
+import RlpgStatus from '../panels/RlpgStatus.vue'
 import { registerApp } from 'spangap-browser/lib/apps'
 import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
+import { registerTopbarIcon } from 'spangap-browser/lib/topbarIcons'
 /* Import cycle with the wrapper panel (it reads the per-identity records and
  * useLxmf from here) — benign: both sides only touch the other's bindings
  * from inside functions, never at module-eval time. */
@@ -76,6 +78,13 @@ export enum LxmfStatus {
   LinkOpenFail = 19, ResMalloc = 20, ResSend = 21, LinkSendDrop = 22,
   PacketSendDrop = 23, ResTransfer = 24, LinkFail = 25, LinkClosed = 26,
   Unknown = 27, NoResponse = 28,
+  /* RLPG mailbox states (tries 255 yet still movable by RLPG service msgs:
+   * OurRlpg → RemoteRlpg → Delivered). */
+  RemoteRlpg = 29, OurRlpg = 30, RemoteRlpgFull = 31, RemoteRlpgErr = 32,
+  RlpgExpired = 33,
+  /* Send failed while the local LoRa radio was shedding frames to channel
+   * contention — the own channel is jammed, not the peer silent. */
+  RadioBusy = 34,
 }
 /* tries === 255 is the one definitive terminal marker (gave up). */
 export const LXMF_TRIES_GAVEUP = 255
@@ -145,6 +154,8 @@ export interface Contact {
   nick: string
   trust: number
   lastSeen: number
+  rlpg: string         // peer's RLPG mailbox dest (32-hex); '' / all-zero = none known
+  caps: number         // announce capability bits (bit0 = accepts double-encrypted payloads); -1 = leaf absent (unknown)
 }
 
 export interface Announce {
@@ -185,6 +196,12 @@ export function peerAvatar(peer: string, name: string): { hue: number; glyph: st
 function num(v: unknown, d = 0): number { const n = Number(v); return Number.isFinite(n) ? n : d }
 function str(v: unknown): string { return v == null ? '' : String(v) }
 
+/** True when a stored `rlpg` value names a real mailbox — non-empty and not
+ *  the all-zero placeholder. */
+export function hasRlpg(rlpg: string): boolean {
+  return /[1-9a-f]/i.test(rlpg)
+}
+
 /* status code → its ALL-CAPS enum name for display. The only direction needed —
  * a stored code is never parsed back from text.
  * MIRROR: keep in sync with lxmfStatusName in lxmf.h (same names, same numbers). */
@@ -205,6 +222,11 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.ResTransfer]: 'RES_TRANSFER', [LxmfStatus.LinkFail]: 'LINK_FAIL',
   [LxmfStatus.LinkClosed]: 'LINK_CLOSED', [LxmfStatus.Unknown]: 'UNKNOWN',
   [LxmfStatus.NoResponse]: 'NO_RESPONSE',
+  [LxmfStatus.RemoteRlpg]: 'REMOTE_RLPG', [LxmfStatus.OurRlpg]: 'OUR_RLPG',
+  [LxmfStatus.RemoteRlpgFull]: 'REMOTE_RLPG_FULL',
+  [LxmfStatus.RemoteRlpgErr]: 'REMOTE_RLPG_ERR',
+  [LxmfStatus.RlpgExpired]: 'RLPG_EXPIRED',
+  [LxmfStatus.RadioBusy]: 'RADIO_BUSY',
 }
 export function lxmfStatusName(status: number): string {
   return STATUS_NAME[status] ?? ''
@@ -261,6 +283,14 @@ export function formatMsgTime(ts: number): string {
   if (!ts) return ''
   const fmt = str(useDeviceStore().get('s.lxmf.msg_time_format')) || '%H:%M'
   return strftime(new Date(ts * 1000), fmt)
+}
+
+/* Format an RLPG certificate expiry (unix seconds) as a local date + time —
+ * a cert validity is days/weeks out, so it needs the date, not just the clock
+ * formatMsgTime uses. Never a raw epoch. 0 / unset → "—". */
+export function formatCertExpiry(ts: number): string {
+  if (!ts) return '—'
+  return strftime(new Date(ts * 1000), '%Y-%m-%d %H:%M')
 }
 
 /* ── Per-sentinel command queues (§3.2) ─────────────────────────────────
@@ -415,7 +445,7 @@ export interface UseLxmf {
   activeConversation: ComputedRef<{ day: string; messages: Message[] }[]>
   contacts: ComputedRef<Record<string, Contact>>
   announces: ComputedRef<Announce[]>
-  peerDirectory: ComputedRef<{ peer: string; name: string; known: boolean }[]>
+  peerDirectory: ComputedRef<{ peer: string; name: string; known: boolean; rlpg: boolean }[]>
   unreadTotal: ComputedRef<number>
   displayName: (peer: string) => string
   reachability: (peer: string) => Reachability | null
@@ -545,6 +575,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         nick: str(c.nick),
         trust: num(c.trust),
         lastSeen: num(c.last_seen),
+        rlpg: str(c.rlpg),
+        caps: num(c.caps, -1),   // mirrored as a decimal string like trust; an absent leaf stays -1 (unknown)
       }
     }
     return out
@@ -677,15 +709,15 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
 
   const peerDirectory = computed(() => {
     const seen = new Set<string>()
-    const rows: { peer: string; name: string; known: boolean }[] = []
+    const rows: { peer: string; name: string; known: boolean; rlpg: boolean }[] = []
     for (const c of Object.values(contacts.value)) {
       seen.add(c.peer)
-      rows.push({ peer: c.peer, name: displayName(c.peer), known: true })
+      rows.push({ peer: c.peer, name: displayName(c.peer), known: true, rlpg: hasRlpg(c.rlpg) })
     }
     for (const a of announces.value) {
       if (seen.has(a.hash)) continue
       seen.add(a.hash)
-      rows.push({ peer: a.hash, name: displayName(a.hash), known: false })
+      rows.push({ peer: a.hash, name: displayName(a.hash), known: false, rlpg: false })
     }
     return rows
   })
@@ -844,6 +876,10 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
 export function registerLxmf() {
   const menu = useMenuStore()
   const lx = useLxmf()
+
+  /* Own-mailbox state in the app header: the selected identity's RLPG
+   * store-and-forward mailbox connection (hidden while none is configured). */
+  registerTopbarIcon({ id: 'lxmf-rlpg', component: RlpgStatus })
 
   /* A contact tapped in the nomad web browser arrives as `lxmf.url_web`
    * (written by the nomad module). Bring the right identity's Messages window
