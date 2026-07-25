@@ -6,6 +6,7 @@ idf_component_register(
     SRCS
         "src/lxmf.cpp"
         "src/lxmf_stamp.cpp"
+        "src/rlpg_wire.cpp"
         ${SPANGAP_CONDITIONAL_SRCS}
     INCLUDE_DIRS "include" ${SPANGAP_CONDITIONAL_INCLUDE_DIRS}
     REQUIRES

@@ -14,6 +14,7 @@
  */
 #include "lxmf.h"
 #include "lxmf_stamp.h"
+#include "rlpg_wire.h"
 #include "mem.h"
 #include "storage.h"
 #include "storage_db.h"
@@ -39,6 +40,7 @@
 #include <memory>
 #include <algorithm>
 #include <array>
+#include <map>
 #include <unordered_map>
 
 static const char* TAG = "lxmf";
@@ -66,6 +68,25 @@ constexpr size_t LXMF_OVERHEAD      = LXMF_DEST_HASH_LEN * 2 + LXMF_SIG_LEN;  /*
  * this, or Packet::pack() throws on the MTU check (surfacing as a
  * spurious "evicted"). Derived from MTU=500: ((464-48-32)/16)*16-1. */
 constexpr size_t LXMF_OPP_PAYLOAD_MAX = 383;
+
+/* Announce app_data element [2] capability bitfield — a 16-bit (two-byte)
+ * field, emitted as a msgpack uint16 so there is headroom well past the first
+ * byte for future flags. Parsers read it width-agnostically (any msgpack uint),
+ * so widening the field is interop-safe with peers that emitted a narrower one.
+ *
+ * bit0 LXMF_ANN_CAP_DOUBLE_ENC: a link/resource payload to this destination may
+ *   be a destination-encrypted envelope blob (mR Identity token) instead of
+ *   plaintext LXMF wire — the receiver decrypts with its identity and re-enters
+ *   the normal inbound pipeline.
+ * bit1 LXMF_ANN_CAP_RX_REPORT: this node accepts the extended delivery proof
+ *   that carries the prover's rx rssi/snr (Packet::prove_report), so a sender
+ *   learns how well it was heard. A peer only appends its rx signal to a proof
+ *   for us because we advertised this; we accept and process rx reports from
+ *   anyone regardless. rnsd owns the proof path, so lxmf pushes each peer's
+ *   advertised value to it via rnsdSetRxReportCap.
+ * Both are always advertised by this implementation. */
+constexpr uint16_t LXMF_ANN_CAP_DOUBLE_ENC = 0x0001;
+constexpr uint16_t LXMF_ANN_CAP_RX_REPORT  = 0x0002;
 
 /* Max concurrent LXMF identities. Schema is an array (id.<n>). */
 #define LXMF_MAX_IDENTITIES 4
@@ -101,6 +122,12 @@ enum : int {
     LXMF_FIELD_RENDERER         = 0x0F,
     LXMF_FIELD_REPLY_TO         = 0x30,   /* Bytes, full LXMessage.hash of the replied-to message */
     LXMF_FIELD_REPLY_QUOTE      = 0x31,   /* Bytes, quoted content (UTF-8) */
+    /* Reticulous-custom, in the private 0x30+ block (reference LXMF uses
+     * 0x01..0x0F and 0xFB..0xFF, so this can't collide). Value = the 32-byte
+     * message_id the recipient just picked up from an RLPG mailbox — a
+     * field-only, content-free message to the original sender that settles
+     * the matching parked outbound to DELIVERED. Never itself confirmed. */
+    LXMF_FIELD_RLPG_DELIVERY    = 0x32,
 };
 
 /* ─────────────── state ─────────────── */
@@ -142,6 +169,26 @@ struct outbound_t {
     uint32_t    proof_deadline_s;       /* unix s */
     int         proof_base_proven;      /* tx_proven at send time */
     int         proof_base_timeouts;    /* proof_timeouts at send time */
+
+    /* REQUESTING_PATH events for this send with no PATH_KNOWN in between.
+     * rnsd emits one per park (initial no-path, and a re-park when the
+     * found path lacks a recallable identity); its path-retry ladder
+     * signals RETRY auxes instead. When the peer has a stored mailbox, a
+     * second park — or a second ladder retry — cancels the rnsd send and
+     * hands the message to RLPG (see applyOutStatus). */
+    uint8_t     path_reqs;
+
+    /* Unix s the slot went in flight. Mailbox-known peers get a wall-
+     * clock budget for the whole direct attempt (path search, egress,
+     * proof wait); the 1 Hz pass preempts the send into RLPG when it is
+     * spent (see resolveDirectSends). */
+    uint32_t    started_s;
+
+    /* Summed lora.<n>.stats.tx_dropped at send setup. Growth by settle
+     * time means the local radio shed frames to channel contention while
+     * this send was in flight — the failure then labels the jammed
+     * channel (RADIO_BUSY), not the peer (see radioBusyOr). */
+    uint32_t    tx_drops_base;
 };
 
 /* A received LXM we can't verify yet because the sender's identity
@@ -216,12 +263,50 @@ static void unsubscribePerIdCmds(int n);
 /* Inbound pipeline + the pending-verification drain. onAnnounceFromRnsd
  * (defined above onInboundLxm) calls the drain; both run on the lxmf
  * task only. */
+/* rlpg_pickup: this wire came off an RLPG mailbox pickup, so a newly-stored
+ * content message earns a delivery confirmation back to its sender. */
 static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
-                         const rx_meta_t* meta = nullptr);
+                         const rx_meta_t* meta = nullptr,
+                         bool rlpg_pickup = false);
 static void recordOutLinkMeta(lxmf_id_t& id, const std::string& peer_hex,
                               const std::string& msg_key, const std::string& tag);
 static void drainPendingVerify(lxmf_id_t& id, const uint8_t* sender_hash);
 static void drainAllPendingVerify(lxmf_id_t& id);
+
+/* RLPG client (section below the inbound-DIRECT handlers). rlpgTryPark is
+ * the delivery-failure hook: instead of settling NO_RESPONSE / NO_ROUTE it
+ * tries the peer's mailbox (or the own-node relay); returns true iff RLPG
+ * took custody or settled the message itself (the relay queue refuses an
+ * oversize wire to a non-capable recipient as TOO_LARGE) — either way the
+ * caller skips its msgFail. */
+static bool rlpgTryPark(lxmf_id_t& id, const std::string& peer_hex,
+                        const std::string& mid, uint8_t fail_status);
+/* Recipient-sourced delivery confirmation. SendDeliveryConfirm emits a
+ * field-only LXMF message to the sender naming the just-picked-up
+ * message_id. ConsumeDeliveryConfirm settles our matching parked outbound
+ * (REMOTE_RLPG/OUR_RLPG/..._FULL/..._ERR) to DELIVERED. ApplyRelayStatus
+ * moves a parked message per an own-node RLPG_FR_RELAY_STATUS frame. */
+static void rlpgSendDeliveryConfirm(lxmf_id_t& id, const uint8_t peer_dh[LXMF_DEST_HASH_LEN],
+                                    const std::string& mid_hex);
+static void rlpgConsumeDeliveryConfirm(lxmf_id_t& id, const std::string& src_hex,
+                                       const std::string& confirmed_mid);
+static void rlpgApplyRelayStatus(lxmf_id_t& id, const std::string& hash_hex, uint8_t code);
+/* Contact mailbox policy (defined with the RLPG client). HasMailbox: the
+ * contact record holds a verified non-zero `rlpg` dest. PeerActive: that
+ * plus `rlpg_active` — mail currently flows via the mailbox, direct sends
+ * get exactly one attempt. DirectDelivered clears `rlpg_active` on a
+ * direct (non-mailbox) delivery proof. */
+static bool rlpgContactHasMailbox(int n, const std::string& peer_hex);
+static bool rlpgPeerActive(int n, const std::string& peer_hex);
+static void rlpgDirectDelivered(int n, const std::string& peer_hex);
+/* PreemptOutbound: park an IN-FLIGHT send into RLPG custody and cancel it
+ * rnsd-side (slot freed, message not marked cancelled). FailToMailbox:
+ * gate for terminal-failure settles — true iff the peer has a stored
+ * mailbox and RLPG took custody, in which case the caller skips its
+ * msgFail. */
+static bool rlpgPreemptOutbound(lxmf_id_t& id, outbound_t& o, uint8_t fail_status);
+static bool rlpgFailToMailbox(lxmf_id_t& id, const std::string& peer_hex,
+                              const std::string& mid, uint8_t fail_status);
 
 /* ─────────────── small helpers ─────────────── */
 
@@ -244,6 +329,31 @@ static std::string secretsPath(int n, const char* tail)
     char buf[80];
     snprintf(buf, sizeof(buf), "secrets.lxmf.id.%d%s%s", n, *tail ? "." : "", tail);
     return buf;
+}
+
+/* Summed LoRa LBT drop counters across the radio slots
+ * (lora.<n>.stats.tx_dropped, absent = 0; the lora task mirrors each
+ * increment at drop time). Snapshot at send setup, compared at settle. */
+static uint32_t loraTxDroppedSum(void)
+{
+    uint32_t s = 0;
+    for (int i = 0; i < 4; ++i) {
+        char k[40];
+        snprintf(k, sizeof(k), "lora.%d.stats.tx_dropped", i);
+        s += (uint32_t)storageGetInt(k, 0);
+    }
+    return s;
+}
+
+/* NO_RESPONSE / NO_ROUTE vs RADIO_BUSY: when the local LoRa radio shed
+ * frames to channel contention during this send, the failure names the
+ * jammed channel, not the peer. Used both as the terminal msgFail reason
+ * and as the fail_status handed to the RLPG park path (which surfaces it
+ * only if the park itself fails). */
+static uint8_t radioBusyOr(const outbound_t& o, uint8_t fallback)
+{
+    return loraTxDroppedSum() > o.tx_drops_base ? (uint8_t)LXMF_ST_RADIO_BUSY
+                                                : fallback;
 }
 
 /* Write an int key only when the value actually changes. storageSet fires change
@@ -305,6 +415,8 @@ struct OutboxWire { std::vector<uint8_t> wire; std::string msg_id_hex; uint64_t 
 static std::unordered_map<std::string, OutboxWire> g_wireOutbox;
 static std::string outboxKey(const std::string& peer, const std::string& mid) { return peer + "/" + mid; }
 
+static uint64_t nowUnixMs();                                     /* fwd */
+
 /* Set a message's unified status (u8 record field), overwritten in place. The
  * cached wire is kept through the delivery-proof window (AWAITING_PROOF) so a
  * timeout retry can resend the identical bytes — same message_id (the recipient
@@ -314,7 +426,15 @@ static std::string outboxKey(const std::string& peer, const std::string& mid) { 
 static void msgSetStatus(int n, const std::string& peer, const std::string& mid,
                          uint8_t status)
 {
-    storageSet(msgPath(n, peer, mid, "status").c_str(), (int)status);
+    if (status == LXMF_ST_DELIVERED) {
+        storageBegin();
+        storageSet(msgPath(n, peer, mid, "status").c_str(), (int)status);
+        storageSet(msgPath(n, peer, mid, "delivered_ts").c_str(),
+                   (int)(nowUnixMs() / 1000));
+        storageEnd();
+    } else {
+        storageSet(msgPath(n, peer, mid, "status").c_str(), (int)status);
+    }
     if (status == LXMF_ST_DELIVERED || status == LXMF_ST_CANCELLED)
         g_wireOutbox.erase(outboxKey(peer, mid));
 }
@@ -379,7 +499,12 @@ static const sdb_schema& lxmfMsgSchema()
                             * anchor for date separators; `ts` is the sender's clock */
          .fixstr("dir", 4).fixstr("method", 16)
          .u32("ts")
+         .u32("delivered_ts") /* unix s the delivery proof (or an RLPG service
+                               * message) settled DELIVERED; 0 = not delivered */
          .data("message_id", 32).data("reply_to", 32)
+         .data("rlpg_tid", 32) /* transient id (SHA-256 of the deposited
+                                * envelope ciphertext) of this outbound
+                                * message's RLPG copy; all-zero = none */
          .text("title").text("content");
         return x;
     }();
@@ -398,8 +523,9 @@ static const sdb_schema& lxmfMsgSchema()
  * raw 64-byte DATA `pubkey` (the contact's RNS identity public key, X25519||Ed25519).
  * Persisting the pubkey lets link initiation survive reboot / identity-cache
  * eviction: on comms-initiate we re-feed it to Identity::remember() when the RAM
- * cache has dropped it. all-zero pubkey = not yet learned. The hdr_size change
- * trips the header check; lxmfMigrateContacts() rewrites older files first. */
+ * cache has dropped it. all-zero pubkey = not yet learned. Older files upgrade
+ * automatically — the generic auto-migrator decodes them via the registered v1
+ * hint layout and re-packs them in this layout. */
 static const sdb_schema& lxmfContactSchema()
 {
     static const sdb_schema s = [] {
@@ -409,6 +535,17 @@ static const sdb_schema& lxmfContactSchema()
         x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
          .u8("trust")
          .data("hash", 16).data("pubkey", 64)
+         .data("rlpg", 16)     /* the contact's rlpg.mailbox dest, cert-verified
+                                * at deposit HELLO; all-zero = none known */
+         .data("rlpg_svc", 16) /* that mailbox's service-identity lxmf.delivery
+                                * dest (from the same verified cert) — the
+                                * trusted source for its status receipts */
+         .u8("rlpg_active")    /* 1 = mail for this peer currently flows via
+                                * their mailbox: one direct attempt, then
+                                * deposit; cleared by a direct delivery proof */
+         .u8("caps")           /* announce caps bitfield (bit0 = accepts
+                                * double-encrypted payloads), persisted from
+                                * the last announce that carried one */
          .text("display_name").text("nick").text("preview");
         return x;
     }();
@@ -427,7 +564,15 @@ static const sdb_schema& lxmfAnnounceSchema()
         sdb_schema x;
         x.schema_id = 3;
         x.schema_ver = 2;
-        x.u32("last").u8("hops").fixstr("cost", 6).data("ratchet", 32).text("name");
+        x.u32("last").u8("hops").fixstr("cost", 6).data("ratchet", 32)
+         /* announce app_data element [2]: the announcer's rlpg.mailbox
+          * dest hash; all-zero = none advertised */
+         .data("rlpg", 16)
+         /* announce app_data element [3]: capability bitfield (bit0 =
+          * accepts double-encrypted payloads); fixstr so the -1
+          * "unknown" sentinel round-trips like `cost` */
+         .fixstr("caps", 4)
+         .text("name");
         return x;
     }();
     return s;
@@ -438,6 +583,35 @@ static std::string contactPath(int n, const std::string& peer_hex, const char* f
     char buf[120];
     snprintf(buf, sizeof(buf), "s.lxmf.id.%d.contacts.%s.%s", n, peer_hex.c_str(), field);
     return buf;
+}
+
+static bool hexToBytes(const char* hex, size_t hex_len,
+                       uint8_t* out, size_t out_len);   /* fwd */
+
+/* Does this contact advertise the rx-report capability (announce caps bit1)?
+ * Read from the persisted contact record first, then the RAM-only announce
+ * catalogue — so a peer heard announcing *before* it became a contact (the
+ * first-message case, where the announce updated the catalogue but not yet any
+ * contact record) is still classified correctly. */
+static bool lxmfContactRxReportCapable(int n, const std::string& peer_hex)
+{
+    if (storageGetInt(contactPath(n, peer_hex, "caps").c_str(), 0)
+        & LXMF_ANN_CAP_RX_REPORT) return true;
+    int ac = std::atoi(storageGetStr(
+        ("lxmf.announces." + peer_hex + ".caps").c_str(), "-1").c_str());
+    return ac > 0 && (ac & LXMF_ANN_CAP_RX_REPORT);
+}
+
+/* Push a contact's rx-report capability to rnsd, which appends our rx signal to
+ * delivery proofs only for peers known to accept it. rnsd's cap table tracks
+ * contacts, and this is its single live write path: called when a contact is
+ * created and whenever its announce is (re)heard, so a contact that gains or
+ * drops bit1 stays in sync (the value is pushed either way). */
+static void lxmfPushRxReportCap(int n, const std::string& peer_hex)
+{
+    uint8_t dh[16];
+    if (!hexToBytes(peer_hex.c_str(), peer_hex.size(), dh, 16)) return;
+    rnsdSetRxReportCap(dh, lxmfContactRxReportCapable(n, peer_hex));
 }
 
 /* Per-message routing telemetry: interface, RNS first-hop transport node, and
@@ -925,6 +1099,16 @@ static void mpPackInt(std::vector<uint8_t>& out, int v)
     }
 }
 
+/* Always emit a msgpack uint16 (0xCD hi lo), even for small values — used for
+ * the two-byte announce caps field so the full 16-bit width is on the wire
+ * regardless of which bits are set. */
+static void mpPackU16(std::vector<uint8_t>& out, uint16_t v)
+{
+    out.push_back(0xCD);
+    out.push_back((uint8_t)((v >> 8) & 0xFF));
+    out.push_back((uint8_t)( v       & 0xFF));
+}
+
 static void mpPackBinHeader(std::vector<uint8_t>& out, size_t len)
 {
     if (len <= 0xFF)   { out.push_back(0xC4); out.push_back((uint8_t)len); return; }
@@ -1101,6 +1285,11 @@ struct LxmfAnnounceInfo {
     std::string name;          /* utf-8 display name, possibly empty */
     int         stamp_cost;    /* -1 = unknown */
     std::string ratchet_hex;   /* empty if not present */
+    std::string rlpg_hex;      /* element [2]: 32-hex rlpg.mailbox dest hash of
+                                * the announcer's RLPG mailbox node; empty if none */
+    int         caps;          /* element [2]: capability bitfield, -1 = unknown.
+                                * bit0 = accepts double-encrypted payloads,
+                                * bit1 = accepts rx-report proofs */
 };
 
 /* LXMF announce app_data shapes seen in the wild (LXMF reference 0.9.8):
@@ -1111,11 +1300,22 @@ struct LxmfAnnounceInfo {
  *   [d] 32B ratchet || raw_utf8_name                       (very old)
  *   [e] raw_utf8_name                                      (very old)
  *
- * Try strict-msgpack forms first; fall back to raw-bytes name. */
+ * Reticulous peers extend [b] positionally (array-length-as-version):
+ *
+ *   [f] msgpack([name_bin_or_nil, stamp_cost, caps_uint,
+ *                rlpg_mailbox_bin16_or_nil])
+ *
+ * Element [2] is the caps bitfield (bit0 = accepts double-encrypted
+ * payloads, bit1 = accepts rx-report proofs); element [3] is the announcer's
+ * RLPG mailbox dest (nil when none is configured). Try strict-msgpack forms
+ * first; fall back to
+ * raw-bytes name — and once a name has parsed from the array, later
+ * malformed elements never demote to that fallback. */
 static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
 {
     LxmfAnnounceInfo info;
     info.stamp_cost = -1;
+    info.caps       = -1;
 
     if (!p || n == 0) return info;
 
@@ -1140,6 +1340,24 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
         if (cnt >= 2) {
             uint64_t cost = 0;
             if (mpReadUint(s, cost)) info.stamp_cost = (int)cost;
+        }
+        /* From here on the name is banked — every path returns true, so a
+         * malformed tail can never demote the announce to the raw-name
+         * heuristic (which would lose the parsed name). */
+        if (cnt >= 3) {
+            /* [2]: capability bitfield (uint). */
+            uint64_t caps = 0;
+            if (mpReadUint(s, caps)) info.caps = (int)caps;
+            else if (!mpScanNext(s)) return true;
+        }
+        if (cnt >= 4) {
+            /* [3]: RLPG mailbox destination hash (bin 16) or nil. */
+            if (s.i < s.n && p[s.i] == 0xC0) { ++s.i; }
+            else {
+                std::string rb;
+                if (mpReadStrOrBin(s, rb) && rb.size() == 16)
+                    info.rlpg_hex = bytesToHex((const uint8_t*)rb.data(), 16);
+            }
         }
         return true;
     };
@@ -1180,6 +1398,8 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
 struct LxmFields {
     std::string reply_to;      /* hex64 hash of the replied-to message, empty if not a reply */
     std::string ticket;        /* raw msgpack value of FIELD_TICKET, empty if none */
+    std::string rlpg_delivery; /* hex64 message_id this message confirms delivery of
+                                * (FIELD_RLPG_DELIVERY), empty if not a confirmation */
     /* Future: telemetry, attachments, etc. */
 };
 
@@ -1216,7 +1436,8 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
     /* [3] fields — map of int → value. Only emit non-empty entries, so a
      * normal (non-reply) message carries no reply field at all. */
     size_t field_count = 0;
-    if (!fields.reply_to.empty()) field_count++;
+    if (!fields.reply_to.empty())      field_count++;
+    if (!fields.rlpg_delivery.empty()) field_count++;
     mpPackMapHeader(out, field_count);
     if (!fields.reply_to.empty()) {
         mpPackInt(out, LXMF_FIELD_REPLY_TO);
@@ -1227,6 +1448,19 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
             for (int k = 0; k < 32; ++k) {
                 unsigned x = 0;
                 std::sscanf(fields.reply_to.c_str() + 2*k, "%2x", &x);
+                raw[k] = (uint8_t)x;
+            }
+        }
+        mpPackBin(out, raw, sizeof(raw));
+    }
+    if (!fields.rlpg_delivery.empty()) {
+        mpPackInt(out, LXMF_FIELD_RLPG_DELIVERY);
+        /* The confirmed message_id as raw 32 B (stored hex64 here). */
+        uint8_t raw[32] = {};
+        if (fields.rlpg_delivery.size() == 64) {
+            for (int k = 0; k < 32; ++k) {
+                unsigned x = 0;
+                std::sscanf(fields.rlpg_delivery.c_str() + 2*k, "%2x", &x);
                 raw[k] = (uint8_t)x;
             }
         }
@@ -1308,6 +1542,15 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
                 for (int j = 0; j < 32; ++j)
                     std::snprintf(hex + 2*j, 3, "%02x", (uint8_t)raw[j]);
                 fields_out->reply_to.assign(hex, 64);
+            }
+        } else if (key == LXMF_FIELD_RLPG_DELIVERY) {
+            std::string raw;
+            if (!mpReadStrOrBin(s, raw)) { if (!mpScanNext(s)) return false; continue; }
+            if (raw.size() == 32 && fields_out) {
+                char hex[65];
+                for (int j = 0; j < 32; ++j)
+                    std::snprintf(hex + 2*j, 3, "%02x", (uint8_t)raw[j]);
+                fields_out->rlpg_delivery.assign(hex, 64);
             }
         } else if (key == LXMF_FIELD_TICKET) {
             /* Capture the raw msgpack value span regardless of its shape
@@ -1609,6 +1852,13 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     LxmfAnnounceInfo info = parseLxmfAnnounce(app_data, app_len);
     std::string dh_hex = bytesToHex(dh, LXMF_DEST_HASH_LEN);
 
+    /* When the array parse yields no name/cost the raw bytes are the only
+     * way to tell an emit-side shape change from a receive-side mangle —
+     * dump them so a "name went blank" hunt has ground truth. */
+    if (info.name.empty() && info.stamp_cost < 0)
+        dbg("announces: %s unparsed app_data (%zu B) %s", dh_hex.c_str(),
+            app_len, bytesToHex(app_data, app_len).c_str());
+
     std::string base = "lxmf.announces." + dh_hex;
 
     /* Write the record's fields. The RAM-only store self-caps
@@ -1616,13 +1866,16 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
      * oldest-inserted record; a re-announce from an existing dest mutates
      * last/hops/cost in place — no new record, no eviction, no scan. `cost` is a
      * fixstr so the -1 "unknown" sentinel round-trips. */
-    char cbuf[8];
+    char cbuf[8], capsbuf[8];
     std::snprintf(cbuf, sizeof(cbuf), "%d", info.stamp_cost);
+    std::snprintf(capsbuf, sizeof(capsbuf), "%d", info.caps);
     storageBegin();
     storageSet((base + ".last").c_str(), (int)(nowUnixMs() / 1000));
     storageSet((base + ".hops").c_str(), hops);
     storageSet((base + ".cost").c_str(), cbuf);
+    storageSet((base + ".caps").c_str(), capsbuf);
     if (!info.ratchet_hex.empty()) storageSet((base + ".ratchet").c_str(), info.ratchet_hex.c_str());
+    if (!info.rlpg_hex.empty())    storageSet((base + ".rlpg").c_str(),    info.rlpg_hex.c_str());
     if (!info.name.empty())        storageSet((base + ".name").c_str(),    info.name.c_str());
     storageEnd();
 
@@ -1635,14 +1888,34 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
      * unknown-sender drop is what triggered this re-announce). Also land
      * the announced name in every slot's contact record: the announce is
      * authoritative for display_name, and the catalogue copy above is
-     * RAM-only, so this write is what makes the name reboot-durable.
-     * Unconditional on purpose — storage no-ops identical values. */
+     * RAM-only, so this write is what makes the name reboot-durable. */
     for (auto& id : s_ids) {
         if (!id.used) continue;
         drainPendingVerify(id, dh);
         if (storageExists(contactPath(id.index, dh_hex, "hash").c_str())) {
-            storageSet(contactPath(id.index, dh_hex, "display_name").c_str(),
-                       info.name.c_str());
+            /* A stored name is never cleared: an empty parse (nameless
+             * announce, or one we failed to decode) keeps the last known
+             * name rather than demoting the contact to a hex hash. */
+            if (!info.name.empty())
+                storageSet(contactPath(id.index, dh_hex, "display_name").c_str(),
+                           info.name.c_str());
+            /* Persist advertised capabilities (announce catalogue is
+             * RAM-only). Written only when the announce carried a caps
+             * element, so a legacy announce never wipes a known value.
+             * Refresh rnsd's rx-report cap for this contact from the update —
+             * this is where a contact that gained (or dropped) bit1 takes
+             * effect for the proofs we emit to them. */
+            if (info.caps >= 0) {
+                setIntIfChanged(contactPath(id.index, dh_hex, "caps"), info.caps);
+                lxmfPushRxReportCap(id.index, dh_hex);
+            }
+            /* The mailbox binding rides the owner-signed announce — persist
+             * it so the contact shows its mailbox without waiting for a
+             * first deposit. Never cleared here: absence in one announce
+             * doesn't revoke a known mailbox (certs expire on their own). */
+            if (!info.rlpg_hex.empty())
+                storageSet(contactPath(id.index, dh_hex, "rlpg").c_str(),
+                           info.rlpg_hex.c_str());
             /* The announce just (re)cached this identity's public key in rnsd —
              * persist it into the contact record now. This is the "first time we
              * see the identity" fill: it is what puts a pubkey on contacts that
@@ -1933,8 +2206,24 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
      * toggle. */
     int cost = storageGetInt("s.lxmf.stamp_cost", 8);
 
+    /* Element [2]: the rlpg.mailbox destination hash of this identity's
+     * own RLPG mailbox node (s.lxmf.id.<n>.rlpg_node, 32-hex — what
+     * `rlpg create` prints), nil when none is configured. Element [3]:
+     * the two-byte caps bitfield — bit0 (accepts double-encrypted payloads)
+     * and bit1 (accepts rx-report proofs) are always set, so the array is
+     * always 4 elements and [2] must stay positional (hence the nil). Appending
+     * array elements is
+     * interop-safe — the reference helpers and parseLxmfAnnounce read
+     * [0]/[1] and ignore extras (array-length-as-version, exactly how
+     * stamp_cost itself was added). Because announces are
+     * identity-signed, [2] is an owner-signed mailbox binding refreshed
+     * on every announce. */
+    std::string rn = storageGetStr(idPath(id_n, "rlpg_node").c_str(), "");
+    uint8_t rlpg[16];
+    bool have_rlpg = hexToBytes(rn.c_str(), rn.size(), rlpg, 16);
+
     std::vector<uint8_t> out;
-    mpPackArrayHeader(out, 2);
+    mpPackArrayHeader(out, 4);
     /* Display name goes out as msgpack BIN, not str: LXMF's
      * display_name_from_app_data does dn.decode("utf-8") on the unpacked
      * value, which only works when it unpacks to Python bytes. A str
@@ -1943,6 +2232,11 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
     if (name.empty()) out.push_back(0xC0 /* nil */);
     else              mpPackBin(out, reinterpret_cast<const uint8_t*>(name.data()), name.size());
     mpPackInt(out, cost);
+    /* [2] caps, [3] mailbox — caps first so it is present even for
+     * identities with no mailbox. Emitted as a two-byte uint16. */
+    mpPackU16(out, LXMF_ANN_CAP_DOUBLE_ENC | LXMF_ANN_CAP_RX_REPORT);
+    if (have_rlpg) mpPackBin(out, rlpg, 16);
+    else           out.push_back(0xC0 /* nil */);
     return out;
 }
 
@@ -1979,7 +2273,7 @@ static void sendAnnounce(lxmf_id_t& id)
                (int)(nowUnixMs() / 1000));
     id.last_announce_tick = xTaskGetTickCount();
     if (id.last_announce_tick == 0) id.last_announce_tick = 1;  /* 0 means "never" */
-    /* Pretty-print the app_data we just built: name + cost (the [b] shape
+    /* Pretty-print the app_data we just built: name + cost (the [f] shape
      * from parseLxmfAnnounce). rnsd will log the wire contents too, but
      * showing it here keeps each line self-contained for debugging. */
     std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
@@ -2228,6 +2522,9 @@ static bool tryDeliveryRetry(lxmf_id_t& id, outbound_t& o, uint32_t now_s)
     const std::string peer_hex = o.peer;
     const std::string mid      = o.msg_key;
 
+    if (rlpgPeerActive(id.index, peer_hex))
+        return false;    /* mailbox-active peer: one direct attempt only —
+                          * the caller's park path deposits instead */
     if (storageGetInt(msgPath(id.index, peer_hex, mid, "tries").c_str(), 0) != 0)
         return false;                                 /* one retry per message */
     if (destRetriedRecently(peer_hex, now_s)) return false;
@@ -2302,6 +2599,9 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         if (!nm.empty())
             storageSet(contactPath(id.index, peer_hex, "display_name").c_str(), nm.c_str());
         storageEnd();
+        /* New contact → add it to rnsd's rx-report cap table, classified from
+         * any announce we've already heard (the catalogue). */
+        lxmfPushRxReportCap(id.index, peer_hex);
     }
 
     if (!idEnabled(id.index)) {
@@ -2444,6 +2744,9 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     o->proof_deadline_s    = 0;
     o->proof_base_proven   = 0;
     o->proof_base_timeouts = 0;
+    o->path_reqs           = 0;
+    o->started_s           = (uint32_t)(nowUnixMs() / 1000);
+    o->tx_drops_base       = loraTxDroppedSum();
 
     /* Persist firmware-owned fields ONCE, on the first pack — the wire itself
      * stays in the RAM outbox, never the store. A resend skips this so the
@@ -2476,7 +2779,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         convlink_t* cl = convGet(id, peer_hex, dh);
         if (!cl) {
             o->used = false;
-            msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_OPEN_FAIL);
+            if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_LINK_OPEN_FAIL))
+                msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_OPEN_FAIL);
             return;
         }
         const std::string ltag    = cl->tag;
@@ -2499,7 +2803,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             void* rbuf = gp_alloc(wire.size());
             if (!rbuf) {
                 o->used = false;
-                msgFail(id.index, peer_hex, mid, LXMF_ST_RES_MALLOC);
+                if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_RES_MALLOC))
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_RES_MALLOC);
                 return;
             }
             memcpy(rbuf, wire.data(), wire.size());
@@ -2508,7 +2813,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             if (!rnsdLinkSendResource(ltag.c_str(), rbuf, wire.size(), o->send_id)) {
                 convDrop(*cl);
                 o->used = false;
-                msgFail(id.index, peer_hex, mid, LXMF_ST_RES_SEND);
+                if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_RES_SEND))
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_RES_SEND);
                 return;
             }
         } else {
@@ -2516,7 +2822,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             if (itsSend(lhandle, wire.data(), wire.size(), 0) == 0) {
                 convDrop(*cl);
                 o->used = false;
-                msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_SEND_DROP);
+                if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_LINK_SEND_DROP))
+                    msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_SEND_DROP);
                 return;
             }
         }
@@ -2560,7 +2867,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
     if (!sendFrame(id, frame.data(), frame.size())) {
         o->used = false;
-        msgFail(id.index, peer_hex, mid, LXMF_ST_PACKET_SEND_DROP);
+        if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_PACKET_SEND_DROP))
+            msgFail(id.index, peer_hex, mid, LXMF_ST_PACKET_SEND_DROP);
         return;
     }
     storageBegin();
@@ -2607,7 +2915,7 @@ static void dedupAdd(const std::string& mid_hex)
 }
 
 static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
-                         const rx_meta_t* meta)
+                         const rx_meta_t* meta, bool rlpg_pickup)
 {
     if (!idEnabled(id.index)) {
         dbg("id %d: inbound LXM dropped (identity disabled)", id.index);
@@ -2703,6 +3011,27 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
         return;
     }
 
+    /* Parse payload (before the stamp gate so a delivery confirmation —
+     * a tiny unstamped control message — is recognized and exempted). */
+    uint64_t    ts = 0;
+    std::string title, content;
+    LxmFields   fields;
+    if (!lxmParsePayload(packed, packed_n,
+                         &ts, &title, &content, &fields)) {
+        warn("id %d: inbound LXM payload malformed", id.index);
+        return;
+    }
+
+    /* Recipient-sourced delivery confirmation: a field-only message (no
+     * title/content) carrying the message_id the sender just picked up from
+     * a mailbox. Settle our matching parked outbound → DELIVERED; never
+     * stored, sounded, stamp-gated, or itself confirmed (it has no content,
+     * so the pickup-confirm path can't fire for it — no loop). */
+    if (!fields.rlpg_delivery.empty() && title.empty() && content.empty()) {
+        rlpgConsumeDeliveryConfirm(id, sh_hex, fields.rlpg_delivery);
+        return;
+    }
+
     /* Stamp handling. When enforcing (s.lxmf.enforce_stamps), verify the
      * PoW against the cost we advertise (s.lxmf.stamp_cost), log the
      * result, and drop on failure. Validation rebuilds the 768 KB
@@ -2728,16 +3057,6 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
     } else if (!stamp_bytes.empty()) {
         info("id %d: inbound stamp present (%zuB, unverified) from=%s mid=%s",
              id.index, stamp_bytes.size(), sh_hex.c_str(), mid_hex.c_str());
-    }
-
-    /* Parse payload. */
-    uint64_t    ts = 0;
-    std::string title, content;
-    LxmFields   fields;
-    if (!lxmParsePayload(packed, packed_n,
-                         &ts, &title, &content, &fields)) {
-        warn("id %d: inbound LXM payload malformed", id.index);
-        return;
     }
 
     /* Log any LXMF ticket the sender handed us. We don't cache or use it
@@ -2771,6 +3090,9 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
         std::string peer_name = bestHeardName(sh_hex);
         if (!peer_name.empty())
             storageSet(contactPath(id.index, sh_hex, "display_name").c_str(), peer_name.c_str());
+        /* New contact → add it to rnsd's rx-report cap table, classified from
+         * any announce we've already heard (the catalogue). */
+        lxmfPushRxReportCap(id.index, sh_hex);
     }
     /* Floor to the whole minute and write only when it advances: contacts then
      * all age in lockstep, and a burst of messages within a minute doesn't
@@ -2800,6 +3122,12 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
     info("id %d: recv mid=%s from=%s len=%zuB title=\"%s\"",
          id.index, mid_hex.c_str(), sh_hex.c_str(), n,
          sanitizeForLog(title).c_str());
+
+    /* Off an RLPG pickup: confirm delivery end-to-end to the sender so its
+     * parked copy advances to DELIVERED. Only newly-stored content messages
+     * reach here (dups and confirmations returned earlier — no loop). */
+    if (rlpg_pickup)
+        rlpgSendDeliveryConfirm(id, sh, mid_hex);
 
     lxmfNotifySound();
 
@@ -2926,6 +3254,7 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         case RNSD_DEST_STATUS_DELIVERED:
             status_code = LXMF_ST_DELIVERED; gaveup = false;
             if (!was_awaiting) id.sent++;
+            rlpgDirectDelivered(id.index, peer_hex);
             /* Signal on the proof: local = our rx of the proof packet, remote =
              * the peer's rx of the message we sent (rx-report). Attach to the
              * outbound message's msgmeta (keyed by its message_id hash). */
@@ -2936,15 +3265,22 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
                                    meta->have_remote, meta->remote_rssi, meta->remote_snr10);
             }
             break;
-        case RNSD_DEST_STATUS_PROOF_TIMEOUT:
+        case RNSD_DEST_STATUS_PROOF_TIMEOUT: {
             /* Egressed opportunistically (no link) and no delivery proof came
-             * back. The retry above was declined (throttled / already retried),
-             * so settle terminal as NO_RESPONSE — without a link we can't tell a
-             * lost proof from an offline peer. */
-            status_code = LXMF_ST_NO_RESPONSE;
+             * back. The retry above was declined (throttled / already retried).
+             * The peer may simply be offline — or the own radio shed frames to
+             * contention (RADIO_BUSY). Try their RLPG mailbox (or the own-node
+             * relay) before giving up; on takeover the deposit session settles
+             * the status. */
+            uint8_t fs = radioBusyOr(*o, LXMF_ST_NO_RESPONSE);
+            if (rlpgTryPark(id, peer_hex, mid, fs)) return;
+            /* No mailbox path either — settle terminal: without a link we
+             * can't tell a lost proof from an offline peer. */
+            status_code = fs;
             if (was_awaiting) { if (id.sent) id.sent--; }
             id.failed++;
             break;
+        }
         case RNSD_DEST_STATUS_CANCELLED:
             status_code = LXMF_ST_CANCELLED; gaveup = false;
             if (!was_awaiting) id.failed++;
@@ -2952,6 +3288,8 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         case RNSD_DEST_STATUS_EVICTED:
             status_code = LXMF_ST_EVICTED;  id.failed++; break;
         case RNSD_DEST_STATUS_FAILED:
+            /* No route to the peer — the mailbox path may still be routable. */
+            if (rlpgTryPark(id, peer_hex, mid, LXMF_ST_NO_ROUTE)) return;
             status_code = LXMF_ST_NO_ROUTE; id.failed++; break;
         case RNSD_DEST_STATUS_TOO_LARGE:
             status_code = LXMF_ST_TOO_LARGE; id.failed++; break;
@@ -2984,8 +3322,23 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
     if (!o) return;
     uint8_t st = 0;   /* 0 = informational only, leave the status unchanged */
     switch (type) {
-        case RNSD_DEST_AUX_REQUESTING_PATH:   st = LXMF_ST_REQUESTING_PATH; break;
-        case RNSD_DEST_AUX_PATH_KNOWN:        st = LXMF_ST_SENDING;         break;
+        case RNSD_DEST_AUX_REQUESTING_PATH:
+            /* rnsd emits this once per park: the initial no-path park,
+             * and a re-park when the found path lacks a recallable
+             * identity. A second park for a mailbox-known peer means the
+             * peer is not currently routable — hand the message to RLPG
+             * (the wall-clock budget in resolveDirectSends is the
+             * backstop for the common single-park case). */
+            if (++o->path_reqs >= 2 &&
+                rlpgContactHasMailbox(id.index, o->peer) &&
+                rlpgPreemptOutbound(id, *o, radioBusyOr(*o, LXMF_ST_NO_ROUTE))) {
+                dbg("id %d: msg %s path-park-capped → rlpg (send_id=%u)",
+                    id.index, o->msg_key.c_str(), (unsigned)send_id);
+                return;
+            }
+            st = LXMF_ST_REQUESTING_PATH; break;
+        case RNSD_DEST_AUX_PATH_KNOWN:        o->path_reqs = 0;
+                                              st = LXMF_ST_SENDING;         break;
         case RNSD_DEST_AUX_EGRESS_QUEUED:     st = LXMF_ST_SENDING;         break;
         case RNSD_DEST_AUX_LINK_ESTABLISHING: st = LXMF_ST_SENDING;         break;
         case RNSD_DEST_AUX_PATH_LOST:         st = LXMF_ST_REQUESTING_PATH; break;
@@ -3016,6 +3369,15 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
                        (int)LXMF_ST_REQUESTING_PATH);
             storageSet(msgPath(id.index, o->peer, o->msg_key, "tries").c_str(), (int)tries);
             storageEnd();
+            /* RETRY auxes are the per-send heartbeat while path-parked
+             * (never egressed). Two ladder retries (~40 s) with no path
+             * and a stored mailbox → the message goes to RLPG; the
+             * wall-clock budget in resolveDirectSends stays the primary
+             * bound. */
+            if (tries >= 2 && rlpgContactHasMailbox(id.index, o->peer) &&
+                rlpgPreemptOutbound(id, *o, radioBusyOr(*o, LXMF_ST_NO_ROUTE)))
+                dbg("id %d: msg %s path-retry-capped → rlpg (send_id=%u)",
+                    id.index, o->msg_key.c_str(), (unsigned)send_id);
             return;
         }
         default: break;
@@ -3181,6 +3543,48 @@ static int onLinkInboxConnect(int handle, const void* data, size_t len)
     return (int)(slot - s_inlinks);
 }
 
+/* Double-encrypted delivery (announce caps bit0): a link/resource payload
+ * whose leading 16 bytes name NO loaded delivery dest may be a
+ * destination-encrypted envelope blob (mR Identity token, the exact bytes
+ * an RLPG node holds) rather than plaintext LXMF wire. Try every loaded
+ * identity; when a decrypt yields a plaintext that leads with that
+ * identity's dest hash, feed it through the normal inbound pipeline.
+ * Returns true iff the payload was consumed as an envelope; false leaves
+ * the caller's existing handling (warn/drop) untouched. The scratch is a
+ * single payload-sized heap block, freed before return; payloads beyond
+ * s.lxmf.max_resource_size are refused outright. */
+static bool tryDoubleEncrypted(const uint8_t* payload, size_t n,
+                               const rx_meta_t* meta)
+{
+    /* A valid token can't be smaller than its overhead plus the minimum
+     * LXMF wire it must contain. */
+    if (n < LXMF_OVERHEAD + 48) return false;
+    if (n > (size_t)storageGetInt("s.lxmf.max_resource_size", 262144))
+        return false;
+    for (const auto& id : s_ids)
+        if (id.used && std::memcmp(payload, id.dest_hash,
+                                   LXMF_DEST_HASH_LEN) == 0)
+            return false;              /* plaintext wire for us — not an envelope */
+    uint8_t* pt = (uint8_t*)gp_alloc(n);
+    if (!pt) return false;
+    for (auto& id : s_ids) {
+        if (!id.used) continue;
+        size_t pt_len = n;
+        if (!rnsdDecryptSelf(id.identity_key.c_str(), payload, n, pt, &pt_len))
+            continue;
+        if (pt_len < LXMF_OVERHEAD ||
+            std::memcmp(pt, id.dest_hash, LXMF_DEST_HASH_LEN) != 0)
+            continue;                  /* decrypted, but not an LXM for this dest */
+        info("id %d: double-encrypted envelope %zuB → %zuB wire", id.index,
+             n, pt_len);
+        onInboundLxm(id, pt, pt_len, meta);
+        gp_free(pt);
+        return true;
+    }
+    gp_free(pt);
+    return false;
+}
+
 static void onLinkInboxRecv(int handle, size_t /*bytesAvail*/)
 {
     inlink_t* s = inlinkByHandle(handle);
@@ -3202,6 +3606,7 @@ static void onLinkInboxRecv(int handle, size_t /*bytesAvail*/)
     rx_meta_t m;
     size_t h = parseRxMeta(buf, n, m);
     if (h == 0) { warn("id %d: inbound Link frame short (%zu)", id.index, n); return; }
+    if (tryDoubleEncrypted(buf + h, n - h, &m)) return;
     onInboundLxm(id, buf + h, n - h, &m);
 }
 
@@ -3214,6 +3619,1177 @@ static void onLinkInboxDisconnect(int ref)
     s.used = false;
     s.handle = -1;
     s.tag.clear();
+}
+
+/* ─────────────── RLPG client ───────────────
+ *
+ * The mailbox side of LXMF delivery (rlpg_wire.h; the node lives in the
+ * rlpg straddle). Two roles on the same "rlpg.mailbox" aspect:
+ *
+ *  depositor — when a send would settle NO_RESPONSE / NO_ROUTE and the
+ *    peer has a certified mailbox (contact record → announce catalogue →
+ *    RAM hint map), a short-lived link deposits the destination-encrypted
+ *    wire there instead; the DEPOSIT_ACK parks the message REMOTE_RLPG
+ *    (tries = 255, but movable — a later service receipt advances it).
+ *  owner — a persistent link to this identity's OWN mailbox
+ *    (s.lxmf.id.<n>.rlpg_node): AUTH over the HELLO nonce, cert
+ *    issue/renewal, held-mail pickup (decrypt → onInboundLxm → RX_PROOF),
+ *    and the OUTBOUND relay queue for messages with no reachable remote
+ *    mailbox.
+ *
+ * Envelope blobs are mR Identity tokens: rnsdEncryptFor(peer_pubkey,
+ * full_lxmf_wire); transient_id = SHA-256 of the ciphertext, recorded in
+ * the message's rlpg_tid field so receipts can be matched back. All state
+ * is plain statics touched only on the lxmf task. */
+
+#define LXMF_RLPG_DEP_SESSIONS  3     /* concurrent deposit links */
+#define LXMF_RLPG_PKT_MAX       360   /* frame bytes that ride one link packet;
+                                       * larger goes as a Resource */
+#define LXMF_RLPG_SESSION_TTL_S 60    /* deposit link with no HELLO/ack → reap */
+#define LXMF_RLPG_OWN_BACKOFF_S 60    /* own-node reconnect cadence */
+#define LXMF_RLPG_RELAYQ_MAX    8     /* RAM relay queue bound */
+#define LXMF_RLPG_RELAY_TTL_S   300   /* queued relay unacked past this → fail */
+#define LXMF_RLPG_RELAY_PK_TRIES 30   /* peer-pubkey recall retries (1 Hz) */
+/* Same-instance mailboxes: an RNS link never loops back to a destination
+ * this instance hosts, so deposits to a co-resident rlpg slot go over a
+ * plain ITS connection to the rlpg task instead (its local-deposit port;
+ * frames verbatim — no HELLO, no telemetry header). */
+#define LXMF_RLPG_LOCAL_PORT    112
+#define LXMF_RLPG_LOCAL_MAX     (66 * 1024)
+
+/* Mailbox routing hints from rlpg.mailbox announces: served lxmf dest
+ * (hex) → mailbox dest. RAM-only, a hint — trust is the cert at HELLO. */
+struct rlpg_hint_t { uint8_t mailbox[16]; uint32_t last_s; };
+static std::map<std::string, rlpg_hint_t> s_rlpgHints;
+static int s_rlpg_ann_handle = -1;
+
+/* Resource opaque ids for RLPG sends start above the uint16 send_id space
+ * so onResourceAux's outbox matching can never collide with them. */
+static uint32_t s_rlpgOpaque = 0x10000;
+static uint16_t s_rlpgTagSeq = 0;
+
+/* Deposit session: one message per link, torn down after the ack. */
+struct rlpg_dep_t {
+    bool        used = false;
+    int         handle = -1;
+    int         id_index = -1;
+    std::string peer;             /* recipient lxmf dest, 32-hex */
+    std::string mid;              /* message key in that conversation */
+    uint8_t     mailbox[16] = {};
+    std::string tag;
+    uint8_t     fail_status = LXMF_ST_NO_RESPONSE;  /* the settle this path preempted */
+    bool        local = false;    /* same-instance mailbox: plain ITS, no
+                                   * HELLO, frames carry no telemetry header */
+    bool        hello_seen = false;
+    bool        sent = false;     /* DEPOSIT egressed, awaiting the ack */
+    uint32_t    started_s = 0;
+};
+static rlpg_dep_t s_rlpgDeps[LXMF_RLPG_DEP_SESSIONS];
+
+/* Own-node (owner) session, one per identity slot. */
+struct rlpg_own_t {
+    int         handle = -1;
+    uint8_t     mailbox[16] = {};
+    std::string tag;
+    bool        hello_seen = false;
+    bool        authed = false;   /* AUTH sent — the node streams held mail
+                                   * and accepts OUTBOUND from here on */
+    uint32_t    next_try_s = 0;   /* reconnect backoff (monotonic s) */
+};
+static rlpg_own_t s_rlpgOwn[LXMF_MAX_IDENTITIES];
+
+/* Outbound-relay queue: messages awaiting hand-off to the own node. The
+ * ciphertext is encrypted once and kept so a resend after a link drop
+ * carries identical bytes — same transient id, true DUPLICATE at the node. */
+struct rlpg_relay_t {
+    int         id_index;
+    std::string peer, mid;
+    uint8_t     fail_status;
+    std::vector<uint8_t> ct;      /* cached envelope ciphertext (empty until built) */
+    int         pk_tries = 0;     /* peer-pubkey recall attempts */
+    bool        sent = false;     /* OUTBOUND egressed, awaiting the ack */
+    uint32_t    deadline_s = 0;
+};
+static std::vector<rlpg_relay_t> s_rlpgRelayQ;
+
+/* Token walker twin of the CLI's collectTokens — that one's statics belong
+ * to the cli task; these are lxmf-task-only. */
+static std::vector<std::string>* s_rlpgTokOut = nullptr;
+static size_t                    s_rlpgTokPfxLen = 0;
+static void rlpgTokLeaf(const char* key, const char* /*val*/)
+{
+    if (!s_rlpgTokOut) return;
+    const char* tail = key + s_rlpgTokPfxLen;
+    const char* dot  = std::strchr(tail, '.');
+    if (!dot) return;
+    std::string t(tail, dot - tail);
+    for (const auto& e : *s_rlpgTokOut) if (e == t) return;
+    s_rlpgTokOut->push_back(std::move(t));
+}
+static std::vector<std::string> rlpgTokens(const std::string& prefix)
+{
+    std::vector<std::string> out;
+    s_rlpgTokOut    = &out;
+    s_rlpgTokPfxLen = prefix.size();
+    storageForEach(prefix.c_str(), rlpgTokLeaf);
+    s_rlpgTokOut = nullptr;
+    return out;
+}
+
+/* Parked settle: status + tries=255 as one atomic transition. 255 stops the
+ * retry machinery, but unlike msgFail this is custody, not surrender — a
+ * later mailbox receipt moves the status again. The cached wire is kept
+ * only while the own-node relay may still need it. */
+static void rlpgPark(int n, const std::string& peer, const std::string& mid,
+                     uint8_t status, bool drop_wire)
+{
+    storageBegin();
+    storageSet(msgPath(n, peer, mid, "status").c_str(), (int)status);
+    storageSet(msgPath(n, peer, mid, "tries").c_str(),  (int)LXMF_TRIES_GAVEUP);
+    storageEnd();
+    if (drop_wire) g_wireOutbox.erase(outboxKey(peer, mid));
+    info("id %d: msg %s parked %s", n, mid.c_str(), lxmfStatusName(status));
+}
+
+/* ── mailbox resolution ── */
+
+static bool rlpgHexIsSet(const std::string& v)
+{
+    if (v.size() != 32) return false;
+    for (char c : v) if (c != '0') return true;
+    return false;
+}
+
+/* The peer's mailbox dest: contact record → announce catalogue → RAM hint
+ * map. All are routing hints; the cert check happens at HELLO. */
+static bool rlpgResolveMailbox(int n, const std::string& peer_hex, uint8_t out[16])
+{
+    std::string v = storageGetStr(contactPath(n, peer_hex, "rlpg").c_str(), "");
+    if (rlpgHexIsSet(v) && hexToBytes(v.c_str(), v.size(), out, 16)) {
+        dbg("id %d: rlpg mailbox for %.8s: contact", n, peer_hex.c_str());
+        return true;
+    }
+    v = storageGetStr(("lxmf.announces." + peer_hex + ".rlpg").c_str(), "");
+    if (rlpgHexIsSet(v) && hexToBytes(v.c_str(), v.size(), out, 16)) {
+        dbg("id %d: rlpg mailbox for %.8s: announce", n, peer_hex.c_str());
+        return true;
+    }
+    auto it = s_rlpgHints.find(peer_hex);
+    if (it != s_rlpgHints.end()) {
+        std::memcpy(out, it->second.mailbox, 16);
+        dbg("id %d: rlpg mailbox for %.8s: hint", n, peer_hex.c_str());
+        return true;
+    }
+    dbg("id %d: rlpg mailbox for %.8s: none", n, peer_hex.c_str());
+    return false;
+}
+
+/* ── contact mailbox policy ── */
+
+/* Non-zero `rlpg` on the contact record itself — the cert-verified,
+ * persisted binding. Announce/hint fallbacks are routing aids only and
+ * do not drive delivery policy. */
+static bool rlpgContactHasMailbox(int n, const std::string& peer_hex)
+{
+    return rlpgHexIsSet(
+        storageGetStr(contactPath(n, peer_hex, "rlpg").c_str(), ""));
+}
+
+/* Mail for this peer currently flows via their mailbox: direct sends get
+ * exactly one attempt (no fresh-route retry) before the deposit path
+ * takes over. */
+static bool rlpgPeerActive(int n, const std::string& peer_hex)
+{
+    return rlpgContactHasMailbox(n, peer_hex) &&
+           storageGetInt(contactPath(n, peer_hex, "rlpg_active").c_str(), 0) != 0;
+}
+
+/* A direct delivery proof (opportunistic, link packet, or resource — not
+ * a mailbox-pickup receipt) means the peer is reachable again: stop
+ * preferring their mailbox. Touches the key only while it is set. */
+static void rlpgDirectDelivered(int n, const std::string& peer_hex)
+{
+    std::string k = contactPath(n, peer_hex, "rlpg_active");
+    if (storageGetInt(k.c_str(), 0) != 0) storageSet(k.c_str(), 0);
+}
+
+/* The peer advertises announce caps bit0 (accepts double-encrypted
+ * payloads) — contact record (reboot-durable) first, then the RAM
+ * announce catalogue. */
+static bool rlpgPeerAcceptsDoubleEnc(int n, const std::string& peer_hex)
+{
+    if (storageGetInt(contactPath(n, peer_hex, "caps").c_str(), 0)
+        & LXMF_ANN_CAP_DOUBLE_ENC) return true;
+    int ac = std::atoi(storageGetStr(
+        ("lxmf.announces." + peer_hex + ".caps").c_str(), "-1").c_str());
+    return ac > 0 && (ac & LXMF_ANN_CAP_DOUBLE_ENC);
+}
+
+/* ── outbound relay queue (via the own node) ── */
+
+/* Queue a message for OUTBOUND relay over the own-node link. False when no
+ * own node is configured, the wire is gone, or the queue is full — the
+ * caller then settles exactly as it would without RLPG. A wire beyond the
+ * single-packet ceiling whose recipient is not known to accept
+ * double-encrypted payloads is settled TOO_LARGE here and TRUE is
+ * returned: the message is terminal and the caller must not settle it
+ * again (true always means "no further settling by the caller"). */
+static bool rlpgRelayEnqueue(lxmf_id_t& id, const std::string& peer,
+                             const std::string& mid, uint8_t fail_status)
+{
+    std::string node = storageGetStr(idPath(id.index, "rlpg_node").c_str(), "");
+    uint8_t mb[16];
+    if (!hexToBytes(node.c_str(), node.size(), mb, 16)) {
+        dbg("id %d: relay enqueue %s refused: no rlpg_node", id.index, mid.c_str());
+        return false;
+    }
+    auto wit = g_wireOutbox.find(outboxKey(peer, mid));
+    if (wit == g_wireOutbox.end()) {
+        dbg("id %d: relay enqueue %s refused: wire gone", id.index, mid.c_str());
+        return false;
+    }
+    for (const auto& e : s_rlpgRelayQ)
+        if (e.id_index == id.index && e.peer == peer && e.mid == mid) return true;
+    /* The node can final-hop a long message only as a double-encrypted
+     * link/resource payload; without that capability on the recipient (and
+     * with their mailbox path already exhausted — this queue is the last
+     * resort) the message would strand in the node's outbound queue until
+     * its timeout. Refuse it now instead. */
+    if (wit->second.wire.size() - LXMF_DEST_HASH_LEN > LXMF_OPP_PAYLOAD_MAX &&
+        !rlpgPeerAcceptsDoubleEnc(id.index, peer)) {
+        warn("id %d: msg %s too large for relay to non-capable %s",
+             id.index, mid.c_str(), peer.c_str());
+        msgFail(id.index, peer, mid, LXMF_ST_TOO_LARGE);
+        return true;
+    }
+    if (s_rlpgRelayQ.size() >= LXMF_RLPG_RELAYQ_MAX) {
+        dbg("id %d: relay enqueue %s refused: queue full", id.index, mid.c_str());
+        return false;
+    }
+    rlpg_relay_t e;
+    e.id_index    = id.index;
+    e.peer        = peer;
+    e.mid         = mid;
+    e.fail_status = fail_status;
+    e.deadline_s  = (uint32_t)(nowUnixMs() / 1000) + LXMF_RLPG_RELAY_TTL_S;
+    s_rlpgRelayQ.push_back(std::move(e));
+    dbg("id %d: msg %s queued for own-node relay", id.index, mid.c_str());
+    return true;
+}
+
+/* ── deposit sessions (sender → the peer's mailbox) ── */
+
+static rlpg_dep_t* rlpgDepByHandle(int handle)
+{
+    for (auto& s : s_rlpgDeps)
+        if (s.used && s.handle == handle) return &s;
+    return nullptr;
+}
+
+/* Deposit failed pre-ack (bad cert, dead link, timeout, send drop): tear
+ * down and fall back — own-node relay if configured, else the exact settle
+ * this path preempted. */
+static void rlpgDepFail(rlpg_dep_t& s)
+{
+    int n = s.id_index;
+    std::string peer = s.peer, mid = s.mid;
+    uint8_t fs = s.fail_status;
+    int h = s.handle;
+    s = rlpg_dep_t{};
+    if (h >= 0) itsDisconnect(h);
+    lxmf_id_t* id = idAt(n);
+    if (id && id->used && rlpgRelayEnqueue(*id, peer, mid, fs)) return;
+    msgFail(n, peer, mid, fs);
+}
+
+/* Encrypt the cached wire to the peer, record its transient id, and send
+ * the DEPOSIT (link packet / Resource / local ITS packet). Owns every
+ * failure path (settle or rlpgDepFail). */
+static void rlpgDepSendEnvelope(rlpg_dep_t& s, lxmf_id_t& id,
+                                const uint8_t peer_dh[16])
+{
+    auto wit = g_wireOutbox.find(outboxKey(s.peer, s.mid));
+    if (wit == g_wireOutbox.end()) {
+        /* Wire evaporated under us — settle as the preempted failure. */
+        int n = s.id_index; std::string peer = s.peer, mid = s.mid;
+        uint8_t fs = s.fail_status; int h = s.handle;
+        s = rlpg_dep_t{};
+        itsDisconnect(h);
+        msgFail(n, peer, mid, fs);
+        return;
+    }
+    uint8_t pk[RNSD_PUBKEY_LEN];
+    lxmfFeedPubkey(s.peer, peer_dh);
+    if (!rnsdRecallPubkey(peer_dh, pk)) { rlpgDepFail(s); return; }
+    const std::vector<uint8_t>& wire = wit->second.wire;
+    std::vector<uint8_t> ct(wire.size() + RNSD_ENCRYPT_OVERHEAD);
+    size_t ct_len = ct.size();
+    if (!rnsdEncryptFor(pk, wire.data(), wire.size(), ct.data(), &ct_len)) {
+        rlpgDepFail(s);
+        return;
+    }
+    uint8_t tid[RNSD_HASH_LEN];
+    rnsdSha256(ct.data(), ct_len, tid);
+    dbg("id %d: rlpg envelope %s: wire %zu B → ct %zu B tid=%s", s.id_index,
+        s.mid.c_str(), wire.size(), ct_len, bytesToHex(tid, 4).c_str());
+    storageSet(msgPath(s.id_index, s.peer, s.mid, "rlpg_tid").c_str(),
+               bytesToHex(tid, RNSD_HASH_LEN).c_str());
+    /* Anonymous deposit — the mailbox signals nothing. Delivery is
+     * confirmed end-to-end by the recipient once it picks the message up. */
+    std::vector<uint8_t> dep =
+        rlpgBuildDeposit(ct.data(), ct_len, nullptr, 0);
+    bool sent_ok;
+    if (s.local) {
+        sent_ok = dep.size() <= LXMF_RLPG_LOCAL_MAX &&
+                  itsSend(s.handle, dep.data(), dep.size(), 0) != 0;
+    } else if (dep.size() <= LXMF_RLPG_PKT_MAX) {
+        sent_ok = itsSend(s.handle, dep.data(), dep.size(), 0) != 0;
+    } else {
+        void* rb = gp_alloc(dep.size());
+        sent_ok = false;
+        if (rb) {
+            std::memcpy(rb, dep.data(), dep.size());
+            /* rnsd owns rb from here (it frees on its own failure too). */
+            sent_ok = rnsdLinkSendResource(s.tag.c_str(), rb, dep.size(),
+                                           s_rlpgOpaque++);
+        }
+    }
+    if (!sent_ok) { rlpgDepFail(s); return; }
+    s.sent = true;
+    dbg("id %d: rlpg deposit %s → mailbox %s (%zu B, %s)", s.id_index,
+        s.mid.c_str(), bytesToHex(s.mailbox, 16).c_str(), ct_len,
+        s.local ? "local" : dep.size() <= LXMF_RLPG_PKT_MAX ? "packet"
+                                                            : "resource");
+}
+
+static void rlpgDepHandleFrame(rlpg_dep_t& s, const RlpgFrame& fr)
+{
+    lxmf_id_t* id = idAt(s.id_index);
+    if (!id || !id->used) { rlpgDepFail(s); return; }
+
+    if (fr.type == RLPG_FR_HELLO && !s.hello_seen) {
+        s.hello_seen = true;
+        uint8_t peer_dh[16];
+        if (!hexToDestHash(s.peer, peer_dh)) { rlpgDepFail(s); return; }
+        /* The cert must be owner-signed FOR the peer we're trying to
+         * reach; when the mailbox identity is recallable, also bind
+         * cert.node_id to it (the link handshake already proved dest
+         * ownership, so a cache miss skips only that cross-check). */
+        RlpgCert c;
+        uint8_t served[16];
+        const char* why = nullptr;   /* first failed cert check, nullptr = ok */
+        if (fr.cert.empty())                                       why = "absent";
+        else if (!rlpgCertParse(fr.cert.data(), fr.cert.size(), c)) why = "unparseable";
+        else if (!rlpgCertVerify(c, served))                        why = "bad signature";
+        else if (std::memcmp(served, peer_dh, 16) != 0)             why = "serves other dest";
+        else {
+            uint8_t mbpk[RNSD_PUBKEY_LEN], nid[RNSD_IDENT_HASH_LEN];
+            if (rnsdRecallPubkey(s.mailbox, mbpk) &&
+                (!rnsdIdentityHashFromPubkey(mbpk, nid) ||
+                 std::memcmp(nid, c.node_id, 16) != 0))
+                why = "node-id mismatch";
+        }
+        dbg("id %d: rlpg HELLO on %s: cert %s", s.id_index, s.tag.c_str(),
+            why ? why : "ok");
+        if (why) {
+            warn("id %d: rlpg mailbox %s cert invalid for %s",
+                 s.id_index, bytesToHex(s.mailbox, 16).c_str(), s.peer.c_str());
+            rlpgDepFail(s);
+            return;
+        }
+        /* Verified binding → persist on the contact (mailbox + the service
+         * dest whose receipts we'll trust). */
+        storageBegin();
+        storageSet(contactPath(s.id_index, s.peer, "rlpg").c_str(),
+                   bytesToHex(s.mailbox, 16).c_str());
+        storageSet(contactPath(s.id_index, s.peer, "rlpg_svc").c_str(),
+                   bytesToHex(c.service_dest, 16).c_str());
+        storageEnd();
+
+        rlpgDepSendEnvelope(s, *id, peer_dh);
+        return;
+    }
+
+    if (fr.type == RLPG_FR_DEPOSIT_ACK && s.sent) {
+        dbg("id %d: rlpg deposit ack for %s: code=%u reason=%u",
+            s.id_index, s.mid.c_str(), fr.code, fr.reason);
+        int n = s.id_index;
+        std::string peer = s.peer, mid = s.mid;
+        uint8_t fs = s.fail_status;
+        int h = s.handle;
+        s = rlpg_dep_t{};             /* one deposit per link — done either way */
+        itsDisconnect(h);
+        lxmf_id_t* sid = idAt(n);
+        switch (fr.code) {
+        case RLPG_ACK_STORED:
+        case RLPG_ACK_DUPLICATE:
+            rlpgPark(n, peer, mid, LXMF_ST_REMOTE_RLPG, /*drop_wire=*/true);
+            /* The mailbox holds this peer's mail — subsequent sends get
+             * one direct attempt, then deposit, until a direct delivery
+             * proof clears the flag. */
+            setIntIfChanged(contactPath(n, peer, "rlpg_active"), 1);
+            break;
+        case RLPG_ACK_FULL:
+        case RLPG_ACK_ERR:
+        default:
+            rlpgPark(n, peer, mid,
+                     fr.code == RLPG_ACK_FULL ? LXMF_ST_REMOTE_RLPG_FULL
+                                              : LXMF_ST_REMOTE_RLPG_ERR,
+                     /*drop_wire=*/false);
+            /* The own-node relay keeps trying refused remotes; without one
+             * the parked FULL/ERR status stands and the wire is done. */
+            if (!(sid && sid->used && rlpgRelayEnqueue(*sid, peer, mid, fs)))
+                g_wireOutbox.erase(outboxKey(peer, mid));
+            break;
+        }
+        return;
+    }
+
+    verb("id %d: rlpg deposit link: unexpected frame %u", s.id_index, fr.type);
+}
+
+static void onRlpgDepRecv(int handle, size_t /*bytesAvail*/)
+{
+    rlpg_dep_t* s = rlpgDepByHandle(handle);
+    if (!s) return;
+    PSRAM_BSS static uint8_t buf[1024];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (!n) return;
+    /* rnsd prepends the inbound-telemetry header on every link packet
+     * forward; the RLPG frame starts after it. Local ITS deposits are
+     * verbatim. */
+    size_t h = 0;
+    if (!s->local) {
+        rx_meta_t m;
+        h = parseRxMeta(buf, n, m);
+        if (!h) return;
+    }
+    RlpgFrame fr;
+    if (!rlpgFrameParse(buf + h, n - h, fr)) return;
+    rlpgDepHandleFrame(*s, fr);
+}
+
+static void onRlpgDepDisc(int ref)
+{
+    if (ref < 0 || ref >= LXMF_RLPG_DEP_SESSIONS) return;
+    rlpg_dep_t& s = s_rlpgDeps[ref];
+    if (!s.used) return;
+    s.handle = -1;                    /* link is gone — no disconnect needed */
+    verb("id %d: rlpg deposit link closed pre-ack (%s)", s.id_index, s.tag.c_str());
+    rlpgDepFail(s);
+}
+
+/* Open a deposit link to the peer's mailbox. Falls back to the own-node
+ * relay when no session slot / link is available. */
+static bool rlpgDepositStart(lxmf_id_t& id, const std::string& peer,
+                             const std::string& mid, const uint8_t mailbox[16],
+                             uint8_t fail_status)
+{
+    for (const auto& s : s_rlpgDeps)
+        if (s.used && s.peer == peer && s.mid == mid) return true;  /* already going */
+    rlpg_dep_t* slot = nullptr;
+    for (auto& s : s_rlpgDeps) if (!s.used) { slot = &s; break; }
+    if (!slot) return rlpgRelayEnqueue(id, peer, mid, fail_status);
+
+    /* A mailbox hosted on THIS instance is unreachable over RNS (a link
+     * never loops back to a local destination) — deposit over the rlpg
+     * task's local ITS port instead. Same envelope, same acks; no HELLO
+     * (and no cert dance — it's this device's own mailbox). Deposits are
+     * anonymous; delivery is confirmed by the recipient, not the mailbox. */
+    std::string mb_hex = bytesToHex(mailbox, 16);
+    for (int k = 0; k < 4; ++k) {
+        char ek[32];
+        std::snprintf(ek, sizeof(ek), "rlpg.id.%d.dest_hash", k);
+        if (storageGetStr(ek, "") != mb_hex) continue;
+        int h = itsConnect("rlpg", LXMF_RLPG_LOCAL_PORT, mailbox, 16,
+                           pdMS_TO_TICKS(2000),
+                           /*ref=*/(int)(slot - s_rlpgDeps),
+                           onRlpgDepRecv, onRlpgDepDisc);
+        if (h < 0) return rlpgRelayEnqueue(id, peer, mid, fail_status);
+        slot->used        = true;
+        slot->handle      = h;
+        slot->id_index    = id.index;
+        slot->peer        = peer;
+        slot->mid         = mid;
+        std::memcpy(slot->mailbox, mailbox, 16);
+        slot->tag         = "local";
+        slot->fail_status = fail_status;
+        slot->local       = true;
+        slot->hello_seen  = true;     /* none coming */
+        slot->started_s   = (uint32_t)(nowUnixMs() / 1000);
+        info("id %d: rlpg local deposit → mailbox %s for %s", id.index,
+             mb_hex.c_str(), mid.c_str());
+        uint8_t peer_dh[16];
+        if (!hexToDestHash(peer, peer_dh)) { rlpgDepFail(*slot); return true; }
+        rlpgDepSendEnvelope(*slot, id, peer_dh);
+        return true;
+    }
+
+    char tag[24];
+    std::snprintf(tag, sizeof(tag), "lxrg.%04x", (unsigned)s_rlpgTagSeq++);
+    int h = rnsdLinkOpen(mailbox, RLPG_ASPECT, id.identity_key.c_str(), tag,
+                         /*path_timeout_ms=*/15000, /*link_timeout_ms=*/0,
+                         /*ref=*/(int)(slot - s_rlpgDeps),
+                         onRlpgDepRecv, onRlpgDepDisc);
+    if (h < 0) return rlpgRelayEnqueue(id, peer, mid, fail_status);
+    slot->used        = true;
+    slot->handle      = h;
+    slot->id_index    = id.index;
+    slot->peer        = peer;
+    slot->mid         = mid;
+    std::memcpy(slot->mailbox, mailbox, 16);
+    slot->tag         = tag;
+    slot->fail_status = fail_status;
+    slot->hello_seen  = false;
+    slot->sent        = false;
+    slot->started_s   = (uint32_t)(nowUnixMs() / 1000);
+    info("id %d: rlpg deposit link %s → mailbox %s for %s", id.index, tag,
+         bytesToHex(mailbox, 16).c_str(), mid.c_str());
+    return true;
+}
+
+/* The delivery-failure hook (see the forward declaration's contract). */
+static bool rlpgTryPark(lxmf_id_t& id, const std::string& peer_hex,
+                        const std::string& mid, uint8_t fail_status)
+{
+    if (g_wireOutbox.find(outboxKey(peer_hex, mid)) == g_wireOutbox.end())
+        return false;                 /* no cached wire (reboot) — fail as ever */
+    uint8_t mb[16];
+    if (rlpgResolveMailbox(id.index, peer_hex, mb))
+        return rlpgDepositStart(id, peer_hex, mid, mb, fail_status);
+    return rlpgRelayEnqueue(id, peer_hex, mid, fail_status);
+}
+
+/* Preempt an in-flight send into RLPG custody: park first, then cancel
+ * the rnsd-side send and free the slot. The message is NOT marked
+ * cancelled — the deposit session settles its status, and the cancelled
+ * OUT_RESULT no-ops on the freed send_id. False = RLPG refused custody;
+ * the slot and the send stay untouched. */
+static bool rlpgPreemptOutbound(lxmf_id_t& id, outbound_t& o, uint8_t fail_status)
+{
+    if (!rlpgTryPark(id, o.peer, o.msg_key, fail_status)) return false;
+    if (id.handle >= 0) {
+        uint8_t f[3] = {
+            RNSD_DEST_OUT_CANCEL,
+            (uint8_t)(o.send_id >> 8),
+            (uint8_t)(o.send_id & 0xFF),
+        };
+        if (itsSend(id.handle, f, sizeof(f), pdMS_TO_TICKS(200)) == 0)
+            warn("id %d: rlpg preempt cancel dropped (mid=%s)",
+                 id.index, o.msg_key.c_str());
+    }
+    /* Proof-phase slots settled pending at "sent" already. */
+    if (!o.awaiting_proof && id.pending > 0) id.pending--;
+    o.used           = false;
+    o.direct         = false;
+    o.is_resource    = false;
+    o.awaiting_proof = false;
+    return true;
+}
+
+/* Terminal-failure gate for outbound settles: with a stored peer mailbox
+ * RLPG takes custody instead of the terminal status. The caller writes
+ * `fail_status` itself only when this returns false. */
+static bool rlpgFailToMailbox(lxmf_id_t& id, const std::string& peer_hex,
+                              const std::string& mid, uint8_t fail_status)
+{
+    if (!rlpgContactHasMailbox(id.index, peer_hex) ||
+        !rlpgTryPark(id, peer_hex, mid, fail_status))
+        return false;
+    dbg("id %d: msg %s settle %s → rlpg custody", id.index, mid.c_str(),
+        lxmfStatusName(fail_status));
+    return true;
+}
+
+/* Wall-clock budget for one direct attempt to a mailbox-known peer: the
+ * whole send — path search, egress, proof wait — gets this long before
+ * the 1 Hz pass hands the message to RLPG. rnsd's path-retry ladder
+ * hunts for hours with only RETRY auxes, so time is the real bound.
+ * Mailbox-active peers get one brief attempt, then straight back to the
+ * mailbox until a direct delivery proves comms again. */
+static uint32_t rlpgDirectBudgetS(int n, const std::string& peer_hex)
+{
+    if (rlpgPeerActive(n, peer_hex)) return 45;
+    int v = storageGetInt("s.lxmf.rlpg.direct_budget_s", 120);
+    return v > 0 ? (uint32_t)v : 120;
+}
+
+/* ── own-node (owner) session ── */
+
+/* Published owner-session state, lxmf.id.<n>.rlpg_state: "idle" (node
+ * configured, link down / backing off), "connecting" (link opened,
+ * pre-AUTH), "connected" (authed). Key absent while no rlpg_node is
+ * configured (st = nullptr clears it). Identical values are skipped so
+ * the 1 Hz tick doesn't churn subscribers. */
+static void rlpgOwnState(int n, const char* st)
+{
+    std::string key = idEphPath(n, "rlpg_state");
+    if (!st) {
+        if (!storageGetStr(key.c_str(), "").empty()) storageUnset(key.c_str());
+        return;
+    }
+    setStrIfChanged(key, st);
+}
+
+/* Flush the relay queue over an authed own-node link: encrypt (once) to
+ * the final recipient, record the ciphertext's transient id, send the
+ * OUTBOUND envelope, and settle on the ack / deadline. */
+static void rlpgRelayFlush(uint32_t now_s)
+{
+    for (auto it = s_rlpgRelayQ.begin(); it != s_rlpgRelayQ.end(); ) {
+        rlpg_relay_t& e = *it;
+        lxmf_id_t* id = idAt(e.id_index);
+        if (!id || !id->used) { it = s_rlpgRelayQ.erase(it); continue; }
+        if (now_s >= e.deadline_s) {
+            dbg("id %d: relay %s dropped: deadline", e.id_index, e.mid.c_str());
+            msgFail(e.id_index, e.peer, e.mid, e.fail_status);
+            it = s_rlpgRelayQ.erase(it);
+            continue;
+        }
+        rlpg_own_t& own = s_rlpgOwn[e.id_index];
+        if (e.sent || own.handle < 0 || !own.authed) { ++it; continue; }
+
+        auto wit = g_wireOutbox.find(outboxKey(e.peer, e.mid));
+        if (wit == g_wireOutbox.end()) {
+            dbg("id %d: relay %s dropped: wire gone", e.id_index, e.mid.c_str());
+            msgFail(e.id_index, e.peer, e.mid, e.fail_status);
+            it = s_rlpgRelayQ.erase(it);
+            continue;
+        }
+        uint8_t dh[16], mhash[RNSD_HASH_LEN];
+        std::string mh = storageGetStr(
+            msgPath(e.id_index, e.peer, e.mid, "message_id").c_str(), "");
+        if (!hexToDestHash(e.peer, dh) ||
+            !hexToBytes(mh.c_str(), mh.size(), mhash, RNSD_HASH_LEN)) {
+            dbg("id %d: relay %s dropped: bad record", e.id_index, e.mid.c_str());
+            msgFail(e.id_index, e.peer, e.mid, e.fail_status);
+            it = s_rlpgRelayQ.erase(it);
+            continue;
+        }
+        if (e.ct.empty()) {
+            uint8_t pk[RNSD_PUBKEY_LEN];
+            lxmfFeedPubkey(e.peer, dh);
+            if (!rnsdRecallPubkey(dh, pk)) {
+                rnsdRequestPath(dh);
+                if (++e.pk_tries > LXMF_RLPG_RELAY_PK_TRIES) {
+                    dbg("id %d: relay %s dropped: peer pubkey unrecallable",
+                        e.id_index, e.mid.c_str());
+                    msgFail(e.id_index, e.peer, e.mid, e.fail_status);
+                    it = s_rlpgRelayQ.erase(it);
+                } else ++it;
+                continue;
+            }
+            const std::vector<uint8_t>& wire = wit->second.wire;
+            e.ct.resize(wire.size() + RNSD_ENCRYPT_OVERHEAD);
+            size_t ct_len = e.ct.size();
+            if (!rnsdEncryptFor(pk, wire.data(), wire.size(), e.ct.data(), &ct_len)) {
+                dbg("id %d: relay %s dropped: encrypt failed", e.id_index, e.mid.c_str());
+                msgFail(e.id_index, e.peer, e.mid, e.fail_status);
+                it = s_rlpgRelayQ.erase(it);
+                continue;
+            }
+            e.ct.resize(ct_len);
+            /* The node deposits these exact bytes at the remote mailbox, so
+             * its pickup receipt keys on this ciphertext's hash. */
+            uint8_t tid[RNSD_HASH_LEN];
+            rnsdSha256(e.ct.data(), e.ct.size(), tid);
+            storageSet(msgPath(e.id_index, e.peer, e.mid, "rlpg_tid").c_str(),
+                       bytesToHex(tid, RNSD_HASH_LEN).c_str());
+        }
+        std::vector<uint8_t> frame =
+            rlpgBuildOutbound(dh, mhash, e.ct.data(), e.ct.size(), /*timeout_s=*/0);
+        bool ok;
+        if (frame.size() <= LXMF_RLPG_PKT_MAX) {
+            ok = itsSend(own.handle, frame.data(), frame.size(), 0) != 0;
+        } else {
+            void* rb = gp_alloc(frame.size());
+            ok = false;
+            if (rb) {
+                std::memcpy(rb, frame.data(), frame.size());
+                ok = rnsdLinkSendResource(own.tag.c_str(), rb, frame.size(),
+                                          s_rlpgOpaque++);
+            }
+        }
+        if (ok) {
+            e.sent = true;
+            dbg("id %d: rlpg outbound %s handed to own node (%zu B)",
+                e.id_index, e.mid.c_str(), e.ct.size());
+        }
+        ++it;                          /* send drop → retried next tick */
+    }
+}
+
+static void rlpgOwnHandleFrame(int n, const RlpgFrame& fr)
+{
+    lxmf_id_t& id = s_ids[n];
+    rlpg_own_t& own = s_rlpgOwn[n];
+
+    switch (fr.type) {
+    case RLPG_FR_HELLO: {
+        if (own.hello_seen) break;
+        own.hello_seen = true;
+        dbg("id %d: rlpg own HELLO on %s (cert=%s)", n, own.tag.c_str(),
+            fr.cert.empty() ? "nil" : "present");
+        /* HELLO service_dest carries the node's own dest now (the mailbox
+         * runs no service identity). Persisted for the status display only;
+         * relay status rides this pickup link, not a service message. */
+        storageSet(idPath(n, "rlpg_service_dest").c_str(),
+                   bytesToHex(fr.service_dest, 16).c_str());
+        /* node_id (from the mailbox identity) keys both the AUTH signable
+         * and a fresh cert. Unrecallable identity → drop the link and let
+         * the reconnect (post path request) retry. */
+        uint8_t mbpk[RNSD_PUBKEY_LEN], node_id[RNSD_IDENT_HASH_LEN];
+        if (!rnsdRecallPubkey(own.mailbox, mbpk) ||
+            !rnsdIdentityHashFromPubkey(mbpk, node_id)) {
+            rnsdRequestPath(own.mailbox);
+            int h = own.handle;
+            own = rlpg_own_t{};
+            own.next_try_s = (uint32_t)(nowUnixMs() / 1000) + LXMF_RLPG_OWN_BACKOFF_S;
+            itsDisconnect(h);
+            rlpgOwnState(n, "idle");
+            break;
+        }
+        /* AUTH first — the node gates CERT_SET / OUTBOUND on it. */
+        uint8_t pub[RNSD_PUBKEY_LEN], sig[RNSD_SIG_LEN], signable[8 + 16 + 16];
+        if (!rnsdIdentityPubkey(id.identity_key.c_str(), pub)) break;
+        rlpgAuthSignable(fr.nonce, node_id, signable);
+        if (!rnsdSign(id.identity_key.c_str(), signable, sizeof(signable), sig)) break;
+        std::vector<uint8_t> auth = rlpgBuildAuth(pub, sig);
+        if (itsSend(own.handle, auth.data(), auth.size(), 0) == 0) {
+            warn("id %d: rlpg AUTH send dropped (%s)", n, own.tag.c_str());
+            break;
+        }
+        own.authed = true;
+        info("id %d: rlpg owner session up (%s)", n, own.tag.c_str());
+        rlpgOwnState(n, "connected");
+
+        /* Cert renewal: absent / unparseable / not ours / older than the
+         * renew window → sign and install a fresh one. */
+        uint32_t renew_s = (uint32_t)storageGetInt("s.lxmf.rlpg.cert_renew_days", 7) * 86400;
+        uint32_t valid_s = (uint32_t)storageGetInt("s.lxmf.rlpg.cert_valid_days", 14) * 86400;
+        uint32_t wall_s  = (uint32_t)(wallUnixMs() / 1000);
+        RlpgCert cur;
+        uint8_t served[16];
+        const char* stale = nullptr;   /* first failed currency check, nullptr = current */
+        if (fr.cert.empty())                                          stale = "absent";
+        else if (!rlpgCertParse(fr.cert.data(), fr.cert.size(), cur)) stale = "unparseable";
+        else if (!rlpgCertVerify(cur, served))                        stale = "bad signature";
+        else if (std::memcmp(served, id.dest_hash, 16) != 0)          stale = "not ours";
+        else if (wall_s >= cur.issued_at + renew_s)                   stale = "renew window";
+        dbg("id %d: rlpg cert %s%s%s", n, stale ? "renewing (" : "current",
+            stale ? stale : "", stale ? ")" : "");
+        if (stale) {
+            RlpgCert c{};
+            std::memcpy(c.node_id, node_id, 16);
+            std::memcpy(c.service_dest, fr.service_dest, 16);
+            c.issued_at  = wall_s;
+            c.expires_at = wall_s + valid_s;
+            std::vector<uint8_t> packed;
+            if (rlpgCertPack(c, id.identity_key.c_str(), packed)) {
+                std::vector<uint8_t> cs = rlpgBuildCertSet(packed);
+                if (itsSend(own.handle, cs.data(), cs.size(), 0) == 0)
+                    warn("id %d: rlpg CERT_SET send dropped", n);
+                else
+                    info("id %d: rlpg cert renewed (valid to %u)", n,
+                         (unsigned)c.expires_at);
+            }
+        }
+        rlpgRelayFlush((uint32_t)(nowUnixMs() / 1000));
+        break;
+    }
+    case RLPG_FR_PICKUP: {
+        /* Held mail: decrypt, feed the normal inbound pipeline, and proof
+         * the pickup. The proof is a custody handoff — the node deletes
+         * the envelope on ANY proof — so it is gated on the message
+         * actually settling here:
+         *   RX_OK      — sender identity recallable, so onInboundLxm
+         *                settles synchronously (store / dedup / drop
+         *                invalid). Re-served envelopes land on the dedup
+         *                path and are proofed OK the same way.
+         *   DISCARD    — garbage only: empty, undecryptable, or a wire
+         *                too short to carry the LXMF header.
+         *   no proof   — decrypts but the sender is unrecallable even
+         *                after reseeding from the contact records:
+         *                onInboundLxm can only buffer the wire
+         *                (pending_verify, evictable), so the node keeps
+         *                the envelope and re-serves it next session;
+         *                transient-id dedup makes the re-serve harmless. */
+        bool ok = false, hold = false, decrypted = false, reseeded = false;
+        if (!fr.blob.empty()) {
+            std::vector<uint8_t> pt(fr.blob.size());
+            size_t pt_len = pt.size();
+            if (rnsdDecryptSelf(id.identity_key.c_str(),
+                                fr.blob.data(), fr.blob.size(),
+                                pt.data(), &pt_len) &&
+                pt_len >= LXMF_OVERHEAD) {
+                decrypted = true;
+                /* Recall gate before the pipeline: a cache miss (reboot
+                 * cleared rnsd's identity cache) is reseeded from any
+                 * identity's persisted contact pubkey. */
+                const uint8_t* sh = pt.data() + LXMF_DEST_HASH_LEN;
+                uint8_t spk[RNSD_PUBKEY_LEN];
+                reseeded = lxmfFeedPubkey(bytesToHex(sh, LXMF_DEST_HASH_LEN), sh);
+                if (rnsdRecallPubkey(sh, spk)) ok = true;
+                else { hold = true; rnsdRequestPath(sh); }
+                onInboundLxm(id, pt.data(), pt_len, nullptr, /*rlpg_pickup=*/true);
+            }
+        }
+        if (!hold) {
+            uint8_t variant = ok ? RLPG_RX_OK : RLPG_RX_DISCARD;
+            std::vector<uint8_t> proof =
+                rlpgBuildRxProof(fr.transient_id, variant);
+            if (own.handle >= 0 &&
+                itsSend(own.handle, proof.data(), proof.size(), 0) == 0)
+                warn("id %d: rlpg RX_PROOF send dropped", n);
+        }
+        dbg("id %d: rlpg pickup tid=%s (%zu B, decrypt %s, recall %s) → %s", n,
+            bytesToHex(fr.transient_id, 4).c_str(), fr.blob.size(),
+            decrypted ? "ok" : "fail",
+            !decrypted ? "-" : ok ? (reseeded ? "reseeded" : "ok") : "miss",
+            hold ? "held (no proof)" : ok ? "proof OK" : "proof DISCARD");
+        break;
+    }
+    case RLPG_FR_OUTBOUND_ACK: {
+        std::string hh = bytesToHex(fr.lxmf_hash, RNSD_HASH_LEN);
+        for (auto it = s_rlpgRelayQ.begin(); it != s_rlpgRelayQ.end(); ++it) {
+            if (it->id_index != n) continue;
+            if (storageGetStr(msgPath(n, it->peer, it->mid,
+                                      "message_id").c_str(), "") != hh)
+                continue;
+            dbg("id %d: rlpg outbound ack for %s: code=%u reason=%u",
+                n, it->mid.c_str(), fr.code, fr.reason);
+            if (fr.code == RLPG_ACK_STORED || fr.code == RLPG_ACK_DUPLICATE)
+                rlpgPark(n, it->peer, it->mid, LXMF_ST_OUR_RLPG, /*drop_wire=*/true);
+            else
+                msgFail(n, it->peer, it->mid, LXMF_ST_NO_RESPONSE);  /* own node refused — terminal */
+            s_rlpgRelayQ.erase(it);
+            break;
+        }
+        break;
+    }
+    case RLPG_FR_RELAY_STATUS:
+        /* Our own node reports the fate of a message we handed it to relay,
+         * over this pickup link. Match by the LXMF message hash and move the
+         * parked message. (DELIVERED for a directly-delivered final hop
+         * arrives here; a mailbox-parked message's DELIVERED instead comes
+         * from the recipient's 0x32 confirmation.) */
+        rlpgApplyRelayStatus(id, bytesToHex(fr.lxmf_hash, RNSD_HASH_LEN), fr.code);
+        break;
+    case RLPG_FR_CERT_ACK:
+        dbg("id %d: rlpg CERT_ACK ok=%u", n, fr.code);
+        break;
+    case RLPG_FR_PICKUP_DONE:
+        dbg("id %d: rlpg pickup stream drained (%u still resource-queued)",
+            n, (unsigned)fr.count);
+        break;
+    default:
+        verb("id %d: rlpg own link: unexpected frame %u", n, fr.type);
+        break;
+    }
+}
+
+static void onRlpgOwnRecv(int handle, size_t /*bytesAvail*/)
+{
+    int n = -1;
+    for (int k = 0; k < LXMF_MAX_IDENTITIES; ++k)
+        if (s_rlpgOwn[k].handle == handle) { n = k; break; }
+    if (n < 0) return;
+    PSRAM_BSS static uint8_t buf[1024];
+    size_t got = itsRecv(handle, buf, sizeof(buf), 0);
+    if (!got) return;
+    /* rnsd prepends the inbound-telemetry header on every link packet
+     * forward; the RLPG frame starts after it. */
+    rx_meta_t m;
+    size_t h = parseRxMeta(buf, got, m);
+    RlpgFrame fr;
+    if (!h || !rlpgFrameParse(buf + h, got - h, fr)) return;
+    rlpgOwnHandleFrame(n, fr);
+}
+
+static void onRlpgOwnDisc(int ref)
+{
+    if (ref < 0 || ref >= LXMF_MAX_IDENTITIES) return;
+    rlpg_own_t& own = s_rlpgOwn[ref];
+    if (own.handle < 0) return;
+    verb("id %d: rlpg own-node link closed (%s)", ref, own.tag.c_str());
+    own = rlpg_own_t{};
+    own.next_try_s = (uint32_t)(nowUnixMs() / 1000) + LXMF_RLPG_OWN_BACKOFF_S;
+    rlpgOwnState(ref, "idle");
+    /* In-flight OUTBOUNDs lost their ack path — rearm them; the node dedups
+     * on the message hash, so a resend of the same ciphertext is harmless. */
+    for (auto& e : s_rlpgRelayQ)
+        if (e.id_index == ref) e.sent = false;
+}
+
+/* Keep one link to each configured own mailbox (reconnect with backoff). */
+static void rlpgOwnTick(uint32_t now_s)
+{
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        lxmf_id_t& id = s_ids[n];
+        rlpg_own_t& own = s_rlpgOwn[n];
+        std::string node = storageGetStr(idPath(n, "rlpg_node").c_str(), "");
+        uint8_t mb[16];
+        bool want = id.used && idEnabled(n) &&
+                    hexToBytes(node.c_str(), node.size(), mb, 16);
+        if (!want) {
+            if (own.handle >= 0) { int h = own.handle; own = rlpg_own_t{}; itsDisconnect(h); }
+            rlpgOwnState(n, nullptr);
+            continue;
+        }
+        if (own.handle >= 0) {
+            if (std::memcmp(own.mailbox, mb, 16) == 0) continue;
+            /* Reconfigured to a different mailbox — reconnect now. */
+            int h = own.handle;
+            own = rlpg_own_t{};
+            itsDisconnect(h);
+        }
+        rlpgOwnState(n, "idle");
+        if (now_s < own.next_try_s) continue;
+        own.next_try_s = now_s + LXMF_RLPG_OWN_BACKOFF_S;
+        uint8_t pk[RNSD_PUBKEY_LEN];
+        if (!rnsdRecallPubkey(mb, pk)) { rnsdRequestPath(mb); continue; }
+        char tag[24];
+        std::snprintf(tag, sizeof(tag), "lxrg.own%d", n);
+        int h = rnsdLinkOpen(mb, RLPG_ASPECT, id.identity_key.c_str(), tag,
+                             /*path_timeout_ms=*/15000, /*link_timeout_ms=*/0,
+                             /*ref=*/n, onRlpgOwnRecv, onRlpgOwnDisc);
+        if (h < 0) continue;
+        own.handle = h;
+        std::memcpy(own.mailbox, mb, 16);
+        own.tag        = tag;
+        own.hello_seen = false;
+        own.authed     = false;
+        rlpgOwnState(n, "connecting");
+        dbg("id %d: rlpg own-node link %s → %s", n, tag, node.c_str());
+    }
+}
+
+/* ── resource inbound on RLPG links ──
+ * For links WE opened, the resource aux carries the REMOTE dest in
+ * local_dest_hash (see onResourceAux) — match it against the sessions'
+ * mailbox dests and dispatch the frame. Returns true when consumed. */
+static bool rlpgResourceInbound(const rnsd_link_resource_done_t& d)
+{
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        rlpg_own_t& own = s_rlpgOwn[n];
+        if (own.handle < 0 ||
+            std::memcmp(own.mailbox, d.local_dest_hash, 16) != 0) continue;
+        RlpgFrame fr;
+        if (d.buf && d.len && rlpgFrameParse((const uint8_t*)d.buf, d.len, fr))
+            rlpgOwnHandleFrame(n, fr);
+        return true;
+    }
+    for (auto& s : s_rlpgDeps) {
+        if (!s.used || std::memcmp(s.mailbox, d.local_dest_hash, 16) != 0) continue;
+        RlpgFrame fr;
+        if (d.buf && d.len && rlpgFrameParse((const uint8_t*)d.buf, d.len, fr))
+            rlpgDepHandleFrame(s, fr);
+        return true;
+    }
+    return false;
+}
+
+/* ── rlpg.mailbox announce subscription ── */
+
+static void onRlpgAnnSubDisc(int /*ref*/)
+{
+    warn("rlpg announce sub: disconnected from rnsd");
+    s_rlpg_ann_handle = -1;
+    /* Reconnect attempted on the next 1 Hz tick. */
+}
+
+static void onRlpgMailboxAnnounce(int handle, size_t /*bytesAvail*/)
+{
+    if (handle != s_rlpg_ann_handle) return;
+    PSRAM_BSS static uint8_t buf[LXMF_ANNOUNCE_HDR + 512];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (n < LXMF_ANNOUNCE_HDR) return;
+    const uint8_t* dh = buf + 1;
+    RlpgAnnounce a;
+    if (!rlpgParseMailboxAppData(buf + LXMF_ANNOUNCE_HDR, n - LXMF_ANNOUNCE_HDR, a) ||
+        !a.certified)
+        return;                       /* reachability-only announce — not a mailbox */
+    rlpg_hint_t& e = s_rlpgHints[bytesToHex(a.served, 16)];
+    std::memcpy(e.mailbox, dh, 16);
+    e.last_s = (uint32_t)(nowUnixMs() / 1000);
+    DBG_REMOTE("rlpg announce: mailbox %s serves %s",
+               bytesToHex(dh, 16).c_str(), bytesToHex(a.served, 16).c_str());
+}
+
+static bool connectRlpgAnnounceSub(void)
+{
+    if (s_rlpg_ann_handle >= 0) return true;
+    rnsd_announces_connect_t req = {};
+    safeStrncpy(req.aspect, RLPG_ASPECT, sizeof(req.aspect));
+    int h = itsConnect("rnsd", RNSD_PORT_ANNOUNCES,
+                       &req, sizeof(req), pdMS_TO_TICKS(2000),
+                       /*ref*/ 0, onRlpgMailboxAnnounce, onRlpgAnnSubDisc);
+    if (h < 0) {
+        warn("rlpg announce sub: connect failed");
+        return false;
+    }
+    s_rlpg_ann_handle = h;
+    info("rlpg announce sub: connected (handle=%d aspect=%s)", h, RLPG_ASPECT);
+    return true;
+}
+
+/* ── outbound-relay status (own node → owner) ── */
+
+/* Apply an RLPG_FR_RELAY_STATUS from our own node: find our outbound with
+ * message_id == hash_hex still parked at a mailbox and move it. Trust is
+ * inherent — the frame arrives over our authenticated pickup link. The
+ * message_id is unique, so the first record wins.
+ *   REMOTE_RLPG            parked at the recipient's mailbox (mail now
+ *                          flows via it → set rlpg_active);
+ *   REMOTE_RLPG_FULL/_ERR  the remote refused (the node keeps retrying);
+ *   DELIVERED              a direct final-hop delivery proof (a mailbox
+ *                          parked message reaches DELIVERED instead via the
+ *                          recipient's 0x32 confirmation);
+ *   NO_RESPONSE            the node's relay timed out — terminal. */
+static void rlpgApplyRelayStatus(lxmf_id_t& id, const std::string& hash_hex, uint8_t code)
+{
+    int n = id.index;
+    std::string mpre = "s.lxmf.id." + std::to_string(n) + ".msgs.";
+    for (const auto& peer : rlpgTokens(mpre)) {
+        for (const auto& key : rlpgTokens(mpre + peer + ".")) {
+            if (storageGetStr(msgPath(n, peer, key, "message_id").c_str(), "") != hash_hex)
+                continue;
+            int st = storageGetInt(msgPath(n, peer, key, "status").c_str(), -1);
+            if (st != LXMF_ST_OUR_RLPG && st != LXMF_ST_REMOTE_RLPG &&
+                st != LXMF_ST_REMOTE_RLPG_FULL && st != LXMF_ST_REMOTE_RLPG_ERR)
+                return;                    /* found, but no longer parked — done */
+            switch (code) {
+            case LXMF_ST_REMOTE_RLPG:
+                setIntIfChanged(contactPath(n, peer, "rlpg_active"), 1);
+                msgSetStatus(n, peer, key, LXMF_ST_REMOTE_RLPG);
+                break;
+            case LXMF_ST_REMOTE_RLPG_FULL:
+            case LXMF_ST_REMOTE_RLPG_ERR:
+            case LXMF_ST_DELIVERED:
+                msgSetStatus(n, peer, key, code);
+                break;
+            case LXMF_ST_NO_RESPONSE:
+                msgFail(n, peer, key, LXMF_ST_NO_RESPONSE);
+                break;
+            default:
+                verb("id %d: rlpg relay status: ignoring code %u", n, code);
+                return;
+            }
+            info("id %d: rlpg relay status: msg %s → %s", n, key.c_str(),
+                 lxmfStatusName(code));
+            return;
+        }
+    }
+    dbg("id %d: rlpg relay status for %.8s: no parked match", n, hash_hex.c_str());
+}
+
+/* ── recipient-sourced delivery confirmation ── */
+
+/* Send a field-only LXMF message to `peer_dh` naming `mid_hex` — the
+ * message we just picked up from a mailbox. Opportunistic, fire-and-forget
+ * (no outbox slot; any OUT_RESULT no-ops on the unknown send_id). No stamp:
+ * it is a tiny control message. The sender's pubkey is in rnsd's cache (we
+ * just verified their signature), so the encrypt-to-dest succeeds. */
+static void rlpgSendDeliveryConfirm(lxmf_id_t& id, const uint8_t peer_dh[LXMF_DEST_HASH_LEN],
+                                    const std::string& mid_hex)
+{
+    LxmFields fields;
+    fields.rlpg_delivery = mid_hex;
+    std::vector<uint8_t> wire = lxmPackWire(id.identity_key.c_str(),
+                                            id.dest_hash, peer_dh, nowUnixMs(),
+                                            /*title=*/"", /*content=*/"", fields,
+                                            /*stamp_cost=*/0, nullptr);
+    if (wire.empty()) { warn("id %d: rlpg confirm pack failed", id.index); return; }
+    uint16_t send_id = id.next_send_id++;
+    if (id.next_send_id == 0) id.next_send_id = 1;
+    std::vector<uint8_t> frame;
+    frame.reserve(3 + wire.size());
+    frame.push_back(RNSD_DEST_OUT_PACKET);
+    frame.push_back((uint8_t)(send_id >> 8));
+    frame.push_back((uint8_t)(send_id & 0xFF));
+    frame.insert(frame.end(), wire.begin(), wire.end());
+    sendFrame(id, frame.data(), frame.size());
+    dbg("id %d: rlpg delivery confirm → %s for mid=%s", id.index,
+        bytesToHex(peer_dh, 4).c_str(), mid_hex.c_str());
+}
+
+/* Settle the outbound we sent to `src_hex` whose message_id == confirmed_mid
+ * to DELIVERED, if it is still parked at a mailbox. Trust is inherent: a
+ * confirmation from peer X can only match a message WE sent to X, and only
+ * the real X (who decrypted it) can produce the id. No match → ignore. */
+static void rlpgConsumeDeliveryConfirm(lxmf_id_t& id, const std::string& src_hex,
+                                       const std::string& confirmed_mid)
+{
+    int n = id.index;
+    std::string kpre = "s.lxmf.id." + std::to_string(n) + ".msgs." + src_hex + ".";
+    for (const auto& key : rlpgTokens(kpre)) {
+        if (storageGetStr(msgPath(n, src_hex, key, "message_id").c_str(), "") != confirmed_mid)
+            continue;
+        int st = storageGetInt(msgPath(n, src_hex, key, "status").c_str(), -1);
+        if (st == LXMF_ST_REMOTE_RLPG || st == LXMF_ST_OUR_RLPG ||
+            st == LXMF_ST_REMOTE_RLPG_FULL || st == LXMF_ST_REMOTE_RLPG_ERR) {
+            msgSetStatus(n, src_hex, key, LXMF_ST_DELIVERED);
+            info("id %d: rlpg delivery confirm from %.8s → msg %s DELIVERED",
+                 n, src_hex.c_str(), key.c_str());
+        }
+        return;                       /* message_id is unique */
+    }
+    dbg("id %d: rlpg delivery confirm from %.8s: no parked match", n, src_hex.c_str());
+}
+
+/* ── client-side expiry ── */
+
+/* A message parked REMOTE_RLPG that never confirms: past the mailbox's
+ * retention (+ grace) it can no longer be picked up, so flip it to
+ * RLPG_EXPIRED locally — the mailbox sends no expiry notice. Deposit time
+ * is approximated by recv_ts (set at send setup). Retention is a single
+ * global fallback for now. TODO: use the recipient mailbox's advertised
+ * retain_days (announce app_data element [4]) per contact. */
+static void rlpgExpireSweep(uint32_t now_s)
+{
+    int expire_days = storageGetInt("s.lxmf.rlpg.expire_days", 9);
+    if (expire_days <= 0) return;
+    uint32_t max_age = (uint32_t)expire_days * 86400;
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        if (!s_ids[n].used) continue;
+        std::string mpre = "s.lxmf.id." + std::to_string(n) + ".msgs.";
+        for (const auto& peer : rlpgTokens(mpre)) {
+            for (const auto& key : rlpgTokens(mpre + peer + ".")) {
+                if (storageGetInt(msgPath(n, peer, key, "status").c_str(), -1)
+                    != LXMF_ST_REMOTE_RLPG) continue;
+                /* `ts` is the send time (unix s, sender clock); `recv_ts`
+                 * is an inbound field and is not a valid age anchor for our
+                 * own outbound. Only age forward — a future/garbage stamp
+                 * (now_s <= dep) never expires. */
+                uint32_t dep = (uint32_t)storageGetInt(
+                    msgPath(n, peer, key, "ts").c_str(), 0);
+                if (dep && now_s > dep && now_s - dep > max_age) {
+                    msgFail(n, peer, key, LXMF_ST_RLPG_EXPIRED);
+                    info("id %d: rlpg msg %s expired unpicked (%u d)",
+                         n, key.c_str(), (unsigned)expire_days);
+                }
+            }
+        }
+    }
+}
+
+/* ── 1 Hz housekeeping ── */
+
+static void rlpgClientTick(void)
+{
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    if (s_rlpg_ann_handle < 0) connectRlpgAnnounceSub();
+    /* Deposit reaper: a link that never produced HELLO/ack. */
+    for (auto& s : s_rlpgDeps) {
+        if (!s.used || now_s - s.started_s <= LXMF_RLPG_SESSION_TTL_S) continue;
+        warn("id %d: rlpg deposit link %s timed out", s.id_index, s.tag.c_str());
+        rlpgDepFail(s);
+    }
+    rlpgOwnTick(now_s);
+    rlpgRelayFlush(now_s);
+    /* Expiry is a whole-store walk — once a minute is plenty. */
+    static uint32_t s_expire_tick = 0;
+    if (++s_expire_tick >= 60) { s_expire_tick = 0; rlpgExpireSweep(now_s); }
 }
 
 /* ─────────────── Resource aux (rnsd → lxmf) ───────────────
@@ -3234,6 +4810,14 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
     std::memcpy(&d, data, sizeof(d));
 
     if (d.opcode == RNSD_LINK_RESOURCE_INBOUND_DONE) {
+        /* RLPG links first: for links WE opened the aux carries the REMOTE
+         * dest in local_dest_hash (see the conv-link recovery note below),
+         * so an active session's mailbox dest identifies its frames
+         * (PICKUP / DEPOSIT_ACK) before the LXMF-wire recovery logic runs. */
+        if (rlpgResourceInbound(d)) {
+            rnsdResourceRelease(d.buf);
+            return;
+        }
         int idx = -1;
         for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
             if (s_ids[n].used &&
@@ -3254,6 +4838,18 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                 if (s_ids[n].used &&
                     std::memcmp(s_ids[n].dest_hash, wire_dest,
                                 LXMF_DEST_HASH_LEN) == 0) { idx = n; break; }
+            }
+        }
+        if (idx < 0 && d.buf && d.len > 0) {
+            /* No identity claims the leading 16 bytes — the resource may
+             * be a double-encrypted envelope (announce caps bit0). */
+            rx_meta_t m;
+            d.iface[sizeof(d.iface) - 1] = '\0';
+            m.iface.assign(d.iface);
+            if (d.rssi != INT16_MIN) { m.have_signal = true; m.rssi = d.rssi; m.snr10 = d.snr; }
+            if (tryDoubleEncrypted((const uint8_t*)d.buf, d.len, &m)) {
+                rnsdResourceRelease(d.buf);
+                return;
             }
         }
         if (idx < 0) {
@@ -3301,12 +4897,15 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                      * reassembled and acknowledged the full wire. */
                     msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
                     recordOutLinkMeta(id, peer_hex, mid, o.link_tag);
+                    rlpgDirectDelivered(id.index, peer_hex);
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    msgFail(id.index, peer_hex, mid, LXMF_ST_RES_TRANSFER);
-                    id.failed++;
+                    if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_RES_TRANSFER)) {
+                        msgFail(id.index, peer_hex, mid, LXMF_ST_RES_TRANSFER);
+                        id.failed++;
+                    }
                     warn("id %d: DIRECT resource failed mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 }
@@ -3362,14 +4961,35 @@ static void resolveDirectSends(void)
             const std::string& mid      = o.msg_key;
             const std::string& peer_hex = o.peer;
 
+            /* Direct-attempt budget for a mailbox-known peer: rnsd's
+             * path-retry ladder alone can hunt for hours while emitting
+             * only RETRY auxes, so the whole attempt is bounded by wall
+             * clock and handed to RLPG when the budget is spent. An
+             * egressed send (awaiting_proof) parks as NO_RESPONSE, a
+             * still path-parked / link-establishing one as NO_ROUTE. */
+            if (rlpgContactHasMailbox(id.index, peer_hex) &&
+                now_s - o.started_s > rlpgDirectBudgetS(id.index, peer_hex) &&
+                rlpgPreemptOutbound(id, o,
+                                    radioBusyOr(o,
+                                        o.awaiting_proof ? LXMF_ST_NO_RESPONSE
+                                                         : LXMF_ST_NO_ROUTE))) {
+                dbg("id %d: msg %s direct budget spent → rlpg",
+                    id.index, mid.c_str());
+                continue;
+            }
+
             /* Opportunistic proof backstop: stage is "sent" and rnsd owes
              * us a second OUT_RESULT (DELIVERED / PROOF_TIMEOUT). If that
              * frame was lost (ITS drop, rnsd restart), settle as no-proof
              * here so the slot frees. Stage stays "sent". */
             if (!o.direct) {
                 if (o.awaiting_proof && now_s >= o.proof_deadline_s) {
-                    if (!tryDeliveryRetry(id, o, now_s))
-                        msgFail(id.index, peer_hex, mid, LXMF_ST_NO_RESPONSE);   /* opportunistic → no response */
+                    /* opportunistic → no response; a contention-jammed
+                     * radio names itself instead */
+                    uint8_t fs = radioBusyOr(o, LXMF_ST_NO_RESPONSE);
+                    if (!tryDeliveryRetry(id, o, now_s) &&
+                        !rlpgTryPark(id, peer_hex, mid, fs))
+                        msgFail(id.index, peer_hex, mid, fs);
                     o.used = false;
                     o.awaiting_proof = false;
                     dbg("id %d: msg %s proof backstop (no OUT_RESULT)",
@@ -3406,12 +5026,15 @@ static void resolveDirectSends(void)
                      * proof-grade, same as the OUTBOUND_DONE fast path. */
                     msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
                     recordOutLinkMeta(id, peer_hex, mid, o.link_tag);
+                    rlpgDirectDelivered(id.index, peer_hex);
                     id.sent++;
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    msgFail(id.index, peer_hex, mid, LXMF_ST_RES_TRANSFER);
-                    id.failed++;
+                    if (!rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_RES_TRANSFER)) {
+                        msgFail(id.index, peer_hex, mid, LXMF_ST_RES_TRANSFER);
+                        id.failed++;
+                    }
                     warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
                          id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
                 }
@@ -3433,6 +5056,7 @@ static void resolveDirectSends(void)
                 int touts  = storageGetInt((base + ".proof_timeouts").c_str(), 0);
                 if (proven > o.proof_base_proven) {
                     msgSetStatus(id.index, peer_hex, mid, LXMF_ST_DELIVERED);
+                    rlpgDirectDelivered(id.index, peer_hex);
                     info("id %d: DIRECT delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                     directLinkSettle(o.link_tag, true, now_s);
@@ -3444,8 +5068,11 @@ static void resolveDirectSends(void)
                      * died, or our backstop hit). Attempt one retry — which tears
                      * the link down, drops the path, and relinks over a fresh
                      * route. If declined (throttled / already retried), settle
-                     * terminal as NO_PROOF (the send did ride an open link). */
-                    if (!tryDeliveryRetry(id, o, now_s))
+                     * terminal as NO_PROOF (the send did ride an open link) —
+                     * unless the peer has a stored mailbox, which takes
+                     * custody instead. */
+                    if (!tryDeliveryRetry(id, o, now_s) &&
+                        !rlpgFailToMailbox(id, peer_hex, mid, LXMF_ST_NO_PROOF))
                         msgFail(id.index, peer_hex, mid, LXMF_ST_NO_PROOF);
                     dbg("id %d: DIRECT no delivery proof mid=%s tag=%s",
                         id.index, mid.c_str(), o.link_tag.c_str());
@@ -3490,8 +5117,10 @@ static void resolveDirectSends(void)
                 continue;                       /* slot stays — proof phase */
             }
 
-            msgFail(id.index, peer_hex, mid, code);
-            id.failed++;
+            if (!rlpgFailToMailbox(id, peer_hex, mid, code)) {
+                msgFail(id.index, peer_hex, mid, code);
+                id.failed++;
+            }
             warn("id %d: DIRECT failed mid=%s tag=%s (%s)",
                  id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
             if (id.pending > 0) id.pending--;
@@ -3907,6 +5536,31 @@ static int s_ann_count_tmp = 0;
 }
 
 /* ─────────────── bootstrap ─────────────── */
+
+/* Boot-time seed of rnsd's rx-report cap table from stored contacts, so a peer
+ * known capable from a previous session gets extended proofs at once — before it
+ * re-announces this session. rnsd's table is RAM-only (empty at boot); we push
+ * only the capable contacts (the reader treats absent as not-capable), keeping
+ * the table to contacts that carry the capability. Live updates thereafter go
+ * through lxmfPushRxReportCap on contact creation / re-announce. */
+static void lxmfPreloadRxReportCaps(void)
+{
+    int seeded = 0;
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        s_seedPeers.clear();
+        std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
+        storageForEach(cpre.c_str(), seedCollectPeer);
+        for (auto& peer : s_seedPeers) {
+            if (!lxmfContactRxReportCapable(n, peer)) continue;
+            uint8_t dh[16];
+            if (!hexToBytes(peer.c_str(), peer.size(), dh, 16)) continue;
+            rnsdSetRxReportCap(dh, true);
+            seeded++;
+        }
+    }
+    s_seedPeers.clear();
+    if (seeded) info("[%s] rx-report cap: preloaded %d capable contact(s)", TAG, seeded);
+}
 
 /* Load every persisted identity slot. No auto-creation — a transport-
  * only node has no identity and is perfectly legitimate; users opt in
@@ -4537,6 +6191,7 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
         cliPrintf("lxmf announce           emit a delivery announce for selected id\n");
         cliPrintf("lxmf link <act> <peer>  open|close|status a conversation link to <32-hex peer>\n");
+        cliPrintf("lxmf rlpg [<mb>|off]    show / set / unset this identity's RLPG mailbox node\n");
         return;
     }
     /* Bare `lxmf` → identity list as status. */
@@ -4634,6 +6289,36 @@ static void cliLxmf(const char* args)
         }
         return;
     }
+    if (verb == "rlpg") {
+        int sel = selectedId();
+        lxmf_id_t* id = idAt(sel);
+        if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
+        while (*rest == ' ') rest++;
+        if (!*rest) {
+            std::string node = storageGetStr(idPath(sel, "rlpg_node").c_str(), "");
+            std::string svc  = storageGetStr(idPath(sel, "rlpg_service_dest").c_str(), "");
+            if (node.empty()) {
+                cliPrintf("no mailbox configured (use `lxmf rlpg <32-hex mailbox>` )\n");
+            } else {
+                cliPrintf("mailbox   %s\n", node.c_str());
+                cliPrintf("service   %s\n", svc.empty() ? "(not yet learned)" : svc.c_str());
+            }
+            return;
+        }
+        if (!std::strcmp(rest, "off")) {
+            storageUnset(idPath(sel, "rlpg_node").c_str());
+            cliPrintf("mailbox unset for id %d\n", sel);
+            return;
+        }
+        if (std::strlen(rest) != 32) {
+            cliPrintf("usage: lxmf rlpg [<32-hex rlpg.mailbox dest>|off]\n");
+            return;
+        }
+        storageSet(idPath(sel, "rlpg_node").c_str(), rest);
+        cliPrintf("mailbox for id %d set to %s — the owner session will "
+                  "connect and install a certificate\n", sel, rest);
+        return;
+    }
 
     cliPrintf("unknown subcommand `%s`. try `lxmf -h`.\n", verb.c_str());
 }
@@ -4684,6 +6369,11 @@ static void lxmfTaskMain(void*)
      * pre-connect window fails cleanly instead of touching an unconnected dest. */
     loadAllIdentities();
 
+    /* Seed rnsd's rx-report cap table from stored contacts before we connect,
+     * so proofs to already-known capable peers go extended from the first
+     * packet. Pure storage + rnsd's RAM map — no rns.ready needed. */
+    lxmfPreloadRxReportCaps();
+
     /* Boot barrier: stay quiet until rns.ready — clock valid, network up (if
      * configured), and the minimum settle floor elapsed. This is what stops the
      * 1970-stamped first announce: rns.ready can't fire before the clock wait
@@ -4714,9 +6404,10 @@ static void lxmfTaskMain(void*)
                       /*maxHandles=*/1, /*toSize=*/0, /*fromSize=*/0);
     itsOnAux(LXMF_LINK_RESOURCE_AUX_PORT, onResourceAux);
 
-    /* itsClient initialisation — one connection per identity plus the
-     * shared announce-fanout subscription. */
-    itsClientInit(16);
+    /* itsClient initialisation — one connection per identity, the two
+     * announce-fanout subscriptions, the conversation-link pool, and the
+     * RLPG deposit / own-node links. */
+    itsClientInit(24);
 
     /* Identity-level commands (clients write `lxmf.cmd.identity_*`). All
      * per-identity command subs are added by createIdentityForSlot /
@@ -4762,6 +6453,10 @@ static void lxmfTaskMain(void*)
      * memcpys the announce into one ITS packet. */
     connectAnnounceSub();
 
+    /* Second fan-out subscription: rlpg.mailbox announces feed the RAM
+     * mailbox-hint map (routing only; trust is the cert at HELLO). */
+    connectRlpgAnnounceSub();
+
     /* Arm the first announce 30 s out (measured from the waitForTime() return
      * above) so the rest of the stack — rnsd + every transport — is up and
      * stable before we advertise. onRnsdIfaceEvent only pushes this later, never
@@ -4781,6 +6476,7 @@ static void lxmfTaskMain(void*)
             resolveDirectSends();   /* settle outbound DIRECT */
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             publishLinks();         /* per-peer link state for the header icons */
+            rlpgClientTick();       /* deposit reaper, own-node link, relay queue */
             /* Retry sends parked on a then-busy conversation link, plus
              * delivery-retry resends (held back by not_before_s until rnsd has
              * dropped the path). Skip anything no longer queued/retrying
@@ -4998,7 +6694,10 @@ static long migrateMsgFile(const std::string& path)
 }
 
 /* The pre-DATA v3 message schema (hdr_size 40): hex-text message_id + thread.
- * Retained only to read old files during the v3 → v4 migration. */
+ * v3 → v4 (drop `thread`, `message_id` hex-text → 32-byte DATA, add `reply_to`)
+ * is purely structural, so it needs no conversion code: registered as a legacy
+ * hint layout, it lets the store's generic auto-migrator decode a v3 file and
+ * re-pack it as the current layout. Retained only for that registration. */
 static const sdb_schema& lxmfMsgSchemaV3()
 {
     static const sdb_schema s = [] {
@@ -5015,56 +6714,14 @@ static const sdb_schema& lxmfMsgSchemaV3()
     return s;
 }
 
-/* v3 → v4: straight field copy. Every v4 field carries over by name; `thread` is
- * dropped, and `message_id` copies as its hex string (the v4 DATA field decodes
- * it). Returns the conversation's max recv_ts (0 if nothing migrated). */
-static long migrateMsgFileV3toV4(const std::string& path)
-{
-    sdb_store in;
-    in.schema = &lxmfMsgSchemaV3();
-    in.path   = path;
-    if (!sdbLoad(&in) || sdbRecordCount(&in) == 0) { sdbEvict(&in); return 0; }
-
-    MigRec rec;
-    sdbForEach(&in, migCollect, &rec);
-    sdbEvict(&in);
-
-    sdb_store out;
-    out.schema = &lxmfMsgSchema();     /* v4 */
-    out.path   = path + ".v4";
-    sdbInitEmpty(&out);
-
-    long runMax = 0;
-    for (const std::string& key : rec.order) {
-        auto& f = rec.byKey[key];
-        for (const char* pf : { "tries", "status", "recv_ts", "dir", "method", "ts",
-                                "title", "content", "message_id" }) {
-            auto it = f.find(pf);
-            if (it != f.end()) sdbSetField(&out, key.c_str(), pf, it->second.c_str());
-        }
-        auto rit = f.find("recv_ts");
-        long recv = rit != f.end() ? atol(rit->second.c_str()) : 0;
-        if (recv > runMax) runMax = recv;
-    }
-    bool ok = sdbFlush(&out);
-    sdbEvict(&out);
-    if (ok) { fs_remove(path.c_str()); fs_rename((path + ".v4").c_str(), path.c_str()); }
-    else    { fs_remove((path + ".v4").c_str()); return 0; }
-    return runMax;
-}
-
 static void lxmfMigrateMsgs()
 {
-    /* Marker keyed to the current layout (hdr_size), so a future schema change
-     * gets a fresh marker and re-runs the migration instead of being locked out. */
-    uint16_t curHdr = lxmfMsgSchema().hdr_size;
-    std::string marker = fsStatePath(("/storage/migrated-lxmf-msgs-hdr"
-                                      + std::to_string(curHdr)).c_str());
-    int mh = fs_open(marker.c_str(), "rb");
-    if (mh >= 0) { fs_close(mh); return; }   /* already migrated to this layout */
-
-    int  files = 0;
-    bool clean = true;                            /* no unknown/unreadable files seen */
+    /* No marker file: the header peek below is a bounded inflate, so a
+     * steady-state boot is a cheap peek-per-file. The one semantic hop (the
+     * fixstr v2 layout → status/tries/recv_ts) is dispatched by hand; every other
+     * older on-disk layout is purely structural and left to the store's generic
+     * auto-migrator (via the legacy hint schemas registered before this runs). */
+    int files = 0;
     for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
         std::string dir = fsStatePath(("/lxmf/msgs/" + std::to_string(n)).c_str());
         int dh = fs_opendir(dir.c_str());
@@ -5082,39 +6739,32 @@ static void lxmfMigrateMsgs()
         for (auto& stem : stems) {
             std::string path = dir + "/" + stem + ".db.gz";
             uint16_t fid = 0, fver = 0, fhdr = 0;
-            /* Peek the on-disk header so we dispatch by the REAL layout instead of
-             * blindly loading with one schema (which would false-mismatch + skip). */
             if (!sdbPeekHeader(path.c_str(), &fid, &fver, &fhdr)) {
                 warn("lxmf mig: id %d %s: unreadable header — left as-is\n", n, stem.c_str());
-                clean = false; continue;
-            }
-            if (fhdr == curHdr) {                 /* already the current v4 — nothing to do */
-                info("lxmf mig: id %d %s: already current (ver=%u hdr=%u)\n", n, stem.c_str(), fver, fhdr);
                 continue;
             }
-            if (fid == 1 && fhdr == 88) {         /* the fixstr v2 layout → convert */
+            if (fid == 1 && fhdr == 88) {
+                /* The fixstr v2 layout carries no recv_ts and packs status as free
+                 * text: a semantic conversion the generic migrator can't express.
+                 * Convert it here (straight to the current layout) and record the
+                 * synthesized recv_ts to seed the directory. */
                 long mx = migrateMsgFile(path);
                 files++;
                 if (mx > 0) peerMax.emplace_back(stem, mx);
-            } else if (fid == 1 && fhdr == 40) {  /* the hex-text v3 layout → convert */
-                long mx = migrateMsgFileV3toV4(path);
-                files++;
-                if (mx > 0) peerMax.emplace_back(stem, mx);
-            } else {                              /* unknown intermediate → don't guess, don't clobber */
-                warn("lxmf mig: id %d %s: UNKNOWN layout id=%u ver=%u hdr=%u — left as-is\n",
-                     n, stem.c_str(), fid, fver, fhdr);
-                clean = false;
+            } else if (sdbUpgradeFileIfStale(path.c_str(), &lxmfMsgSchema())) {
+                files++;   /* structural upgrade (v3 hex-text, or v4 in the old file frame) */
             }
             /* A conversion is heavy (gunzip + rebuild + gzip + flash write) and
              * runs synchronously on the init task. Yield after each file so the
              * first-boot migration of many conversations feeds the task WDT and
-             * spreads the write/current load instead of one long stall. */
+             * spreads the write/flash load instead of one long stall. */
             vTaskDelay(1);
         }
 
-        /* Carry the running max into the conversation directory too, so the first
-         * post-migration message keeps recv_ts monotonic (last_ts is the running
-         * max the write path clamps against). */
+        /* Carry the semantic conversion's running max into the conversation
+         * directory, so the first post-migration message keeps recv_ts monotonic
+         * (last_ts is the running max the write path clamps against). Structural
+         * upgrades already preserve recv_ts, so only the v2 hop needs this. */
         if (!peerMax.empty()) {
             sdb_store cs;
             cs.schema = &lxmfContactSchema();
@@ -5136,24 +6786,14 @@ static void lxmfMigrateMsgs()
             sdbEvict(&cs);
         }
     }
-    /* Only mark done on a clean run — leave it unmarked if any file was an unknown
-     * layout, so restoring the original state + reflashing can retry the migration
-     * (rather than being permanently locked out by a half-understood run). */
-    if (clean) {
-        int cf = fs_open(marker.c_str(), "wb");
-        if (cf >= 0) fs_close(cf);
-    } else {
-        warn("lxmf: migration left files unconverted — NOT marking done (will retry)\n");
-    }
-    if (files) info("lxmf: migrated %d conversation file(s) to the v4 (DATA) layout\n", files);
+    if (files) info("lxmf: upgraded %d conversation file(s) to the current layout\n", files);
 }
 
-/* ── One-shot contacts v1 → v2 migration ────────────────────────────────────
- * v1 stored `hash` as hex text and had no pubkey. v2 makes `hash` a raw 16-byte
- * DATA field and adds a raw 64-byte `pubkey` (unset until an announce is heard).
- * The hdr_size change (29 → 109) trips the store's header check, so v1 files load
- * empty; decode each with the retained v1 schema and rewrite as v2 first. One
- * file per identity slot (peers are records). Marker-gated → runs once. */
+/* The v1 contact schema (hdr_size 29): `hash` as hex text, no pubkey. v2 makes
+ * `hash` a raw 16-byte DATA field and adds a raw 64-byte `pubkey` (unset until an
+ * announce is heard) — a purely structural change. Registered as a legacy hint
+ * layout so the store's generic auto-migrator decodes a v1 file and re-packs it
+ * as the current layout; retained only for that registration. */
 static const sdb_schema& lxmfContactSchemaV1()
 {
     static const sdb_schema s = [] {
@@ -5168,72 +6808,74 @@ static const sdb_schema& lxmfContactSchemaV1()
     return s;
 }
 
-static void migrateContactFile(const std::string& path)
+/* The message layout just before delivered_ts + rlpg_tid were appended
+ * (hdr_size 104): DATA message_id/reply_to already present. A format_ver-1 file,
+ * so it needs this hint for the auto-migrator to decode it; the two newer fields
+ * default in on migration. */
+static const sdb_schema& lxmfMsgSchemaV4a()
 {
-    sdb_store in;
-    in.schema = &lxmfContactSchemaV1();
-    in.path   = path;
-    if (!sdbLoad(&in) || sdbRecordCount(&in) == 0) { sdbEvict(&in); return; }
-
-    MigRec rec;
-    sdbForEach(&in, migCollect, &rec);
-    sdbEvict(&in);
-
-    sdb_store out;
-    out.schema = &lxmfContactSchema();     /* v2 */
-    out.path   = path + ".v2";
-    sdbInitEmpty(&out);
-
-    for (const std::string& key : rec.order) {
-        auto& f = rec.byKey[key];
-        /* `hash` copies as its hex string — the v2 DATA field decodes it. `pubkey`
-         * has no v1 source, so it stays unset (all-zero) and is learned lazily. */
-        for (const char* pf : { "count", "last_ts", "unread", "read_ts", "last_seen",
-                                "trust", "hash", "display_name", "nick", "preview" }) {
-            auto it = f.find(pf);
-            if (it != f.end()) sdbSetField(&out, key.c_str(), pf, it->second.c_str());
-        }
-    }
-    bool ok = sdbFlush(&out);
-    sdbEvict(&out);
-    if (ok) { fs_remove(path.c_str()); fs_rename((path + ".v2").c_str(), path.c_str()); }
-    else    fs_remove((path + ".v2").c_str());
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 1;
+        x.schema_ver = 4;
+        x.u8("tries").u8("status")
+         .u32("recv_ts")
+         .fixstr("dir", 4).fixstr("method", 16)
+         .u32("ts")
+         .data("message_id", 32).data("reply_to", 32)
+         .text("title").text("content");
+        return x;
+    }();
+    return s;
 }
 
+/* The contact layout just before rlpg + rlpg_svc were appended (hdr_size 109):
+ * DATA hash/pubkey already present. A format_ver-1 file, so it needs this hint;
+ * the two newer dest fields default in on migration. */
+static const sdb_schema& lxmfContactSchemaV2a()
+{
+    static const sdb_schema s = [] {
+        sdb_schema x;
+        x.schema_id = 2;
+        x.schema_ver = 2;
+        x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+         .u8("trust")
+         .data("hash", 16).data("pubkey", 64)
+         .text("display_name").text("nick").text("preview");
+        return x;
+    }();
+    return s;
+}
+
+/* Register the retired on-disk layouts so the store's generic auto-migrator can
+ * decode format_ver-1 files (which carry no embedded descriptor). Every layout
+ * that may still be on flash needs an entry, keyed by (schema_id, hdr_size); the
+ * one exception is the semantic v2 message layout (hdr 88), handled by
+ * lxmfMigrateMsgs() and never auto-converted. Must run before the stores load.
+ * Going forward, format_ver-2 files self-describe and need no new entries here —
+ * this list only has to cover the pre-descriptor layouts already in the field. */
+static void lxmfRegisterLegacyLayouts()
+{
+    sdbRegisterLegacyLayout(&lxmfMsgSchemaV3());        /* messages hdr 40  */
+    sdbRegisterLegacyLayout(&lxmfMsgSchemaV4a());       /* messages hdr 104 */
+    sdbRegisterLegacyLayout(&lxmfContactSchemaV1());    /* contacts hdr 29  */
+    sdbRegisterLegacyLayout(&lxmfContactSchemaV2a());   /* contacts hdr 109 */
+}
+
+/* Upgrade each identity's contact file to the current layout. Purely structural
+ * (v1 → v2, or a v2 file still in the old file frame → the descriptor frame), so
+ * the generic auto-migrator does the whole job; this only walks the slots. No
+ * marker: the peek inside sdbUpgradeFileIfStale is a bounded inflate, cheap to
+ * run every boot. */
 static void lxmfMigrateContacts()
 {
-    uint16_t curHdr = lxmfContactSchema().hdr_size;
-    std::string marker = fsStatePath(("/storage/migrated-lxmf-contacts-hdr"
-                                      + std::to_string(curHdr)).c_str());
-    int mh = fs_open(marker.c_str(), "rb");
-    if (mh >= 0) { fs_close(mh); return; }   /* already migrated to this layout */
-
-    int  files = 0;
-    bool clean = true;
+    int files = 0;
     for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
         std::string path = fsStatePath(("/lxmf/contacts/" + std::to_string(n) + ".db.gz").c_str());
-        uint16_t fid = 0, fver = 0, fhdr = 0;
-        if (!sdbPeekHeader(path.c_str(), &fid, &fver, &fhdr)) continue;   /* no file yet */
-        if (fhdr == curHdr) continue;                                     /* already v2 */
-        if (fid == 2 && fhdr == 29) {                                     /* v1 hex-text layout → convert */
-            migrateContactFile(path);
-            files++;
-        } else {
-            warn("lxmf mig: contacts id %d: UNKNOWN layout id=%u ver=%u hdr=%u — left as-is\n",
-                 n, fid, fver, fhdr);
-            clean = false;
-        }
-        /* Yield after each heavy per-file conversion so the migration feeds the
-         * task WDT and doesn't stall the init task in one burst. */
+        if (sdbUpgradeFileIfStale(path.c_str(), &lxmfContactSchema())) files++;
         vTaskDelay(1);
     }
-    if (clean) {
-        int cf = fs_open(marker.c_str(), "wb");
-        if (cf >= 0) fs_close(cf);
-    } else {
-        warn("lxmf: contact migration left files unconverted — NOT marking done (will retry)\n");
-    }
-    if (files) info("lxmf: migrated %d contact file(s) to the v2 (DATA) layout\n", files);
+    if (files) info("lxmf: upgraded %d contact file(s) to the current layout\n", files);
 }
 
 void LxmfService::onInit()
@@ -5243,9 +6885,11 @@ void LxmfService::onInit()
      * before any message read/write so routing serves the record store. */
     {
         /* Convert older on-disk layouts to the current schemas before the live
-         * stores touch them. Contacts first: the msgs migration carries each
-         * conversation's max recv_ts into the contact directory, which must be at
-         * the current (v2) layout for that write to land. */
+         * stores touch them. Register the legacy hint schemas first so the generic
+         * auto-migrator can decode descriptor-less v1 files. Contacts before msgs:
+         * the msgs migration carries each conversation's max recv_ts into the
+         * contact directory, which must be at the current layout for that to land. */
+        lxmfRegisterLegacyLayouts();
         lxmfMigrateContacts();
         lxmfMigrateMsgs();
 

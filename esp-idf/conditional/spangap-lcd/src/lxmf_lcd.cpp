@@ -214,6 +214,7 @@ struct RowSpec {
     std::string peer, title, sub, age;
     lv_color_t  titleColor{};
     int         unread = 0;
+    bool        rlpg = false;           /* contact has a stored RLPG mailbox → arrow glyph */
 };
 struct ListRow { std::string key, sig; lv_obj_t* obj = nullptr; };   /* one live row */
 std::vector<ListRow> g_rowsC;           /* Contacts rows in render order (search box excluded) */
@@ -308,6 +309,7 @@ lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidd
 lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle image (chain=up, broken-chain=down) */
 lv_obj_t* s_threadSig  = nullptr;       /* header signal bars (contact rssi/snr, falling back to gw) */
 lv_obj_t* s_gwBars     = nullptr;       /* system status-bar signal bars (rnsd.gw.*), created once */
+lv_obj_t* s_rlpgInd    = nullptr;       /* system status-bar RLPG mailbox arrow (lxmf.id.<n>.rlpg_state), created once */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_msgDetail = nullptr;        /* per-message detail page (covers the thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
@@ -351,6 +353,9 @@ lv_obj_t* makeSignalBars(lv_obj_t* parent);
 void setSignalBars(lv_obj_t* box, int local, int remote = -1, int heightPct = 100);
 int signalBarsAt(const std::string& prefix);
 int signalRemoteBarsAt(const std::string& prefix);
+lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color);
+void tintRlpgArrow(lv_obj_t* box, lv_color_t c);
+void rlpgStatusUpdate(const char* = nullptr, const char* = nullptr);
 void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
@@ -474,6 +479,7 @@ void selectId(int n) {
     g_id = n;
     g_msgsPrefix = (n >= 0) ? ("s.lxmf.id." + std::to_string(n) + ".msgs") : "";
     refreshMsgs();
+    rlpgStatusUpdate();   /* the status-bar mailbox arrow follows the selected slot */
 }
 
 std::string peerName(const std::string& peer) {
@@ -1741,6 +1747,163 @@ void onSignalChange(const char* key, const char*) {
     }
 }
 
+/* ---- RLPG mailbox glyph: a small dotted right-arrow (store-and-forward) ---- */
+
+/* Recolour every part of an arrow built by makeRlpgArrow. Setting both bg and
+ * line colour on each child is harmless — the dashes render bg only, the
+ * chevron line only. */
+void tintRlpgArrow(lv_obj_t* box, lv_color_t c) {
+    if (!box) return;
+    uint32_t n = lv_obj_get_child_count(box);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t* ch = lv_obj_get_child(box, (int32_t)i);
+        lv_obj_set_style_bg_color(ch, c, 0);
+        lv_obj_set_style_line_color(ch, c, 0);
+    }
+}
+
+/* Build the glyph into `parent` (caller positions it): three square dashes as
+ * the shaft + an lv_line chevron as the head, vertically centred in a
+ * content-sized flex row. ~13×6 px at zoom 1. Recolour with tintRlpgArrow(). */
+lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color) {
+    lv_obj_t* box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(box, lcdPx(2), 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0; i < 3; i++) {                     /* the dashed shaft */
+        lv_obj_t* d = lv_obj_create(box);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_size(d, lcdPx(2), lcdPx(2));
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+    }
+    lv_obj_t* head = lv_line_create(box);             /* the chevron head */
+    auto* pts = new lv_point_precise_t[3];
+    lv_value_precise_t w = (lv_value_precise_t)lcdPx(3);
+    lv_value_precise_t h = (lv_value_precise_t)lcdPx(6);
+    pts[0] = { 0, 0 };
+    pts[1] = { w, (lv_value_precise_t)(h / 2) };
+    pts[2] = { 0, h };
+    lv_line_set_points(head, pts, 3);
+    lv_obj_set_style_line_width(head, lcdPx(2), 0);
+    lv_obj_set_style_line_rounded(head, true, 0);
+    /* A content-sized line widget is only as wide as its max point x, but the
+     * rounded stroke overhangs the tip by ~half its width — size it explicitly
+     * so the point of the arrow isn't clipped. */
+    lv_obj_set_size(head, w + lcdPx(2), h + lcdPx(2));
+    lv_obj_add_event_cb(head, [](lv_event_t* e) {     /* the line keeps the points by pointer */
+        delete[] static_cast<lv_point_precise_t*>(lv_event_get_user_data(e));
+    }, LV_EVENT_DELETE, pts);
+    tintRlpgArrow(box, color);
+    return box;
+}
+
+/* Signal-style delivery ticks, LVGL-drawn (the web SVG can't cross to the
+ * device): one open circle (reached a mailbox) or two overlapping open
+ * circles (delivered), each with its own check, in `color` (the bubble text)
+ * with the front circle occluding the back one in `bg` (the bubble
+ * background) — so the thin bubble-coloured seam reads between the two.
+ * Content-positioned; each check's heap points free on delete. */
+static lv_obj_t* makeDeliveryTicks(lv_obj_t* parent, bool two,
+                                   lv_color_t color, lv_color_t bg)
+{
+    int d   = lcdPx(12);         /* circle diameter */
+    int bw  = lcdPx(2);          /* ring stroke */
+    int off = lcdPx(7);          /* 2nd-circle overlap offset */
+
+    lv_obj_t* box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, two ? d + off : d, d);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
+
+    auto circleAt = [&](int x, bool backing) {
+        lv_obj_t* c = lv_obj_create(box);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_size(c, d, d);
+        lv_obj_set_pos(c, x, 0);
+        lv_obj_set_style_radius(c, LV_RADIUS_CIRCLE, 0);
+        lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+        if (backing) {                       /* filled bubble-colour occluder */
+            lv_obj_set_style_bg_color(c, bg, 0);
+            lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+        } else {                             /* open ring */
+            lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(c, bw, 0);
+            lv_obj_set_style_border_color(c, color, 0);
+        }
+    };
+    auto checkAt = [&](int x) {              /* V check centred in the circle at x */
+        int ccx = x + d / 2, ccy = d / 2;
+        auto* pts = new lv_point_precise_t[3];
+        pts[0] = { (lv_value_precise_t)(ccx - lcdPx(3)), (lv_value_precise_t)(ccy) };
+        pts[1] = { (lv_value_precise_t)(ccx - lcdPx(1)), (lv_value_precise_t)(ccy + lcdPx(2)) };
+        pts[2] = { (lv_value_precise_t)(ccx + lcdPx(3)), (lv_value_precise_t)(ccy - lcdPx(2)) };
+        lv_obj_t* ln = lv_line_create(box);
+        lv_line_set_points(ln, pts, 3);
+        lv_obj_set_style_line_width(ln, lcdPx(2), 0);
+        lv_obj_set_style_line_color(ln, color, 0);
+        lv_obj_set_style_line_rounded(ln, true, 0);
+        lv_obj_remove_flag(ln, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(ln, [](lv_event_t* e) {
+            delete[] static_cast<lv_point_precise_t*>(lv_event_get_user_data(e));
+        }, LV_EVENT_DELETE, pts);
+    };
+
+    circleAt(0, false); checkAt(0);          /* back (or only) circle + check */
+    if (two) {
+        circleAt(off, true);                 /* occlude the overlap in bubble bg */
+        circleAt(off, false); checkAt(off);  /* front circle + check on top */
+    }
+    return box;
+}
+
+/* System status-bar RLPG indicator: the selected identity's own
+ * store-and-forward mailbox state (lxmf.id.<n>.rlpg_state). Key absent/"" =
+ * no mailbox configured → hidden; "idle" grey, "connecting" yellow,
+ * "connected" green. Before the messenger has picked a slot (g_id < 0) it
+ * follows the lowest loaded identity. s_rlpgInd lives in the shell status bar
+ * (created once in appInit), so it persists across app opens; a null handle
+ * (status bar not up) no-ops. */
+void rlpgStatusUpdate(const char*, const char*) {
+    if (!s_rlpgInd) return;
+    int n = g_id;
+    if (n < 0) {
+        std::vector<int> ids;
+        loadedIds(ids);
+        if (!ids.empty()) n = ids[0];
+    }
+    std::string st;
+    if (n >= 0) {
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.rlpg_state", n);
+        st = storageGetStr(k, "");
+    }
+    if (st.empty()) { lv_obj_add_flag(s_rlpgInd, LV_OBJ_FLAG_HIDDEN); return; }
+    uint32_t c = st == "connected"  ? 0x3fa34du :
+                 st == "connecting" ? 0xd4a017u : 0x888888u;
+    tintRlpgArrow(s_rlpgInd, lv_color_hex(c));
+    lv_obj_remove_flag(s_rlpgInd, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Make an object and its whole subtree transparent to touch, so a press falls
+ * through to the clickable ancestor beneath it. A plain lv_obj is CLICKABLE by
+ * default; the meta row's grow-spacer, delivery-tick circles and signal-bar
+ * boxes would otherwise win the hit-test over the bubble and swallow the
+ * long-press that opens the message detail — leaving only the (non-clickable)
+ * text labels pressable. Links live in the bubble body, never in meta, so this
+ * strips no real tap target. */
+void passThroughInput(lv_obj_t* o) {
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    uint32_t n = lv_obj_get_child_count(o);
+    for (uint32_t i = 0; i < n; i++)
+        passThroughInput(lv_obj_get_child(o, (int32_t)i));
+}
+
 void fillMeta(lv_obj_t* meta, const Msg& m) {
     lv_obj_clean(meta);
 
@@ -1779,19 +1942,32 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
     lv_label_set_text(tl, tbuf);
 
     if (!m.in) {
-        const char* sym = "...";                     /* queued/requesting/sending/awaiting → in flight */
-        lv_color_t  col = lv_color_hex(0x8a93a0);
-        if (m.status == LXMF_ST_DELIVERED)      { sym = LV_SYMBOL_OK LV_SYMBOL_OK; col = lv_color_hex(0x4abf6a); }
-        else if (m.status == LXMF_ST_CANCELLED) { sym = LV_SYMBOL_CLOSE;           col = lv_color_hex(0x8a93a0); }
-        else if (m.tries == LXMF_TRIES_GAVEUP)  { sym = LV_SYMBOL_CLOSE;           col = lv_color_hex(0xd9534f); }
-        lv_obj_t* ic = lv_label_create(meta);    /* delivery glyph (small) */
-        lv_obj_set_style_text_font(ic, kFontSmall, 0);
-        lv_obj_set_style_text_color(ic, col, 0);
-        lv_label_set_text(ic, sym);
+        /* Signal-style ticks in the bubble's own text colour, occluded by the
+         * outbound bubble bg: two open circles = delivered, one = reached a
+         * mailbox (own/remote RLPG, awaiting pickup). A real failure/refusal
+         * (FULL/ERR/EXPIRED/gave-up) is ✕; cancelled a grey ✕; else in flight. */
+        lv_color_t tick = lv_color_hex(0xe8eef6), bubBg = lv_color_hex(0x2563a0);
+        if (m.status == LXMF_ST_DELIVERED) {
+            makeDeliveryTicks(meta, /*two=*/true, tick, bubBg);
+        } else if (m.status == LXMF_ST_REMOTE_RLPG || m.status == LXMF_ST_OUR_RLPG) {
+            makeDeliveryTicks(meta, /*two=*/false, tick, bubBg);
+        } else {
+            const char* sym = "...";                 /* in flight */
+            lv_color_t  col = lv_color_hex(0x8a93a0);
+            if (m.status == LXMF_ST_CANCELLED)     { sym = LV_SYMBOL_CLOSE; }
+            else if (m.tries == LXMF_TRIES_GAVEUP) { sym = LV_SYMBOL_CLOSE; col = lv_color_hex(0xd9534f); }
+            lv_obj_t* ic = lv_label_create(meta);
+            lv_obj_set_style_text_font(ic, kFontSmall, 0);
+            lv_obj_set_style_text_color(ic, col, 0);
+            lv_label_set_text(ic, sym);
+        }
     }
 
     /* LoRa indicator — rightmost, after time + delivery glyph. */
     if (m.iface.rfind("LoRa", 0) == 0) addLoraInd(meta, m.message_id);
+
+    /* The whole meta row must let the bubble's long-press through. */
+    passThroughInput(meta);
 }
 
 /* Pin the time to the bubble's right at ALL widths: measure the meta line's
@@ -2198,7 +2374,8 @@ void closeHistory() {
 
 /* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
 
-struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; int count = 0; };
+struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; int count = 0;
+              bool rlpg = false; /* a non-trivial contacts.<peer>.rlpg = stored mailbox dest */ };
 
 /* Conversation list built from the maintained directory (contacts.<peer>.*),
    NOT by walking messages — O(conversations), and it touches only the small
@@ -2225,6 +2402,8 @@ void convCb(const char* key, const char* val) {
     else if (!strcmp(field, "unread"))  c->unread  = val ? atoi(val) : 0;
     else if (!strcmp(field, "read_ts")) c->read_ts = val ? atol(val) : 0;
     else if (!strcmp(field, "preview")) c->preview = val ? val : "";
+    /* rlpg: the peer's mailbox dest (32-hex); empty / all-zero = none known. */
+    else if (!strcmp(field, "rlpg"))    c->rlpg    = val && *val && strspn(val, "0") != strlen(val);
 }
 
 /* Compact "time since" badge shown at the right of every row: how long ago we
@@ -2674,6 +2853,13 @@ lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
 
     fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);   /* row → flex: [body][age] */
 
+    /* Dotted-arrow mailbox glyph: this contact has a stored RLPG mailbox, so a
+     * message to them can be parked for store-and-forward pickup. */
+    if (s.rlpg) {
+        lv_obj_t* mb = makeRlpgArrow(row, lv_color_hex(0x8a93a0));
+        lv_obj_set_style_pad_left(mb, 4, 0);
+    }
+
     /* Per-contact signal bars, shown when we've seen this peer DIRECT (a
      * lxmf.contactsig.<peer> record exists, i.e. a zero-hop radio packet). */
     int cbars = signalBarsAt("lxmf.contactsig." + s.peer);
@@ -2912,8 +3098,9 @@ void rebuildList(bool keepScroll) {
         RowSpec s; s.kind = RK_CONTACT; s.key = c.peer; s.peer = c.peer;
         s.title = nm; s.sub = printable(c.preview, true);
         s.age = la > 0 ? relAge(now - la) : std::string();
-        s.titleColor = lv_color_white(); s.unread = c.unread;
-        s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread);   /* age excluded on purpose */
+        s.titleColor = lv_color_white(); s.unread = c.unread; s.rlpg = c.rlpg;
+        s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread)
+              + (c.rlpg ? "|R" : "");                                       /* age excluded on purpose */
         tC.push_back(std::move(s));
         cRows++;
     }
@@ -3504,6 +3691,14 @@ void LxmfApp::appInit() {
         storageSubscribeChanges("rnsd.gw",         onSignalChange);
         storageSubscribeChanges("lxmf.contactsig", onSignalChange);
         gwSignalUpdate();
+        /* RLPG mailbox arrow: the selected identity's own store-and-forward
+         * connection state, hidden while no mailbox is configured. Rides the
+         * lxmf.id live tree (rlpg_state / up edges), same lcd-task discipline. */
+        lv_obj_t* rslot = lcdStatusbarAddIndicator();
+        s_rlpgInd = rslot ? makeRlpgArrow(rslot, lv_color_hex(0x888888)) : nullptr;
+        if (s_rlpgInd) lv_obj_add_flag(s_rlpgInd, LV_OBJ_FLAG_HIDDEN);
+        storageSubscribeChanges("lxmf.id", rlpgStatusUpdate);
+        rlpgStatusUpdate();
         /* Drive the age-fade between packets: re-evaluate the gw bars' opacity
          * every 20 s (≈90 steps across the 30-min fade), which also drops them
          * once fully faded. Cheap; the storage callbacks handle value changes. */
