@@ -48,7 +48,7 @@
           </span>
           <!-- Parked at a mailbox (own/remote RLPG): one open circle + check —
                reached a mailbox, awaiting pickup. Before the gave-up test,
-               since these carry tries==255. FULL/ERR/EXPIRED fall through ✕. -->
+               since these carry tries==255. FULL/ERR fall through ✕. -->
           <span v-else-if="m.status === LxmfStatus.RemoteRlpg ||
                            m.status === LxmfStatus.OurRlpg" class="chip ticks"
                 title="stored at a mailbox — awaiting pickup">

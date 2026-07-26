@@ -1945,7 +1945,7 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
         /* Signal-style ticks in the bubble's own text colour, occluded by the
          * outbound bubble bg: two open circles = delivered, one = reached a
          * mailbox (own/remote RLPG, awaiting pickup). A real failure/refusal
-         * (FULL/ERR/EXPIRED/gave-up) is ✕; cancelled a grey ✕; else in flight. */
+         * (FULL/ERR/gave-up) is ✕; cancelled a grey ✕; else in flight. */
         lv_color_t tick = lv_color_hex(0xe8eef6), bubBg = lv_color_hex(0x2563a0);
         if (m.status == LXMF_ST_DELIVERED) {
             makeDeliveryTicks(meta, /*two=*/true, tick, bubBg);

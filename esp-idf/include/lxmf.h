@@ -77,7 +77,7 @@ enum LxmfStatus : uint8_t {
     LXMF_ST_OUR_RLPG          = 30,  /* handed to our own RLPG node for relay */
     LXMF_ST_REMOTE_RLPG_FULL  = 31,  /* recipient's mailbox refused: quota full */
     LXMF_ST_REMOTE_RLPG_ERR   = 32,  /* recipient's mailbox refused: error */
-    LXMF_ST_RLPG_EXPIRED      = 33,  /* held past mailbox retention, dropped unpicked */
+    /* 33 retired (was RLPG_EXPIRED) */
     LXMF_ST_RADIO_BUSY        = 34,  /* send failed while the local LoRa radio was
                                       * shedding frames to channel contention — the
                                       * own channel is jammed, not the peer silent */
@@ -121,7 +121,6 @@ static inline const char* lxmfStatusName(uint8_t s) {
         case LXMF_ST_OUR_RLPG:          return "OUR_RLPG";
         case LXMF_ST_REMOTE_RLPG_FULL:  return "REMOTE_RLPG_FULL";
         case LXMF_ST_REMOTE_RLPG_ERR:   return "REMOTE_RLPG_ERR";
-        case LXMF_ST_RLPG_EXPIRED:      return "RLPG_EXPIRED";
         case LXMF_ST_RADIO_BUSY:        return "RADIO_BUSY";
         default:                        return "";
     }

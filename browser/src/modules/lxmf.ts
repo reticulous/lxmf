@@ -81,7 +81,7 @@ export enum LxmfStatus {
   /* RLPG mailbox states (tries 255 yet still movable by RLPG service msgs:
    * OurRlpg → RemoteRlpg → Delivered). */
   RemoteRlpg = 29, OurRlpg = 30, RemoteRlpgFull = 31, RemoteRlpgErr = 32,
-  RlpgExpired = 33,
+  /* 33 retired (was RlpgExpired) */
   /* Send failed while the local LoRa radio was shedding frames to channel
    * contention — the own channel is jammed, not the peer silent. */
   RadioBusy = 34,
@@ -225,7 +225,6 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.RemoteRlpg]: 'REMOTE_RLPG', [LxmfStatus.OurRlpg]: 'OUR_RLPG',
   [LxmfStatus.RemoteRlpgFull]: 'REMOTE_RLPG_FULL',
   [LxmfStatus.RemoteRlpgErr]: 'REMOTE_RLPG_ERR',
-  [LxmfStatus.RlpgExpired]: 'RLPG_EXPIRED',
   [LxmfStatus.RadioBusy]: 'RADIO_BUSY',
 }
 export function lxmfStatusName(status: number): string {

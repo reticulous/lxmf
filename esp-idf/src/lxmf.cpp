@@ -4737,42 +4737,6 @@ static void rlpgConsumeDeliveryConfirm(lxmf_id_t& id, const std::string& src_hex
     dbg("id %d: rlpg delivery confirm from %.8s: no parked match", n, src_hex.c_str());
 }
 
-/* ── client-side expiry ── */
-
-/* A message parked REMOTE_RLPG that never confirms: past the mailbox's
- * retention (+ grace) it can no longer be picked up, so flip it to
- * RLPG_EXPIRED locally — the mailbox sends no expiry notice. Deposit time
- * is approximated by recv_ts (set at send setup). Retention is a single
- * global fallback for now. TODO: use the recipient mailbox's advertised
- * retain_days (announce app_data element [4]) per contact. */
-static void rlpgExpireSweep(uint32_t now_s)
-{
-    int expire_days = storageGetInt("s.lxmf.rlpg.expire_days", 9);
-    if (expire_days <= 0) return;
-    uint32_t max_age = (uint32_t)expire_days * 86400;
-    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
-        if (!s_ids[n].used) continue;
-        std::string mpre = "s.lxmf.id." + std::to_string(n) + ".msgs.";
-        for (const auto& peer : rlpgTokens(mpre)) {
-            for (const auto& key : rlpgTokens(mpre + peer + ".")) {
-                if (storageGetInt(msgPath(n, peer, key, "status").c_str(), -1)
-                    != LXMF_ST_REMOTE_RLPG) continue;
-                /* `ts` is the send time (unix s, sender clock); `recv_ts`
-                 * is an inbound field and is not a valid age anchor for our
-                 * own outbound. Only age forward — a future/garbage stamp
-                 * (now_s <= dep) never expires. */
-                uint32_t dep = (uint32_t)storageGetInt(
-                    msgPath(n, peer, key, "ts").c_str(), 0);
-                if (dep && now_s > dep && now_s - dep > max_age) {
-                    msgFail(n, peer, key, LXMF_ST_RLPG_EXPIRED);
-                    info("id %d: rlpg msg %s expired unpicked (%u d)",
-                         n, key.c_str(), (unsigned)expire_days);
-                }
-            }
-        }
-    }
-}
-
 /* ── 1 Hz housekeeping ── */
 
 static void rlpgClientTick(void)
@@ -4787,9 +4751,6 @@ static void rlpgClientTick(void)
     }
     rlpgOwnTick(now_s);
     rlpgRelayFlush(now_s);
-    /* Expiry is a whole-store walk — once a minute is plenty. */
-    static uint32_t s_expire_tick = 0;
-    if (++s_expire_tick >= 60) { s_expire_tick = 0; rlpgExpireSweep(now_s); }
 }
 
 /* ─────────────── Resource aux (rnsd → lxmf) ───────────────
