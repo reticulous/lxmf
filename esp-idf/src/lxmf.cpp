@@ -248,6 +248,8 @@ struct lxmf_id_t {
 };
 
 static TaskHandle_t s_task = nullptr;
+static volatile bool s_stop = false;   /* rns stop → break the work loop and park */
+static volatile bool s_parked = false; /* true while parked (stopped); lxmfStop waits on it */
 PSRAM_BSS static lxmf_id_t    s_ids[LXMF_MAX_IDENTITIES];
 
 /* Inbound dedup ring (recent message_ids, hex64). */
@@ -2273,12 +2275,13 @@ static void sendAnnounce(lxmf_id_t& id)
                (int)(nowUnixMs() / 1000));
     id.last_announce_tick = xTaskGetTickCount();
     if (id.last_announce_tick == 0) id.last_announce_tick = 1;  /* 0 means "never" */
-    /* Pretty-print the app_data we just built: name + cost (the [f] shape
-     * from parseLxmfAnnounce). rnsd will log the wire contents too, but
-     * showing it here keeps each line self-contained for debugging. */
+    /* Present tense: we've handed the announce to rnsd, which decides whether it
+     * actually reaches the air (it logs "announcing …" or "announce held …") —
+     * so don't claim "sent" here. Pretty-print the app_data we built: name + cost
+     * (the [f] shape from parseLxmfAnnounce), keeping the line self-contained. */
     std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
     int cost = storageGetInt("s.lxmf.stamp_cost", 8);
-    info("id %d: announce sent name=\"%s\" cost=%d (%zu B app_data)",
+    info("id %d: announcing name=\"%s\" cost=%d (%zu B app_data)",
          id.index, sanitizeForLog(name).c_str(), cost, app_data.size());
 }
 
@@ -5396,6 +5399,16 @@ static void unsubscribePerIdCmds(int n)
 static TickType_t s_lastPublishTick = 0;
 static TickType_t s_lastBackfillTick = 0;   /* throttles backfillContactNames() */
 #define LXMF_PUBLISH_INTERVAL_MS 1000
+#define LXMF_PUBLISH_IDLE_MS     5000   /* no UI watching: stretch the tick for light sleep */
+
+/* How often the maintenance tick fires. When a UI wants telemetry (LCD build or
+ * WiFi up so a browser can read the keys) keep it snappy at 1 Hz; on a headless,
+ * WiFi-down node nobody reads the stats, so drop to 5 s — the bundled maintenance
+ * (link reaping, send resolution) is all minute-scale and tolerates it, and this
+ * stops the tick from capping light sleep. */
+static uint32_t lxmfTickIntervalMs(void) {
+    return uiTelemetryWanted() ? LXMF_PUBLISH_INTERVAL_MS : LXMF_PUBLISH_IDLE_MS;
+}
 
 /* When non-zero, the absolute tick at which any newly-armed announce
  * should fire. Armed once at task startup (covers the case where rnsd
@@ -5406,10 +5419,9 @@ static TickType_t s_lastBackfillTick = 0;   /* throttles backfillContactNames() 
  * not after each one). */
 static TickType_t s_announce_due_tick = 0;
 #define LXMF_ANNOUNCE_DEBOUNCE_MS 10000
-/* The first announce of the session is held this long after the clock goes
- * valid (waitForTime returns in lxmfTaskMain), so rnsd + the transports are up
- * and stable before we advertise. Armed once at startup; later announces use
- * the 10 s iface-up debounce only. */
+/* The first announce of the session is held this long after task start, so rnsd
+ * + the transports are up and stable before we advertise. Armed once at startup;
+ * later announces use the 10 s iface-up debounce only. */
 #define LXMF_FIRST_ANNOUNCE_DELAY_MS 30000
 
 static void onRnsdIfaceEvent(const char* /*key*/, const char* /*val*/)
@@ -6289,7 +6301,7 @@ static void cliLxmf(const char* args)
 static TickType_t nextDeadline(void)
 {
     TickType_t now = xTaskGetTickCount();
-    TickType_t due = s_lastPublishTick + pdMS_TO_TICKS(LXMF_PUBLISH_INTERVAL_MS);
+    TickType_t due = s_lastPublishTick + pdMS_TO_TICKS(lxmfTickIntervalMs());
     if (due <= now) return 0;
     return due - now;
 }
@@ -6317,6 +6329,23 @@ static void onOpenContactUrl(const char* /*key*/, const char* val)
     }
 }
 
+/* Re-establish every rnsd connection lxmf's live operation depends on: one
+ * our-dest per loaded identity, plus the lxmf.delivery and rlpg.mailbox
+ * announce subscriptions. Runs on first task entry and on every resume from
+ * park — each connect helper no-ops when its handle is already live, so the
+ * work loop's own reconnect paths and this share one code path. Teardown (the
+ * park path in lxmfTaskMain) drops these so rnsd frees the server slots; this
+ * brings them back. Not the one-time client/server init or storage subs —
+ * those persist across a park and must never be repeated. */
+static void lxmfBringUp(void)
+{
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        if (s_ids[n].used) connectOurDest(s_ids[n]);
+    }
+    connectAnnounceSub();
+    connectRlpgAnnounceSub();
+}
+
 static void lxmfTaskMain(void*)
 {
     info("[%s] task up", TAG);
@@ -6335,15 +6364,9 @@ static void lxmfTaskMain(void*)
      * packet. Pure storage + rnsd's RAM map — no rns.ready needed. */
     lxmfPreloadRxReportCaps();
 
-    /* Boot barrier: stay quiet until rns.ready — clock valid, network up (if
-     * configured), and the minimum settle floor elapsed. This is what stops the
-     * 1970-stamped first announce: rns.ready can't fire before the clock wait
-     * resolves. Bounded fallback so a wedged rnsd can't pin us. No rnsd, no
-     * point — so bail (don't start) if rns.ready never comes. */
-    if (!waitForFlag("rns.ready", 120)) {
-        err("[%s] rns.ready never set — not starting", TAG);
-        killSelf();
-    }
+    /* No boot barrier here: the RNS orchestrator only calls lxmfStart() once rnsd
+     * is up and past its boot window (clock valid, network settled), so rnsd's
+     * ports are ready and the first announce can't be 1970-stamped. */
 
     /* lxmf is both an ITS client (RNSD_PORT_DEST / RNSD_PORT_LINK /
      * announce-fanout connects) and a server hosting
@@ -6393,33 +6416,19 @@ static void lxmfTaskMain(void*)
             s_dbg_only_local = val && val[0] && std::atoi(val) != 0;
         });
 
-    /* Hold off until the platform clock is valid (rnsd + the transports gate on
-     * the same signal), so our first delivery announce isn't stamped with the
-     * 1970 epoch and rnsd is already up before we connect to its ports below.
-     * Bounded; proceeds on timeout. */
-    waitForTime(0);
+  for (;;) {   /* Park, don't delete: this task lives across rns stop/start, so its
+                * ITS ports + shared inbox are reused, not re-init'd. The bring-up
+                * below (re)connects the rnsd conns torn down on the last park; the
+                * teardown after the work loop drops them again. */
+    /* Connect each loaded identity's delivery dest, and the two announce
+     * fan-out subscriptions (lxmf.delivery + rlpg.mailbox). This is the step
+     * that actually needs rnsd; the identities themselves (keys + dest hashes)
+     * were loaded before the loop. We do NOT announce here — that's driven by
+     * iface_event_seq + the periodic schedule, both checked from the 1 Hz tick. */
+    lxmfBringUp();
 
-    /* Connect each loaded identity's delivery dest — this is the step that
-     * actually needs rnsd. The identities themselves (keys + dest hashes) were
-     * loaded before the barrier. rnsd should be up by the time we get here; we'll
-     * just block in itsConnect if it's not. We do NOT announce here — that's
-     * driven by iface_event_seq + the periodic schedule, both checked from the
-     * 1 Hz tick. */
-    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
-        if (s_ids[n].used) connectOurDest(s_ids[n]);
-    }
-
-    /* Subscribe to lxmf.delivery announces via rnsd's fan-out port. All
-     * announce-catalogue writes happen on this task — rnsd's task only
-     * memcpys the announce into one ITS packet. */
-    connectAnnounceSub();
-
-    /* Second fan-out subscription: rlpg.mailbox announces feed the RAM
-     * mailbox-hint map (routing only; trust is the cert at HELLO). */
-    connectRlpgAnnounceSub();
-
-    /* Arm the first announce 30 s out (measured from the waitForTime() return
-     * above) so the rest of the stack — rnsd + every transport — is up and
+    /* Arm the first announce 30 s out (measured from bring-up) so the rest of
+     * the stack — rnsd + every transport — is up and
      * stable before we advertise. onRnsdIfaceEvent only pushes this later, never
      * earlier, so ifaces coming up inside the window can't pull it in. Covers
      * the case where rnsd brought ifaces up before our subscription landed. */
@@ -6428,11 +6437,11 @@ static void lxmfTaskMain(void*)
     s_lastPublishTick = xTaskGetTickCount();
     publishStats();
 
-    for (;;) {
+    while (!s_stop) {
         itsPoll(nextDeadline());
 
         TickType_t now = xTaskGetTickCount();
-        if (now - s_lastPublishTick >= pdMS_TO_TICKS(LXMF_PUBLISH_INTERVAL_MS)) {
+        if (now - s_lastPublishTick >= pdMS_TO_TICKS(lxmfTickIntervalMs())) {
             publishStats();
             resolveDirectSends();   /* settle outbound DIRECT */
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
@@ -6526,6 +6535,62 @@ static void lxmfTaskMain(void*)
             s_lastPublishTick = now;
         }
     }
+
+    /* rns stop. The persistent state (s_ids, dedup ring, buffers) is PSRAM_BSS,
+     * not heap — it stays put for the next lxmfStart(); the one-time client/
+     * server init and storage subs above likewise persist and are never redone.
+     *
+     * Teardown (the whole point of parking rather than deleting): itsDisconnect
+     * every rnsd connection we hold so rnsd fires onDisconnect and frees the
+     * matching server slots — the our-dest handles (RNSD_PORT_DEST) and the two
+     * announce subscriptions (RNSD_PORT_ANNOUNCES). Also drop the conversation
+     * links (RNSD_PORT_LINK). Each handle back to -1 so a resume reconnects
+     * cleanly via lxmfBringUp(). */
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        if (s_ids[n].handle >= 0) {
+            itsDisconnect(s_ids[n].handle);
+            s_ids[n].handle = -1;
+        }
+    }
+    if (s_announce_sub_handle >= 0) {
+        itsDisconnect(s_announce_sub_handle);
+        s_announce_sub_handle = -1;
+    }
+    if (s_rlpg_ann_handle >= 0) {
+        itsDisconnect(s_rlpg_ann_handle);
+        s_rlpg_ann_handle = -1;
+    }
+    for (auto& c : s_convlinks) convDrop(c);
+    /* Remaining RNSD_PORT_LINK holders — inbound DIRECT links, RLPG deposit and
+     * own-node links. Empty on a quiescent node, but disconnect any live one so
+     * its rnsd link slot frees across a stop/start cycle. */
+    for (auto& s : s_inlinks)  if (s.used && s.handle >= 0) { itsDisconnect(s.handle); s = inlink_t{}; }
+    for (auto& d : s_rlpgDeps) if (d.handle >= 0) { int h = d.handle; d = rlpg_dep_t{}; itsDisconnect(h); }
+    for (auto& o : s_rlpgOwn)  if (o.handle >= 0) { int h = o.handle; o = rlpg_own_t{}; itsDisconnect(h); }
+
+    /* Park on the inbox until lxmfStart() clears s_stop and notifies. */
+    s_parked = true;
+    info("[%s] stopped", TAG);
+    while (s_stop) itsPoll(portMAX_DELAY);
+    s_parked = false;
+  }
+}
+
+/* ── RNS lifecycle hooks (registered with the orchestrator; see rnsServiceRegister) ── */
+static void lxmfStart(void) {
+    s_stop = false;
+    if (!s_task)
+        s_task = spawnTask(lxmfTaskMain, TAG, 8192, nullptr, 1, 0, STACK_PSRAM);
+    else
+        xTaskNotifyGive(s_task);   /* un-park the resident task */
+}
+
+static void lxmfStop(void) {
+    if (!s_task || s_stop) return;
+    s_stop = true;
+    xTaskNotifyGive(s_task);   /* break the work loop; the task parks, not deleted */
+    for (int i = 0; i < 300 && !s_parked; i++) delay(10);   /* await park */
+    if (!s_parked) warn("[%s] stop timed out", TAG);
 }
 
 /* ── One-shot message-store migrations ──────────────────────────────────────
@@ -6999,10 +7064,12 @@ void LxmfService::onInit()
 
     cliRegisterCmd("lxmf", cliLxmf);
 
-    /* Core 0, prio 1, 8 KB PSRAM stack. Pinned to the transport core (alongside
-     * rnsd, prio 2) that feeds it, so inbound-message bursts no longer contend
-     * with the LCD/audio tasks on core 1. */
-    s_task = spawnTask(lxmfTaskMain, TAG, 8192, nullptr, 1, 0, STACK_PSRAM);
+    /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
+     * calls lxmfStart() (which spawns lxmfTaskMain) once rnsd is up and past its
+     * boot window, and rnsStop() calls lxmfStop(). Core 0, prio 1, 8 KB PSRAM
+     * stack — pinned to the transport core (alongside rnsd, prio 2) that feeds
+     * it, so inbound-message bursts don't contend with the LCD/audio tasks. */
+    rnsServiceRegister(TAG, lxmfStart, lxmfStop);
 
     /* The on-device LXMessenger launcher tile registers via lxmfLcdRegister(),
      * a when: spangap/spangap-lcd init: hook (conditional/spangap-lcd/ slice).
