@@ -46,6 +46,24 @@
         </div>
       </template>
 
+      <!-- Per-contact propagation node: offered as the second option of the
+           resend dialog for this contact's messages. -->
+      <div class="sect">Propagation node</div>
+      <select class="pnsel" :value="pnSelValue" @change="onPnSelect">
+        <option value="">None</option>
+        <option v-for="node in pnNodes" :key="node.hash" :value="node.hash">
+          {{ node.name || node.hash.slice(0, 8) + '…' }} (ours)
+        </option>
+        <option v-if="pnIsForeign" :value="contactPn">
+          {{ contactPn.slice(0, 8) }}… (custom)
+        </option>
+        <option value="~custom">Other…</option>
+      </select>
+      <div v-if="pnCustom" class="pncustom">
+        <input v-model="pnCustomHash" class="pnfld" placeholder="32-hex node dest hash" />
+        <button class="pnset" :disabled="!validCustomPn" @click="applyCustomPn">Set</button>
+      </div>
+
       <template v-if="ratchet">
         <div class="sect">Ratchet</div>
         <div class="sn small">{{ ratchet }}</div>
@@ -64,7 +82,8 @@ import { matArrowBack, matVerifiedUser, matContentCopy, matCheck }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import RlpgIcon from './RlpgIcon.vue'
-import { hasRlpg, type Contact, type Reachability } from '../../modules/lxmf'
+import { hasRlpg, hasDest, type Contact, type PnNode, type Reachability }
+  from '../../modules/lxmf'
 
 const props = defineProps<{
   peer: string
@@ -72,11 +91,36 @@ const props = defineProps<{
   contact: Contact | null
   reach: Reachability | null
   ratchet: string
+  pnNodes: PnNode[]
 }>()
 const emit = defineEmits<{
   close: []
   'delete-conversation': [peer: string]
+  'set-pn': [peer: string, hash: string]
 }>()
+
+/* ── Per-contact propagation node ── */
+const contactPn = computed(() => {
+  const v = props.contact?.pn ?? ''
+  return hasDest(v) ? v.toLowerCase() : ''
+})
+const pnIsForeign = computed(() =>
+  !!contactPn.value && !props.pnNodes.some(n => n.hash === contactPn.value))
+const pnCustom = ref(false)
+const pnCustomHash = ref('')
+const validCustomPn = computed(() => /^[0-9a-f]{32}$/i.test(pnCustomHash.value.trim()))
+const pnSelValue = computed(() => (pnCustom.value ? '~custom' : contactPn.value))
+function onPnSelect(e: Event) {
+  const v = (e.target as HTMLSelectElement).value
+  if (v === '~custom') { pnCustom.value = true; return }
+  pnCustom.value = false
+  emit('set-pn', props.peer, v)
+}
+function applyCustomPn() {
+  emit('set-pn', props.peer, pnCustomHash.value.trim().toLowerCase())
+  pnCustom.value = false
+  pnCustomHash.value = ''
+}
 
 const verified = computed(() => (props.contact?.trust ?? 0) >= 1)
 const mailbox = computed(() => hasRlpg(props.contact?.rlpg ?? ''))
@@ -167,4 +211,22 @@ const reachLine = computed(() => {
   padding: 9px; font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
 }
 .danger:hover { background: rgba(160,86,86,0.15); }
+.pnsel {
+  width: 100%; background: #2a2a2a; color: #e8e8e8;
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+  padding: 7px 10px; font-size: calc(13px * var(--rfs, 1)); outline: none;
+}
+.pncustom { display: flex; gap: 8px; margin-top: 8px; }
+.pnfld {
+  flex: 1; background: #2a2a2a; color: #e8e8e8;
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+  padding: 6px 10px; font-size: calc(11px * var(--rfs, 1));
+  font-family: 'JetBrains Mono', monospace; outline: none;
+}
+.pnset {
+  background: #3a5d47; border: none; color: #eaffea;
+  border-radius: 6px; padding: 6px 12px; font-size: calc(12px * var(--rfs, 1));
+  cursor: pointer;
+}
+.pnset:disabled { background: #333; color: #777; cursor: default; }
 </style>

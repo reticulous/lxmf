@@ -85,6 +85,9 @@ export enum LxmfStatus {
   /* Send failed while the local LoRa radio was shedding frames to channel
    * contention — the own channel is jammed, not the peer silent. */
   RadioBusy = 34,
+  /* Classic lxmf.propagation node states. OnPn is final — a propagation
+   * node issues no delivery proof; the recipient pulls on its next sync. */
+  OnPn = 35, PnFail = 36, PnRejected = 37,
 }
 /* tries === 255 is the one definitive terminal marker (gave up). */
 export const LXMF_TRIES_GAVEUP = 255
@@ -156,6 +159,15 @@ export interface Contact {
   lastSeen: number
   rlpg: string         // peer's RLPG mailbox dest (32-hex); '' / all-zero = none known
   caps: number         // announce capability bits (bit0 = accepts double-encrypted payloads); -1 = leaf absent (unknown)
+  pn: string           // per-contact propagation node (32-hex); '' / all-zero = none set
+}
+
+/** One entry of the global propagation-node list (s.lxmf.pn.<i>), in
+ *  index order. `check` = this node is polled for held messages. */
+export interface PnNode {
+  hash: string
+  name: string
+  check: boolean
 }
 
 export interface Announce {
@@ -202,6 +214,12 @@ export function hasRlpg(rlpg: string): boolean {
   return /[1-9a-f]/i.test(rlpg)
 }
 
+/** True when a stored destination field (e.g. a contact's `pn`) names a real
+ *  dest — non-empty and not the all-zero placeholder. */
+export function hasDest(v: string): boolean {
+  return /[1-9a-f]/i.test(v)
+}
+
 /* status code → its ALL-CAPS enum name for display. The only direction needed —
  * a stored code is never parsed back from text.
  * MIRROR: keep in sync with lxmfStatusName in lxmf.h (same names, same numbers). */
@@ -226,6 +244,8 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.RemoteRlpgFull]: 'REMOTE_RLPG_FULL',
   [LxmfStatus.RemoteRlpgErr]: 'REMOTE_RLPG_ERR',
   [LxmfStatus.RadioBusy]: 'RADIO_BUSY',
+  [LxmfStatus.OnPn]: 'ON_PN', [LxmfStatus.PnFail]: 'PN_FAIL',
+  [LxmfStatus.PnRejected]: 'PN_REJECTED',
 }
 export function lxmfStatusName(status: number): string {
   return STATUS_NAME[status] ?? ''
@@ -468,6 +488,19 @@ export interface UseLxmf {
   openPeer: (peer: string) => void
   send: (peer: string, content: string, opts?: { method?: string; thread?: string }) => Promise<void>
   resend: (peer: string, key: string) => Promise<void>
+  /** Resend through a propagation node (via = 32-hex node); '' = direct. */
+  resendVia: (peer: string, key: string, via: string) => Promise<void>
+  /** Global propagation-node list (s.lxmf.pn.<i>), in index order. */
+  pnNodes: ComputedRef<PnNode[]>
+  pnAdd: (hash: string, name?: string) => void
+  pnRemove: (i: number) => void
+  pnMove: (i: number, dir: -1 | 1) => void
+  pnSetName: (i: number, name: string) => void
+  pnSetCheck: (i: number, on: boolean) => void
+  pnSyncNow: () => Promise<void>
+  pnStatus: (hash: string) => { lastCheckS: number; lastErr: string; lastGot: number } | null
+  /** Set / clear ('') the per-contact propagation node. */
+  setContactPn: (peer: string, hash: string) => void
   cancel: (peer: string, key: string) => Promise<void>
   deleteMessage: (peer: string, key: string) => Promise<void>
   deleteConversation: (peer: string) => Promise<void>
@@ -590,6 +623,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         lastSeen: num(c.last_seen),
         rlpg: str(c.rlpg),
         caps: num(c.caps, -1),   // mirrored as a decimal string like trust; an absent leaf stays -1 (unknown)
+        pn: str(c.pn),
       }
     }
     return out
@@ -843,6 +877,103 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     device.sendJson(patch)
   }
 
+  /* ── Propagation nodes (global, index-ordered list at s.lxmf.pn.<i>) ──
+   * Client-owned plain config keys; the firmware only reads them. A slot
+   * whose hash isn't 32-hex counts as free, so "delete" compacts the list
+   * and blanks the tail (the storage DC has no key-delete). */
+  const PN_MAX = 8
+  const pnNodes = computed<PnNode[]>(() => {
+    const raw = device.get('s.lxmf.pn') ?? {}
+    const out: PnNode[] = []
+    for (let i = 0; i < PN_MAX; i++) {
+      const e = raw[i] ?? {}
+      const hash = str(e.hash).toLowerCase()
+      if (!/^[0-9a-f]{32}$/.test(hash)) continue
+      out.push({ hash, name: str(e.name), check: num(e.check, 1) === 1 })
+    }
+    return out
+  })
+
+  /** Rewrite the whole list (used by every mutator): slots 0..n-1 get the
+   *  entries, the remaining previously-used slots are blanked. */
+  function pnWrite(list: PnNode[]) {
+    const patch: Patch = {}
+    const prev = pnNodes.value.length
+    for (let i = 0; i < Math.max(list.length, prev); i++) {
+      const e = list[i]
+      deepAssign(patch, nest(`s.lxmf.pn.${i}`, e
+        ? { hash: e.hash, name: e.name, check: e.check ? 1 : 0 }
+        : { hash: '', name: '', check: 0 }))
+    }
+    device.sendJson(patch)
+  }
+  const pnAdd = (hash: string, name = '') => {
+    const h = hash.trim().toLowerCase()
+    if (!/^[0-9a-f]{32}$/.test(h)) throw new Error('node hash must be 32 hex chars')
+    const list = pnNodes.value.slice()
+    if (list.some(e => e.hash === h)) return
+    if (list.length >= PN_MAX) throw new Error(`at most ${PN_MAX} nodes`)
+    list.push({ hash: h, name: name.trim(), check: true })
+    pnWrite(list)
+  }
+  const pnRemove = (i: number) => {
+    const list = pnNodes.value.slice()
+    if (i < 0 || i >= list.length) return
+    list.splice(i, 1)
+    pnWrite(list)
+  }
+  const pnMove = (i: number, dir: -1 | 1) => {
+    const list = pnNodes.value.slice()
+    const j = i + dir
+    if (i < 0 || i >= list.length || j < 0 || j >= list.length) return
+    const t = list[i]!; list[i] = list[j]!; list[j] = t
+    pnWrite(list)
+  }
+  const pnSetName = (i: number, name: string) => {
+    const list = pnNodes.value.slice()
+    if (!list[i]) return
+    list[i] = { ...list[i]!, name: name.trim() }
+    pnWrite(list)
+  }
+  const pnSetCheck = (i: number, on: boolean) => {
+    const list = pnNodes.value.slice()
+    if (!list[i]) return
+    list[i] = { ...list[i]!, check: on }
+    pnWrite(list)
+  }
+  /** Check the marked nodes for held messages now (all usable identities). */
+  const pnSyncNow = () => queue('lxmf.cmd.pn_sync').enqueue('all')
+  /** Ephemeral per-node sync result (lxmf.pn.<hash>.*), null if never checked. */
+  const pnStatus = (hash: string): { lastCheckS: number; lastErr: string; lastGot: number } | null => {
+    const r = device.get(`lxmf.pn.${hash}`)
+    if (!r) return null
+    return { lastCheckS: num(r.last_check_s), lastErr: str(r.last_err), lastGot: num(r.last_got) }
+  }
+
+  /** Per-contact propagation node ('' clears). Plain config write — the
+   *  firmware reads it only through the resend dialog's via option. */
+  const setContactPn = (peer: string, hash: string) => {
+    const h = hash.trim().toLowerCase()
+    if (h && !/^[0-9a-f]{32}$/.test(h)) throw new Error('node hash must be 32 hex chars')
+    device.set(`s.lxmf.id.${activeId.value}.contacts.${peer}.pn`,
+               h || '00000000000000000000000000000000')
+  }
+
+  /** Resend through a propagation node (via = node hash); '' resends direct. */
+  const resendVia = (peer: string, key: string, via: string) => {
+    if (!via) return resend(peer, key)
+    const n = activeId.value
+    const statusOf = () =>
+      num(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.status`))
+    return sendQ('send').enqueue(`${peer}/${key}/pn:${via}`, {
+      settle: () => {
+        const st = statusOf()
+        return st === LxmfStatus.Sending || st === LxmfStatus.OnPn ||
+               st === LxmfStatus.PnFail || st === LxmfStatus.PnRejected
+      },
+    })
+  }
+
   const createIdentity = (label: string) =>
     queue('lxmf.cmd.identity_new').enqueue(label || 'main')
   const importIdentity = (privHex: string) =>
@@ -878,7 +1009,9 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     conversations, activeConversation, contacts, announces,
     peerDirectory, unreadTotal,
     displayName, reachability, contactOf, draftFor, setDraft, openPeer,
-    send, resend, cancel, deleteMessage, deleteConversation,
+    send, resend, resendVia, cancel, deleteMessage, deleteConversation,
+    pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
+    pnStatus, setContactPn,
     markConversationRead, msgMeta, announceNow, linkState, toggleLink,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }

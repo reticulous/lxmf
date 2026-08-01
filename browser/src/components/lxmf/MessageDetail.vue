@@ -87,6 +87,24 @@
           <div class="k">Read</div><div class="v">{{ m.read ? 'yes' : 'no' }}</div>
         </template>
       </div>
+
+      <button v-if="m.dir === 'out'" class="resend" @click="openResend">Resend…</button>
+    </div>
+
+    <!-- Resend dialog: direct first, the contact's node second (when set),
+         then our propagation nodes. -->
+    <div v-if="resendOpen" class="dlg-bg" @click="resendOpen = false">
+      <div class="dlg" @click.stop>
+        <div class="dtitle">Resend message</div>
+        <label v-for="opt in resendOptions" :key="opt.via" class="ropt">
+          <input type="radio" name="resend-via" :value="opt.via" v-model="resendVia" />
+          <span>{{ opt.label }}</span>
+        </label>
+        <div class="dbtns">
+          <button class="go" @click="doResend">Resend</button>
+          <button class="cancel" @click="resendOpen = false">Cancel</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -94,15 +112,50 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
-import { type Message, type MsgMeta, lxmfStatusName, loraBars, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+import { type Message, type MsgMeta, type PnNode, lxmfStatusName, loraBars,
+         hasDest, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 import SignalBars from './SignalBars.vue'
 
 const props = defineProps<{
   m: Message
   meta: MsgMeta | null
   peerName: string
+  pnNodes: PnNode[]
+  contactPn: string
 }>()
-const emit = defineEmits<{ close: [] }>()
+const emit = defineEmits<{
+  close: []
+  /** via = '' → resend directly; else the 32-hex propagation node. */
+  resend: [m: Message, via: string]
+}>()
+
+/* ── Resend dialog ── */
+const resendOpen = ref(false)
+const resendVia = ref('')
+const resendOptions = computed(() => {
+  const opts: { via: string; label: string }[] = [{ via: '', label: 'Directly' }]
+  const cpn = hasDest(props.contactPn) ? props.contactPn.toLowerCase() : ''
+  if (cpn) {
+    const known = props.pnNodes.find(n => n.hash === cpn)
+    opts.push({
+      via: cpn,
+      label: `Contact’s node — ${known?.name || cpn.slice(0, 8) + '…'}`,
+    })
+  }
+  for (const n of props.pnNodes) {
+    if (n.hash === cpn) continue
+    opts.push({ via: n.hash, label: `Node ${n.name || n.hash.slice(0, 8) + '…'}` })
+  }
+  return opts
+})
+function openResend() {
+  resendVia.value = ''
+  resendOpen.value = true
+}
+function doResend() {
+  resendOpen.value = false
+  emit('resend', props.m, resendVia.value)
+}
 
 const statusName = computed(() => lxmfStatusName(props.m.status))
 const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
@@ -206,4 +259,34 @@ async function copy(key: string, val: string) {
   cursor: pointer; padding: 4px; border-radius: 5px;
 }
 .copy:hover { background: rgba(255,255,255,0.08); color: #cfcfcf; }
+.resend {
+  margin-top: 18px; width: 100%; background: #3a5d47; border: none;
+  color: #eaffea; border-radius: 8px; padding: 9px;
+  font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
+}
+.resend:hover { background: #46704f; }
+.dlg-bg {
+  position: absolute; inset: 0; background: rgba(0,0,0,0.5); z-index: 8;
+  display: flex; align-items: center; justify-content: center;
+}
+.dlg {
+  width: 100%; max-width: 320px; margin: 16px; background: #262626;
+  border-radius: 12px; padding: 14px;
+}
+.dtitle {
+  color: #e8e8e8; font-weight: 600; font-size: calc(14px * var(--rfs, 1));
+  margin-bottom: 10px;
+}
+.ropt {
+  display: flex; align-items: center; gap: 8px; padding: 7px 2px;
+  color: #d8d8d8; font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
+}
+.dbtns { display: flex; gap: 8px; margin-top: 12px; }
+.dbtns button {
+  flex: 1; border: none; border-radius: 8px; padding: 8px;
+  font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
+}
+.dbtns .go { background: #3a5d47; color: #eaffea; }
+.dbtns .go:hover { background: #46704f; }
+.dbtns .cancel { background: #333; color: #c8c8c8; }
 </style>

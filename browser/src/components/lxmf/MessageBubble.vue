@@ -46,12 +46,14 @@
                 title="delivered — cryptographic proof received">
             <DeliveryTicks variant="delivered" />
           </span>
-          <!-- Parked at a mailbox (own/remote RLPG): one open circle + check —
-               reached a mailbox, awaiting pickup. Before the gave-up test,
-               since these carry tries==255. FULL/ERR fall through ✕. -->
+          <!-- Parked at a mailbox (own/remote RLPG) or uploaded to a
+               propagation node: one open circle + check — stored for pickup.
+               Before the gave-up test, since these carry tries==255.
+               FULL/ERR/PN_FAIL fall through ✕. -->
           <span v-else-if="m.status === LxmfStatus.RemoteRlpg ||
-                           m.status === LxmfStatus.OurRlpg" class="chip ticks"
-                title="stored at a mailbox — awaiting pickup">
+                           m.status === LxmfStatus.OurRlpg ||
+                           m.status === LxmfStatus.OnPn" class="chip ticks"
+                title="stored for pickup (mailbox / propagation node)">
             <DeliveryTicks variant="sent" />
           </span>
           <span v-else-if="m.status === LxmfStatus.Cancelled" class="chip">

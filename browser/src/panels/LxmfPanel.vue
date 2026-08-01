@@ -36,6 +36,60 @@
 
     <q-separator dark />
 
+    <div class="text-caption text-grey-5">Propagation nodes</div>
+    <div class="text-caption text-grey-5">
+      Classic LXMF store-and-forward nodes. Messages can be resent through
+      one from a message's detail page; nodes with “check” on are polled
+      for messages held for your identities.
+    </div>
+    <div v-if="lxmf.pnNodes.value.length === 0" class="none">
+      No propagation nodes configured.
+    </div>
+    <div v-for="(node, i) in lxmf.pnNodes.value" :key="node.hash" class="ident">
+      <div class="irow">
+        <div class="pnmain">
+          <input
+            class="fld pnname"
+            :value="node.name"
+            placeholder="(unnamed)"
+            @change="e => lxmf.pnSetName(i, (e.target as HTMLInputElement).value)"
+          />
+          <div class="ihash">{{ node.hash }}</div>
+          <div v-if="pnStatusLine(node.hash)" class="pnstat">{{ pnStatusLine(node.hash) }}</div>
+        </div>
+        <div class="iact">
+          <label class="chk" title="Check this node for held messages">
+            <input type="checkbox" :checked="node.check"
+                   @change="e => lxmf.pnSetCheck(i, (e.target as HTMLInputElement).checked)" />
+            check
+          </label>
+          <button class="mv" :disabled="i === 0" title="Move up"
+                  @click="lxmf.pnMove(i, -1)">↑</button>
+          <button class="mv" :disabled="i === lxmf.pnNodes.value.length - 1" title="Move down"
+                  @click="lxmf.pnMove(i, 1)">↓</button>
+          <button class="del" title="Remove" @click="removePn(i)">✕</button>
+        </div>
+      </div>
+    </div>
+    <div class="add">
+      <input v-model="pnHash" class="fld mono" placeholder="32-hex node dest hash" />
+      <input v-model="pnName" class="fld pnaddname" placeholder="Name (optional)" />
+      <button class="act" :disabled="!validPnHash" @click="addPn">Add</button>
+    </div>
+    <div class="add">
+      <button class="act" :disabled="!lxmf.pnNodes.value.some(n => n.check)" @click="checkNow">
+        Check for messages now
+      </button>
+      <span v-if="syncing" class="pnstat">checking {{ syncing.slice(0, 8) }}…</span>
+    </div>
+    <SettingSlider label="Check interval (s)" k="s.lxmf.pn.check_interval_s"
+                   :min="0" :max="21600" :step="300" />
+    <div class="text-caption text-grey-5">
+      How often the checked nodes are polled. 0 = only when asked.
+    </div>
+
+    <q-separator dark />
+
     <div class="text-caption text-grey-5">Identities</div>
     <div v-if="lxmf.identities.value.length === 0" class="none">
       No identities. Without one this device is a transport-only node
@@ -80,6 +134,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useLxmf } from '../modules/lxmf'
 
 const lxmf = useLxmf()
@@ -89,6 +144,36 @@ const busy = ref(false)
 const msg = ref('')
 
 const validHex = computed(() => /^[0-9a-f]{128}$/i.test(importHex.value.trim()))
+
+/* ── Propagation nodes ── */
+const pnHash = ref('')
+const pnName = ref('')
+const validPnHash = computed(() => /^[0-9a-f]{32}$/i.test(pnHash.value.trim()))
+const syncing = computed(() =>
+  String(useDeviceStore().get('lxmf.pn.sync') ?? ''))
+
+function addPn() {
+  try { lxmf.pnAdd(pnHash.value, pnName.value) }
+  catch (e) { msg.value = e instanceof Error ? e.message : 'failed'; return }
+  pnHash.value = ''
+  pnName.value = ''
+}
+function removePn(i: number) {
+  const node = lxmf.pnNodes.value[i]
+  if (!node) return
+  if (!window.confirm(`Remove propagation node ${node.name || node.hash}?`)) return
+  lxmf.pnRemove(i)
+}
+function checkNow() {
+  lxmf.pnSyncNow()
+}
+function pnStatusLine(hash: string): string {
+  const st = lxmf.pnStatus(hash)
+  if (!st || !st.lastCheckS) return ''
+  const when = new Date(st.lastCheckS * 1000).toLocaleTimeString()
+  return st.lastErr ? `last check ${when}: ${st.lastErr}`
+                    : `last check ${when}: ${st.lastGot} message(s)`
+}
 
 async function run(fn: () => Promise<void>, ok: string) {
   busy.value = true
@@ -141,6 +226,20 @@ function destroy(n: number) {
   padding: 7px 10px; font-size: 13px; outline: none;
 }
 .fld.mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.pnmain { flex: 1; min-width: 0; }
+.pnname { width: 160px; margin-bottom: 3px; padding: 3px 8px; font-size: 12px; }
+.pnaddname { max-width: 160px; }
+.pnstat { color: #8a9a8a; font-size: 11px; margin-top: 2px; }
+.chk {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: #b8c0b8; font-size: 12px; cursor: pointer; user-select: none;
+}
+.mv {
+  background: none; border: 1px solid rgba(255,255,255,0.18); color: #b8b8b8;
+  border-radius: 5px; padding: 2px 7px; font-size: 12px; cursor: pointer;
+}
+.mv:disabled { opacity: 0.3; cursor: default; }
+.mv:not(:disabled):hover { background: rgba(255,255,255,0.08); }
 .fld:focus { border-color: rgba(120,170,140,0.6); }
 .act {
   background: #3a5d47; border: none; color: #eaffea;

@@ -89,8 +89,10 @@
           :contact="lxmf.contactOf(lxmf.activePeer.value)"
           :reach="lxmf.reachability(lxmf.activePeer.value)"
           :ratchet="ratchetOf(lxmf.activePeer.value)"
+          :pn-nodes="lxmf.pnNodes.value"
           @close="showContact = false"
           @delete-conversation="onDeleteConversation"
+          @set-pn="(peer, hash) => lxmf.setContactPn(peer, hash)"
         />
 
         <MessageDetail
@@ -98,7 +100,10 @@
           :m="detailMsg"
           :meta="lxmf.msgMeta(detailMsg.messageId)"
           :peer-name="lxmf.displayName(detailMsg.peer)"
+          :pn-nodes="lxmf.pnNodes.value"
+          :contact-pn="lxmf.contactOf(detailMsg.peer)?.pn ?? ''"
           @close="detailMsg = null"
+          @resend="onResendVia"
         />
 
         <!-- message action sheet (Signal long-press analog) -->
@@ -189,6 +194,11 @@ async function onSend(content: string) {
 
 function ratchetOf(peer: string): string {
   return lxmf.announces.value.find(a => a.hash === peer)?.ratchet ?? ''
+}
+
+function onResendVia(m: Message, via: string) {
+  detailMsg.value = null
+  lxmf.resendVia(m.peer, m.key, via)
 }
 
 function onDeleteConversation(peer: string) {
