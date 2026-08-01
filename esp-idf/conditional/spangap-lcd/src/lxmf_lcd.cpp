@@ -1949,7 +1949,8 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
         lv_color_t tick = lv_color_hex(0xe8eef6), bubBg = lv_color_hex(0x2563a0);
         if (m.status == LXMF_ST_DELIVERED) {
             makeDeliveryTicks(meta, /*two=*/true, tick, bubBg);
-        } else if (m.status == LXMF_ST_REMOTE_RLPG || m.status == LXMF_ST_OUR_RLPG) {
+        } else if (m.status == LXMF_ST_REMOTE_RLPG || m.status == LXMF_ST_OUR_RLPG ||
+                   m.status == LXMF_ST_ON_PN) {
             makeDeliveryTicks(meta, /*two=*/false, tick, bubBg);
         } else {
             const char* sym = "...";                 /* in flight */
@@ -2442,6 +2443,62 @@ long lastAnnounce(const std::string& peer) {
  * hidden while it's up (so keyboard focus can't reach covered widgets) and
  * restored by the back chevron — thread or list, whichever opened it. */
 
+/* ---- propagation-node list model (s.lxmf.pn.<i>, client-owned) ----
+ * Index-ordered global list of classic lxmf.propagation nodes; a slot whose
+ * hash isn't 32-hex counts as free. The firmware only reads these keys, so
+ * every mutation here is a plain rewrite of the list. */
+
+const int PN_MAX = 8;
+
+struct PnEntry { std::string hash, name; bool check; };
+
+std::vector<PnEntry> pnList() {
+    std::vector<PnEntry> out;
+    for (int i = 0; i < PN_MAX; i++) {
+        char k[40];
+        snprintf(k, sizeof k, "s.lxmf.pn.%d.hash", i);
+        std::string h = storageGetStr(k, "");
+        if (h.size() != 32) continue;
+        PnEntry e;
+        e.hash = h;
+        snprintf(k, sizeof k, "s.lxmf.pn.%d.name", i);
+        e.name = storageGetStr(k, "");
+        snprintf(k, sizeof k, "s.lxmf.pn.%d.check", i);
+        e.check = storageGetInt(k, 1) != 0;
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+/* Rewrite the whole list: entries land at 0..n-1, the previously-used tail
+ * is blanked (hash "" = free slot). */
+void pnStoreList(const std::vector<PnEntry>& list, size_t prev_len) {
+    storageBegin();
+    for (size_t i = 0; i < std::max(list.size(), prev_len); i++) {
+        char k[40];
+        snprintf(k, sizeof k, "s.lxmf.pn.%d.hash", (int)i);
+        storageSet(k, i < list.size() ? list[i].hash.c_str() : "");
+        snprintf(k, sizeof k, "s.lxmf.pn.%d.name", (int)i);
+        storageSet(k, i < list.size() ? list[i].name.c_str() : "");
+        snprintf(k, sizeof k, "s.lxmf.pn.%d.check", (int)i);
+        storageSet(k, i < list.size() ? (list[i].check ? 1 : 0) : 0);
+    }
+    storageEnd();
+}
+
+/* Short display label for a node: its name, else the hash's first 8 hex. */
+std::string pnLabel(const PnEntry& e) {
+    return e.name.empty() ? e.hash.substr(0, 8) + ".." : e.name;
+}
+
+/* Heap-int index rider for per-row button callbacks (freed with the widget). */
+void onIdxDelete(lv_event_t* e) { delete static_cast<int*>(lv_event_get_user_data(e)); }
+void bindIdx(lv_obj_t* o, lv_event_cb_t cb, lv_event_code_t code, int idx) {
+    auto* p = new int(idx);
+    lv_obj_add_event_cb(o, cb, code, p);
+    lv_obj_add_event_cb(o, onIdxDelete, LV_EVENT_DELETE, p);
+}
+
 std::string groupHash(const std::string& h) {
     std::string out;
     out.reserve(h.size() + h.size() / 4);
@@ -2549,6 +2606,22 @@ void showDeleteConfirm(lv_event_t*) {
     deferFocus(cnc);   /* safe default under the cursor */
 }
 
+/* Contact-info "Propagation node" dropdown changed: write the selected node
+ * (or the all-zero "none") to the contact record. The index→hash map rides
+ * the widget as user data. */
+void onInfoPnChanged(lv_event_t* e) {
+    auto* vias = static_cast<std::vector<std::string>*>(lv_event_get_user_data(e));
+    lv_obj_t* dd = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    uint32_t sel = lv_dropdown_get_selected(dd);
+    if (!vias || sel >= vias->size() || g_id < 0 || g_infoPeer.empty()) return;
+    const std::string& h = (*vias)[sel];
+    std::string k = "s.lxmf.id." + std::to_string(g_id) + ".contacts." + g_infoPeer + ".pn";
+    storageSet(k.c_str(), h.empty() ? "00000000000000000000000000000000" : h.c_str());
+}
+void onInfoPnDelete(lv_event_t* e) {
+    delete static_cast<std::vector<std::string>*>(lv_event_get_user_data(e));
+}
+
 void showInfo(const std::string& peer) {
     refreshFont();
     g_infoFromThread = s_thread && !lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
@@ -2601,6 +2674,38 @@ void showInfo(const std::string& peer) {
         mkLabel(body, "Heard on the mesh " + relAge(nowMonoS() - la) + " ago",
                 lv_color_hex(0x8a93a0));
 
+    /* Per-contact propagation node — offered as the second option of the
+     * resend dialog for this contact's messages. Options: none, the
+     * configured node list, plus the current value when it isn't ours. */
+    mkLabel(body, "Propagation node", lv_color_hex(0x8a93a0));
+    lv_obj_t* dd = lv_dropdown_create(body);
+    lv_obj_set_width(dd, lv_pct(100));
+    lv_obj_set_style_text_font(dd, kFont, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(dd), kFont, 0);
+    auto* vias = new std::vector<std::string>;      /* index → hash ('' = none) */
+    vias->push_back("");
+    std::string opts = "None";
+    std::string cur = g_id < 0 ? "" :
+        storageGetStr(("s.lxmf.id." + std::to_string(g_id) +
+                       ".contacts." + peer + ".pn").c_str(), "");
+    if (cur.find_first_not_of('0') == std::string::npos) cur.clear();
+    int sel = 0;
+    for (auto& e : pnList()) {
+        vias->push_back(e.hash);
+        opts += "\n" + pnLabel(e);
+        if (e.hash == cur) sel = (int)vias->size() - 1;
+    }
+    if (!cur.empty() && sel == 0) {                 /* set to a node not in our list */
+        vias->push_back(cur);
+        opts += "\n" + cur.substr(0, 8) + "..";
+        sel = (int)vias->size() - 1;
+    }
+    lv_dropdown_set_options(dd, opts.c_str());
+    lv_dropdown_set_selected(dd, sel);
+    lv_obj_add_event_cb(dd, onInfoPnChanged, LV_EVENT_VALUE_CHANGED, vias);
+    lv_obj_add_event_cb(dd, onInfoPnDelete,  LV_EVENT_DELETE, vias);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), dd);
+
     lv_obj_t* del = lv_button_create(body);
     lv_obj_remove_style_all(del);
     lv_obj_set_width(del, lv_pct(100));
@@ -2640,9 +2745,113 @@ void detailRow(lv_obj_t* body, const char* k, const std::string& v) {
     lv_obj_set_width(val, lv_pct(100));
 }
 
+/* ---- resend dialog (message detail page, outbound messages) ----
+ * A scrim + box over the detail page: a dropdown ordered [Directly,
+ * contact's node (when set), our nodes], default Directly, plus
+ * Resend/Cancel. Confirming writes the cmd.send sentinel — with a
+ * "/pn:<hash>" via segment for a propagation-node resend — and returns
+ * to the thread, where the status updates live. */
+lv_obj_t* s_resendDlg = nullptr;            /* child of s_msgDetail */
+lv_obj_t* s_resendDd  = nullptr;
+std::string g_resendKey;                    /* message key the dialog acts on */
+std::vector<std::string> g_resendVias;      /* dropdown index → via ('' = direct) */
+
+void closeResendDlg() {
+    if (s_resendDlg) lv_obj_delete(s_resendDlg);
+    s_resendDlg = nullptr;
+    s_resendDd = nullptr;
+}
+
+void msgDetailBack();   /* fwd */
+
+void onResendGo(lv_event_t*) {
+    uint32_t sel = s_resendDd ? lv_dropdown_get_selected(s_resendDd) : 0;
+    std::string via = sel < g_resendVias.size() ? g_resendVias[sel] : "";
+    closeResendDlg();
+    if (g_id < 0 || g_curPeer.empty() || g_resendKey.empty()) return;
+    char k[48];
+    snprintf(k, sizeof k, "lxmf.id.%d.cmd.send", g_id);
+    std::string v = g_curPeer + "/" + g_resendKey;
+    if (!via.empty()) v += "/pn:" + via;
+    storageSet(k, v.c_str());
+    msgDetailBack();                        /* thread shows the live status */
+}
+
+void showResendDialog(lv_event_t*) {
+    if (!s_msgDetail || s_resendDlg || g_id < 0 || g_curPeer.empty()) return;
+
+    /* Full-page scrim absorbing taps outside the box. */
+    s_resendDlg = lv_obj_create(s_msgDetail);
+    lv_obj_remove_style_all(s_resendDlg);
+    lv_obj_set_size(s_resendDlg, lv_pct(100), lv_pct(100));
+    lv_obj_add_flag(s_resendDlg, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_resendDlg, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_resendDlg, LV_OPA_50, 0);
+    lv_obj_add_flag(s_resendDlg, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_resendDlg, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* box = lv_obj_create(s_resendDlg);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(85));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_all(box, 10, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 8, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    mkLabel(box, "Resend message", lv_color_white());
+
+    /* [Directly] first; the contact's node second when set; our nodes after. */
+    g_resendVias.clear();
+    g_resendVias.push_back("");
+    std::string opts = "Directly";
+    std::string cpn = storageGetStr(("s.lxmf.id." + std::to_string(g_id) +
+                                     ".contacts." + g_curPeer + ".pn").c_str(), "");
+    if (cpn.find_first_not_of('0') == std::string::npos) cpn.clear();
+    if (!cpn.empty()) {
+        std::string label = cpn.substr(0, 8) + "..";
+        for (auto& e : pnList()) if (e.hash == cpn) { label = pnLabel(e); break; }
+        g_resendVias.push_back(cpn);
+        opts += "\nContact node: " + label;
+    }
+    for (auto& e : pnList()) {
+        if (e.hash == cpn) continue;
+        g_resendVias.push_back(e.hash);
+        opts += "\nNode: " + pnLabel(e);
+    }
+
+    s_resendDd = lv_dropdown_create(box);
+    lv_obj_set_width(s_resendDd, lv_pct(100));
+    lv_obj_set_style_text_font(s_resendDd, kFont, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(s_resendDd), kFont, 0);
+    lv_dropdown_set_options(s_resendDd, opts.c_str());
+    lv_dropdown_set_selected(s_resendDd, 0);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_resendDd);
+
+    lv_obj_t* btns = lv_obj_create(box);
+    lv_obj_remove_style_all(btns);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btns, 8, 0);
+    lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* go = confirmButton(btns, "Resend", lv_color_hex(0x2a4a35));
+    lv_obj_add_event_cb(go, onResendGo, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cnc = confirmButton(btns, "Cancel", lv_color_hex(0x2a313a));
+    lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeResendDlg(); }, LV_EVENT_CLICKED, nullptr);
+    deferFocus(go);
+}
+
 void closeMsgDetail() {
-    if (s_msgDetail) lv_obj_delete(s_msgDetail);
+    if (s_msgDetail) lv_obj_delete(s_msgDetail);   /* s_resendDlg is a child — dies with it */
     s_msgDetail = nullptr;
+    s_resendDlg = nullptr;
+    s_resendDd = nullptr;
 }
 
 void msgDetailBack() {
@@ -2747,6 +2956,23 @@ void showMsgDetail(const std::string& mkey) {
         detailRow(body, "In reply to", groupHash(reply));
     if (!title.empty()) detailRow(body, "Title", title);
     detailRow(body, "Content", content);
+
+    if (!in) {
+        /* Resend — directly or through a propagation node (dialog). */
+        g_resendKey = mkey;
+        lv_obj_t* rs = lv_button_create(body);
+        lv_obj_remove_style_all(rs);
+        lv_obj_set_width(rs, lv_pct(100));
+        lv_obj_set_height(rs, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(rs, lv_color_hex(0x2a4a35), 0);
+        lv_obj_set_style_bg_opa(rs, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(rs, 4, 0);
+        lv_obj_set_style_pad_ver(rs, 4, 0);
+        lv_obj_set_style_margin_top(rs, 10, 0);
+        lv_obj_center(mkLabel(rs, "Resend...", lv_color_white()));
+        lv_obj_add_event_cb(rs, showResendDialog, LV_EVENT_CLICKED, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), rs);
+    }
 
     deferFocus(back);
 }
@@ -3500,7 +3726,7 @@ void onLayerDelete(lv_event_t*) {
     cancelChunk(g_chunkC); cancelChunk(g_chunkM);
     g_rowsC.clear(); g_rowsM.clear();
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
-    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; g_infoPeer.clear();
+    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
     /* A queued search rebuild would touch freed widgets — drop it. */
@@ -3526,7 +3752,7 @@ void lxmfApp(void* arg) {
     g_needMsgLoad = false;
     g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
     s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
-    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
+    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
@@ -3558,6 +3784,129 @@ void lxmfApp(void* arg) {
 
 /* ---- Settings → Reticulum → LXMF (admin pane, mirrors the web LxmfPanel) ---- */
 
+/* ---- propagation-node section (settings pane) ----
+ * The row container is rebuilt in place after every mutation (move/delete/
+ * add), so order changes show immediately without reopening the pane. */
+lv_obj_t* s_pnBox    = nullptr;   /* row container inside the settings pane */
+lv_obj_t* s_pnHashTa = nullptr;   /* add: hash field (hardware keyboard) */
+lv_obj_t* s_pnNameTa = nullptr;   /* add: name field */
+
+void pnRebuildRows();   /* fwd */
+
+void onPnRowUp(lv_event_t* e) {
+    int i = *static_cast<int*>(lv_event_get_user_data(e));
+    auto l = pnList();
+    if (i <= 0 || (size_t)i >= l.size()) return;
+    std::swap(l[i - 1], l[i]);
+    pnStoreList(l, l.size());
+    pnRebuildRows();
+}
+void onPnRowDown(lv_event_t* e) {
+    int i = *static_cast<int*>(lv_event_get_user_data(e));
+    auto l = pnList();
+    if (i < 0 || (size_t)(i + 1) >= l.size()) return;
+    std::swap(l[i], l[i + 1]);
+    pnStoreList(l, l.size());
+    pnRebuildRows();
+}
+void onPnRowDel(lv_event_t* e) {
+    int i = *static_cast<int*>(lv_event_get_user_data(e));
+    auto l = pnList();
+    if (i < 0 || (size_t)i >= l.size()) return;
+    size_t prev = l.size();
+    l.erase(l.begin() + i);
+    pnStoreList(l, prev);
+    pnRebuildRows();
+}
+void onPnRowCheck(lv_event_t* e) {
+    int i = *static_cast<int*>(lv_event_get_user_data(e));
+    lv_obj_t* sw = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    char k[40];
+    snprintf(k, sizeof k, "s.lxmf.pn.%d.check", i);
+    storageSet(k, lv_obj_has_state(sw, LV_STATE_CHECKED) ? 1 : 0);
+}
+
+void pnRebuildRows() {
+    if (!s_pnBox) return;
+    lv_obj_clean(s_pnBox);
+    auto l = pnList();
+    if (l.empty()) {
+        mkLabel(s_pnBox, "No propagation nodes configured.", lv_color_hex(0x8a93a0));
+        return;
+    }
+    int idx = 0;
+    for (auto& e : l) {
+        lv_obj_t* row = lv_obj_create(s_pnBox);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_style_pad_ver(row, 1, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        /* "check" switch: poll this node for held messages. */
+        lv_obj_t* sw = lv_switch_create(row);
+        lv_obj_set_size(sw, 30, 16);
+        if (e.check) lv_obj_add_state(sw, LV_STATE_CHECKED);
+        bindIdx(sw, onPnRowCheck, LV_EVENT_VALUE_CHANGED, idx);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), sw);
+
+        lv_obj_t* col = lv_obj_create(row);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_flex_grow(col, 1);
+        lv_obj_set_width(col, 0);
+        lv_obj_set_height(col, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(col, LV_OBJ_FLAG_CLICKABLE);
+        mkLabel(col, pnLabel(e), lv_color_hex(0xe0e0e0));
+        lv_obj_t* hl = mkLabel(col, e.hash, lv_color_hex(0x6a7280));
+        lv_obj_set_style_text_font(hl, kFontSmall, 0);
+        lv_label_set_long_mode(hl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(hl, lv_pct(100));
+        lv_obj_set_height(hl, lv_font_get_line_height(kFontSmall));
+
+        struct BtnSpec { const char* sym; lv_event_cb_t cb; };
+        const BtnSpec btns[] = {
+            { LV_SYMBOL_UP,    onPnRowUp },
+            { LV_SYMBOL_DOWN,  onPnRowDown },
+            { LV_SYMBOL_CLOSE, onPnRowDel },
+        };
+        for (auto& b : btns) {
+            lv_obj_t* bt = lv_button_create(row);
+            lv_obj_remove_style_all(bt);
+            lv_obj_set_style_bg_color(bt, lv_color_hex(0x2a313a), 0);
+            lv_obj_set_style_bg_opa(bt, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(bt, 4, 0);
+            lv_obj_set_style_pad_all(bt, 4, 0);
+            lv_obj_center(mkLabel(bt, b.sym, lv_color_hex(0xc0c8d0)));
+            bindIdx(bt, b.cb, LV_EVENT_CLICKED, idx);
+            if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), bt);
+        }
+        idx++;
+    }
+}
+
+void onPnAdd(lv_event_t*) {
+    if (!s_pnHashTa) return;
+    std::string h = lv_textarea_get_text(s_pnHashTa);
+    std::string nm = s_pnNameTa ? lv_textarea_get_text(s_pnNameTa) : "";
+    if (h.size() != 32) return;
+    /* The pn_add sentinel validates + appends at the first free index. */
+    storageSet("lxmf.cmd.pn_add", (h + "|" + nm).c_str());
+    lv_textarea_set_text(s_pnHashTa, "");
+    if (s_pnNameTa) lv_textarea_set_text(s_pnNameTa, "");
+    /* The append is processed on the lxmf task — refresh shortly after. */
+    lv_timer_t* t = lv_timer_create(
+        [](lv_timer_t* tm) { pnRebuildRows(); lv_timer_delete(tm); }, 500, nullptr);
+    (void)t;
+}
+
+void onPnCheckNow(void*) { storageSet("lxmf.cmd.pn_sync", "all"); }
+
 void lxmfSettingsPane(void* arg) {
     lv_obj_t* p = static_cast<lv_obj_t*>(arg);
     lcdSettingSection(p, "LXMF");
@@ -3572,6 +3921,69 @@ void lxmfSettingsPane(void* arg) {
     lcdSettingCaption(p, "Pay a peer's advertised PoW cost when sending.");
     lcdSettingSwitch (p, "Require stamps", "s.lxmf.enforce_stamps");
     lcdSettingCaption(p, "Drop inbound messages without a valid stamp.");
+
+    lcdSettingSection(p, "Propagation nodes");
+    lcdSettingCaption(p, "Classic LXMF store-and-forward nodes. Messages can be "
+                         "resent through one from a message's detail page; nodes "
+                         "with the switch on are polled for held messages.");
+    s_pnBox = lv_obj_create(p);
+    lv_obj_remove_style_all(s_pnBox);
+    lv_obj_set_width(s_pnBox, lv_pct(100));
+    lv_obj_set_height(s_pnBox, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_pnBox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_pnBox, 3, 0);
+    lv_obj_remove_flag(s_pnBox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_pnBox, [](lv_event_t*) { s_pnBox = nullptr; },
+                        LV_EVENT_DELETE, nullptr);
+    pnRebuildRows();
+    if (lcdHasKeyboard()) {
+        /* Hash + name fields with an explicit Add button (Enter commits too). */
+        lv_obj_t* row = lv_obj_create(p);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_pnHashTa = lv_textarea_create(row);
+        lv_textarea_set_one_line(s_pnHashTa, true);
+        lv_textarea_set_placeholder_text(s_pnHashTa, "32-hex node hash");
+        lv_obj_set_style_text_font(s_pnHashTa, kFont, 0);
+        lv_obj_set_flex_grow(s_pnHashTa, 2);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_pnHashTa);
+        lv_obj_add_event_cb(s_pnHashTa, onPnAdd, LV_EVENT_READY, nullptr);
+        lv_obj_add_event_cb(s_pnHashTa, [](lv_event_t*) { s_pnHashTa = nullptr; },
+                            LV_EVENT_DELETE, nullptr);
+
+        s_pnNameTa = lv_textarea_create(row);
+        lv_textarea_set_one_line(s_pnNameTa, true);
+        lv_textarea_set_placeholder_text(s_pnNameTa, "Name");
+        lv_obj_set_style_text_font(s_pnNameTa, kFont, 0);
+        lv_obj_set_flex_grow(s_pnNameTa, 1);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_pnNameTa);
+        lv_obj_add_event_cb(s_pnNameTa, onPnAdd, LV_EVENT_READY, nullptr);
+        lv_obj_add_event_cb(s_pnNameTa, [](lv_event_t*) { s_pnNameTa = nullptr; },
+                            LV_EVENT_DELETE, nullptr);
+
+        lv_obj_t* add = lv_button_create(row);
+        lv_obj_set_style_pad_ver(add, 2, 0);
+        lv_obj_set_style_pad_hor(add, 8, 0);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), add);
+        lv_obj_t* al = lv_label_create(add);
+        lv_obj_set_style_text_font(al, kFont, 0);
+        lv_label_set_text(al, "Add");
+        lv_obj_center(al);
+        lv_obj_add_event_cb(add, onPnAdd, LV_EVENT_CLICKED, nullptr);
+    } else {
+        /* Touch-only: one field, "<hash>|<name>" — the pn_add sentinel splits it. */
+        lcdSettingText(p, "Add node (hash|name)", "lxmf.cmd.pn_add");
+    }
+    lcdSettingButton(p, "Check for messages now", onPnCheckNow);
+    lcdSettingSlider(p, "Check interval (s)", "s.lxmf.pn.check_interval_s", 0, 21600);
+    lcdSettingCaption(p, "How often checked nodes are polled; 0 = only when asked.");
 
     lcdSettingSection(p, "Identities");
     /* One block per existing slot; literal dest/enabled keys (the helpers keep
