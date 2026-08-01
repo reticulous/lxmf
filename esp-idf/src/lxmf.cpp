@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 static const char* TAG = "lxmf";
@@ -548,6 +549,9 @@ static const sdb_schema& lxmfContactSchema()
          .u8("caps")           /* announce caps bitfield (bit0 = accepts
                                 * double-encrypted payloads), persisted from
                                 * the last announce that carried one */
+         .data("pn", 16)       /* the contact's preferred classic
+                                * lxmf.propagation node, client-set from the
+                                * contact details page; all-zero = none */
          .text("display_name").text("nick").text("preview");
         return x;
     }();
@@ -2570,6 +2574,78 @@ static void convReap(void)
     }
 }
 
+/* Resolve the packed + signed (+ delivery-stamped) wire for (peer, mid): reuse
+ * the RAM outbox (a resend must not re-pack or re-pay the multi-second stamp),
+ * else pack from the stored record and cache it. On the first pack the
+ * firmware-owned record fields (message_id, ts, status=queued) are persisted
+ * and the conversation directory bumped — a resend skips both. Returns false
+ * when packing fails (the message is then already settled PACK_FAIL). */
+static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
+                                const std::string& mid, const uint8_t dh[16],
+                                std::vector<uint8_t>& wire, std::string& msg_id_hex)
+{
+    std::string obk = outboxKey(peer_hex, mid);
+    auto it = g_wireOutbox.find(obk);
+    if (it != g_wireOutbox.end()) {
+        wire = it->second.wire;
+        msg_id_hex = it->second.msg_id_hex;
+        return true;
+    }
+
+    std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
+    std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
+    std::string reply_to = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_to").c_str(), "");
+
+    LxmFields fields;
+    fields.reply_to = reply_to;
+
+    /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
+     * but only when generation is enabled and they actually advertise a
+     * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case).
+     * A cost above what we're willing to grind (LXMF_STAMP_MAX_COST) is
+     * refused — send unstamped rather than freeze the task for minutes. */
+    int stamp_cost = 0;
+    if (storageGetInt("s.lxmf.generate_stamps", 1) != 0) {
+        AnnounceEntry ae;
+        if (readAnnounce(peer_hex, &ae) && ae.cost > 0) {
+            if (ae.cost > LXMF_STAMP_MAX_COST)
+                warn("id %d: peer stamp cost %d > max %d — sending unstamped",
+                     id.index, ae.cost, LXMF_STAMP_MAX_COST);
+            else
+                stamp_cost = ae.cost;
+        }
+    }
+
+    /* Pack the LXM wire so the opportunistic-vs-DIRECT decision keys off
+     * the *actual* packed size, not a content estimate that under-counts
+     * the signature, fields/reply_to, stamp and msgpack framing. */
+    uint64_t ts_ms = wallUnixMs();
+    uint8_t mid_raw[RNSD_HASH_LEN];
+    wire = lxmPackWire(id.identity_key.c_str(), id.dest_hash, dh,
+                       ts_ms, title, content, fields, stamp_cost, mid_raw);
+    if (wire.empty()) {
+        err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
+        msgFail(id.index, peer_hex, mid, LXMF_ST_PACK_FAIL);
+        return false;
+    }
+    msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
+    g_wireOutbox[obk] = { wire, msg_id_hex, ts_ms };
+
+    /* Persist firmware-owned fields ONCE, on the first pack — the wire itself
+     * stays in the RAM outbox, never the store. A resend hits the outbox above
+     * so the conversation directory count isn't bumped again. */
+    storageBegin();
+    storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
+    storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
+    storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_QUEUED);
+    int recv = bumpConvDirectory(id.index, peer_hex, (int)(ts_ms / 1000),
+                      storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str()),
+                      /*inbound=*/false);
+    storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
+    storageEnd();
+    return true;
+}
+
 static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                          const std::string& mid)
 {
@@ -2625,60 +2701,13 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     }
 
     /* Resolve the packed wire: reuse the RAM outbox on a resend (no re-pack, no
-     * multi-second re-stamp), else pack from the stored title/content and cache
-     * it. `firstPack` gates the one-time record-persist + directory bump below —
-     * a resend must not re-bump the conversation count. */
-    std::string obk = outboxKey(peer_hex, mid);
+     * multi-second re-stamp), else pack from the stored title/content, cache it,
+     * and persist the one-time record fields + directory bump (shared with the
+     * propagation-node upload path). */
     std::vector<uint8_t> wire;
     std::string msg_id_hex;
-    uint64_t ts_ms;
-    bool firstPack = false;
-    {
-        auto it = g_wireOutbox.find(obk);
-        if (it != g_wireOutbox.end()) {
-            wire = it->second.wire; msg_id_hex = it->second.msg_id_hex; ts_ms = it->second.ts_ms;
-        } else {
-            firstPack = true;
-            std::string title   = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(),   "");
-            std::string content = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
-            std::string reply_to = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_to").c_str(), "");
-
-            LxmFields fields;
-            fields.reply_to = reply_to;
-
-            /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
-             * but only when generation is enabled and they actually advertise a
-             * cost > 0. Unknown/zero cost → no stamp, no PoW delay (common case).
-             * A cost above what we're willing to grind (LXMF_STAMP_MAX_COST) is
-             * refused — send unstamped rather than freeze the task for minutes. */
-            int stamp_cost = 0;
-            if (storageGetInt("s.lxmf.generate_stamps", 1) != 0) {
-                AnnounceEntry ae;
-                if (readAnnounce(peer_hex, &ae) && ae.cost > 0) {
-                    if (ae.cost > LXMF_STAMP_MAX_COST)
-                        warn("id %d: peer stamp cost %d > max %d — sending unstamped",
-                             id.index, ae.cost, LXMF_STAMP_MAX_COST);
-                    else
-                        stamp_cost = ae.cost;
-                }
-            }
-
-            /* Pack the LXM wire so the opportunistic-vs-DIRECT decision keys off
-             * the *actual* packed size, not a content estimate that under-counts
-             * the signature, fields/reply_to, stamp and msgpack framing. */
-            ts_ms = wallUnixMs();
-            uint8_t mid_raw[RNSD_HASH_LEN];
-            wire = lxmPackWire(id.identity_key.c_str(), id.dest_hash, dh,
-                               ts_ms, title, content, fields, stamp_cost, mid_raw);
-            if (wire.empty()) {
-                err("id %d: msg %s pack/sign failed", id.index, mid.c_str());
-                msgFail(id.index, peer_hex, mid, LXMF_ST_PACK_FAIL);
-                return;
-            }
-            msg_id_hex = bytesToHex(mid_raw, RNSD_HASH_LEN);
-            g_wireOutbox[obk] = { wire, msg_id_hex, ts_ms };
-        }
-    }
+    if (!resolveOutboundWire(id, peer_hex, mid, dh, wire, msg_id_hex))
+        return;
 
     /* Delivery-method selection. Resolution order is per-message override
      * → per-identity default → global default → "link-if-one-exists". The
@@ -2750,21 +2779,6 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     o->path_reqs           = 0;
     o->started_s           = (uint32_t)(nowUnixMs() / 1000);
     o->tx_drops_base       = loraTxDroppedSum();
-
-    /* Persist firmware-owned fields ONCE, on the first pack — the wire itself
-     * stays in the RAM outbox, never the store. A resend skips this so the
-     * conversation directory count isn't bumped again. */
-    if (firstPack) {
-        storageBegin();
-        storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
-        storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
-        storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_QUEUED);
-        int recv = bumpConvDirectory(id.index, peer_hex, (int)(ts_ms / 1000),
-                          storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str()),
-                          /*inbound=*/false);
-        storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
-        storageEnd();
-    }
 
     if (use_direct) {
         /* DIRECT: send the *full* LXM wire (incl. the 16-byte dest hash)
@@ -4756,6 +4770,734 @@ static void rlpgClientTick(void)
     rlpgRelayFlush(now_s);
 }
 
+/* ─────────────── classic propagation-node (PN) client ───────────────
+ *
+ * Send and receive through standard `lxmf.propagation` store-and-forward
+ * nodes, wire-compatible with the reference LXMF 0.9.8 LXMRouter:
+ *
+ *  upload — an explicit resend "via node" (cmd.send value
+ *    `<peer>/<key>/pn:<hash>`): the packed wire's tail is
+ *    destination-encrypted (rnsdEncryptFor), the node's announced
+ *    propagation stamp is paid (PoW over the transient id, 1000-round
+ *    workblock), and msgpack([timebase, [lxmf_data]]) goes over a fresh
+ *    lxmf.propagation link — one link packet when it fits, else a
+ *    Resource. The node's packet proof / resource ACK settles ON_PN
+ *    (terminal: a propagation node issues no delivery proof; the
+ *    recipient pulls the message on its own next sync).
+ *
+ *  sync — the node list (s.lxmf.pn.<i>.{hash,name,check}, client-owned,
+ *    index-ordered, hash "" = free slot) is checked periodically
+ *    (s.lxmf.pn.check_interval_s) and on demand (lxmf.cmd.pn_sync). One
+ *    session at a time walks a (node × identity) queue: open a link,
+ *    identify with the identity's key (the node serves only the
+ *    lxmf.delivery dest derived from it), then loop `/get` request
+ *    rounds — [nil,nil] lists transient ids; [wants,haves,limit_kb]
+ *    fetches blobs (the node deletes the haves); [nil,got] confirms
+ *    delivery so the node deletes what we ingested — until a round
+ *    yields nothing new. Each blob is dest16 || destination-encrypted
+ *    src+sig+payload; decrypt with the identity and feed the normal
+ *    inbound pipeline. ITS_MAX_MSG_DATA caps a request at ~8 inline
+ *    transient ids, hence the small per-round bounds and the loop.
+ *
+ * All state is plain statics touched only on the lxmf task. */
+
+#define LXMF_PN_MAX             8     /* s.lxmf.pn.<i> list indices scanned */
+#define LXMF_PN_UP_SESSIONS     2     /* concurrent upload links */
+#define LXMF_PN_UP_TTL_S        90    /* upload with no settle → fail */
+#define LXMF_PN_SYNC_TTL_S      180   /* whole sync session budget */
+#define LXMF_PN_SYNC_ROUNDS_MAX 10    /* list/fetch/delete cycles per session */
+#define LXMF_PN_PKT_MAX         360   /* upload bytes that ride one link packet */
+#define LXMF_PN_STAMP_MAX_COST  20    /* refuse to grind PoW past this */
+#define LXMF_PN_FETCH_MAX       6     /* wants per /get round (ITS aux budget) */
+#define LXMF_PN_HAVES_MAX       2     /* haves per /get round (ditto) */
+#define LXMF_PN_SEEN_TIDS_MAX   512   /* transient-id dedup set bound */
+
+struct pn_node_t { std::string hex; std::string name; bool check; };
+
+/* The configured node list, in index order, malformed/empty slots skipped. */
+static std::vector<pn_node_t> pnNodeList()
+{
+    std::vector<pn_node_t> out;
+    for (int i = 0; i < LXMF_PN_MAX; ++i) {
+        char k[40];
+        std::snprintf(k, sizeof k, "s.lxmf.pn.%d.hash", i);
+        std::string h = storageGetStr(k, "");
+        uint8_t dh[16];
+        if (!hexToBytes(h.c_str(), h.size(), dh, 16)) continue;
+        pn_node_t nd;
+        nd.hex = h;
+        std::snprintf(k, sizeof k, "s.lxmf.pn.%d.name", i);
+        nd.name = storageGetStr(k, "");
+        std::snprintf(k, sizeof k, "s.lxmf.pn.%d.check", i);
+        nd.check = storageGetInt(k, 1) != 0;
+        out.push_back(std::move(nd));
+    }
+    return out;
+}
+
+/* Parse a propagation-node announce app_data — reference 0.9.8 msgpack
+ * [legacy_false, timebase, node_active, per_transfer_kb, per_sync_kb,
+ *  [stamp_cost, flexibility, peering_cost], metadata] — for the fields a
+ * client needs. Returns false when the shape doesn't validate. */
+static bool pnParseNodeAppData(const uint8_t* p, size_t n, bool& active,
+                               int& stamp_cost, uint32_t& transfer_kb)
+{
+    if (!p || n < 2) return false;
+    mpScan s{p, n, 0, 0, 0};
+    uint8_t b = p[s.i++];
+    size_t cnt;
+    uint64_t v;
+    if (b >= 0x90 && b <= 0x9F) cnt = b & 0x0F;
+    else if (b == 0xDC) { if (!mpReadBe(s, 2, v)) return false; cnt = (size_t)v; }
+    else return false;
+    if (cnt < 7) return false;
+    if (!mpScanNext(s)) return false;                  /* [0] legacy flag */
+    if (!mpScanNext(s)) return false;                  /* [1] node timebase */
+    if (s.i >= s.n) return false;
+    active = (p[s.i] == 0xC3);                         /* [2] node state */
+    if (!mpScanNext(s)) return false;
+    uint64_t lim = 0;                                  /* [3] per-transfer kB */
+    if (mpReadUint(s, lim)) transfer_kb = (uint32_t)lim;
+    else { transfer_kb = 0; if (!mpScanNext(s)) return false; }
+    if (!mpScanNext(s)) return false;                  /* [4] per-sync limit */
+    stamp_cost = -1;                                   /* [5] [cost, flex, peering] */
+    if (s.i < s.n && (p[s.i] & 0xF0) == 0x90 && (p[s.i] & 0x0F) >= 1) {
+        ++s.i;
+        uint64_t c = 0;
+        if (mpReadUint(s, c)) stamp_cost = (int)c;
+    }
+    return true;
+}
+
+/* The node's last-heard announce, via rnsd's identity cache. */
+static bool pnNodeInfo(const uint8_t node[16], bool& active,
+                       int& stamp_cost, uint32_t& transfer_kb)
+{
+    uint8_t app[512];
+    size_t  len = sizeof(app);
+    if (!rnsdRecallAppData(node, app, &len)) return false;
+    return pnParseNodeAppData(app, len, active, stamp_cost, transfer_kb);
+}
+
+/* ── upload (PROPAGATED) sessions ── */
+
+struct pn_up_t {
+    bool        used = false;
+    int         handle = -1;
+    int         id_index = -1;
+    std::string peer, mid;
+    uint8_t     node[16] = {};
+    std::string tag;
+    bool        is_resource = false;
+    uint32_t    opaque = 0;              /* resource-settle correlation */
+    int         proof_base_proven = 0;   /* packet-settle counters, baselined */
+    int         proof_base_timeouts = 0;
+    uint32_t    started_s = 0;
+};
+static pn_up_t s_pnUps[LXMF_PN_UP_SESSIONS];
+/* Opaque ids above both the uint16 send_id space and the RLPG range
+ * (0x10000+) so aux matching can never collide. */
+static uint32_t s_pnOpaque = 0x20000;
+static uint16_t s_pnTagSeq = 0;
+
+/* Settle the upload either way: the record goes terminal (tries=255, wire
+ * dropped) — ON_PN is final because a propagation node never proves
+ * delivery to the sender. */
+static void pnUpSettle(pn_up_t& s, uint8_t status)
+{
+    int n = s.id_index;
+    std::string peer = s.peer, mid = s.mid;
+    int h = s.handle;
+    s = pn_up_t{};
+    if (h >= 0) itsDisconnect(h);
+    msgFail(n, peer, mid, status);
+    lxmf_id_t* id = idAt(n);
+    if (id && id->used) {
+        if (status == LXMF_ST_ON_PN) id->sent++;
+        else                         id->failed++;
+    }
+    info("id %d: pn upload %s → %s", n, mid.c_str(), lxmfStatusName(status));
+}
+
+static pn_up_t* pnUpByHandle(int handle)
+{
+    for (auto& s : s_pnUps)
+        if (s.used && s.handle == handle) return &s;
+    return nullptr;
+}
+
+/* The node's only traffic to an uploader is an error signal: a link packet
+ * carrying msgpack([errcode]) right before it tears the link down. */
+static void onPnUpRecv(int handle, size_t /*bytesAvail*/)
+{
+    pn_up_t* s = pnUpByHandle(handle);
+    if (!s) return;
+    PSRAM_BSS static uint8_t buf[512];
+    size_t n = itsRecv(handle, buf, sizeof(buf), 0);
+    if (!n) return;
+    rx_meta_t m;
+    size_t h = parseRxMeta(buf, n, m);
+    if (!h || h >= n || (buf[h] & 0xF0) != 0x90) return;
+    mpScan sc{buf, n, h + 1, 0, 0};
+    uint64_t code = 0;
+    if (!mpReadUint(sc, code)) return;
+    warn("id %d: pn node signalled error 0x%02x for %s", s->id_index,
+         (unsigned)code, s->mid.c_str());
+    pnUpSettle(*s, LXMF_ST_PN_REJECTED);
+}
+
+static void onPnUpDisc(int ref)
+{
+    if (ref < 0 || ref >= LXMF_PN_UP_SESSIONS) return;
+    pn_up_t& s = s_pnUps[ref];
+    if (!s.used) return;
+    s.handle = -1;                    /* link is gone — no disconnect needed */
+    /* The node may prove the packet and drop the link before the 1 Hz poll
+     * ran — check the proof counter before declaring failure. */
+    if (!s.is_resource &&
+        storageGetInt(("rnsd.links." + s.tag + ".tx_proven").c_str(), 0) >
+            s.proof_base_proven) {
+        pnUpSettle(s, LXMF_ST_ON_PN);
+        return;
+    }
+    verb("id %d: pn upload link closed pre-settle (%s)", s.id_index, s.tag.c_str());
+    pnUpSettle(s, LXMF_ST_PN_FAIL);
+}
+
+/* Upload the message to `node`. Explicit-only — invoked from cmd.send's
+ * `pn:<hash>` via segment; there is no automatic fallback. Owns every
+ * failure settle. */
+static void pnUploadStart(lxmf_id_t& id, const std::string& peer_hex,
+                          const std::string& mid, const uint8_t node[16])
+{
+    for (const auto& s : s_pnUps)
+        if (s.used && s.peer == peer_hex && s.mid == mid) return;  /* already going */
+    pn_up_t* slot = nullptr;
+    for (auto& s : s_pnUps) if (!s.used) { slot = &s; break; }
+    if (!slot) {
+        warn("id %d: pn upload %s refused: sessions busy", id.index, mid.c_str());
+        msgFail(id.index, peer_hex, mid, LXMF_ST_OUTBOX_FULL);
+        return;
+    }
+    uint8_t dh[16];
+    if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh)) {
+        msgFail(id.index, peer_hex, mid, LXMF_ST_BAD_PEER);
+        return;
+    }
+    if (!idEnabled(id.index)) {
+        msgFail(id.index, peer_hex, mid, LXMF_ST_DISABLED);
+        return;
+    }
+
+    std::vector<uint8_t> wire;
+    std::string msg_id_hex;
+    if (!resolveOutboundWire(id, peer_hex, mid, dh, wire, msg_id_hex)) return;
+
+    /* lxmf_data = dest16 || destination-encrypted(src+sig+payload) — the
+     * node stores the blob blind, keyed by its SHA-256 (the transient id,
+     * computed before the stamp is appended). */
+    uint8_t pk[RNSD_PUBKEY_LEN];
+    lxmfFeedPubkey(peer_hex, dh);
+    if (!rnsdRecallPubkey(dh, pk)) {
+        rnsdRequestPath(dh);
+        warn("id %d: pn upload %s: recipient identity unknown", id.index, mid.c_str());
+        msgFail(id.index, peer_hex, mid, LXMF_ST_PN_FAIL);
+        return;
+    }
+    std::vector<uint8_t> lxmf_data(LXMF_DEST_HASH_LEN +
+                                   (wire.size() - LXMF_DEST_HASH_LEN) +
+                                   RNSD_ENCRYPT_OVERHEAD);
+    std::memcpy(lxmf_data.data(), wire.data(), LXMF_DEST_HASH_LEN);
+    size_t ct_len = lxmf_data.size() - LXMF_DEST_HASH_LEN;
+    if (!rnsdEncryptFor(pk, wire.data() + LXMF_DEST_HASH_LEN,
+                        wire.size() - LXMF_DEST_HASH_LEN,
+                        lxmf_data.data() + LXMF_DEST_HASH_LEN, &ct_len)) {
+        msgFail(id.index, peer_hex, mid, LXMF_ST_PN_FAIL);
+        return;
+    }
+    lxmf_data.resize(LXMF_DEST_HASH_LEN + ct_len);
+    uint8_t tid[RNSD_HASH_LEN];
+    rnsdSha256(lxmf_data.data(), lxmf_data.size(), tid);
+
+    /* The node's announced propagation stamp cost (PoW over the transient
+     * id, 1000-round workblock). Unknown announce → send unstamped and let
+     * a cost-enforcing node reject rather than guess a cost. */
+    bool active = false;
+    int cost = -1;
+    uint32_t transfer_kb = 0;
+    if (!pnNodeInfo(node, active, cost, transfer_kb))
+        warn("id %d: pn %s announce unknown — sending unstamped",
+             id.index, bytesToHex(node, 8).c_str());
+    if (cost > LXMF_PN_STAMP_MAX_COST) {
+        warn("id %d: pn stamp cost %d > max %d — sending unstamped",
+             id.index, cost, LXMF_PN_STAMP_MAX_COST);
+        cost = 0;
+    }
+    if (cost > 0) {
+        uint8_t stamp[LXMF_STAMP_LEN];
+        if (lxmfStampGenerate(tid, cost, stamp, stampYield, nowUnixMs,
+                              LXMF_STAMP_ROUNDS_PN))
+            lxmf_data.insert(lxmf_data.end(), stamp, stamp + LXMF_STAMP_LEN);
+    }
+
+    /* propagation_packed = msgpack([timebase, [lxmf_data]]). */
+    std::vector<uint8_t> packed;
+    packed.reserve(lxmf_data.size() + 16);
+    mpPackArrayHeader(packed, 2);
+    mpPackFloat64(packed, (double)wallUnixMs() / 1000.0);
+    mpPackArrayHeader(packed, 1);
+    mpPackBin(packed, lxmf_data.data(), lxmf_data.size());
+
+    if (transfer_kb > 0 && packed.size() > (size_t)transfer_kb * 1000) {
+        warn("id %d: pn upload %s exceeds node transfer limit (%zu B > %u kB)",
+             id.index, mid.c_str(), packed.size(), (unsigned)transfer_kb);
+        msgFail(id.index, peer_hex, mid, LXMF_ST_TOO_LARGE);
+        return;
+    }
+
+    char tag[24];
+    std::snprintf(tag, sizeof(tag), "lxpn.%04x", (unsigned)s_pnTagSeq++);
+    int h = rnsdLinkOpen(node, "lxmf.propagation", id.identity_key.c_str(), tag,
+                         /*path_timeout_ms=*/15000, /*link_timeout_ms=*/0,
+                         /*ref=*/(int)(slot - s_pnUps), onPnUpRecv, onPnUpDisc);
+    if (h < 0) {
+        msgFail(id.index, peer_hex, mid, LXMF_ST_LINK_OPEN_FAIL);
+        return;
+    }
+    slot->used     = true;
+    slot->handle   = h;
+    slot->id_index = id.index;
+    slot->peer     = peer_hex;
+    slot->mid      = mid;
+    std::memcpy(slot->node, node, 16);
+    slot->tag       = tag;
+    slot->started_s = (uint32_t)(nowUnixMs() / 1000);
+
+    /* rnsd buffers one pre-active packet / Resource and flushes it on
+     * establishment, so send right away. */
+    bool ok;
+    if (packed.size() <= LXMF_PN_PKT_MAX) {
+        slot->is_resource = false;
+        std::string base = "rnsd.links." + slot->tag;
+        slot->proof_base_proven   = storageGetInt((base + ".tx_proven").c_str(), 0);
+        slot->proof_base_timeouts = storageGetInt((base + ".proof_timeouts").c_str(), 0);
+        ok = itsSend(h, packed.data(), packed.size(), 0) != 0;
+    } else {
+        slot->is_resource = true;
+        slot->opaque = s_pnOpaque++;
+        void* rb = gp_alloc(packed.size());
+        ok = false;
+        if (rb) {
+            std::memcpy(rb, packed.data(), packed.size());
+            /* rnsd owns rb from here (it frees on its own failure too). */
+            ok = rnsdLinkSendResource(slot->tag.c_str(), rb, packed.size(),
+                                      slot->opaque);
+        }
+    }
+    if (!ok) { pnUpSettle(*slot, LXMF_ST_PN_FAIL); return; }
+    storageBegin();
+    storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_SENDING);
+    storageSet(msgPath(id.index, peer_hex, mid, "tries").c_str(),  0);
+    storageEnd();
+    info("id %d: pn upload %s → node %s (%zu B, %s%s)", id.index, mid.c_str(),
+         bytesToHex(node, 16).c_str(), packed.size(),
+         slot->is_resource ? "resource" : "packet", cost > 0 ? ", stamped" : "");
+}
+
+/* Resource-aux settle for pn uploads (opaque ids 0x20000+). Returns true
+ * when consumed. */
+static bool pnResourceAux(const rnsd_link_resource_done_t& d)
+{
+    if (d.opcode != RNSD_LINK_RESOURCE_OUTBOUND_DONE &&
+        d.opcode != RNSD_LINK_RESOURCE_FAILED) return false;
+    for (auto& s : s_pnUps) {
+        if (!s.used || !s.is_resource || s.opaque != d.opaque_id) continue;
+        pnUpSettle(s, d.opcode == RNSD_LINK_RESOURCE_OUTBOUND_DONE
+                          ? LXMF_ST_ON_PN : LXMF_ST_PN_FAIL);
+        return true;
+    }
+    return false;
+}
+
+/* ── sync (message retrieval) ── */
+
+enum { PN_PH_IDLE = 0, PN_PH_WAIT_ACTIVE, PN_PH_LIST, PN_PH_FETCH, PN_PH_DEL };
+
+struct pn_sync_job_t { std::string node_hex; int id_index; };
+static std::vector<pn_sync_job_t> s_pnSyncQ;
+
+struct pn_sync_t {
+    int         phase = PN_PH_IDLE;
+    int         handle = -1;
+    std::string tag, node_hex;
+    uint8_t     node[16] = {};
+    int         id_index = -1;
+    int         req_id = -1;
+    int         rounds = 0;              /* list/fetch/delete cycles done */
+    std::vector<std::string> got;        /* binary tids ingested this round */
+    int         got_msgs = 0;            /* messages handed to the pipeline */
+    uint32_t    started_s = 0;
+};
+static pn_sync_t s_pnSync;
+
+/* Transient ids already ingested — filters re-listed blobs (a failed
+ * delete-confirm round re-serves them) out of the next round's wants.
+ * RAM-only and bounded; the message-id dedup in onInboundLxm is the
+ * authoritative backstop. */
+static std::set<std::string> s_pnSeenTids;
+
+static void pnSeenTid(const std::string& tid)
+{
+    if (s_pnSeenTids.size() >= LXMF_PN_SEEN_TIDS_MAX) s_pnSeenTids.clear();
+    s_pnSeenTids.insert(tid);
+}
+
+static void pnSyncDone(const char* err_msg)
+{
+    if (s_pnSync.phase == PN_PH_IDLE) return;
+    std::string pre = "lxmf.pn." + s_pnSync.node_hex + ".";
+    storageBegin();
+    storageSet((pre + "last_check_s").c_str(), (int)(nowUnixMs() / 1000));
+    storageSet((pre + "last_err").c_str(), err_msg ? err_msg : "");
+    if (!err_msg) storageSet((pre + "last_got").c_str(), s_pnSync.got_msgs);
+    storageEnd();
+    if (err_msg)
+        warn("pn sync %s id %d: %s", s_pnSync.node_hex.c_str(),
+             s_pnSync.id_index, err_msg);
+    else
+        info("pn sync %s id %d: complete, %d message(s)",
+             s_pnSync.node_hex.c_str(), s_pnSync.id_index, s_pnSync.got_msgs);
+    int h = s_pnSync.handle;
+    s_pnSync = pn_sync_t{};               /* reset BEFORE disconnect — the disc
+                                           * callback then sees IDLE and no-ops */
+    if (h >= 0) itsDisconnect(h);
+    setStrIfChanged("lxmf.pn.sync", "");
+}
+
+static void onPnSyncRecv(int handle, size_t /*bytesAvail*/)
+{
+    /* The node speaks to a syncing client through request responses, not
+     * link packets — drain and ignore. */
+    uint8_t buf[256];
+    itsRecv(handle, buf, sizeof buf, 0);
+}
+
+static void onPnSyncDisc(int /*ref*/)
+{
+    if (s_pnSync.phase == PN_PH_IDLE) return;
+    s_pnSync.handle = -1;
+    pnSyncDone("link closed");
+}
+
+/* Issue one `/get` request on the session link. `data` must be a complete
+ * msgpack object (data_packed). Returns false when the request could not
+ * be queued (the caller settles the session). */
+static bool pnSyncRequest(const std::vector<uint8_t>& data, int next_phase)
+{
+    int rid = rnsdLinkRequest(s_pnSync.tag.c_str(), "/get",
+                              data.data(), data.size(),
+                              LXMF_LINK_RESOURCE_AUX_PORT, /*data_packed=*/true);
+    if (rid < 0) return false;
+    s_pnSync.req_id = rid;
+    s_pnSync.phase  = next_phase;
+    return true;
+}
+
+/* Start a list round: [nil, nil] → the node returns the transient ids it
+ * holds for our identified destination. */
+static bool pnSyncListRound(void)
+{
+    if (++s_pnSync.rounds > LXMF_PN_SYNC_ROUNDS_MAX) return false;
+    s_pnSync.got.clear();
+    std::vector<uint8_t> req = { 0x92, 0xC0, 0xC0 };
+    return pnSyncRequest(req, PN_PH_LIST);
+}
+
+/* One downloaded lxmf_data blob: leading 16-byte dest hash + the
+ * destination-encrypted src+sig+payload (the node strips the propagation
+ * stamp before serving). Decrypt with the session identity and feed the
+ * normal inbound pipeline. True when a message was handed on. */
+static bool pnIngestBlob(lxmf_id_t& id, const uint8_t* p, size_t n)
+{
+    if (n < LXMF_OVERHEAD) return false;
+    if (std::memcmp(p, id.dest_hash, LXMF_DEST_HASH_LEN) != 0) {
+        verb("pn sync: blob for foreign dest %s — dropped",
+             bytesToHex(p, 8).c_str());
+        return false;
+    }
+    std::vector<uint8_t> wire(n);         /* plaintext is smaller than the ct */
+    std::memcpy(wire.data(), p, LXMF_DEST_HASH_LEN);
+    size_t pt_len = wire.size() - LXMF_DEST_HASH_LEN;
+    if (!rnsdDecryptSelf(id.identity_key.c_str(), p + LXMF_DEST_HASH_LEN,
+                         n - LXMF_DEST_HASH_LEN,
+                         wire.data() + LXMF_DEST_HASH_LEN, &pt_len)) {
+        verb("pn sync: blob decrypt failed (%zu B)", n);
+        return false;
+    }
+    wire.resize(LXMF_DEST_HASH_LEN + pt_len);
+    if (wire.size() < LXMF_OVERHEAD) return false;
+    onInboundLxm(id, wire.data(), wire.size());
+    return true;
+}
+
+/* A `/get` response (or failure) landing on the resource-aux port for the
+ * sync session's in-flight request. Consumes every REQUEST_* aux (nothing
+ * else in lxmf issues link requests); owns d.buf. */
+static bool pnRequestAux(const rnsd_link_resource_done_t& d)
+{
+    if (d.opcode != RNSD_LINK_REQUEST_RESPONSE &&
+        d.opcode != RNSD_LINK_REQUEST_FAILED) return false;
+    pn_sync_t& sy = s_pnSync;
+    if (sy.phase == PN_PH_IDLE || (int)d.opaque_id != sy.req_id) {
+        if (d.buf) rnsdResourceRelease(d.buf);      /* stale — drop */
+        return true;
+    }
+    if (d.opcode == RNSD_LINK_REQUEST_FAILED) {
+        if (d.buf) rnsdResourceRelease(d.buf);
+        /* The delete-confirm round is best-effort — the ingest already
+         * succeeded; the tid dedup absorbs a re-serve next session. */
+        if (sy.phase == PN_PH_DEL) pnSyncDone(nullptr);
+        else                       pnSyncDone("request failed");
+        return true;
+    }
+    const uint8_t* p = (const uint8_t*)d.buf;
+    size_t n = d.len;
+
+    if (sy.phase == PN_PH_LIST) {
+        /* msgpack list of bin32 transient ids, or a bare error int. */
+        std::vector<std::string> wants, haves;
+        bool ok = false;
+        if (p && n) {
+            uint8_t b = p[0];
+            if ((b & 0xF0) == 0x90 || b == 0xDC || b == 0xDD) {
+                mpScan s{p, n, 1, 0, 0};
+                uint64_t cnt = 0;
+                if ((b & 0xF0) == 0x90) { cnt = b & 0x0F; ok = true; }
+                else if (b == 0xDC)     ok = mpReadBe(s, 2, cnt);
+                else                    ok = mpReadBe(s, 4, cnt);
+                for (uint64_t k = 0; ok && k < cnt; ++k) {
+                    std::string tid;
+                    if (!mpReadStrOrBin(s, tid) || tid.size() != 32) { ok = false; break; }
+                    if (s_pnSeenTids.count(tid)) {
+                        if (haves.size() < LXMF_PN_HAVES_MAX) haves.push_back(tid);
+                    } else if (wants.size() < LXMF_PN_FETCH_MAX) {
+                        wants.push_back(tid);
+                    }
+                }
+            } else {
+                uint64_t code = 0;
+                mpScan s{p, n, 0, 0, 0};
+                if (mpReadUint(s, code)) {
+                    rnsdResourceRelease(d.buf);
+                    pnSyncDone(code == 0xF0 ? "node: not identified"
+                             : code == 0xF1 ? "node: access denied"
+                             : code == 0xF6 ? "node: throttled"
+                                            : "node error");
+                    return true;
+                }
+            }
+        } else {
+            ok = true;                                 /* empty list */
+        }
+        rnsdResourceRelease(d.buf);
+        if (!ok) { pnSyncDone("bad list response"); return true; }
+        if (wants.empty() && haves.empty()) { pnSyncDone(nullptr); return true; }
+        /* Fetch round: [wants, haves, limit_kb] — the node serves the wants
+         * (within limit_kb) and deletes the haves. */
+        std::vector<uint8_t> req;
+        mpPackArrayHeader(req, 3);
+        mpPackArrayHeader(req, wants.size());
+        for (auto& t : wants) mpPackBin(req, (const uint8_t*)t.data(), t.size());
+        mpPackArrayHeader(req, haves.size());
+        for (auto& t : haves) mpPackBin(req, (const uint8_t*)t.data(), t.size());
+        int limit_kb = storageGetInt("s.lxmf.max_resource_size", 262144) / 1000;
+        mpPackInt(req, limit_kb > 0 ? limit_kb : 1);
+        if (!pnSyncRequest(req, PN_PH_FETCH)) pnSyncDone("request failed");
+        return true;
+    }
+
+    if (sy.phase == PN_PH_FETCH) {
+        /* msgpack list of raw lxmf_data blobs. */
+        lxmf_id_t* id = idAt(sy.id_index);
+        bool ok = false;
+        if (p && n && id && id->used) {
+            uint8_t b = p[0];
+            if ((b & 0xF0) == 0x90 || b == 0xDC || b == 0xDD) {
+                mpScan s{p, n, 1, 0, 0};
+                uint64_t cnt = 0;
+                if ((b & 0xF0) == 0x90) { cnt = b & 0x0F; ok = true; }
+                else if (b == 0xDC)     ok = mpReadBe(s, 2, cnt);
+                else                    ok = mpReadBe(s, 4, cnt);
+                for (uint64_t k = 0; ok && k < cnt; ++k) {
+                    std::string blob;
+                    if (!mpReadStrOrBin(s, blob)) { ok = false; break; }
+                    uint8_t tid[RNSD_HASH_LEN];
+                    rnsdSha256((const uint8_t*)blob.data(), blob.size(), tid);
+                    std::string tids((const char*)tid, RNSD_HASH_LEN);
+                    sy.got.push_back(tids);
+                    pnSeenTid(tids);
+                    if (pnIngestBlob(*id, (const uint8_t*)blob.data(), blob.size()))
+                        sy.got_msgs++;
+                }
+            }
+        }
+        rnsdResourceRelease(d.buf);
+        if (!ok) { pnSyncDone("bad fetch response"); return true; }
+        if (sy.got.empty()) { pnSyncDone(nullptr); return true; }
+        /* Delete-confirm round: [nil, got] — the node drops the copies we
+         * just ingested. Its response chains into the next list round. */
+        std::vector<uint8_t> req;
+        mpPackArrayHeader(req, 2);
+        req.push_back(0xC0);
+        mpPackArrayHeader(req, sy.got.size());
+        for (auto& t : sy.got) mpPackBin(req, (const uint8_t*)t.data(), t.size());
+        if (!pnSyncRequest(req, PN_PH_DEL)) pnSyncDone(nullptr);
+        return true;
+    }
+
+    if (sy.phase == PN_PH_DEL) {
+        rnsdResourceRelease(d.buf);
+        /* Round complete — list again; more may be held than one round's
+         * ITS-bounded wants could name. */
+        if (!pnSyncListRound()) pnSyncDone(nullptr);
+        return true;
+    }
+
+    if (d.buf) rnsdResourceRelease(d.buf);
+    return true;
+}
+
+/* Queue a sync of `node_hex` for every usable identity (dedup'd against
+ * the queue and the active session). */
+static void pnEnqueueSync(const std::string& node_hex)
+{
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
+        if (!s_ids[n].used || !idEnabled(n)) continue;
+        bool dup = s_pnSync.phase != PN_PH_IDLE &&
+                   s_pnSync.node_hex == node_hex && s_pnSync.id_index == n;
+        for (auto& j : s_pnSyncQ)
+            if (j.node_hex == node_hex && j.id_index == n) dup = true;
+        if (!dup) s_pnSyncQ.push_back({ node_hex, n });
+    }
+}
+
+/* Advance the sync machine: start the next queued session, watch the link
+ * establish, kick the first request. Request rounds then chain through
+ * pnRequestAux. */
+static void pnSyncAdvance(uint32_t now_s)
+{
+    pn_sync_t& sy = s_pnSync;
+    if (sy.phase == PN_PH_IDLE) {
+        if (s_pnSyncQ.empty()) return;
+        pn_sync_job_t job = s_pnSyncQ.front();
+        s_pnSyncQ.erase(s_pnSyncQ.begin());
+        lxmf_id_t* id = idAt(job.id_index);
+        uint8_t node[16];
+        if (!id || !id->used || !idEnabled(job.id_index) ||
+            !hexToDestHash(job.node_hex, node)) return;
+        uint8_t pk[RNSD_PUBKEY_LEN];
+        if (!rnsdRecallPubkey(node, pk)) {
+            /* Never heard the node announce — ask for a path (which
+             * prompts one) and let the next check retry. */
+            rnsdRequestPath(node);
+            storageSet(("lxmf.pn." + job.node_hex + ".last_err").c_str(),
+                       "node unknown — path requested");
+            return;
+        }
+        char tag[24];
+        std::snprintf(tag, sizeof(tag), "lxpn.s%03x",
+                      (unsigned)(s_pnTagSeq++ & 0xFFF));
+        int h = rnsdLinkOpen(node, "lxmf.propagation",
+                             id->identity_key.c_str(), tag,
+                             /*path_timeout_ms=*/15000, /*link_timeout_ms=*/0,
+                             /*ref=*/0, onPnSyncRecv, onPnSyncDisc);
+        if (h < 0) {
+            storageSet(("lxmf.pn." + job.node_hex + ".last_err").c_str(),
+                       "link open failed");
+            return;
+        }
+        sy.phase  = PN_PH_WAIT_ACTIVE;
+        sy.handle = h;
+        sy.tag    = tag;
+        sy.node_hex = job.node_hex;
+        std::memcpy(sy.node, node, 16);
+        sy.id_index  = job.id_index;
+        sy.started_s = now_s;
+        setStrIfChanged("lxmf.pn.sync", job.node_hex.c_str());
+        dbg("pn sync: link %s → node %s (id %d)", tag,
+            job.node_hex.c_str(), job.id_index);
+        return;
+    }
+    if (now_s - sy.started_s > LXMF_PN_SYNC_TTL_S) { pnSyncDone("timeout"); return; }
+    if (sy.phase == PN_PH_WAIT_ACTIVE) {
+        std::string st = storageGetStr(("rnsd.links." + sy.tag + ".state").c_str(), "");
+        if (st == "failed" || st == "closed" || st == "closing") {
+            pnSyncDone("link failed");
+            return;
+        }
+        if (st != "active") return;
+        /* Identified request session: the node serves only the
+         * lxmf.delivery dest derived from the identified identity. The
+         * identify and the request ride the same link in order. */
+        rnsdLinkIdentify(sy.tag.c_str());
+        if (!pnSyncListRound()) pnSyncDone("request failed");
+    }
+}
+
+/* Periodic check of the nodes marked for checking. First pass ~2 min
+ * after bring-up, then every s.lxmf.pn.check_interval_s (0 = manual only,
+ * via lxmf.cmd.pn_sync). */
+static void pnScheduleChecks(uint32_t now_s)
+{
+    static uint32_t next_s = 0;
+    int interval = storageGetInt("s.lxmf.pn.check_interval_s", 1800);
+    if (interval <= 0) { next_s = 0; return; }
+    if (next_s == 0) { next_s = now_s + 120; return; }
+    if ((int32_t)(now_s - next_s) < 0) return;
+    next_s = now_s + (uint32_t)interval;
+    for (auto& nd : pnNodeList())
+        if (nd.check) pnEnqueueSync(nd.hex);
+}
+
+/* 1 Hz housekeeping: settle packet-class uploads off the link's proof
+ * counters, reap stalled sessions, drive the sync machine. */
+static void pnClientTick(void)
+{
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    for (auto& s : s_pnUps) {
+        if (!s.used) continue;
+        if (!s.is_resource) {
+            std::string base = "rnsd.links." + s.tag;
+            if (storageGetInt((base + ".tx_proven").c_str(), 0) > s.proof_base_proven) {
+                pnUpSettle(s, LXMF_ST_ON_PN);
+                continue;
+            }
+            if (storageGetInt((base + ".proof_timeouts").c_str(), 0) > s.proof_base_timeouts ||
+                storageGetStr((base + ".state").c_str(), "") == "failed") {
+                pnUpSettle(s, LXMF_ST_PN_FAIL);
+                continue;
+            }
+        }
+        if (now_s - s.started_s > LXMF_PN_UP_TTL_S) pnUpSettle(s, LXMF_ST_PN_FAIL);
+    }
+    pnScheduleChecks(now_s);
+    pnSyncAdvance(now_s);
+}
+
+/* Park-path teardown: drop every pn link so rnsd frees the slots. */
+static void pnTeardown(void)
+{
+    for (auto& s : s_pnUps)
+        if (s.handle >= 0) { int h = s.handle; s = pn_up_t{}; itsDisconnect(h); }
+    if (s_pnSync.handle >= 0) {
+        int h = s_pnSync.handle;
+        s_pnSync = pn_sync_t{};
+        itsDisconnect(h);
+        setStrIfChanged("lxmf.pn.sync", "");
+    }
+    s_pnSyncQ.clear();
+}
+
 /* ─────────────── Resource aux (rnsd → lxmf) ───────────────
  *
  * rnsd sends one rnsd_link_resource_done_t aux frame to
@@ -4772,6 +5514,11 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
     }
     rnsd_link_resource_done_t d;
     std::memcpy(&d, data, sizeof(d));
+
+    /* Propagation-node client first: /get responses (REQUEST_* opcodes)
+     * and pn-upload resource settles (opaque ids 0x20000+). */
+    if (pnRequestAux(d)) return;
+    if (pnResourceAux(d)) return;
 
     if (d.opcode == RNSD_LINK_RESOURCE_INBOUND_DONE) {
         /* RLPG links first: for links WE opened the aux carries the REMOTE
@@ -5277,6 +6024,50 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                 destroyIdentity((int)n);
             }
         }
+        else if (std::strcmp(tail, "pn_sync") == 0) {
+            /* "all" → every check-marked node; a 32-hex value → that node
+             * (whether or not check-marked). Queued per usable identity. */
+            std::string v = val;
+            if (v.size() == 32) {
+                pnEnqueueSync(v);
+            } else {
+                for (auto& nd : pnNodeList())
+                    if (nd.check) pnEnqueueSync(nd.hex);
+            }
+        }
+        else if (std::strcmp(tail, "pn_add") == 0) {
+            /* "<32hex>[|name]" → append at the first free list index (the
+             * on-device settings pane's add path; the web writes the list
+             * directly). */
+            std::string v = val, name;
+            size_t bar = v.find('|');
+            if (bar != std::string::npos) { name = v.substr(bar + 1); v = v.substr(0, bar); }
+            uint8_t dh[16];
+            if (!hexToBytes(v.c_str(), v.size(), dh, 16)) {
+                warn("pn_add: bad hash \"%s\"", val);
+            } else {
+                int slot = -1;
+                for (int i = 0; i < LXMF_PN_MAX && slot < 0; ++i) {
+                    char k[40];
+                    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.hash", i);
+                    if (storageGetStr(k, "").size() != 32) slot = i;
+                }
+                if (slot < 0) {
+                    warn("pn_add: list full (%d nodes)", LXMF_PN_MAX);
+                } else {
+                    char k[40];
+                    storageBegin();
+                    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.hash", slot);
+                    storageSet(k, v.c_str());
+                    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.name", slot);
+                    storageSet(k, name.c_str());
+                    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.check", slot);
+                    storageSet(k, 1);
+                    storageEnd();
+                    info("pn_add: node %s at index %d", v.c_str(), slot);
+                }
+            }
+        }
         else {
             warn("unknown lxmf.cmd: %s", tail);
         }
@@ -5307,15 +6098,22 @@ static void handleIdCmd(int n, const char* key, const char* val)
 
     /* send/cancel/delete value is "<peer>/<key>" (per-contact store).
      * delete also accepts "<peer>/" or "<peer>" → whole conversation.
+     * send accepts an optional third segment "<peer>/<key>/pn:<hash>" —
+     * upload to that propagation node instead of the direct paths.
      * announce ignores the value. */
     std::string raw = val;
-    std::string peer_hex, mid;
+    std::string peer_hex, mid, via;
     size_t slash = raw.find('/');
     if (slash == std::string::npos) {
         peer_hex = raw;                 /* delete: whole conversation */
     } else {
         peer_hex = raw.substr(0, slash);
         mid      = raw.substr(slash + 1);
+        size_t slash2 = mid.find('/');
+        if (slash2 != std::string::npos) {
+            via = mid.substr(slash2 + 1);
+            mid = mid.substr(0, slash2);
+        }
     }
 
     try {
@@ -5327,10 +6125,20 @@ static void handleIdCmd(int n, const char* key, const char* val)
             warn("id %d: cmd.%s for absent identity", n, verb);
         }
         else if (std::strcmp(verb, "send") == 0) {
-            if (mid.empty())
+            if (mid.empty()) {
                 warn("id %d: cmd.send needs <peer>/<key> (got \"%s\")", n, val);
-            else
+            } else if (via.rfind("pn:", 0) == 0) {
+                uint8_t node[16];
+                std::string nh = via.substr(3);
+                if (!hexToBytes(nh.c_str(), nh.size(), node, 16))
+                    warn("id %d: cmd.send bad pn hash \"%s\"", n, nh.c_str());
+                else
+                    pnUploadStart(id, peer_hex, mid, node);
+            } else if (!via.empty()) {
+                warn("id %d: cmd.send unknown via \"%s\"", n, via.c_str());
+            } else {
                 processSend(id, peer_hex, mid);
+            }
         }
         else if (std::strcmp(verb, "cancel") == 0) {
             if (mid.empty())
@@ -6447,6 +7255,7 @@ static void lxmfTaskMain(void*)
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             publishLinks();         /* per-peer link state for the header icons */
             rlpgClientTick();       /* deposit reaper, own-node link, relay queue */
+            pnClientTick();         /* propagation-node uploads + sync machine */
             /* Retry sends parked on a then-busy conversation link, plus
              * delivery-retry resends (held back by not_before_s until rnsd has
              * dropped the path). Skip anything no longer queued/retrying
@@ -6567,6 +7376,7 @@ static void lxmfTaskMain(void*)
     for (auto& s : s_inlinks)  if (s.used && s.handle >= 0) { itsDisconnect(s.handle); s = inlink_t{}; }
     for (auto& d : s_rlpgDeps) if (d.handle >= 0) { int h = d.handle; d = rlpg_dep_t{}; itsDisconnect(h); }
     for (auto& o : s_rlpgOwn)  if (o.handle >= 0) { int h = o.handle; o = rlpg_own_t{}; itsDisconnect(h); }
+    pnTeardown();
 
     /* Park on the inbox until lxmfStart() clears s_stop and notifies. */
     s_parked = true;
@@ -6875,9 +7685,11 @@ static const sdb_schema& lxmfContactSchemaV2a()
 
 /* The three contact layouts that a device could have written while the RLPG
  * fields were being appended one at a time, before the self-describing on-disk
- * descriptor existed: rlpg (hdr 125), + rlpg_svc (141), + rlpg_active (142). The
- * final field (caps) makes the current hdr 143. Every RLPG field is appended, so
- * these share the whole v2a fixed prefix and the auto-migrator (which maps by
+ * descriptor existed: rlpg (hdr 125), + rlpg_svc (141), + rlpg_active (142).
+ * They are the whole pre-descriptor range — the appends after them (caps at hdr
+ * 143, pn at 159) land in self-describing format_ver-2 files that need no hint.
+ * Every one of these fields is appended, so the three layouts below share the
+ * whole v2a fixed prefix and the auto-migrator (which maps by
  * field name) lands each value in the current record and defaults the fields the
  * file predates. Without these hints a descriptor-less contacts file at any of
  * these sizes is an unknown (schema_id, hdr_size) and the loader starts it empty
@@ -7058,6 +7870,9 @@ void LxmfService::onInit()
     /* strftime format for per-message timestamps in the thread, honoured by both
      * the LCD bubbles and the web UI (which runs a small strftime shim). */
     storageDefault("s.lxmf.msg_time_format", "%H:%M");
+    /* Propagation-node check cadence: how often the nodes marked for
+     * checking (s.lxmf.pn.<i>.check) are synced. 0 = manual only. */
+    storageDefault("s.lxmf.pn.check_interval_s", 1800);
     storageEnd();
 
     s_dbg_only_local = storageGetInt("s.lxmf.debug.only_local", 0) != 0;

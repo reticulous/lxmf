@@ -81,6 +81,12 @@ enum LxmfStatus : uint8_t {
     LXMF_ST_RADIO_BUSY        = 34,  /* send failed while the local LoRa radio was
                                       * shedding frames to channel contention — the
                                       * own channel is jammed, not the peer silent */
+    /* Classic lxmf.propagation node states (tries == 255). ON_PN is the
+     * final state of a propagated send — a propagation node issues no
+     * delivery proof; the recipient pulls the message on its next sync. */
+    LXMF_ST_ON_PN             = 35,  /* uploaded to a propagation node */
+    LXMF_ST_PN_FAIL           = 36,  /* propagation upload failed (link/transfer) */
+    LXMF_ST_PN_REJECTED       = 37,  /* the node refused the upload (stamp/access) */
 };
 
 /* status code → its ALL-CAPS enum name for display (meta line, CLI). This is the
@@ -122,6 +128,9 @@ static inline const char* lxmfStatusName(uint8_t s) {
         case LXMF_ST_REMOTE_RLPG_FULL:  return "REMOTE_RLPG_FULL";
         case LXMF_ST_REMOTE_RLPG_ERR:   return "REMOTE_RLPG_ERR";
         case LXMF_ST_RADIO_BUSY:        return "RADIO_BUSY";
+        case LXMF_ST_ON_PN:             return "ON_PN";
+        case LXMF_ST_PN_FAIL:           return "PN_FAIL";
+        case LXMF_ST_PN_REJECTED:       return "PN_REJECTED";
         default:                        return "";
     }
 }

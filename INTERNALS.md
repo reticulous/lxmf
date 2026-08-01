@@ -81,10 +81,11 @@ State these as absent, not "coming":
   value shape is `[expiry_unix_s, ticket_16B]`, with 21 d expiry / 14 d renew
   / 5 d grace lifetimes). No stamp is ever skipped — every stamped send pays
   full PoW. `s.lxmf.auto_ticket` is read by nothing.
-- **PROPAGATED mode** (`0x03`) and running as a propagation node — no
-  store-and-forward, no `lxmf.propagation` destination, no prop-node `/get`
-  (upstream propagation-node stamps use a 1000-round workblock and peering
-  stamps 25, vs the recipient stamp's fixed 3000 — §8).
+- **Running as a propagation node** — no store-and-forward hosting, no
+  `lxmf.propagation` IN destination, no `/get`/`/offer` handlers, no
+  node-to-node sync/peering (peering stamps use a 25-round workblock).
+  The *client* side of PROPAGATED (`0x03`) — upload to a node and sync
+  from a node — IS implemented; see §8b.
 - **PAPER mode** (`0x05`).
 - **Group conversations** (`FIELD_GROUP = 0x0B` reserved), **audio
   messages** (`FIELD_AUDIO = 0x07`; such messages display
@@ -199,8 +200,10 @@ destination_hash(16) | source_hash(16) | Ed25519 sig(64) | msgpack(payload)
 - `src` is the sender's **`lxmf.delivery` destination hash**, not the
   identity hash. The recipient does `Identity.recall(src_hash)`, and that map
   is keyed by destination hash; a wrong `src` is a silent drop.
-- `transient_id = SHA-256(encrypted_lxmf_data)` is the propagation store's
-  index — **`transient_id ≠ message_id`** (unused until propagation lands).
+- `transient_id = SHA-256(lxmf_data)` is the propagation store's index,
+  where `lxmf_data = dest16 || destination-encrypted(src+sig+payload)` and
+  the hash is taken **before** the propagation stamp is appended —
+  **`transient_id ≠ message_id`** (see §8b).
 
 Constants: `LXMF_DEST_HASH_LEN = 16`, `LXMF_SIG_LEN = 64`,
 `LXMF_OVERHEAD = 112`, `LXMF_OPP_PAYLOAD_MAX = 383` (RNS ENCRYPTED_MDU —
@@ -379,6 +382,12 @@ publishLinks (1 Hz) re-derives lxmf.id.<n>.link.<peer> = active|establishing (un
   on demand; CLI `lxmf link open|close|status <peer>`.
 ```
 
+The pack itself sits in `resolveOutboundWire`, shared with the
+propagation-node upload (§8b): RAM-outbox (`g_wireOutbox`) hit on a resend —
+no re-pack and no re-paid multi-second stamp — else pack, cache, and persist
+the firmware-owned record fields (`message_id`, `ts`, `status=queued`) plus
+the conversation-directory bump exactly once, on that first pack.
+
 Local outbound key is `o_<unix_ms>_<rand4>` (the real `message_id` isn't
 stable while a draft mutates; it's carried as a sidecar). Inbound records key
 directly by `message_id`, both under the `<peer>` subtree. The outbox slot
@@ -425,23 +434,108 @@ both directions, reaped by `convReap` past `s.lxmf.link.idle_s` (default
 
 Hashcash PoW per the reference LXStamper: a 32-byte nonce chosen so that
 `SHA-256(workblock || nonce)`, as a big-endian 256-bit integer, is
-`≤ 2^(256 − cost)`. The `workblock` is a **768 KB** buffer expanded from the
-`message_id` via HKDF-SHA256 over a **fixed 3000 rounds** (both ends must
-derive the identical block — *not* a tunable). Implemented in
-`lxmf_stamp.cpp` with self-contained SHA-256/HMAC/HKDF kept off the shared
-hardware SHA engine.
+`≤ 2^(256 − cost)`. The `workblock` is an HKDF-SHA256 expansion of a 32-byte
+seed, 256 B per round over a round count fixed per stamp kind (both ends must
+derive the identical block — *not* a tunable; last bullet). Rounds are derived
+independently and consumed strictly in order, so `absorbWorkblock` streams the
+block through the running SHA-256 256 bytes at a time and never holds it —
+neither path allocates. Implemented in `lxmf_stamp.cpp` with self-contained
+SHA-256/HMAC/HKDF kept off the shared hardware SHA engine.
 
 - The stamp is payload element **[4]**, appended **after** signing, so it is
   neither signed nor part of `message_id`. On the wire a stamped payload is a
   5-element fixarray (`0x95`); inbound, `lxmSplitStamp` rewrites the header
   to `0x94` to recover the signed bytes.
 - **Generation** (`s.lxmf.generate_stamps`) runs only when the recipient's
-  announce advertised cost > 0. The 768 KB block is built once, a midstate is
-  cached, and each nonce attempt compresses only the final 64-byte block.
-  ~4 s on a T-Deck (build dominates), yielding ~every 500 ms. A peer cost
+  announce advertised cost > 0. The block is absorbed once into a cached
+  midstate, and each nonce attempt compresses only the final 64-byte block.
+  ~4 s on a T-Deck (the absorb dominates), yielding ~every 500 ms. A peer cost
   above `LXMF_STAMP_MAX_COST = 18` is refused (sent unstamped).
-- **Validation** (`s.lxmf.enforce_stamps`) is one workblock hash; also yields
-  ~every 500 ms. Allocation failure fails closed.
+- **Validation** (`s.lxmf.enforce_stamps`) is one workblock absorb plus one
+  hash, whatever the cost; also yields ~every 500 ms.
+- The workblock round count is a per-kind protocol constant
+  (`lxmf_stamp.h`): 3000 (768 KB) for a recipient delivery stamp over the
+  `message_id`, 1000 (256 KB) for a propagation-node stamp over the
+  `transient_id` (§8b). Both calls take the count as a parameter,
+  defaulting to the delivery value.
+
+## 8b. Propagation-node client
+
+Client-side support for classic `lxmf.propagation` store-and-forward
+nodes (reference LXMRouter 0.9.8), in the "propagation-node (PN) client"
+section of `lxmf.cpp`. The node list is client-owned plain config
+(`s.lxmf.pn.<i>.{hash,name,check}`, `i` 0..`LXMF_PN_MAX`-1 = 7,
+index-ordered, non-32-hex hash = free slot); the firmware only reads it,
+so the UIs mutate it by plain rewrites.
+
+**Upload** (`pnUploadStart`, from `cmd.send = <peer>/<key>/pn:<hash>`;
+explicit-only — no automatic fallback):
+
+1. Resolve the wire via `resolveOutboundWire` (shared with `processReady`:
+   RAM-outbox reuse, else pack + delivery-stamp + one-time record persist).
+2. `lxmf_data = wire[0:16] || rnsdEncryptFor(peer_pubkey, wire[16:])`;
+   `transient_id = SHA-256(lxmf_data)`.
+3. Pay the node's announced propagation stamp: cost is element `[5][0]`
+   of the node's 7-element announce app_data (`pnParseNodeAppData`; the
+   whole shape is `[legacy_false, timebase, active, per_transfer_kb,
+   per_sync_kb, [cost, flexibility, peering], metadata]`). PoW over the
+   transient id with the 1000-round workblock; unknown announce → send
+   unstamped (a cost-enforcing node rejects — never guess a cost); cost
+   above `LXMF_PN_STAMP_MAX_COST` (20) → unstamped with a warning. The
+   stamp is appended to `lxmf_data` *after* the transient id is taken.
+   `s.lxmf.generate_stamps` does not gate this one — it governs the
+   recipient delivery stamp inside the packed wire (§8), which a node
+   upload carries unchanged.
+4. `propagation_packed = msgpack([timebase_f64, [lxmf_data]])`, size-gated
+   on the announce's per-transfer kB.
+5. A fresh link (`lxpn.<seq>`, aspect `lxmf.propagation`), one link packet
+   when ≤ `LXMF_PN_PKT_MAX` (360 B) else a Resource
+   (opaque ids 0x20000+ so aux matching can't collide with send_ids or
+   RLPG's 0x10000+ range). rnsd's pre-active outbox buffers either.
+
+Settle: the node's packet proof (the `rnsd.links.<tag>.tx_proven`
+counter, baselined at send and polled at 1 Hz + checked in the disconnect
+callback — the node proves then drops the link) or the Resource
+OUTBOUND_DONE → **`ON_PN`** (terminal, tries=255 via `msgFail`, counts as
+`sent`): a propagation node never proves delivery to the sender, the
+recipient pulls on its own sync. Proof timeout / link failure / TTL
+(`LXMF_PN_UP_TTL_S` = 90) → `PN_FAIL`; an error link-packet
+(`msgpack([errcode])`, e.g. 0xF5 invalid stamp) → `PN_REJECTED`. Two
+concurrent upload sessions (`LXMF_PN_UP_SESSIONS`); a third → `OUTBOX_FULL`.
+Pre-flight settles: no cached recipient pubkey (step 2 can't encrypt) →
+path request + `PN_FAIL`, over the node's per-transfer limit (step 4) →
+`TOO_LARGE`, link-open refusal → `LINK_OPEN_FAIL`. `pnUploadStart` owns
+every one of them, so no caller has to.
+
+**Sync** (`pnSyncAdvance` + `pnRequestAux`): one session at a time walks
+a (node × identity) queue, fed by the periodic scheduler
+(`s.lxmf.pn.check_interval_s`, default 1800, first pass ~2 min after
+bring-up; 0 = manual) and the `lxmf.cmd.pn_sync` sentinel ("all" =
+check-marked nodes, or one 32-hex node). Per session: open a link with
+the identity's key, wait for `rnsd.links.<tag>.state == active`,
+`rnsdLinkIdentify` (the node serves only the `lxmf.delivery` dest derived
+from the identified identity), then loop `/get` request rounds via
+`rnsdLinkRequest` (responses land as `RNSD_LINK_REQUEST_RESPONSE` auxes
+on the shared `LXMF_LINK_RESOURCE_AUX_PORT`, dispatched ahead of the
+resource logic in `onResourceAux`):
+
+- `[nil, nil]` → the node's held transient-id list (or a bare msgpack
+  error int: 0xF0 not-identified, 0xF1 no-access, 0xF6 throttled).
+- `[wants, haves, limit_kb]` → the wanted blobs (node deletes the haves).
+  ITS_MAX_MSG_DATA (320 B) caps the inline request at ~8 bin32 ids, hence
+  `LXMF_PN_FETCH_MAX` 6 + `LXMF_PN_HAVES_MAX` 2 per round and the loop
+  (≤ `LXMF_PN_SYNC_ROUNDS_MAX` rounds, `LXMF_PN_SYNC_TTL_S` = 180 budget).
+- `[nil, got]` → delete-confirm for what was ingested; its response chains
+  into the next list round until a round yields nothing new.
+
+Each blob (`pnIngestBlob`): leading dest16 must match the session
+identity, `rnsdDecryptSelf` the rest (the node strips the stamp before
+serving), rebuild `dest16 || plaintext` = the normal LXMF wire, and feed
+`onInboundLxm` — verify/dedup/store as any inbound. `s_pnSeenTids` (RAM,
+capped 512) filters re-served ids out of later wants; the message-id
+dedup is the authoritative backstop. Results are published to
+`lxmf.pn.<hash>.{last_check_s,last_err,last_got}` and the in-progress
+node to `lxmf.pn.sync`.
 
 ## 9. Announces
 
@@ -531,6 +625,11 @@ sound                /fixed/lxmf/ding.wav   notification WAV
 sound_enabled        1      play the notification sound on inbound delivery
 debug.only_local     0      demote per-announce dbg lines to verbose
 cli.selected_id      0      the CLI's selected identity
+pn.<i>.hash          —      propagation-node list, index-ordered (i 0..7);
+                            non-32-hex = free slot (client-owned, §8b)
+pn.<i>.name          ""     optional display name
+pn.<i>.check         1      poll this node for held messages
+pn.check_interval_s  1800   propagation-node check cadence; 0 = manual only
 ```
 
 `s.lxmf.max_resource_size` (262144) is read by rnsd (the inbound-Resource
@@ -540,7 +639,7 @@ size gate), documented in [rns](../rns), not here.
 
 ```
 label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-if-one-exists)
-contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,unread,read_ts}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce)
+contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pn = the client-set per-contact propagation node, all-zero = none)
 
 msgs.<id>.dir            in | out
 msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)
@@ -599,6 +698,9 @@ lxmf.up · lxmf.id.<n>.up · lxmf.id.<n>.dest_hash · lxmf.id.<n>.last_announce_
 lxmf.id.<n>.stats.{sent,received,pending,failed}
 
 lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (RAM-only record store, §9 — not cfgRoot)
+
+lxmf.pn.sync                        node hash currently being synced, "" idle (§8b)
+lxmf.pn.<hash>.{last_check_s,last_err,last_got}   per-node sync results (RAM)
 
 lxmf.msgmeta.<message_id_hex>.{last,hops,first_hop,dir,rssi,snr,iface}   (RAM-only record store — not cfgRoot)
 ```

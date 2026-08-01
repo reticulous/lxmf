@@ -47,6 +47,10 @@ format and the per-byte deltas from upstream are in
   the device has heard of.
 - **Stamps.** Pays and (optionally) enforces LXMF proof-of-work stamps as
   spam friction.
+- **Propagation nodes.** Sends through and receives from classic
+  `lxmf.propagation` store-and-forward nodes (see below) — a message can
+  be resent via a node from its detail page, and a user-ordered node list
+  is polled for held messages.
 - **Message-notification sound.** Plays a short sound on inbound delivery
   via the optional [audio](../audio) engine.
 
@@ -108,12 +112,14 @@ key. Presence = request in flight; absence = done.
 | `lxmf.cmd.identity_new` | optional label | generate a new identity, allocate the next slot, bring its mailbox up |
 | `lxmf.cmd.identity_import` | 128-hex private key | import a key into a new slot |
 | `lxmf.cmd.identity_destroy` | `<n>` | wipe identity `n` — its secret, all its storage, its subscriptions |
+| `lxmf.cmd.pn_sync` | `all` or `<32-hex>` | check propagation nodes for held messages now (all check-marked, or one node) |
+| `lxmf.cmd.pn_add` | `<32-hex>[\|<name>]` | append a propagation node at the first free list index |
 
 **Per-identity** (`lxmf.id.<n>.cmd.*`):
 
 | Key | Value | Effect |
 |---|---|---|
-| `lxmf.id.<n>.cmd.send` | `<peer>/<key>` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>` |
+| `lxmf.id.<n>.cmd.send` | `<peer>/<key>[/pn:<hash>]` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>`; the optional `pn:` segment uploads to that propagation node instead |
 | `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>` | cancel an in-flight send |
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
@@ -233,6 +239,50 @@ It reflects a Link torn down for any reason, tracking the per-second
 There is **no automatic retry** — to re-send after `stage = failed`, write
 `cmd.send` again.
 
+## Propagation nodes
+
+Classic LXMF **propagation nodes** (reference `lxmf.propagation`
+store-and-forward, as run by NomadNet et al.) are supported as a client,
+wire-compatible with LXMF 0.9.8:
+
+- **Node list.** A global, ordered list at `s.lxmf.pn.<i>.{hash,name,check}`
+  (`i` = 0…7; a slot whose `hash` isn't 32-hex is free). Client-owned —
+  view, add, reorder and delete it from the LXMF settings panel (web) or
+  the on-device settings pane; the web panel also renames in place.
+  `check = 1` marks a node to be polled for messages held for this
+  device's identities.
+- **Sending.** An outbound message's detail page (web and LCD) has a
+  **Resend** button opening a dialog: resend **directly**, via the
+  **contact's node** (when one is set on the contact), or via one of **our
+  nodes**. A node resend encrypts the wire to the recipient, pays the node's
+  announced propagation stamp (a separate, smaller proof-of-work than the
+  recipient delivery stamp), and uploads over an `lxmf.propagation` link.
+  Success settles the message **`ON_PN`** — final, shown as the single
+  "stored for pickup" tick: a propagation node never proves delivery; the
+  recipient collects the message on its own next sync. Failures settle
+  `PN_FAIL` (link/transfer) or `PN_REJECTED` (the node refused, e.g. an
+  under-paid stamp).
+- **Per-contact node.** Each contact's details page can name that
+  contact's propagation node (any dest hash — a quick-pick of our own
+  list plus free entry). It is offered as the resend dialog's second
+  option; nothing is sent to it automatically.
+- **Receiving.** Every node marked `check` is synced on a timer
+  (`s.lxmf.pn.check_interval_s`, default 1800; `0` = manual only) and on
+  demand (`lxmf.cmd.pn_sync = all` or a node hash — the settings panels'
+  "Check for messages now"). A sync identifies over the link so the node
+  serves exactly this identity's mail, downloads the held messages
+  through the normal verify/dedup/store pipeline, and confirms them so
+  the node deletes its copies. Per-node results land in
+  `lxmf.pn.<hash>.{last_check_s,last_err,last_got}` (RAM);
+  `lxmf.pn.sync` holds the node currently being checked.
+
+Command sentinels: `lxmf.id.<n>.cmd.send = <peer>/<key>/pn:<hash>`
+(resend via node), `lxmf.cmd.pn_sync`, and
+`lxmf.cmd.pn_add = <hash>[|<name>]` (append to the list — used by the
+on-device pane).
+
+This device does not *run* a propagation node — it is a client only.
+
 ## Receiving a message
 
 Inbound messages are verified, de-duplicated, and stored at
@@ -276,7 +326,10 @@ reaches `delivered`.
 
 Both frontends render the stage on outbound bubbles: `queued`/`sending` →
 grey `…`, `sent` → one grey check, `delivered` → two green checks,
-`failed`/`cancelled` → red ✕ (web shows `last_error` as a tooltip).
+`failed`/`cancelled` → red ✕ (web shows `last_error` as a tooltip). A message
+sitting in someone else's custody — parked at an RLPG mailbox, or uploaded to
+a propagation node (`ON_PN`) — gets a single open-circle tick: stored for
+pickup, no proof of arrival.
 
 ## Announces
 
@@ -319,6 +372,14 @@ and the on-device settings pane:
 Both generation and validation yield ~every 500 ms so the rest of the system
 keeps ticking.
 
+Uploading to a propagation node pays a **second, separate stamp** on top of
+whatever the recipient's own cost put in the message: the node's announced
+propagation cost, over a third-size workblock (256 KB against the recipient
+stamp's 768 KB). It is paid whenever the node's announce advertises one — the
+three knobs above govern only the recipient stamp. A node whose announce we
+have never heard is sent an unstamped upload rather than one paying a guessed
+cost, and it may reject it (`PN_REJECTED`).
+
 ## Storage variables
 
 ### Settings (`s.lxmf.*`)
@@ -332,6 +393,10 @@ keeps ticking.
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
+| `s.lxmf.pn.<i>.hash` | — | Propagation-node list, index-ordered (`i` = 0–7); non-32-hex = free slot. |
+| `s.lxmf.pn.<i>.name` | `""` | Optional display name for that node. |
+| `s.lxmf.pn.<i>.check` | `1` | Poll this node for held messages. |
+| `s.lxmf.pn.check_interval_s` | `1800` | Propagation-node check cadence; `0` = manual only. |
 | `s.lxmf.sound` | `/fixed/lxmf/ding.wav` | Message-notification WAV (point at your own device-rate file if you like). |
 | `s.lxmf.sound_enabled` | `1` | Play the notification sound on inbound delivery. |
 | `s.lxmf.debug.only_local` | `0` | Demote per-announce catalogue debug logs to verbose. |
@@ -349,7 +414,7 @@ enabled          1 (default); 0 = dark
 display_name     utf-8, advertised in announces
 default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
                  (empty ⇒ inherit global s.lxmf.default_method, default link-if-one-exists)
-contacts.<peer>.{hash,nick,display_name,trust,last_seen}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces)
+contacts.<peer>.{hash,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
 msgs.<peer>.<key>.{dir,stage,peer,title,content,thread,method,ts,read,
                    wire,message_id,attempts,last_error}    per-conversation message records
 ```
