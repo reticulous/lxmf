@@ -34,6 +34,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -6537,28 +6538,35 @@ static void cliId(const char* rest)
               bytesToHex(id->dest_hash, LXMF_DEST_HASH_LEN).c_str());
 }
 
-/* ── `lxmf chats` / `lxmf msgs [<peer>|<stage>]` ──
+/* ── `lxmf chats` / `lxmf msgs [<peer>|<status>]` ──
  *
  * The per-contact store makes
  * this two-level: no arg → conversation list; <peer> → that thread;
- * a bare stage word → cross-conversation filter. */
+ * a bare status name → cross-conversation filter. */
 
 struct MsgRow {
     std::string peer;
     std::string key;
     std::string dir;
-    std::string stage;
+    std::string status;   /* lxmfStatusName() of the record's status code */
     std::string title;
     int         ts;
     int         read;
 };
 
-static bool isStageWord(const std::string& s)
+/* A typed word → the canonical ALL-CAPS status name, "" if it names none.
+ * Case-insensitive, so `lxmf msgs delivered` works. This is the one place a
+ * status is resolved from text; stored codes are still never parsed back. */
+static std::string statusWordCanon(const std::string& s)
 {
-    static const char* const ST[] = { "draft", "queued", "sending", "sent",
-        "delivered", "failed", "cancelled", "received" };
-    for (const char* w : ST) if (s == w) return true;
-    return false;
+    if (s.empty()) return "";
+    std::string up = s;
+    for (char& c : up) c = (char)std::toupper((unsigned char)c);
+    for (int code = 0; code <= LXMF_ST_PN_REJECTED; code++) {
+        const char* name = lxmfStatusName((uint8_t)code);
+        if (*name && up == name) return name;
+    }
+    return "";
 }
 
 static std::string peerDisplayName(int sel, const std::string& peer)
@@ -6575,7 +6583,7 @@ static MsgRow readMsgRow(int sel, const std::string& peer, const std::string& ke
     r.peer  = peer;
     r.key   = key;
     r.dir   = storageGetStr(msgPath(sel, peer, key, "dir").c_str(),   "");
-    r.stage = lxmfStatusName((uint8_t)storageGetInt(msgPath(sel, peer, key, "status").c_str(), 0));
+    r.status = lxmfStatusName((uint8_t)storageGetInt(msgPath(sel, peer, key, "status").c_str(), 0));
     r.title = storageGetStr(msgPath(sel, peer, key, "title").c_str(), "");
     r.ts    = storageGetInt(msgPath(sel, peer, key, "ts").c_str(),    0);
     r.read  = (r.ts <= convReadTs(sel, peer)) ? 1 : 0;   /* per-conversation watermark */
@@ -6589,23 +6597,23 @@ static void printMsgRows(int sel, std::vector<MsgRow>& rows, bool show_peer)
     s_msgs_list.clear();
     if (rows.empty()) return;
     if (show_peer)
-        cliPrintf("%-3s %-3s %-9s %-16s %-6s %s\n",
-                  "#", "dir", "stage", "peer", "unread", "title");
+        cliPrintf("%-3s %-3s %-17s %-16s %-6s %s\n",
+                  "#", "dir", "status", "peer", "unread", "title");
     else
-        cliPrintf("%-3s %-3s %-9s %-6s %s\n",
-                  "#", "dir", "stage", "unread", "title");
+        cliPrintf("%-3s %-3s %-17s %-6s %s\n",
+                  "#", "dir", "status", "unread", "title");
     int n = 1;
     for (const auto& r : rows) {
         s_msgs_list.push_back({ r.peer, r.key });
         const char* unread = (r.dir == "in" && !r.read) ? "*" : "";
         if (show_peer) {
             std::string p16 = r.peer.size() >= 16 ? r.peer.substr(0, 16) : r.peer;
-            cliPrintf("%-3d %-3s %-9s %-16s %-6s %s\n",
-                      n++, r.dir.c_str(), r.stage.c_str(), p16.c_str(),
+            cliPrintf("%-3d %-3s %-17s %-16s %-6s %s\n",
+                      n++, r.dir.c_str(), r.status.c_str(), p16.c_str(),
                       unread, r.title.c_str());
         } else {
-            cliPrintf("%-3d %-3s %-9s %-6s %s\n",
-                      n++, r.dir.c_str(), r.stage.c_str(),
+            cliPrintf("%-3d %-3s %-17s %-6s %s\n",
+                      n++, r.dir.c_str(), r.status.c_str(),
                       unread, r.title.c_str());
         }
     }
@@ -6673,7 +6681,8 @@ static void cliMsgs(const char* rest)
 
     if (arg.empty()) { cliChats(sel); return; }
 
-    if (isStageWord(arg)) {
+    const std::string want = statusWordCanon(arg);
+    if (!want.empty()) {
         /* Cross-conversation filter — walk every peer subtree. */
         char prefix[64];
         std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.", sel);
@@ -6681,10 +6690,10 @@ static void cliMsgs(const char* rest)
         for (const auto& peer : collectTokens(prefix))
             for (const auto& key : collectTokens(msgPrefix(sel, peer))) {
                 MsgRow r = readMsgRow(sel, peer, key);
-                if (r.stage == arg) rows.push_back(std::move(r));
+                if (r.status == want) rows.push_back(std::move(r));
             }
-        cliPrintf("id %d  %zu message(s) filtered to stage=%s\n",
-                  sel, rows.size(), arg.c_str());
+        cliPrintf("id %d  %zu message(s) with status=%s\n",
+                  sel, rows.size(), want.c_str());
         printMsgRows(sel, rows, /*show_peer=*/true);
         return;
     }
@@ -6964,7 +6973,7 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf id                 list identities (* = selected)\n");
         cliPrintf("lxmf id <n>             switch selected identity\n");
         cliPrintf("lxmf chats              list conversations for selected id (numbered)\n");
-        cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <stage> = filter\n");
+        cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <status> = filter\n");
         cliPrintf("lxmf read <n>           print msg n from last listing; marks read\n");
         cliPrintf("lxmf contacts           list contacts for selected id (numbered)\n");
         cliPrintf("lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");

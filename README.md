@@ -83,7 +83,7 @@ Consequences a frontend can rely on:
   others reflect it. No locking, no merge.
 - **Single writer per field.** Client-owned and firmware-owned fields are
   disjoint. You create a message record and set its content; the firmware
-  owns `stage`, `wire`, `message_id`, `attempts`, `last_error`.
+  owns `status`, `tries`, `wire`, `message_id`.
 
 lxmf starts automatically when the straddle is in the build (its init is
 folded into the generated startup dispatcher, after rnsd). The task always
@@ -193,24 +193,32 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
    s.lxmf.id.<n>.msgs.<peer>.<key>.title    = <utf-8>
    s.lxmf.id.<n>.msgs.<peer>.<key>.content  = <utf-8>
    s.lxmf.id.<n>.msgs.<peer>.<key>.thread   = <hex64 root message_id, or "">
-   s.lxmf.id.<n>.msgs.<peer>.<key>.stage    = draft
+   s.lxmf.id.<n>.msgs.<peer>.<key>.status   = 0            # DRAFT
    ```
 
    (`peer` is both the path segment and a field — the field is kept for the
-   indexed-query contract.) While `stage == draft` you may edit freely.
+   indexed-query contract.) A `DRAFT` record is filtered out of the thread, so
+   you may edit it freely; the web composer skips this state entirely, keeping
+   typed text in RAM and writing the record already `QUEUED`.
 
 2. Commit with `lxmf.id.<n>.cmd.send = <peer>/<key>` (ideally in the same
-   transaction as step 1).
+   transaction as step 1), or `<peer>/<key>/pn:<32-hex>` to upload it to a
+   propagation node instead of delivering it directly.
 
-3. Watch `…stage` progress:
+3. Watch `…status` — a single `u8` code carrying both the lifecycle stage and,
+   if it stops, the reason:
 
    ```
-   draft → queued → sending → sent          (delivered only on a proven DIRECT/Resource transfer)
-                            ↘ failed | cancelled
+   DRAFT → QUEUED → REQUESTING_PATH → SENDING → AWAITING_PROOF → DELIVERED
+                                              ↘ RETRYING_LINK / RETRYING_DELIVERY
+                                              ↘ NO_ROUTE | LINK_FAIL | … | CANCELLED
    ```
 
-   `last_error` carries a short human string during the attempt
-   (`requesting path`, `establishing link`, …); `attempts` counts retries.
+   The companion `…tries` byte is the try count for the current phase, and
+   `tries == 255` is the **one** definitive terminal marker: below it the
+   message is still in play and a sweep may retry it, whatever the status says.
+   `DELIVERED` means a cryptographic delivery proof (or the proof-grade
+   Resource transfer acknowledgement) arrived — nothing else does.
 
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
@@ -236,8 +244,8 @@ down — that tapping opens or closes on demand (`lxmf.id.<n>.cmd.link_open` /
 It reflects a Link torn down for any reason, tracking the per-second
 `lxmf.id.<n>.link.<peer>` state.
 
-There is **no automatic retry** — to re-send after `stage = failed`, write
-`cmd.send` again.
+A message that gave up (`tries == 255`) is not retried on its own — write
+`cmd.send` again to re-send it.
 
 ## Propagation nodes
 
@@ -286,7 +294,7 @@ This device does not *run* a propagation node — it is a client only.
 ## Receiving a message
 
 Inbound messages are verified, de-duplicated, and stored at
-`s.lxmf.id.<n>.msgs.<peer>.<message_id>.*` with `stage = received`,
+`s.lxmf.id.<n>.msgs.<peer>.<message_id>.*` with `status = RECEIVED`,
 `dir = in`, `read = 0`. `<peer>` is the sender's 32-hex destination; the
 64-hex key is the real LXMF `message_id`. Dedup survives reboots, so the
 same message arriving twice is stored once.
@@ -305,31 +313,37 @@ is known the buffered message is replayed, verified, and stored. Opportunistic
 LXMF has no retransmission, so buffering is what keeps a single-packet message
 from a not-yet-known sender from being lost.
 
-## Delivery stages & proofs
+## Delivery status & proofs
 
-| stage | meaning |
-|---|---|
-| `draft` | composed, not yet handed to the task |
-| `queued` | accepted; waiting (e.g. for a busy conversation Link) |
-| `sending` | in flight (path request, link establishment, transfer) |
-| `sent` | egressed / transfer accepted — no proof of arrival |
-| `delivered` | cryptographic delivery proof received, or the proof-grade Resource transfer ACK |
-| `failed` | terminal error (`last_error` says why) |
-| `cancelled` | user cancelled |
-| `received` | inbound message |
+One `u8` `status` code per message carries the lifecycle stage, the terminal
+outcome and the give-up reason together. The names below are what the CLI and
+both frontends print; the numbers are persisted, so the list is append-only
+(`LxmfStatus` in `esp-idf/include/lxmf.h`, mirrored in the browser's
+`modules/lxmf.ts`).
 
-`sent` is **not** `delivered`. Opportunistic packets get no native ack — a
-proof timeout is *not* a failure (the message may have arrived; the peer may
-not prove inbound, or the proof was lost). The stage stays `sent` with
-`last_error = "no delivery proof"`. Only a proven DIRECT/Resource transfer
-reaches `delivered`.
+| group | statuses | meaning |
+|---|---|---|
+| progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` | still in play; a sweep may act |
+| settled | `DELIVERED` `CANCELLED` `RECEIVED` | proof received / user cancelled / inbound |
+| gave up | `NO_PROOF` `NO_ROUTE` `TOO_LARGE` `LINK_FAIL` `LINK_OPEN_FAIL` `RES_SEND` `RADIO_BUSY` `OUTBOX_FULL` … | why it stopped |
+| in someone else's custody | `REMOTE_RLPG` `OUR_RLPG` `ON_PN` `REMOTE_RLPG_FULL` `REMOTE_RLPG_ERR` `PN_FAIL` `PN_REJECTED` | mailbox / propagation-node states |
 
-Both frontends render the stage on outbound bubbles: `queued`/`sending` →
-grey `…`, `sent` → one grey check, `delivered` → two green checks,
-`failed`/`cancelled` → red ✕ (web shows `last_error` as a tooltip). A message
-sitting in someone else's custody — parked at an RLPG mailbox, or uploaded to
-a propagation node (`ON_PN`) — gets a single open-circle tick: stored for
-pickup, no proof of arrival.
+The companion `tries` byte, not the status, is the definitive terminal marker:
+`tries == 255` means gave up, and below that the message is still live whatever
+the status reads. A one-shot status sets it to 255 the moment it occurs.
+
+**Egress is not delivery.** Opportunistic packets get no native
+acknowledgement, so a proof timeout is *not* a failure — the message may well
+have arrived, the peer may not prove inbound, or the proof was lost. That
+settles as `NO_PROOF`, distinct from `DELIVERED`, which only a cryptographic
+delivery proof (or the proof-grade Resource transfer acknowledgement) produces.
+
+Both frontends render this on outbound bubbles as the ALL-CAPS status name
+plus a glyph: grey `…` while in play, two green checks for `DELIVERED` (which
+needs no name), a grey ✕ for `CANCELLED`, a red ✕ once `tries` hits 255. A
+message sitting in someone else's custody — parked at an RLPG mailbox
+(`REMOTE_RLPG`/`OUR_RLPG`) or uploaded to a propagation node (`ON_PN`) — gets a
+single open-circle tick: stored for pickup, no proof of arrival.
 
 ## Announces
 
@@ -415,8 +429,8 @@ display_name     utf-8, advertised in announces
 default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
                  (empty ⇒ inherit global s.lxmf.default_method, default link-if-one-exists)
 contacts.<peer>.{hash,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
-msgs.<peer>.<key>.{dir,stage,peer,title,content,thread,method,ts,read,
-                   wire,message_id,attempts,last_error}    per-conversation message records
+msgs.<peer>.<key>.{dir,status,tries,peer,title,content,thread,method,ts,recv_ts,
+                   read,wire,message_id}    per-conversation message records
 ```
 
 ### Runtime & telemetry (`lxmf.*`, RAM)
@@ -464,7 +478,8 @@ lxmf id                     list identities (* = selected)
 lxmf id <n>                 switch selected identity
 lxmf chats                  list conversations (one row per peer; numbered)
 lxmf msgs [<arg>]           no arg = chats; <peer> = that thread (newest first);
-                            a bare <stage> word = cross-conversation filter
+                            a bare status name = cross-conversation filter
+                            (case-insensitive, e.g. `lxmf msgs delivered`)
 lxmf read <n>               print message #n from the last `lxmf msgs`; marks it read
 lxmf contacts               list this identity's contacts (numbered)
 lxmf announces [<arg>]      cross-identity announce catalogue; <arg> = 32-hex
