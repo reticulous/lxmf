@@ -172,31 +172,27 @@ struct Yielder {
     }
 };
 
-/* Protocol constant — must match the reference exactly so both ends
- * derive the same workblock. 3000 * 256 B = 768000 B (block-aligned). */
-constexpr int    WORKBLOCK_EXPAND_ROUNDS = 3000;
-constexpr size_t WORKBLOCK_LEN = (size_t)WORKBLOCK_EXPAND_ROUNDS * 256;
-
-/* Absorb the workblock expansion of message_id straight into `s` — the
- * rounds are derived independently (message_id + round index) and hashed
- * strictly in order, so the 768 KB block never needs to exist in memory:
- * each 256-byte round goes through a stack buffer into the running hash.
- * The workblock's only consumers are SHA-256 passes (the validation
- * digest and the generation midstate), both sequential. Yields ~every
- * 500 ms — this expansion is the bulk of the ~4 s. */
-void absorbWorkblock(Sha256& s, const uint8_t message_id[32], Yielder& y)
+/* Absorb the workblock expansion of `seed` straight into `s` — the
+ * rounds are derived independently (seed + round index) and hashed
+ * strictly in order, so the block (rounds * 256 B; 768 KB delivery,
+ * 256 KB propagation) never needs to exist in memory: each 256-byte
+ * round goes through a stack buffer into the running hash. The
+ * workblock's only consumers are SHA-256 passes (the validation digest
+ * and the generation midstate), both sequential. Yields ~every 500 ms —
+ * this expansion is the bulk of the ~4 s. */
+void absorbWorkblock(Sha256& s, const uint8_t seed[32], int rounds, Yielder& y)
 {
-    for (int n = 0; n < WORKBLOCK_EXPAND_ROUNDS; ++n) {
+    for (int n = 0; n < rounds; ++n) {
         uint8_t pb[3];
         size_t  pbl = packb_uint(n, pb);
-        /* salt = SHA-256(message_id || msgpack(n)) */
+        /* salt = SHA-256(seed || msgpack(n)) */
         uint8_t saltbuf[35];
-        std::memcpy(saltbuf, message_id, 32);
+        std::memcpy(saltbuf, seed, 32);
         std::memcpy(saltbuf + 32, pb, pbl);
         uint8_t salt[32];
         sha256(saltbuf, 32 + pbl, salt);
         uint8_t chunk[256];
-        hkdf256(message_id, 32, salt, 32, chunk);
+        hkdf256(seed, 32, salt, 32, chunk);
         sha256_update(s, chunk, sizeof(chunk));
         y.tick();
     }
@@ -216,9 +212,10 @@ bool hash_meets_cost(const uint8_t digest[32], int cost)
 
 } // namespace
 
-bool lxmfStampValid(const uint8_t message_id[32], int target_cost,
+bool lxmfStampValid(const uint8_t seed[32], int target_cost,
                     const uint8_t* stamp, size_t stamp_len,
-                    lxmf_yield_fn yield, lxmf_now_ms_fn now_ms)
+                    lxmf_yield_fn yield, lxmf_now_ms_fn now_ms,
+                    int rounds)
 {
     if (target_cost <= 0) return true;
     if (!stamp || stamp_len == 0) return false;
@@ -226,16 +223,17 @@ bool lxmfStampValid(const uint8_t message_id[32], int target_cost,
     y.reset();
     Sha256 s;
     sha256_init(s);
-    absorbWorkblock(s, message_id, y);
+    absorbWorkblock(s, seed, rounds, y);
     sha256_update(s, stamp, stamp_len);
     uint8_t d[32];
     sha256_final(s, d);
     return hash_meets_cost(d, target_cost);
 }
 
-bool lxmfStampGenerate(const uint8_t message_id[32], int target_cost,
+bool lxmfStampGenerate(const uint8_t seed[32], int target_cost,
                        uint8_t out_stamp[LXMF_STAMP_LEN],
-                       lxmf_yield_fn yield, lxmf_now_ms_fn now_ms)
+                       lxmf_yield_fn yield, lxmf_now_ms_fn now_ms,
+                       int rounds)
 {
     if (target_cost <= 0) return false;
     Yielder y{yield, now_ms, 0};
@@ -245,7 +243,7 @@ bool lxmfStampGenerate(const uint8_t message_id[32], int target_cost,
      * compresses only the final block holding the 32-byte stamp. */
     Sha256 base;
     sha256_init(base);
-    absorbWorkblock(base, message_id, y);
+    absorbWorkblock(base, seed, rounds, y);
 
     uint8_t  stamp[LXMF_STAMP_LEN] = {0};
     uint64_t counter = 0;
