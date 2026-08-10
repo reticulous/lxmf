@@ -39,6 +39,10 @@ requires:
 services:
   - { class: LxmfService, header: lxmf.h }
   - { class: LxmfApp, header: lxmf_app.h, when: spangap/spangap-lcd }
+  # Mono-OLED page: total unread across all identities. Lives under
+  # conditional/tinylcd/, so without tinylcd staged neither the trampoline nor
+  # the class compiles.
+  - { class: LxmfTinyPage, header: lxmf_tiny.h, when: spangap/tinylcd }
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.

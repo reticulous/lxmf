@@ -486,7 +486,7 @@ lxmf announces [<arg>]      cross-identity announce catalogue; <arg> = 32-hex
                             (one row) or a name substring; no arg = full dump
 lxmf send <peer> <msg>      send; <peer> = 32-hex, a number from the last numbered
                             listing, or a name substring
-lxmf announce               announce the selected identity now
+lxmf a[nnounce]             announce the selected identity now
 ```
 
 Numbered listings (`chats`, `msgs`, `contacts`, `announces`) feed the index

@@ -45,6 +45,8 @@
 #include <set>
 #include <unordered_map>
 
+
+
 static const char* TAG = "lxmf";
 
 /* Cached `s.lxmf.debug.only_local` — when true, the per-announce
@@ -6979,7 +6981,7 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");
         cliPrintf("                      arg = 32-hex (instant lookup) or name substring\n");
         cliPrintf("lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
-        cliPrintf("lxmf announce           emit a delivery announce for selected id\n");
+        cliPrintf("lxmf a[nnounce]         emit a delivery announce for selected id\n");
         cliPrintf("lxmf link <act> <peer>  open|close|status a conversation link to <32-hex peer>\n");
         cliPrintf("lxmf rlpg [<mb>|off]    show / set / unset this identity's RLPG mailbox node\n");
         return;
@@ -7044,7 +7046,7 @@ static void cliLxmf(const char* args)
     if (verb == "contacts")  { cliContacts(); return; }
     if (verb == "announces") { cliAnnounces(rest); return; }
     if (verb == "send")      { cliSend(rest); return; }
-    if (verb == "announce") {
+    if (cliVerbIs(verb.c_str(), "announce", 1)) {
         int sel = selectedId();
         lxmf_id_t* id = idAt(sel);
         if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
