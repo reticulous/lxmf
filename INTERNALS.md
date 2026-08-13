@@ -748,6 +748,16 @@ disappearing, because ephemeral `lxmf.*` deletions are not propagated back
 over the storage DataChannel, so "sentinel gone" is unobservable and using
 it produced false send failures.
 
+**What counts as a contact.** A contact is a peer with **at least one stored
+message**, inbound or outbound — the directory's `contacts.<peer>.count > 0`.
+The existence of the `contacts.<peer>` record is *not* the test: the record
+also carries per-peer settings (`pn`) and the announced `display_name`, so
+keying off it would promote a peer out of "On the Mesh" the moment anything
+touched it. Both rails split on `count > 0` (browser `peerDirectory`, LCD
+`rebuildList`), and every write a mere *open* performs — the read watermark
+and unread clear in both frontends — is conditional on there being something
+to change, so opening an on-the-mesh peer writes nothing at all.
+
 **On-device LCD app** (`esp-idf/conditional/spangap-lcd/src/lxmf_lcd.cpp`):
 the **LXMF** app — `class LxmfApp : public LcdApp`, constructed
 `LcdApp({ .name = "LXMF", .iconBasename = "lxmf" })` and installed via

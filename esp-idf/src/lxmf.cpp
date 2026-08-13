@@ -525,13 +525,19 @@ static const sdb_schema& lxmfMsgSchema()
  * the peer hash redundantly with the record key — it is the "contact exists"
  * sentinel the seed/first-contact paths test via storageExists.
  *
- * schema_ver 2 moved `hash` from hex text to a raw 16-byte DATA field and added a
- * raw 64-byte DATA `pubkey` (the contact's RNS identity public key, X25519||Ed25519).
- * Persisting the pubkey lets link initiation survive reboot / identity-cache
- * eviction: on comms-initiate we re-feed it to Identity::remember() when the RAM
- * cache has dropped it. all-zero pubkey = not yet learned. Older files upgrade
- * automatically — the generic auto-migrator decodes them via the registered v1
- * hint layout and re-packs them in this layout. */
+ * schema_ver 2 moved `hash` from hex text to a raw 16-byte DATA field. Older
+ * files upgrade automatically — the generic auto-migrator decodes them via the
+ * registered legacy hint layouts and re-packs them in this one, dropping values
+ * for fields this layout no longer carries.
+ *
+ * A contact's public key is deliberately NOT here. rnsd's directory is
+ * authoritative for "what I currently know about that destination", holds the
+ * key in the same record as the route, and persists it; lxmf claims each
+ * contact (lxmfClaimContact) so that record outranks unclaimed announce traffic
+ * under eviction. Storing a second copy here would be a second thing to keep
+ * consistent for no gain — a key with no path saves no work, because acquiring
+ * a path means a path request and the response is an announce carrying the
+ * key. */
 static const sdb_schema& lxmfContactSchema()
 {
     static const sdb_schema s = [] {
@@ -540,7 +546,7 @@ static const sdb_schema& lxmfContactSchema()
         x.schema_ver = 2;
         x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
          .u8("trust")
-         .data("hash", 16).data("pubkey", 64)
+         .data("hash", 16)
          .data("rlpg", 16)     /* the contact's rlpg.mailbox dest, cert-verified
                                 * at deposit HELLO; all-zero = none known */
          .data("rlpg_svc", 16) /* that mailbox's service-identity lxmf.delivery
@@ -800,45 +806,25 @@ static void contactSigUpdate(const std::string& peer_hex, const rx_meta_t* meta)
     }
 }
 
-/* Contact identity persistence. rnsd's identity cache is RAM-only and self-culls,
- * so a contact's public key is lost across a reboot (or when the cache fills with
- * announces). We persist it in the contact record (the `pubkey` DATA field) and
- * re-seed it on demand, so link initiation to a known contact survives without
- * waiting for a fresh announce. */
-
-/* CAPTURE — persist the peer's public key into contact (n, peer) when rnsd has it
- * cached and our stored copy is absent/stale. Only touches a contact that already
- * exists (never materialises one from a bare recall). */
-static void lxmfCapturePubkey(int n, const std::string& peer_hex,
-                              const uint8_t dh[RNSD_DEST_HASH_LEN])
+/* Claim a contact in rnsd's directory. The claim is what keeps a contact's
+ * identity — and its route — from being evicted by the announce traffic of a
+ * busy public network: eviction ranks claimed records above unclaimed ones, and
+ * PERSIST above ephemeral. It is a preference, not a guarantee; rnsd may still
+ * break it under real pressure, in which case the next announce or path
+ * response restores the record.
+ *
+ * Safe to assert repeatedly (it restamps), and safe to assert for a contact we
+ * have never heard from — the claim waits on an otherwise empty record for the
+ * first announce to land on. The address book bounds the population, which is
+ * the condition that makes a long-lived claim legitimate at all.
+ *
+ * DIR, not DIR_BLOB: we need to know who a contact is, not to answer path
+ * requests on their behalf. */
+static void lxmfClaimContact(const std::string& peer_hex)
 {
-    uint8_t live[RNSD_PUBKEY_LEN];
-    if (!rnsdRecallPubkey(dh, live)) return;                  /* cache doesn't have it yet */
-    if (!storageExists(contactPath(n, peer_hex, "hash").c_str())) return;  /* not a contact */
-    std::string path = contactPath(n, peer_hex, "pubkey");
-    uint8_t cur[RNSD_PUBKEY_LEN]; size_t cl = sizeof(cur);
-    if (storageGetData(path.c_str(), cur, &cl) && cl == RNSD_PUBKEY_LEN
-        && std::memcmp(cur, live, RNSD_PUBKEY_LEN) == 0) return;   /* already stored, unchanged */
-    storageSetData(path.c_str(), live, RNSD_PUBKEY_LEN);
-}
-
-/* FEED — if rnsd's cache lacks the peer's identity, re-seed it from any persisted
- * contact copy (a peer may be a contact under several local identities; the key
- * is the same). Returns true if a key was fed. */
-static bool lxmfFeedPubkey(const std::string& peer_hex,
-                           const uint8_t dh[RNSD_DEST_HASH_LEN])
-{
-    uint8_t tmp[RNSD_PUBKEY_LEN];
-    if (rnsdRecallPubkey(dh, tmp)) return false;              /* already cached */
-    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
-        uint8_t pk[RNSD_PUBKEY_LEN]; size_t pl = sizeof(pk);
-        if (storageGetData(contactPath(n, peer_hex, "pubkey").c_str(), pk, &pl)
-            && pl == RNSD_PUBKEY_LEN) {
-            rnsdRememberPubkey(dh, pk);
-            return true;
-        }
-    }
-    return false;
+    uint8_t dh[16];
+    if (!hexToBytes(peer_hex.c_str(), peer_hex.size(), dh, 16)) return;
+    rnsdClaim(dh, RNSD_CLAIM_LXMF, RNSD_CLAIM_PERSIST, RNSD_CLAIM_LAYER_DIR, 0);
 }
 
 /* Per-conversation read watermark: the ts (seconds) up to and including which
@@ -1751,8 +1737,12 @@ static bool isOwnDest(const uint8_t dh[LXMF_DEST_HASH_LEN])
 
 static int s_announce_sub_handle = -1;
 
-/* RNSD_PORT_ANNOUNCES frame: hops(1) | dest_hash(16) | identity_hash(16) | app_data(N) */
-constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16;
+/* RNSD_PORT_ANNOUNCES frame:
+ *   hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | app_data(N)
+ * The public key rides along so a subscriber can act on an announce without
+ * calling back into rnsd for the identity. */
+constexpr size_t LXMF_ANNOUNCE_PUBKEY_OFF = 1 + 16 + 16;
+constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16 + 64;
 
 /* ── lxmf.announces.<hex> record fields (store schema 3) ──
  *
@@ -1925,13 +1915,10 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
             if (!info.rlpg_hex.empty())
                 storageSet(contactPath(id.index, dh_hex, "rlpg").c_str(),
                            info.rlpg_hex.c_str());
-            /* The announce just (re)cached this identity's public key in rnsd —
-             * persist it into the contact record now. This is the "first time we
-             * see the identity" fill: it is what puts a pubkey on contacts that
-             * predate pubkey persistence (after the v1→v2 migration they start
-             * empty) and keeps it fresh, so a link survives the next reboot
-             * without waiting to hear the peer again. */
-            lxmfCapturePubkey(id.index, dh_hex, dh);
+            /* Restamp the claim while we are here: an announce is evidence
+             * this contact is live, and claim recency is what orders eviction
+             * among claimed records. */
+            lxmfClaimContact(dh_hex);
         }
     }
 
@@ -2417,12 +2404,9 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
         convDrop(*c);
     }
     if (!open_if_missing) return nullptr;
-    /* Comms-initiate: make sure rnsd can recall this peer's identity for the link
-     * — re-seed a persisted copy if the live cache dropped it — then persist
-     * whatever ends up cached so the next boot starts warm. Cheap no-ops when the
-     * cache is already populated and the store already matches. */
-    lxmfFeedPubkey(peer_hex, dh);
-    lxmfCapturePubkey(id.index, peer_hex, dh);
+    /* Comms-initiate: assert the claim so the peer's directory record outlives
+     * the announce churn for as long as we are talking to them. */
+    lxmfClaimContact(peer_hex);
     convlink_t* slot = nullptr;
     for (auto& s : s_convlinks) if (!s.used) { slot = &s; break; }
     if (!slot) {                          /* full: evict the LRU idle one */
@@ -3123,10 +3107,9 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
     storageSet(msgPath(id.index, sh_hex, mid_hex, "recv_ts").c_str(), recv);
     storageEnd();
 
-    /* First-learn capture: we just verified this sender's signature, so their
-     * identity is in rnsd's cache, and bumpConvDirectory has materialised the
-     * contact — persist their public key so a future link survives reboot/eviction. */
-    lxmfCapturePubkey(id.index, sh_hex, sh);
+    /* bumpConvDirectory has materialised the contact, so claim it: from here on
+     * their directory record is protected like any other contact's. */
+    lxmfClaimContact(sh_hex);
 
     /* Routing telemetry → RAM-only msgmeta store (keyed by message_id). */
     if (meta)
@@ -3151,10 +3134,10 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
 
     lxmfNotifySound();
 
-    /* Breather: this task runs on core 0 (prio 1) under the rnsd transport
-     * (prio 2). A burst of inbound messages processed back-to-back monopolises
-     * the core against the idle task (WDT) and equal-priority peers (cron).
-     * Yield so they get a slice between messages. */
+    /* Breather: this task runs on core 0 (prio 1) alongside the rnsd transport
+     * that feeds it, at the same priority. A burst of inbound messages
+     * processed back-to-back monopolises the core against the idle task (WDT)
+     * and its peers (rnsd, cron). Yield so they get a slice between messages. */
     stampYield();
 }
 
@@ -3939,7 +3922,6 @@ static void rlpgDepSendEnvelope(rlpg_dep_t& s, lxmf_id_t& id,
         return;
     }
     uint8_t pk[RNSD_PUBKEY_LEN];
-    lxmfFeedPubkey(s.peer, peer_dh);
     if (!rnsdRecallPubkey(peer_dh, pk)) { rlpgDepFail(s); return; }
     const std::vector<uint8_t>& wire = wit->second.wire;
     std::vector<uint8_t> ct(wire.size() + RNSD_ENCRYPT_OVERHEAD);
@@ -4288,7 +4270,6 @@ static void rlpgRelayFlush(uint32_t now_s)
         }
         if (e.ct.empty()) {
             uint8_t pk[RNSD_PUBKEY_LEN];
-            lxmfFeedPubkey(e.peer, dh);
             if (!rnsdRecallPubkey(dh, pk)) {
                 rnsdRequestPath(dh);
                 if (++e.pk_tries > LXMF_RLPG_RELAY_PK_TRIES) {
@@ -4428,13 +4409,12 @@ static void rlpgOwnHandleFrame(int n, const RlpgFrame& fr)
          *                path and are proofed OK the same way.
          *   DISCARD    — garbage only: empty, undecryptable, or a wire
          *                too short to carry the LXMF header.
-         *   no proof   — decrypts but the sender is unrecallable even
-         *                after reseeding from the contact records:
+         *   no proof   — decrypts but the sender is unrecallable:
          *                onInboundLxm can only buffer the wire
          *                (pending_verify, evictable), so the node keeps
          *                the envelope and re-serves it next session;
          *                transient-id dedup makes the re-serve harmless. */
-        bool ok = false, hold = false, decrypted = false, reseeded = false;
+        bool ok = false, hold = false, decrypted = false;
         if (!fr.blob.empty()) {
             std::vector<uint8_t> pt(fr.blob.size());
             size_t pt_len = pt.size();
@@ -4443,12 +4423,12 @@ static void rlpgOwnHandleFrame(int n, const RlpgFrame& fr)
                                 pt.data(), &pt_len) &&
                 pt_len >= LXMF_OVERHEAD) {
                 decrypted = true;
-                /* Recall gate before the pipeline: a cache miss (reboot
-                 * cleared rnsd's identity cache) is reseeded from any
-                 * identity's persisted contact pubkey. */
+                /* Recall gate before the pipeline: without the sender's
+                 * identity we cannot verify the message, so hold it and ask
+                 * for a path — the path response is an announce and carries
+                 * the key. */
                 const uint8_t* sh = pt.data() + LXMF_DEST_HASH_LEN;
                 uint8_t spk[RNSD_PUBKEY_LEN];
-                reseeded = lxmfFeedPubkey(bytesToHex(sh, LXMF_DEST_HASH_LEN), sh);
                 if (rnsdRecallPubkey(sh, spk)) ok = true;
                 else { hold = true; rnsdRequestPath(sh); }
                 onInboundLxm(id, pt.data(), pt_len, nullptr, /*rlpg_pickup=*/true);
@@ -4465,7 +4445,7 @@ static void rlpgOwnHandleFrame(int n, const RlpgFrame& fr)
         dbg("id %d: rlpg pickup tid=%s (%zu B, decrypt %s, recall %s) → %s", n,
             bytesToHex(fr.transient_id, 4).c_str(), fr.blob.size(),
             decrypted ? "ok" : "fail",
-            !decrypted ? "-" : ok ? (reseeded ? "reseeded" : "ok") : "miss",
+            !decrypted ? "-" : ok ? "ok" : "miss",
             hold ? "held (no proof)" : ok ? "proof OK" : "proof DISCARD");
         break;
     }
@@ -5000,7 +4980,6 @@ static void pnUploadStart(lxmf_id_t& id, const std::string& peer_hex,
      * node stores the blob blind, keyed by its SHA-256 (the transient id,
      * computed before the stamp is appended). */
     uint8_t pk[RNSD_PUBKEY_LEN];
-    lxmfFeedPubkey(peer_hex, dh);
     if (!rnsdRecallPubkey(dh, pk)) {
         rnsdRequestPath(dh);
         warn("id %d: pn upload %s: recipient identity unknown", id.index, mid.c_str());
@@ -6335,6 +6314,11 @@ static void lxmfPreloadRxReportCaps(void)
         std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
         storageForEach(cpre.c_str(), seedCollectPeer);
         for (auto& peer : s_seedPeers) {
+            /* Re-assert the directory claim for every contact. rnsd keeps
+             * claims compiled into its persisted image, so this is usually a
+             * restamp rather than news — but a discarded image must cost only
+             * the head start, never the intent, and the intent lives here. */
+            lxmfClaimContact(peer);
             if (!lxmfContactRxReportCapable(n, peer)) continue;
             uint8_t dh[16];
             if (!hexToBytes(peer.c_str(), peer.size(), dh, 16)) continue;
@@ -6775,6 +6759,11 @@ static void cliContacts(void)
     std::vector<ContactRow> rows;
     rows.reserve(hashes.size());
     for (const auto& h : hashes) {
+        /* A contact is a peer we've exchanged at least one message with — the
+         * directory count, not the record's existence. A record also backs
+         * announce-only state (display_name, a client-set pn), and those peers
+         * belong to the announce catalogue (`lxmf announces`), not here. */
+        if (storageGetInt(contactPath(sel, h, "count").c_str(), 0) <= 0) continue;
         ContactRow r;
         r.hash         = h;
         r.nick         = storageGetStr(contactPath(sel, h, "nick").c_str(),         "");
@@ -7893,7 +7882,7 @@ void LxmfService::onInit()
     /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
      * calls lxmfStart() (which spawns lxmfTaskMain) once rnsd is up and past its
      * boot window, and rnsStop() calls lxmfStop(). Core 0, prio 1, 8 KB PSRAM
-     * stack — pinned to the transport core (alongside rnsd, prio 2) that feeds
+     * stack — pinned to the transport core (alongside rnsd, prio 1) that feeds
      * it, so inbound-message bursts don't contend with the LCD/audio tasks. */
     rnsServiceRegister(TAG, lxmfStart, lxmfStop);
 

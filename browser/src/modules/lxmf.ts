@@ -754,17 +754,28 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     return buckets
   })
 
+  /* A contact is a peer with at least one stored message, in or out — i.e. a
+   * conversation (directory count > 0). The mere existence of a
+   * contacts.<peer> record is NOT the test: a record also carries per-peer
+   * settings (pn) and the announced display_name, so a peer merely opened
+   * from "On the Mesh" must not be promoted out of that section. */
+  const contactPeers = computed(() => new Set(conversations.value.map(c => c.peer)))
+
   const peerDirectory = computed(() => {
     const seen = new Set<string>()
     const rows: { peer: string; name: string; known: boolean; rlpg: boolean }[] = []
     for (const c of Object.values(contacts.value)) {
+      if (!contactPeers.value.has(c.peer)) continue   // record, but no messages
       seen.add(c.peer)
       rows.push({ peer: c.peer, name: displayName(c.peer), known: true, rlpg: hasRlpg(c.rlpg) })
     }
     for (const a of announces.value) {
       if (seen.has(a.hash)) continue
       seen.add(a.hash)
-      rows.push({ peer: a.hash, name: displayName(a.hash), known: false, rlpg: false })
+      /* An on-the-mesh peer can still have a record (announce name, a set pn) —
+       * its RLPG mailbox is worth showing even before any message. */
+      rows.push({ peer: a.hash, name: displayName(a.hash), known: false,
+                  rlpg: hasRlpg(contacts.value[a.hash]?.rlpg ?? '') })
     }
     return rows
   })
@@ -870,11 +881,16 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     // works even before the conversation body has been fetched. Also clear the
     // maintained unread counter (the firmware clears it when it marks read; the
     // browser must do the same when it does).
+    // Both writes are conditional so opening a peer we've never exchanged a
+    // message with writes nothing at all: an unconditional unread = 0 would
+    // create the contacts.<peer> record and stub a contact out of thin air.
     const lastTs = num(device.get(`${base}.last_ts`) ?? 0)
     const cur = num(device.get(`${base}.read_ts`) ?? 0)
-    const patch = nest(`${base}.unread`, 0)
+    const patch: Patch = {}
+    if (num(device.get(`${base}.unread`) ?? 0) !== 0)
+      deepAssign(patch, nest(`${base}.unread`, 0))
     if (lastTs > cur) deepAssign(patch, nest(`${base}.read_ts`, lastTs))
-    device.sendJson(patch)
+    if (Object.keys(patch).length) device.sendJson(patch)
   }
 
   /* ── Propagation nodes (global, index-ordered list at s.lxmf.pn.<i>) ──
