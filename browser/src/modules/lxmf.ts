@@ -133,6 +133,25 @@ export interface MsgMeta {
   remoteSnr: string    // dB as text, '' if the peer didn't report
 }
 
+/* One probe outcome from lxmf.ping.<peer>.*, RAM-only and overwritten by the
+ * next probe. `state` is the only field always present: 'probing' / 'path' while
+ * in flight, then 'ok' or a reason it stopped. Every measurement is a string
+ * exactly as the firmware wrote it (dBm, dB) and is '' when that side reported
+ * nothing — a vanilla peer reports neither of its own, and a non-radio hop has
+ * no signal to report at either end. */
+export interface PingResult {
+  state: string        // probing | path | ok | no-proof | no-route | timeout | cancelled | failed | offline
+  ts: number           // unix seconds of the last state change
+  rttMs: number        // round trip, 0 unless state is 'ok'
+  hops: number
+  tx: string           // our antenna tx power, dBm
+  rssi: string         // our rx of the delivery proof, dBm
+  snr: string          // our rx of the delivery proof, dB
+  peerTx: string       // the peer's antenna tx power, dBm
+  peerRssi: string     // the peer's rx of our probe, dBm
+  peerSnr: string      // the peer's rx of our probe, dB
+}
+
 export interface Conversation {
   peer: string
   name: string
@@ -512,6 +531,11 @@ export interface UseLxmf {
   linkState: (peer: string) => '' | 'establishing' | 'active'
   /** Open the link if down, close it if up. */
   toggleLink: (peer: string) => Promise<void>
+  /** Probe a peer: one packet out, its delivery proof back. Resolves once the
+   *  sentinel is taken — the measurement itself lands in `pingResult(peer)`. */
+  ping: (peer: string) => Promise<void>
+  /** Latest probe outcome for a peer (lxmf.ping.<peer>.*), null if never probed. */
+  pingResult: (peer: string) => PingResult | null
   createIdentity: (label: string) => Promise<void>
   importIdentity: (privHex: string) => Promise<void>
   destroyIdentity: (n: number) => Promise<void>
@@ -872,6 +896,29 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     })
   }
 
+  /* Probe: write the sentinel and let the firmware's published record carry the
+   * answer. Settling on the sentinel alone is deliberate — the round trip takes
+   * as long as the mesh takes, and the caller watches pingResult for that. */
+  const ping = (peer: string): Promise<void> =>
+    queue(`lxmf.id.${activeId.value}.cmd.ping`).enqueue(peer)
+
+  const pingResult = (peer: string): PingResult | null => {
+    const r = device.get(`lxmf.ping.${peer}`)
+    if (!r || !str(r.state)) return null
+    return {
+      state: str(r.state),
+      ts: num(r.ts),
+      rttMs: num(r.rtt_ms),
+      hops: num(r.hops),
+      tx: str(r.tx),
+      rssi: str(r.rssi),
+      snr: str(r.snr),
+      peerTx: str(r.peer_tx),
+      peerRssi: str(r.peer_rssi),
+      peerSnr: str(r.peer_snr),
+    }
+  }
+
   /** One per-conversation watermark write, never a set() per message: record
    *  the newest message ts as "read up to here". Unread is derived from it. */
   function markConversationRead(peer: string) {
@@ -1029,6 +1076,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
     pnStatus, setContactPn,
     markConversationRead, msgMeta, announceNow, linkState, toggleLink,
+    ping, pingResult,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }
 }

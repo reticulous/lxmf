@@ -294,8 +294,11 @@ missing `InterfaceImpl` members). Receive-only, LoRa-only.
 **Remote signal & per-contact signal.** For an outbound message, the DELIVERED
 `OUT_RESULT` trailer carries two readings rnsd took at proof time: `local` (our
 rx of the delivery proof) and `remote` (the peer's rx of *our* message, decoded
-from the reticulous rx-report proof — see [rns §5.7](../rns/INTERNALS.md)).
-`applyOutResult` writes both into the message's msgmeta record
+from the reticulous rx-report proof — see [rns §5.7](../rns/INTERNALS.md)). Two
+antenna tx powers ride behind them (`rx_meta_t.txp` / `.remote_txp`, `INT8_MIN`
+= unknown); only Ping surfaces those, since a power belongs beside the *other*
+end's rssi and a message bubble has room for one reading, not a link budget.
+`applyOutResult` writes the two signals into the message's msgmeta record
 (`msgmetaWriteSignal`, signal-only so it never clobbers the SENT iface/hops);
 `remote_*` is present only for a reticulous peer. Separately, `contactSigUpdate`
 (in `onInboundLxm`, the single inbound choke point) maintains an in-RAM
@@ -406,10 +409,35 @@ both directions, reaped by `convReap` past `s.lxmf.link.idle_s` (default
 (baselines captured at send time) and the Resource ACK
 (`RNSD_LINK_RESOURCE_OUTBOUND_DONE`) is proof-grade.
 
+### Ping
+
+`cmd.ping` rides the same `OUT_PACKET` path with a 32-byte wire (`peer_dest ‖
+our_dest`), so rnsd strips the leading destination and the peer's plaintext is
+exactly our `lxmf.delivery` hash — which is where the peer's rnsd reads the
+sender from when it decides whether to extend the proof. That is the whole
+reason the probe is an lxmf send and not `rnprobe`: rnprobe sends from rnsd's
+identity with a zero payload, so the peer resolves no contact and answers plain.
+
+The in-flight probe is one `ping_t` per identity, drawing its `send_id` from the
+same counter as messages; `pingApplyOutResult` / `pingApplyOutStatus` claim that
+`send_id` **before** the outbox lookup, so the two never confuse each other.
+`SENT` is not an outcome (rnsd follows it with a second result when the proof
+lands or times out). Pressing again supersedes rather than queues — a
+measurement the user is watching should be the newest one, not the oldest
+queued. `pingTick` on the 1 Hz pass settles `timeout` at
+`LXMF_PING_TIMEOUT_S = 20`, which is what covers the one case rnsd emits no
+result for at all: a send parked on a path search that never resolves. A late
+result for an abandoned probe falls through to `applyOutResult` and logs an
+unknown-send_id line at verb level.
+
 ## 7. Inbound lifecycle
 
 `onInboundLxm` (fed by `IN_PACKET`, inbound-Link, and inbound-Resource):
 
+0. Exactly `2 × 16` bytes is a **Ping probe** (dest ‖ src, nothing after) — log
+   and return. rnsd has already proved it on hand-off, which is the whole answer
+   the prober wanted; naming it here is what keeps a probed peer from logging a
+   malformed-wire warning per press.
 1. Length ≥ `LXMF_OVERHEAD = 112`.
 2. `wire[0..16] == id.dest_hash` (else rnsd routing weirdness — warn, drop).
 3. `rnsdRecallPubkey(src_hash)`; if absent → buffer the wire in the
@@ -575,6 +603,22 @@ this write is what makes it reboot-durable. Unconditional (no read-compare —
 storage no-ops identical values); frontends therefore never need to promote
 announce names into contacts themselves, they only fall back to the live
 catalogue for non-contact peers.
+
+**Capability bits.** app_data element `[2]` is a msgpack `uint16` bitfield
+(`LXMF_ANN_CAP_*`), always emitted so element `[3]` — the RLPG mailbox — stays
+positional. Parsers read it width-agnostically, so widening it later is
+interop-safe.
+
+| bit | meaning |
+|---|---|
+| 0 `DOUBLE_ENC` | a link/resource payload to us may be a destination-encrypted envelope blob rather than plaintext LXMF wire |
+| 1 `RX_REPORT` | we accept the extended delivery proof carrying the prover's rx rssi/snr and its antenna tx power |
+
+Both are advertised. Bit 1 gates a *foreign* implementation, not an older one of
+ours: stock Reticulum length-rejects the longer proof, so it must never see one.
+`lxmfContactRxReportCapable` reads a peer's bit and `lxmfPushRxReportCap` pushes
+it to rnsd on contact creation, on each re-announce, and from stored contacts at
+boot.
 
 **Concurrency:** `AnnounceFanout::received_announce` runs on the **rnsd**
 task (inside `Transport::inbound`) but only does `memcpy + itsSend(timeout=0)`

@@ -83,11 +83,12 @@ constexpr size_t LXMF_OPP_PAYLOAD_MAX = 383;
  *   plaintext LXMF wire — the receiver decrypts with its identity and re-enters
  *   the normal inbound pipeline.
  * bit1 LXMF_ANN_CAP_RX_REPORT: this node accepts the extended delivery proof
- *   that carries the prover's rx rssi/snr (Packet::prove_report), so a sender
- *   learns how well it was heard. A peer only appends its rx signal to a proof
- *   for us because we advertised this; we accept and process rx reports from
- *   anyone regardless. rnsd owns the proof path, so lxmf pushes each peer's
- *   advertised value to it via rnsdSetRxReportCap.
+ *   that carries the prover's rx rssi/snr and its antenna tx power
+ *   (Packet::prove_report), so a sender learns how well it was heard and at what
+ *   power the answer left — the two halves of a path loss. A peer only appends
+ *   the report to a proof for us because we advertised this; we accept and
+ *   process rx reports from anyone regardless. rnsd owns the proof path, so lxmf
+ *   pushes each peer's advertised value to it via rnsdSetRxReportCap.
  * Both are always advertised by this implementation. */
 constexpr uint16_t LXMF_ANN_CAP_DOUBLE_ENC = 0x0001;
 constexpr uint16_t LXMF_ANN_CAP_RX_REPORT  = 0x0002;
@@ -217,6 +218,13 @@ struct rx_meta_t {
     bool        have_remote = false;
     int         remote_rssi = 0;       /* dBm */
     int         remote_snr10 = 0;      /* dB * 10 */
+    /* Antenna transmit powers in dBm, INT8_MIN = unknown. `txp` is ours on the
+     * radio the proof came back by; `remote_txp` is the peer's, from its rx
+     * report. Each is the counterpart of the OTHER side's rssi above, which
+     * is what turns the pair into a path loss. Ping reads them; the message
+     * paths carry them without storing them. */
+    int         txp = INT8_MIN;
+    int         remote_txp = INT8_MIN;
 };
 
 struct pending_verify_t {
@@ -227,6 +235,18 @@ struct pending_verify_t {
     bool                 have_meta = false;
 };
 
+/* An in-flight Ping — the contact page's reachability probe. One per identity:
+ * the button is a single measurement the user watches, so a second press
+ * supersedes the first rather than queueing behind it. It rides the same
+ * our-dest connection and send_id space as messages, so OUT_RESULT dispatch
+ * checks this slot before the outbox table. */
+struct ping_t {
+    bool        used = false;
+    uint16_t    send_id = 0;
+    std::string peer;               /* 32-hex destination being probed */
+    uint32_t    deadline_s = 0;     /* unix s; settle "timeout" past it whatever rnsd says */
+};
+
 struct lxmf_id_t {
     bool          used;
     int         index;                              /* 0..LXMF_MAX_IDENTITIES-1 */
@@ -235,6 +255,7 @@ struct lxmf_id_t {
     uint8_t     dest_hash[RNSD_DEST_HASH_LEN];      /* 16-byte LXMF delivery destination hash */
     uint16_t    next_send_id;
     outbound_t  outboxes[8];                        /* in-flight send_id → message-key tracking */
+    ping_t      ping;                               /* the contact page's Ping, at most one */
 
     /* Stats (mirrored to lxmf.id.<n>.stats.* at 1 Hz). */
     uint32_t      sent;
@@ -2925,6 +2946,16 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
         dbg("id %d: inbound LXM dropped (identity disabled)", id.index);
         return;
     }
+    /* A Ping probe: destination hash and sender hash, nothing after them. It
+     * carries no message and is never meant to parse as one — rnsd has already
+     * proved it on hand-off, which is the entire answer the prober wanted. Named
+     * here so a peer being probed logs one legible line instead of a malformed-
+     * wire warning per press. */
+    if (n == 2 * LXMF_DEST_HASH_LEN) {
+        verb("id %d: ping probe from %s", id.index,
+             bytesToHex(wire + LXMF_DEST_HASH_LEN, LXMF_DEST_HASH_LEN).c_str());
+        return;
+    }
     if (n < LXMF_OVERHEAD) {
         warn("id %d: inbound LXM too short (%zu B)", id.index, n);
         return;
@@ -3192,6 +3223,183 @@ static void drainAllPendingVerify(lxmf_id_t& id)
     for (auto& s : senders) drainPendingVerify(id, s.data());
 }
 
+/* ─────────────── Ping ───────────────
+ *
+ *   us ──probe packet (peer_dest | our_dest)──►  peer
+ *   us ◄──────── delivery proof (+ rx report) ── peer
+ *
+ * The contact page's reachability probe: `rnprobe lxmf.delivery <hash>` with the
+ * one difference that matters, which is *who it comes from*. rnprobe sends from
+ * rnsd's own identity with a zero payload, so the far end sees a sender it has
+ * no contact record for and answers with a plain proof. The probe here goes out
+ * on the identity's own our-dest connection with our lxmf.delivery hash as the
+ * first sixteen bytes of the plaintext — exactly where the peer's rnsd looks for
+ * the sender — so we are recognised as a contact that advertised the rx-report
+ * capability and the proof comes back extended, carrying the peer's rx of us and
+ * its tx power. That round trip is the whole point: rtt plus both directions'
+ * signal from one packet each way.
+ *
+ * The probe payload is the sixteen-byte source hash and nothing else. It is not
+ * a valid LXM wire, so the peer's lxmf drops it after its rnsd has already
+ * proved it — proving happens on hand-off, before any parsing. Sixteen bytes is
+ * also as cheap as an encrypted single-destination packet gets; the envelope
+ * floor dominates either way.
+ *
+ * Results land under `lxmf.ping.<peer>.*` (RAM, browser-mirrored by the plain
+ * `lxmf.` key sync). `state` is the only field a UI must read: `probing` while
+ * in flight, then a settled word. The rest are present only when measured. */
+
+#define LXMF_PING_TIMEOUT_S 20
+
+static std::string pingPath(const std::string& peer_hex, const char* field)
+{
+    return "lxmf.ping." + peer_hex + "." + field;
+}
+
+/* Clear every field of a peer's ping record, so a fresh probe never shows the
+ * previous one's numbers next to its own `probing`. */
+static void pingClear(const std::string& peer_hex)
+{
+    static const char* kFields[] = { "state", "ts", "rtt_ms", "hops",
+                                     "tx", "rssi", "snr",
+                                     "peer_tx", "peer_rssi", "peer_snr" };
+    storageBegin();
+    for (const char* f : kFields) storageUnset(pingPath(peer_hex, f).c_str());
+    storageEnd();
+}
+
+/* Settle a ping: write the outcome word and whatever the proof measured, then
+ * free the slot. `meta` is null for every outcome but a delivered proof. dBm
+ * and dB are text in the same encoding the msgmeta store uses, so a UI formats
+ * them the same way; an unknown tx power is simply an absent key. */
+static void pingSettle(lxmf_id_t& id, const char* state,
+                       uint32_t rtt_ms, const rx_meta_t* meta)
+{
+    if (!id.ping.used) return;
+    std::string peer = id.ping.peer;
+    id.ping.used = false;
+
+    auto fmt_snr = [](char* out, size_t n, int s10) {
+        int sa = s10 < 0 ? -s10 : s10;   /* sign kept separately so −0.x keeps its − */
+        std::snprintf(out, n, "%s%d.%d", s10 < 0 ? "-" : "", sa / 10, sa % 10);
+    };
+    char sbuf[16];
+    storageBegin();
+    storageSet(pingPath(peer, "state").c_str(), state);
+    storageSet(pingPath(peer, "ts").c_str(),    (int)(nowUnixMs() / 1000));
+    if (meta) {
+        storageSet(pingPath(peer, "rtt_ms").c_str(), (int)rtt_ms);
+        storageSet(pingPath(peer, "hops").c_str(),   (int)meta->hops);
+        if (meta->txp != INT8_MIN)
+            storageSet(pingPath(peer, "tx").c_str(), meta->txp);
+        if (meta->have_signal) {
+            storageSet(pingPath(peer, "rssi").c_str(), meta->rssi);
+            fmt_snr(sbuf, sizeof(sbuf), meta->snr10);
+            storageSet(pingPath(peer, "snr").c_str(), sbuf);
+        }
+        if (meta->remote_txp != INT8_MIN)
+            storageSet(pingPath(peer, "peer_tx").c_str(), meta->remote_txp);
+        if (meta->have_remote) {
+            storageSet(pingPath(peer, "peer_rssi").c_str(), meta->remote_rssi);
+            fmt_snr(sbuf, sizeof(sbuf), meta->remote_snr10);
+            storageSet(pingPath(peer, "peer_snr").c_str(), sbuf);
+        }
+    }
+    storageEnd();
+    info("id %d: ping %s → %s (rtt=%u ms)", id.index, peer.c_str(), state,
+         (unsigned)rtt_ms);
+}
+
+/* Start a probe to `peer_hex`, superseding any ping already in flight for this
+ * identity (its result is abandoned, not settled — the user asked for a newer
+ * measurement and a stale OUT_RESULT would overwrite it). */
+static void pingStart(lxmf_id_t& id, const std::string& peer_hex)
+{
+    uint8_t dh[LXMF_DEST_HASH_LEN];
+    if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh)) {
+        warn("id %d: ping bad peer \"%s\"", id.index, peer_hex.c_str());
+        return;
+    }
+    if (id.handle < 0) {
+        pingClear(peer_hex);
+        storageBegin();
+        storageSet(pingPath(peer_hex, "state").c_str(), "offline");
+        storageSet(pingPath(peer_hex, "ts").c_str(), (int)(nowUnixMs() / 1000));
+        storageEnd();
+        return;
+    }
+
+    id.ping.used       = true;
+    id.ping.send_id    = id.next_send_id++;
+    if (id.next_send_id == 0) id.next_send_id = 1;
+    id.ping.peer       = peer_hex;
+    id.ping.deadline_s = (uint32_t)(nowUnixMs() / 1000) + LXMF_PING_TIMEOUT_S;
+
+    pingClear(peer_hex);
+    storageBegin();
+    storageSet(pingPath(peer_hex, "state").c_str(), "probing");
+    storageSet(pingPath(peer_hex, "ts").c_str(), (int)(nowUnixMs() / 1000));
+    storageEnd();
+
+    /* OUT_PACKET frame: op | send_id(2) | wire. rnsd strips the leading
+     * destination hash and sends the remainder as the packet payload — so the
+     * peer's plaintext is exactly our own destination hash. */
+    uint8_t frame[3 + 2 * LXMF_DEST_HASH_LEN];
+    frame[0] = RNSD_DEST_OUT_PACKET;
+    frame[1] = (uint8_t)(id.ping.send_id >> 8);
+    frame[2] = (uint8_t)(id.ping.send_id & 0xFF);
+    std::memcpy(frame + 3,                       dh,           LXMF_DEST_HASH_LEN);
+    std::memcpy(frame + 3 + LXMF_DEST_HASH_LEN,  id.dest_hash, LXMF_DEST_HASH_LEN);
+
+    if (!sendFrame(id, frame, sizeof(frame))) {
+        pingSettle(id, "failed", 0, nullptr);
+        return;
+    }
+    info("id %d: ping %s send_id=%u", id.index, peer_hex.c_str(),
+         (unsigned)id.ping.send_id);
+}
+
+/* True when this OUT_RESULT belongs to the in-flight ping — consumed here
+ * instead of being looked up in the outbox table. rnsd emits SENT first and a
+ * second result when the proof lands or times out, so SENT is not an outcome. */
+static bool pingApplyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
+                               uint32_t rtt_ms, const rx_meta_t* meta)
+{
+    if (!id.ping.used || id.ping.send_id != send_id) return false;
+    switch (status) {
+        case RNSD_DEST_STATUS_SENT:                                   return true;
+        case RNSD_DEST_STATUS_DELIVERED: pingSettle(id, "ok", rtt_ms, meta);  break;
+        case RNSD_DEST_STATUS_PROOF_TIMEOUT: pingSettle(id, "no-proof", 0, nullptr); break;
+        case RNSD_DEST_STATUS_FAILED:    pingSettle(id, "no-route", 0, nullptr); break;
+        case RNSD_DEST_STATUS_TOO_LARGE: pingSettle(id, "failed",   0, nullptr); break;
+        case RNSD_DEST_STATUS_CANCELLED: pingSettle(id, "cancelled",0, nullptr); break;
+        default:                         pingSettle(id, "failed",   0, nullptr); break;
+    }
+    return true;
+}
+
+/* Ditto for the aux stream: the ping owns the send_id, so swallow its statuses
+ * rather than letting the outbox lookup warn about an unknown one. A path search
+ * is worth showing — it is the slow case the user is watching. */
+static bool pingApplyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type)
+{
+    if (!id.ping.used || id.ping.send_id != send_id) return false;
+    if (type == RNSD_DEST_AUX_REQUESTING_PATH) {
+        storageSet(pingPath(id.ping.peer, "state").c_str(), "path");
+    }
+    return true;
+}
+
+/* 1 Hz backstop. rnsd settles a probe on its own in the normal cases, but a
+ * send parked on a path search that never resolves produces no result at all —
+ * so the deadline is what guarantees the UI stops saying `probing`. */
+static void pingTick(lxmf_id_t& id)
+{
+    if (!id.ping.used) return;
+    if ((uint32_t)(nowUnixMs() / 1000) < id.ping.deadline_s) return;
+    pingSettle(id, "timeout", 0, nullptr);
+}
+
 /* ─────────────── our-dest frame handlers ─────────────── */
 
 static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
@@ -3442,15 +3650,19 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
             rx_meta_t m;
             m.hops = hops;
             if (status == RNSD_DEST_STATUS_DELIVERED) {
-                /* DELIVERED trailer: signal(8) = local rssi|snr, remote rssi|snr
-                 * (int16 BE each; rssi INT16_MIN = absent, snr dB×10). */
-                if (n >= 9 + 8) {
+                /* DELIVERED trailer, fixed 10 bytes: local rssi|snr, remote
+                 * rssi|snr (int16 BE each; rssi INT16_MIN = absent, snr dB×10),
+                 * then the two antenna tx powers, local first (int8 dBm each,
+                 * INT8_MIN = unknown). */
+                if (n >= 9 + 10) {
                     size_t p = 9;
                     auto rd16 = [&](void) -> int16_t {
                         int16_t v = (int16_t)(((uint16_t)buf[p] << 8) | buf[p + 1]); p += 2; return v; };
                     int16_t lr = rd16(), ls = rd16(), rr = rd16(), rs = rd16();
                     if (lr != INT16_MIN) { m.have_signal = true; m.rssi = lr; m.snr10 = ls; }
                     if (rr != INT16_MIN) { m.have_remote = true; m.remote_rssi = rr; m.remote_snr10 = rs; }
+                    m.txp        = (int)(int8_t)buf[p];
+                    m.remote_txp = (int)(int8_t)buf[p + 1];
                 }
             }
             else if (n >= 9 + LXMF_DEST_HASH_LEN + 1) {
@@ -3464,14 +3676,16 @@ static void onOurDestRecv(int handle, size_t /*bytesAvail*/)
                 uint8_t iface_len = buf[p++];
                 if (p + iface_len <= n) m.iface.assign((const char*)buf + p, iface_len);
             }
-            applyOutResult(*id, send_id, status, rtt_ms, hops, &m);
+            if (!pingApplyOutResult(*id, send_id, status, rtt_ms, &m))
+                applyOutResult(*id, send_id, status, rtt_ms, hops, &m);
             break;
         }
         case RNSD_DEST_OUT_STATUS: {
             if (n < 4) { warn("OUT_STATUS short (%zu)", n); break; }
             uint16_t send_id = ((uint16_t)buf[1] << 8) | (uint16_t)buf[2];
             uint8_t type     = buf[3];
-            applyOutStatus(*id, send_id, type, buf + 4, n - 4);
+            if (!pingApplyOutStatus(*id, send_id, type))
+                applyOutStatus(*id, send_id, type, buf + 4, n - 4);
             break;
         }
         default:
@@ -6082,6 +6296,7 @@ static void handleIdCmd(int n, const char* key, const char* val)
      * delete also accepts "<peer>/" or "<peer>" → whole conversation.
      * send accepts an optional third segment "<peer>/<key>/pn:<hash>" —
      * upload to that propagation node instead of the direct paths.
+     * link_open/link_close/ping take a bare "<peer>".
      * announce ignores the value. */
     std::string raw = val;
     std::string peer_hex, mid, via;
@@ -6142,6 +6357,9 @@ static void handleIdCmd(int n, const char* key, const char* val)
         else if (std::strcmp(verb, "link_close") == 0) {
             if (convlink_t* c = convFind(id.index, peer_hex)) convDrop(*c);
             publishLinks();
+        }
+        else if (std::strcmp(verb, "ping") == 0) {
+            pingStart(id, peer_hex);
         }
         else {
             warn("id %d: unknown cmd %s", n, verb);
@@ -6422,7 +6640,8 @@ static void cliEnqueueSend(int id_n, const std::string& peer_hex,
  *   - 32-char hex (the LXMF destination hash) → returned directly
  *   - a positive integer N → the Nth entry from the most recent
  *     `lxmf contacts` / `lxmf announces` listing
- *   - any other text → case-insensitive substring match against
+ *   - any other text → case-insensitive substring match against the
+ *     selected identity's contacts (nick and display_name) and against
  *     `lxmf.announces.<hex>.display_name`; exactly one match returns
  *     the hash, multiple prints a disambiguation list (name + hash),
  *     zero prints an error.
@@ -6441,7 +6660,25 @@ static void peerNameLookupRec(const std::string& hex, const AnnounceEntry& e)
 {
     if (!s_peer_name_ctx) return;
     if (!nameContainsCI(e.name, s_peer_name_ctx->query)) return;
+    for (const auto& m : s_peer_name_ctx->matches)   /* already via contacts */
+        if (m.hash == hex) return;
     s_peer_name_ctx->matches.push_back({hex, e.name});
+}
+
+/* Contact half of the name lookup: a nick is local and often the only
+ * handle a peer has here, so it matches alongside display_name. */
+static void peerNameLookupContacts(int sel, PeerNameLookupCtx& ctx)
+{
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.contacts.", sel);
+    for (const auto& h : collectTokens(prefix)) {
+        std::string nick = storageGetStr(contactPath(sel, h, "nick").c_str(), "");
+        std::string name = storageGetStr(contactPath(sel, h, "display_name").c_str(), "");
+        if (!nameContainsCI(nick, ctx.query) && !nameContainsCI(name, ctx.query))
+            continue;
+        if (name.empty()) name = nick;
+        ctx.matches.push_back({h, name});
+    }
 }
 
 static std::string cliResolvePeer(const std::string& arg)
@@ -6465,9 +6702,11 @@ static std::string cliResolvePeer(const std::string& arg)
         return s_peer_list[(size_t)n - 1];
     }
 
-    /* Treat the remainder as a case-insensitive display-name substring
-     * lookup against the cross-identity announce catalogue. */
+    /* Treat the remainder as a case-insensitive substring lookup: our own
+     * contacts first (nick or display_name), then the cross-identity
+     * announce catalogue for peers we have no contact record for. */
     PeerNameLookupCtx ctx{arg, {}};
+    peerNameLookupContacts(selectedId(), ctx);
     s_peer_name_ctx = &ctx;
     forEachAnnounce(peerNameLookupRec);
     s_peer_name_ctx = nullptr;
@@ -6478,11 +6717,11 @@ static std::string cliResolvePeer(const std::string& arg)
     }
     if (ctx.matches.size() == 1) return ctx.matches[0].hash;
 
-    /* Multiple matches — refuse the send, but populate the peer list
+    /* Multiple matches — refuse the command, but populate the peer list
      * so the user can pick by line number on a retry:
      *   lxmf send 2 "hi"   */
     s_peer_list.clear();
-    s_peer_list_label = "announce match";
+    s_peer_list_label = "name match";
     cliPrintf("ambiguous \"%s\" — %zu matches:\n",
               arg.c_str(), ctx.matches.size());
     cliPrintf("%-3s %-32s %s\n", "#", "destination", "name");
@@ -6492,7 +6731,7 @@ static std::string cliResolvePeer(const std::string& arg)
         cliPrintf("%-3d %-32s %s\n",
                   row++, m.hash.c_str(), sanitizeForLog(m.name).c_str());
     }
-    cliPrintf("(retry with `lxmf send <#> <text>`, a longer substring, or the 32-hex hash)\n");
+    cliPrintf("(retry with the line number, a longer substring, or the 32-hex hash)\n");
     return "";
 }
 
@@ -6736,7 +6975,10 @@ static void cliRead(const char* rest)
     if (dir == "in") convMarkRead(sel, peer, ts);   /* watermark up to this msg */
 }
 
-/* ── `lxmf contacts` ── */
+/* ── `lxmf c[ontacts] [<substring>]` ──
+ *
+ * The optional argument is a case-insensitive substring filter over both
+ * display_name and nick — the two handles a contact is known by here. */
 
 struct ContactRow {
     std::string hash;
@@ -6746,8 +6988,12 @@ struct ContactRow {
     int last_seen;
 };
 
-static void cliContacts(void)
+static void cliContacts(const char* rest)
 {
+    while (rest && *rest == ' ') rest++;
+    std::string filter = (rest && *rest) ? std::string(rest) : "";
+    while (!filter.empty() && filter.back() == ' ') filter.pop_back();
+
     int sel = selectedId();
     lxmf_id_t* id = idAt(sel);
     if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
@@ -6775,6 +7021,8 @@ static void cliContacts(void)
                           "lxmf.announces.%s.name", h.c_str());
             r.display_name = storageGetStr(annKey, "");
         }
+        if (!nameContainsCI(r.display_name, filter) &&
+            !nameContainsCI(r.nick, filter)) continue;
         r.trust     = storageGetInt(contactPath(sel, h, "trust").c_str(),     0);
         r.last_seen = storageGetInt(contactPath(sel, h, "last_seen").c_str(), 0);
         rows.push_back(std::move(r));
@@ -6787,7 +7035,11 @@ static void cliContacts(void)
     s_peer_list.clear();
     s_peer_list_label = "contacts";
 
-    cliPrintf("id %d  %zu contact(s)\n", sel, rows.size());
+    if (filter.empty())
+        cliPrintf("id %d  %zu contact(s)\n", sel, rows.size());
+    else
+        cliPrintf("id %d  %zu contact(s) matching \"%s\"\n",
+                  sel, rows.size(), filter.c_str());
     if (rows.empty()) return;
     cliPrintf("%-3s %-32s %-5s %-12s %s\n",
               "#", "destination", "trust", "nick", "display_name");
@@ -6909,7 +7161,8 @@ static void cliSend(const char* rest)
     const char* sp = std::strchr(rest, ' ');
     if (!sp || sp == rest) {
         cliPrintf("usage: lxmf send <peer> <text>\n");
-        cliPrintf("<peer> = 32-hex destination, or a number from `contacts`/`announces`\n");
+        cliPrintf("<peer> = 32-hex destination, a number from `contacts`/`announces`, "
+                  "or a name/nick substring\n");
         return;
     }
     std::string peer_arg(rest, sp - rest);
@@ -6966,12 +7219,15 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf chats              list conversations for selected id (numbered)\n");
         cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <status> = filter\n");
         cliPrintf("lxmf read <n>           print msg n from last listing; marks read\n");
-        cliPrintf("lxmf contacts           list contacts for selected id (numbered)\n");
+        cliPrintf("lxmf c[ontacts] [<arg>] list contacts for selected id (numbered);\n");
+        cliPrintf("                      arg = name/nick substring filter\n");
         cliPrintf("lxmf announces [<arg>]  every lxmf.delivery announce we've heard;\n");
         cliPrintf("                      arg = 32-hex (instant lookup) or name substring\n");
-        cliPrintf("lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or display name\n");
+        cliPrintf("lxmf send <peer> <msg>  send msg; <peer> = 32-hex, list-#, or name/nick\n");
         cliPrintf("lxmf a[nnounce]         emit a delivery announce for selected id\n");
         cliPrintf("lxmf link <act> <peer>  open|close|status a conversation link to <32-hex peer>\n");
+        cliPrintf("lxmf p[ing] <peer>      probe peer (32-hex, list-#, name/nick):\n");
+        cliPrintf("                      rtt + both ends' txpwr/rssi/snr\n");
         cliPrintf("lxmf rlpg [<mb>|off]    show / set / unset this identity's RLPG mailbox node\n");
         return;
     }
@@ -7025,14 +7281,17 @@ static void cliLxmf(const char* args)
         return;
     }
     if (verb == "id")        { cliId(rest); return; }
-    if (verb == "chats")     { int s = selectedId();
+    /* `ch…` is chats, `c…` is contacts — checked in that order so the
+     * one-letter abbreviation lands on contacts. */
+    if (cliVerbIs(verb.c_str(), "chats", 2))
+                             { int s = selectedId();
                                lxmf_id_t* i = idAt(s);
                                if (!i || !i->used) cliPrintf("no identity at slot %d\n", s);
                                else cliChats(s);
                                return; }
     if (verb == "msgs")      { cliMsgs(rest); return; }
     if (verb == "read")      { cliRead(rest); return; }
-    if (verb == "contacts")  { cliContacts(); return; }
+    if (cliVerbIs(verb.c_str(), "contacts", 1)) { cliContacts(rest); return; }
     if (verb == "announces") { cliAnnounces(rest); return; }
     if (verb == "send")      { cliSend(rest); return; }
     if (cliVerbIs(verb.c_str(), "announce", 1)) {
@@ -7068,6 +7327,114 @@ static void cliLxmf(const char* args)
         } else {
             cliPrintf("usage: lxmf link open|close|status <32-hex peer>\n");
         }
+        return;
+    }
+    if (cliVerbIs(verb.c_str(), "ping", 1)) {
+        int sel = selectedId();
+        lxmf_id_t* id = idAt(sel);
+        if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
+        while (*rest == ' ') rest++;
+        std::string arg = rest;
+        while (!arg.empty() && arg.back() == ' ') arg.pop_back();
+        if (arg.empty()) {
+            cliPrintf("usage: lxmf ping <peer>\n");
+            cliPrintf("<peer> = 32-hex destination, a number from the last listing, "
+                      "or a name/nick substring\n");
+            return;
+        }
+        std::string peer = cliResolvePeer(arg);
+        if (peer.empty()) return;
+        std::string who = peerDisplayName(sel, peer);
+        std::string label = peer;
+        if (!who.empty()) label += " (" + sanitizeForLog(who) + ")";
+
+        /* Sentinel — the probe goes out on the lxmf task, which owns the
+         * our-dest handle, and writes its outcome under lxmf.ping.<peer>.*.
+         * The prompt then waits for that outcome: a probe you have to poll for
+         * by hand reads as a dead command. */
+        std::string cmd_key = idEphPath(sel, "cmd.ping");
+        storageSet(cmd_key.c_str(), peer.c_str());
+        cliPrintf("probing %s...\n", label.c_str());
+
+        auto fld = [&](const char* f) {
+            return storageGetStr(pingPath(peer, f).c_str(), ""); };
+
+        /* The wait itself is a read of the client's input (rnsh waits out its
+         * channel setup the same way). That gives three things one blocking
+         * call can't: Ctrl-C arrives as a keystroke, the cli task's ITS inbox
+         * keeps being serviced (park it and new CLI connections are refused
+         * for the whole probe), and a closed session ends the wait. Without a
+         * session — cron, `spangap cli` — there is no input to block on and no
+         * one to interrupt, so a plain delay paces the loop instead. */
+        char kc;
+        const bool interactive = (cliReadRaw(&kc, 1, 0) >= 0);
+        TickType_t t0       = xTaskGetTickCount();
+        TickType_t deadline = t0 + pdMS_TO_TICKS((LXMF_PING_TIMEOUT_S + 2) * 1000);
+        std::string st;
+        bool aborted = false;
+        for (;;) {
+            if ((int)(xTaskGetTickCount() - deadline) >= 0) break;
+            if (interactive) {
+                int r = cliReadRaw(&kc, 1, 100);
+                if (r < 0) return;                      /* client went away */
+                if (r > 0 && (kc == 0x03 || kc == 0x04)) { aborted = true; break; }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            /* While the sentinel is still there the lxmf task has not started
+             * this probe, so any terminal state under the peer belongs to the
+             * previous one — keep waiting rather than reporting it as ours. */
+            if (storageExists(cmd_key.c_str())) continue;
+            st = fld("state");
+            if (!st.empty() && st != "probing" && st != "path") break;
+        }
+        unsigned waited = (unsigned)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+        if (aborted) {
+            /* The probe is the lxmf task's, not ours to recall — say where it
+             * lands so the measurement isn't presumed lost. */
+            cliPrintf("cancelled after %u ms — probe still in flight, "
+                      "settles under lxmf.ping.%s\n", waited, peer.c_str());
+            return;
+        }
+        if (st.empty() || st == "probing" || st == "path") {
+            cliPrintf("no result after %u ms (still %s)\n",
+                      waited, st.empty() ? "unstarted" : st.c_str());
+            return;
+        }
+        cliPrintf("%s after %u ms", st.c_str(), waited);
+
+        /* One direction per clause: the power the sending end used, and what
+         * the receiving end heard of it — our tx pairs with the peer's rssi,
+         * which is what makes the pair a path loss. A proof carrying no rx
+         * report measures neither end of us->them, so the half we do hold is
+         * stated as one sentence rather than as a direction of question
+         * marks; it carries the round trip, so the rtt/hops clause would only
+         * repeat it. */
+        std::string rtt   = fld("rtt_ms");
+        std::string tx    = fld("tx"),      rssi  = fld("rssi"),      snr  = fld("snr");
+        std::string ptx   = fld("peer_tx"), prssi = fld("peer_rssi"), psnr = fld("peer_snr");
+        if (ptx.empty() && prssi.empty()) {
+            std::string line = "Probe sent at "
+                             + (tx.empty() ? std::string("unknown power") : tx + " dBm");
+            if (!rssi.empty()) {
+                line += ", proof RSSI " + rssi + " dBm";
+                if (!snr.empty()) line += " / SNR " + snr + " dB";
+            }
+            std::string hops = fld("hops");
+            if (!hops.empty()) line += ", " + hops + (hops == "1" ? " hop" : " hops");
+            if (!rtt.empty())  line += ", round trip " + rtt + " ms";
+            cliPrintf(" | %s.", line.c_str());
+        } else {
+            if (!rtt.empty())
+                cliPrintf(" | rtt=%s ms hops=%s", rtt.c_str(), fld("hops").c_str());
+            cliPrintf(" | us->them: txpwr %s dBm, rx %s dBm %s dB",
+                      tx.empty() ? "?" : tx.c_str(),
+                      prssi.empty() ? "?" : prssi.c_str(), psnr.c_str());
+            cliPrintf(" | them->us: txpwr %s dBm, rx %s dBm %s dB",
+                      ptx.empty() ? "?" : ptx.c_str(),
+                      rssi.empty() ? "?" : rssi.c_str(), snr.c_str());
+        }
+        cliPrintf("\n");
         return;
     }
     if (verb == "rlpg") {
@@ -7252,6 +7619,7 @@ static void lxmfTaskMain(void*)
         if (now - s_lastPublishTick >= pdMS_TO_TICKS(lxmfTickIntervalMs())) {
             publishStats();
             resolveDirectSends();   /* settle outbound DIRECT */
+            for (auto& id : s_ids) if (id.used) pingTick(id);   /* ping deadline backstop */
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             publishLinks();         /* per-peer link state for the header icons */
             rlpgClientTick();       /* deposit reaper, own-node link, relay queue */

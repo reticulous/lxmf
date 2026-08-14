@@ -313,6 +313,7 @@ lv_obj_t* s_rlpgInd    = nullptr;       /* system status-bar RLPG mailbox arrow 
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_msgDetail = nullptr;        /* per-message detail page (covers the thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
+lv_obj_t* s_pingLbl  = nullptr;         /* Ping result, under the info page's button row (child of s_info) */
 std::string g_infoPeer;                 /* peer shown on the contact info page */
 bool      g_infoFromThread = false;     /* where its back chevron returns to */
 lv_obj_t* s_compose  = nullptr;         /* compose entry (lcdInputBox) */
@@ -2510,9 +2511,10 @@ std::string groupHash(const std::string& h) {
 }
 
 void closeInfo() {
-    if (s_info) lv_obj_delete(s_info);   /* s_confirm is a child — dies with it */
+    if (s_info) lv_obj_delete(s_info);   /* s_confirm + s_pingLbl are children — die with it */
     s_info = nullptr;
     s_confirm = nullptr;
+    s_pingLbl = nullptr;
     g_infoPeer.clear();
 }
 
@@ -2606,6 +2608,86 @@ void showDeleteConfirm(lv_event_t*) {
     deferFocus(cnc);   /* safe default under the cursor */
 }
 
+/* ---- Ping (contact info page) ----
+ * `lxmf.id.<n>.cmd.ping = <peer>` sends one probe packet and the firmware
+ * publishes the round trip under lxmf.ping.<peer>.*. The result sits inline
+ * under the button row rather than in a popover: the button stays reachable, so
+ * re-measuring is one press. */
+
+/* One direction of the link: the power the sending end transmitted at, and what
+ * the receiving end heard of it — so `tx` pairs with the OTHER end's rssi,
+ * which is what makes the pair a path loss. Halves nobody reported read as "?"
+ * rather than as a measurement. */
+std::string pingSide(const std::string& tx, const std::string& rssi,
+                     const std::string& snr) {
+    std::string sent = tx.empty() ? "? dBm" : tx + " dBm";
+    if (rssi.empty()) return sent + " -> not heard";
+    return sent + " -> " + rssi + " dBm" + (snr.empty() ? "" : " / " + snr + " dB");
+}
+
+/* Our half alone, for a proof that carried no rx report: the peer never said
+ * what it heard or what it answered at, so both directions would render mostly
+ * as "?" — which reads as a failed measurement rather than one that was never
+ * offered. State what we do know as one sentence, round trip included, and it
+ * replaces the whole reading rather than sitting under a header repeating it. */
+std::string pingOurHalf(const std::string& tx, const std::string& rssi,
+                        const std::string& snr, const std::string& hops,
+                        const std::string& rtt) {
+    std::string s = "Probe sent at "
+                  + (tx.empty() ? std::string("unknown power") : tx + " dBm");
+    if (!rssi.empty()) {
+        s += ", proof RSSI " + rssi + " dBm";
+        if (!snr.empty()) s += " / SNR " + snr + " dB";
+    }
+    if (!hops.empty()) s += ", " + hops + (hops == "1" ? " hop" : " hops");
+    if (!rtt.empty())  s += ", round trip " + rtt + " ms";
+    return s + ".";
+}
+
+/* Render the published record into the inline label. Called on open and on
+ * every lxmf.ping.<peer> change, so `probing` becomes the measurement in place. */
+void pingLabelUpdate() {
+    if (!s_pingLbl || g_infoPeer.empty()) return;
+    auto fld = [&](const char* f) {
+        return storageGetStr(("lxmf.ping." + g_infoPeer + "." + f).c_str(), ""); };
+    std::string st = fld("state");
+    std::string text;
+    if      (st.empty())      text = "";
+    else if (st == "probing") text = "Probing...";
+    else if (st == "path")    text = "Finding a path...";
+    else if (st == "ok") {
+        std::string ptx = fld("peer_tx"), prssi = fld("peer_rssi");
+        if (ptx.empty() && prssi.empty())
+            text = pingOurHalf(fld("tx"), fld("rssi"), fld("snr"),
+                               fld("hops"), fld("rtt_ms"));
+        else
+            text = fld("rtt_ms") + " ms, " + fld("hops") + " hops\n"
+                 + "us->them " + pingSide(fld("tx"), prssi, fld("peer_snr")) + "\n"
+                 + "them->us " + pingSide(ptx, fld("rssi"), fld("snr"));
+    }
+    else if (st == "no-proof") text = "Delivered, but no proof came back.";
+    else if (st == "no-route") text = "No route to this contact.";
+    else if (st == "timeout")  text = "No answer.";
+    else if (st == "cancelled")text = "Probe cancelled.";
+    else if (st == "offline")  text = "This identity is not connected.";
+    else                       text = "Probe failed.";
+    lv_label_set_text(s_pingLbl, text.c_str());
+}
+
+void onPingClick(lv_event_t*) {
+    if (g_id < 0 || g_infoPeer.empty()) return;
+    char k[48];
+    snprintf(k, sizeof k, "lxmf.id.%d.cmd.ping", g_id);
+    storageSet(k, g_infoPeer.c_str());
+    if (s_pingLbl) lv_label_set_text(s_pingLbl, "Probing...");
+}
+
+/* A ping record changed. Only the open info page cares, and only about its own
+ * peer. Registered on the lcd task so it may touch LVGL. */
+void onPingChange(const char*, const char*) {
+    if (s_info && s_pingLbl) pingLabelUpdate();
+}
+
 /* Contact-info "Propagation node" dropdown changed: write the selected node
  * (or the all-zero "none") to the contact record. The index→hash map rides
  * the widget as user data. */
@@ -2664,6 +2746,40 @@ void showInfo(const std::string& peer) {
     lv_obj_set_style_pad_ver(body, 6, 0);
     lv_obj_set_style_pad_row(body, 4, 0);
 
+    /* Action row, above everything else: each button is its own text's width,
+     * so they read as a row of verbs rather than a stack of choices. The Ping
+     * result lands in the label directly beneath, leaving the button pressable
+     * for a re-measure. */
+    lv_obj_t* acts = lv_obj_create(body);
+    lv_obj_remove_style_all(acts);
+    lv_obj_set_width(acts, lv_pct(100));
+    lv_obj_set_height(acts, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(acts, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(acts, 8, 0);
+    lv_obj_remove_flag(acts, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto actButton = [&](const char* text, lv_color_t bg, lv_event_cb_t cb) {
+        lv_obj_t* b = lv_button_create(acts);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(b, bg, 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(b, 4, 0);
+        lv_obj_set_style_pad_ver(b, 4, 0);
+        lv_obj_set_style_pad_hor(b, 10, 0);
+        mkLabel(b, text, lv_color_white());
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+        return b;
+    };
+    actButton("Delete", lv_color_hex(0x5a2a2a), showDeleteConfirm);
+    actButton("Ping",   lv_color_hex(0x2a313a), onPingClick);
+
+    s_pingLbl = mkLabel(body, "", lv_color_hex(0xc8d8c8));
+    lv_label_set_long_mode(s_pingLbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_pingLbl, lv_pct(100));
+    pingLabelUpdate();      /* a previous probe's result is still worth showing */
+
     mkLabel(body, "Destination hash", lv_color_hex(0x8a93a0));
     lv_obj_t* hash = mkLabel(body, groupHash(peer), lv_color_hex(0xc8d8c8));
     lv_label_set_long_mode(hash, LV_LABEL_LONG_WRAP);
@@ -2705,20 +2821,6 @@ void showInfo(const std::string& peer) {
     lv_obj_add_event_cb(dd, onInfoPnChanged, LV_EVENT_VALUE_CHANGED, vias);
     lv_obj_add_event_cb(dd, onInfoPnDelete,  LV_EVENT_DELETE, vias);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), dd);
-
-    lv_obj_t* del = lv_button_create(body);
-    lv_obj_remove_style_all(del);
-    lv_obj_set_width(del, lv_pct(100));
-    lv_obj_set_height(del, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(del, lv_color_hex(0x5a2a2a), 0);
-    lv_obj_set_style_bg_opa(del, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(del, 4, 0);
-    lv_obj_set_style_pad_ver(del, 4, 0);
-    lv_obj_set_style_margin_top(del, 10, 0);
-    lv_obj_t* dl = mkLabel(del, "Delete conversation", lv_color_white());
-    lv_obj_center(dl);
-    lv_obj_add_event_cb(del, showDeleteConfirm, LV_EVENT_CLICKED, nullptr);
-    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), del);
 
     deferFocus(back);
 }
@@ -3726,7 +3828,7 @@ void onLayerDelete(lv_event_t*) {
     cancelChunk(g_chunkC); cancelChunk(g_chunkM);
     g_rowsC.clear(); g_rowsM.clear();
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
-    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear();
+    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_pingLbl = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
     /* A queued search rebuild would touch freed widgets — drop it. */
@@ -3752,7 +3854,7 @@ void lxmfApp(void* arg) {
     g_needMsgLoad = false;
     g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
     s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
-    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
+    s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_pingLbl = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear(); g_infoFromThread = false;
     g_curPeer.clear(); g_qContacts.clear(); g_qMesh.clear();
     g_activeTab = 0;   /* Contacts tab selected by default on each fresh open */
     g_id = -1; g_msgsPrefix.clear(); g_msgs.clear();
@@ -3777,6 +3879,7 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity up/dest edge */
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
         storageSubscribeChanges("lxmf.msgmeta",   onStorageChange);   /* per-message routing (LoRa pill) */
+        storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }

@@ -90,9 +90,11 @@
           :reach="lxmf.reachability(lxmf.activePeer.value)"
           :ratchet="ratchetOf(lxmf.activePeer.value)"
           :pn-nodes="lxmf.pnNodes.value"
+          :ping="lxmf.pingResult(lxmf.activePeer.value)"
           @close="showContact = false"
           @delete-conversation="onDeleteConversation"
           @set-pn="(peer, hash) => lxmf.setContactPn(peer, hash)"
+          @ping="onPing"
         />
 
         <MessageDetail
@@ -199,6 +201,16 @@ function ratchetOf(peer: string): string {
 function onResendVia(m: Message, via: string) {
   detailMsg.value = null
   lxmf.resendVia(m.peer, m.key, via)
+}
+
+async function onPing(peer: string) {
+  try {
+    await lxmf.ping(peer)
+  } catch (e) {
+    // Sentinel never taken (identity down). The card shows the firmware's own
+    // outcome; there's nothing to report here beyond not throwing.
+    console.warn('lxmf ping failed:', e instanceof Error ? e.message : e)
+  }
 }
 
 function onDeleteConversation(peer: string) {

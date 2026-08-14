@@ -123,6 +123,7 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>` | cancel an in-flight send |
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
+| `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — one packet out, its delivery proof back (see **Ping**) |
 
 To make a sentinel atomic with its data, write the data fields and the
 sentinel in one `storageBegin()/storageEnd()` transaction — the firmware
@@ -345,6 +346,88 @@ message sitting in someone else's custody — parked at an RLPG mailbox
 (`REMOTE_RLPG`/`OUR_RLPG`) or uploaded to a propagation node (`ON_PN`) — gets a
 single open-circle tick: stored for pickup, no proof of arrival.
 
+## Ping
+
+```
+us ──probe packet (peer_dest | our_dest)──►  peer
+us ◄──────── delivery proof (+ rx report) ── peer
+```
+
+The contact detail page's **Ping** button (web and LCD, plus `lxmf ping <peer>`)
+measures a contact: round-trip time, hop count, and — when the link is a direct
+radio one — the transmit power and received signal at *both* ends, from one
+packet each way.
+
+It is `rnprobe lxmf.delivery <hash>` with the one difference that matters, which
+is who it comes from. `rnprobe` sends from rnsd's own identity with a zero
+payload, so the far end sees a sender it holds no contact record for and answers
+with a plain proof. The probe here goes out on the identity's own destination
+with our `lxmf.delivery` hash as the first sixteen bytes of the plaintext —
+exactly where the peer's rnsd looks for the sender — so we are recognised as a
+contact that advertised the rx-report capability and the proof comes back
+**extended**, carrying the peer's own rx of us and the power it answered at (see
+[rns](../rns)). The payload is that source hash and nothing else: it is not a
+valid LXM wire, and the peer's lxmf names it as a probe and drops it *after* its
+rnsd has already proved it, since proving happens on hand-off and before any
+parsing.
+
+Results are published per peer, RAM-only, overwritten by the next probe:
+
+```
+lxmf.ping.<peer>.state       probing | path | ok | no-proof | no-route |
+                             timeout | cancelled | failed | offline
+lxmf.ping.<peer>.ts          unix seconds of the last state change
+lxmf.ping.<peer>.rtt_ms      round trip; present on `ok`
+lxmf.ping.<peer>.hops
+lxmf.ping.<peer>.tx          our antenna tx power, dBm
+lxmf.ping.<peer>.rssi/.snr   our rx of the delivery proof
+lxmf.ping.<peer>.peer_tx     the peer's antenna tx power, dBm
+lxmf.ping.<peer>.peer_rssi/.peer_snr   the peer's rx of our probe
+```
+
+Each side's `tx` pairs with the *other* side's `rssi`, which is what makes the
+pair a path loss rather than two unrelated numbers. Every surface renders the
+two directions on that pairing — `us->them` is our `tx` with the peer's
+`peer_rssi`, `them->us` is `peer_tx` with our `rssi` — never a side's own tx
+next to its own rx, which measures nothing. Only `state` is always present: a
+hop that isn't radio has no signal to report at either end, and those keys are
+simply absent rather than zero.
+
+A peer that appends no rx report (any client that isn't ours) leaves the
+`peer_*` half unmeasured, so both directions would render mostly as
+placeholders — which reads as a measurement that failed rather than one that
+was never offered. Every surface collapses that case to one sentence of what we
+do hold, round trip included, so it replaces the reading rather than sitting
+under a header that repeats it:
+
+```
+Probe sent at 17 dBm, proof RSSI -94 dBm / SNR 8.5 dB, 1 hop, round trip 1102 ms.
+```
+
+In the CLI it follows the command's own outcome and wait:
+
+```
+ok after 1204 ms | Probe sent at 17 dBm, proof RSSI -94 dBm / SNR 8.5 dB, 1 hop, round trip 1102 ms.
+```
+
+One ping per identity is in flight at a time; pressing again supersedes rather
+than queues, and a probe that draws no result at all settles `timeout` after
+20 s so the display never sticks on `probing`.
+
+The buttons fire and forget — the keys above are what they render. `lxmf ping`
+instead holds the prompt until `state` settles, then prints the outcome with
+the time it waited. It waits by reading the client's input in 100 ms slices,
+which is what makes **Ctrl-C** (or Ctrl-D) end the wait, keeps the cli task's
+ITS inbox serviced so new CLI connections aren't refused for the probe's
+duration, and ends the wait when the session closes. Cancelling ends the
+*wait*, not the probe: it is the lxmf task's, and its result still lands under
+`lxmf.ping.<peer>`. Without an interactive session (cron, `spangap cli`) there
+is nothing to read, and a plain delay paces the loop instead.
+
+The 20 s settle must stay inside rnsd's proof window (`s.rnsd.proof_timeout_s`):
+a probe that gives up before the transport does reports `no-proof` for a proof
+still in flight.
+
 ## Announces
 
 - Each enabled identity announces ~30 s after startup and after each
@@ -449,6 +532,7 @@ lxmf.msgmeta.<message_id>.{last,hops,first_hop,dir,iface,rssi,snr,remote_rssi,re
                                  message we sent, from its rx-report proof (reticulous peers only).
 lxmf.contactsig.<peer>.{rssi,snr}   per-contact direct signal: our rx of the last zero-hop radio packet
                                  from that peer; deleted when a relayed or non-radio packet supersedes it.
+lxmf.ping.<peer>.*               latest probe result for that contact — see Ping above.
 ```
 
 **Signal display.** A received message shows either its radio signal (amber bars)
@@ -481,18 +565,25 @@ lxmf msgs [<arg>]           no arg = chats; <peer> = that thread (newest first);
                             a bare status name = cross-conversation filter
                             (case-insensitive, e.g. `lxmf msgs delivered`)
 lxmf read <n>               print message #n from the last `lxmf msgs`; marks it read
-lxmf contacts               list this identity's contacts (numbered)
+lxmf c[ontacts] [<arg>]     list this identity's contacts (numbered); <arg> =
+                            case-insensitive substring of display_name or nick
 lxmf announces [<arg>]      cross-identity announce catalogue; <arg> = 32-hex
                             (one row) or a name substring; no arg = full dump
 lxmf send <peer> <msg>      send; <peer> = 32-hex, a number from the last numbered
-                            listing, or a name substring
+                            listing, or a name/nick substring
 lxmf a[nnounce]             announce the selected identity now
+lxmf p[ing] <peer>          probe <peer> (same forms as `send`); holds the prompt
+                            until the probe settles, its 20 s timeout expires, or
+                            Ctrl-C, then prints the outcome, the wait, and both
+                            ends' signal
 ```
 
 Numbered listings (`chats`, `msgs`, `contacts`, `announces`) feed the index
-arguments of `read` / `send` / `msgs <#>`. A name substring with multiple
-matches prints a disambiguation list instead of sending. Run any of these
-on-device with `spangap cli "<command>"`.
+arguments of `read` / `send` / `ping` / `msgs <#>`. A `<peer>` substring is
+matched case-insensitively against this identity's contacts (display_name and
+nick) first, then the announce catalogue; multiple matches print a numbered
+disambiguation list instead of acting, so the retry can pick a line number. Run
+any of these on-device with `spangap cli "<command>"`.
 
 ## Frontends
 
@@ -516,6 +607,12 @@ destination hash grouped in fours for eye comparison (the web copy button
 still yields the bare unspaced hex) and holding the delete-conversation
 flow behind an explicit "Are you sure?" confirm. The page's back chevron
 returns to whichever screen opened it — contact overview or message view.
+
+The page opens with a row of buttons, each sized to its own text: **Delete**
+(the conversation, behind the confirm) and **Ping**. The web Ping result is a
+popover under the button, dismissed by a touch anywhere; the LCD's is inline
+under the button row instead, which leaves the button reachable so a re-measure
+is one press.
 
 ## What it owns
 
