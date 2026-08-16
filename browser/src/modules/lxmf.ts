@@ -552,9 +552,15 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const idTree = computed<Record<string, any>>(() => device.get('s.lxmf.id') ?? {})
   const liveTree = computed<Record<string, any>>(() => device.get('lxmf.id') ?? {})
 
+  /* A slot counts as an identity only once it carries config of its own — the
+   * `label` the firmware writes when it creates or imports one. Bare presence
+   * of an `s.lxmf.id.<n>` subtree is not enough: a destroyed slot's contacts
+   * store is a separate structured-DB instance that a later fetch can ship back
+   * into the mirror, and that must not resurrect the identity's row. */
   const identities = computed<Identity[]>(() =>
     Object.keys(idTree.value)
-      .map(Number).filter(n => !Number.isNaN(n)).sort((a, b) => a - b)
+      .map(Number).filter(n => !Number.isNaN(n) && idTree.value[n]?.label !== undefined)
+      .sort((a, b) => a - b)
       .map((n) => {
         const s = idTree.value[n] ?? {}
         const live = liveTree.value[n] ?? {}

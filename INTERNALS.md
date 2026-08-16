@@ -631,8 +631,22 @@ path, so announce traffic cannot overflow rnsd's recv queue.
 The schema is an array (`…id.<n>.*`, `n ∈ [0, LXMF_MAX_IDENTITIES = 4)`);
 single-identity runs at `n = 0`. Each slot is fully compartmentalised —
 contacts, messages, drafts siloed by path; `destroyIdentity(n)` wipes
-`secrets.lxmf.id.<n>.privkey`, `s.lxmf.id.<n>.*`, and `lxmf.id.<n>.*` and
-nothing else.
+`secrets.lxmf.id.<n>.privkey`, `s.lxmf.id.<n>.*`, and `lxmf.id.<n>.*`, and
+nothing outside the slot.
+
+**Its record stores have to be named one by one.** The conversations
+(`s.lxmf.id.<n>.msgs.<peer>`) and the contact directory
+(`s.lxmf.id.<n>.contacts`) are structured-record-store *instances* (§11), and
+only a key that names an instance exactly routes to one — deleting the
+identity's config subtree does not reach them. So the destroy walks `contacts`
+for its peers first, drops each `msgs.<peer>` by name, then the directory
+itself. Miss that and the files outlive the identity on disk: the next identity
+created in the slot inherits the previous one's messages and contacts, and a
+later fetch can ship a destroyed slot's contacts store back into the browser
+mirror. That is also why the browser counts a slot as an identity only when it
+carries `s.lxmf.id.<n>.label` (the key the firmware writes on create/import)
+rather than on the bare presence of the subtree — `identities` in
+`browser/src/modules/lxmf.ts`.
 
 LXMF owns its identities, not rnsd. It generates Ed25519+X25519 keypairs via
 an `rnsd.h` helper on the lxmf task (no rnsd round-trip), stores them at

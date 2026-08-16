@@ -2124,7 +2124,18 @@ static void destroyIdentity(int n)
     /* secrets.lxmf.id.<n>.privkey via rnsd's identity API, plus any
      * other secrets under the subtree. */
     rnsdIdentityErase(secretsPath(n, "privkey").c_str());
+    /* The conversations and the contact directory are record-store instances,
+     * and only a key that names an instance exactly routes to one — deleting
+     * the identity's config subtree does not touch them. Drop each by name, or
+     * they outlive the identity on disk and the next identity created in this
+     * slot inherits its messages and contacts. */
+    std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
+    s_seedPeers.clear();
+    storageForEach(cpre.c_str(), seedCollectPeer);
     storageBegin();
+    for (auto& peer : s_seedPeers)
+        storageDeleteTree(("s.lxmf.id." + std::to_string(n) + ".msgs." + peer).c_str());
+    storageDeleteTree(cpre.c_str());
     storageDeleteTree(secretsPath(n, "").c_str());
     storageDeleteTree(idPath(n, "").c_str());
     storageDeleteTree(idEphPath(n, "").c_str());
