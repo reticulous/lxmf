@@ -15,7 +15,6 @@ import { ref, reactive, computed, watch,
          type ComputedRef, type Ref, type WritableComputedRef } from 'vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useMenuStore } from 'spangap-browser/stores/menu'
-import LxmfPanel from '../panels/LxmfPanel.vue'
 import RlpgStatus from '../panels/RlpgStatus.vue'
 import { registerApp } from 'spangap-browser/lib/apps'
 import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
@@ -1141,9 +1140,6 @@ export function registerLxmf() {
       regSingle = true
     }
   }, { immediate: true })
-
-  /* Settings → Mesh Network → LXMF Messages (the LXMF settings panel). */
-  menu.register('settings/mesh/lxmf', 'LXMF Messages', { type: 'panel', component: LxmfPanel }, { placement: 3 })
 
   /* Dock app: the messenger. (Announces has no separate app — the announce
    * stream lives inside the LXMF window.) */

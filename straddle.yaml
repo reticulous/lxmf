@@ -48,3 +48,183 @@ services:
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.
 browser_register:
   - call: registerLxmf
+
+# Declarative settings: both surfaces + storage defaults from one block. The
+# identity slots are a fixed set, so they are rows gated on the slot being
+# occupied; the propagation nodes are a collection, with lxmf.cpp owning every
+# mutation through the lxmf.pnode.* sentinels. The two identity forms submit to
+# validating sentinels of their own, which is why the 128-hex and 32-hex rules
+# are stated once in the firmware rather than as a regex in each UI.
+settings:
+  - at:
+      - { id: mesh, label: "Mesh Network", short: "Mesh", order: 3 }
+      - { id: lxmf, label: "LXMF Messages", short: "LXMF", order: 2 }
+    rows:
+      - section: "Identities"
+      - caption: "Without an identity this device is a transport-only node — it relays the mesh but has no mailbox."
+      # Identity slot 0. lxmf.cpp publishes `used` as the gate and the rest as
+      # finished text, so the block is present only while the slot is.
+      - section: "Identity 0"
+        when_key: "lxmf.id.0.used"
+      - value:  { label: "Name", key: "lxmf.id.0.label_text" }
+        when_key: "lxmf.id.0.used"
+      - value:  { label: "Address", key: "lxmf.id.0.dest_hash", copyable: true }
+        when_key: "lxmf.id.0.used"
+      - value:  { label: "State", key: "lxmf.id.0.state_text" }
+        when_key: "lxmf.id.0.used"
+      - value:  { label: "Messages", key: "lxmf.id.0.traffic" }
+        when_key: "lxmf.id.0.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.0.enabled" }
+        when_key: "lxmf.id.0.used"
+      - button:
+          label: "Destroy identity 0"
+          danger: true
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  danger: true
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "0", edge: true } }
+        when_key: "lxmf.id.0.used"
+      # Identity slot 1. lxmf.cpp publishes `used` as the gate and the rest as
+      # finished text, so the block is present only while the slot is.
+      - section: "Identity 1"
+        when_key: "lxmf.id.1.used"
+      - value:  { label: "Name", key: "lxmf.id.1.label_text" }
+        when_key: "lxmf.id.1.used"
+      - value:  { label: "Address", key: "lxmf.id.1.dest_hash", copyable: true }
+        when_key: "lxmf.id.1.used"
+      - value:  { label: "State", key: "lxmf.id.1.state_text" }
+        when_key: "lxmf.id.1.used"
+      - value:  { label: "Messages", key: "lxmf.id.1.traffic" }
+        when_key: "lxmf.id.1.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.1.enabled" }
+        when_key: "lxmf.id.1.used"
+      - button:
+          label: "Destroy identity 1"
+          danger: true
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  danger: true
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "1", edge: true } }
+        when_key: "lxmf.id.1.used"
+      # Identity slot 2. lxmf.cpp publishes `used` as the gate and the rest as
+      # finished text, so the block is present only while the slot is.
+      - section: "Identity 2"
+        when_key: "lxmf.id.2.used"
+      - value:  { label: "Name", key: "lxmf.id.2.label_text" }
+        when_key: "lxmf.id.2.used"
+      - value:  { label: "Address", key: "lxmf.id.2.dest_hash", copyable: true }
+        when_key: "lxmf.id.2.used"
+      - value:  { label: "State", key: "lxmf.id.2.state_text" }
+        when_key: "lxmf.id.2.used"
+      - value:  { label: "Messages", key: "lxmf.id.2.traffic" }
+        when_key: "lxmf.id.2.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.2.enabled" }
+        when_key: "lxmf.id.2.used"
+      - button:
+          label: "Destroy identity 2"
+          danger: true
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  danger: true
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "2", edge: true } }
+        when_key: "lxmf.id.2.used"
+      # Identity slot 3. lxmf.cpp publishes `used` as the gate and the rest as
+      # finished text, so the block is present only while the slot is.
+      - section: "Identity 3"
+        when_key: "lxmf.id.3.used"
+      - value:  { label: "Name", key: "lxmf.id.3.label_text" }
+        when_key: "lxmf.id.3.used"
+      - value:  { label: "Address", key: "lxmf.id.3.dest_hash", copyable: true }
+        when_key: "lxmf.id.3.used"
+      - value:  { label: "State", key: "lxmf.id.3.state_text" }
+        when_key: "lxmf.id.3.used"
+      - value:  { label: "Messages", key: "lxmf.id.3.traffic" }
+        when_key: "lxmf.id.3.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.3.enabled" }
+        when_key: "lxmf.id.3.used"
+      - button:
+          label: "Destroy identity 3"
+          danger: true
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  danger: true
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "3", edge: true } }
+        when_key: "lxmf.id.3.used"
+      - button:
+          label: "Create identity"
+          do:
+            form:
+              title: "Create identity"
+              submit: "Create"
+              cmd: lxmf.identity.new
+              fields:
+                - text: { label: "Display name", field: name }
+      - button:
+          label: "Import identity"
+          do:
+            form:
+              title: "Import identity"
+              submit: "Import"
+              cmd: lxmf.identity.import
+              fields:
+                - text: { label: "Private key", field: privkey, secret: true, placeholder: "128 hex characters" }
+      - section: "Announces"
+      - slider: { label: "Re-announce (s)", key: "s.lxmf.announce_interval_s", min: 0, max: 21600 }
+      - caption: "0 = announce on demand only."
+      - slider: { label: "Catalogue cap", key: "s.lxmf.max_announces", min: 256, max: 8192 }
+      - section: "Stamps"
+      - slider: { label: "Advertised cost", key: "s.lxmf.stamp_cost", min: 0, max: 18 }
+      - caption: "Proof-of-work cost (bits) we ask senders to pay. 0 advertises none; higher costs take senders longer to compute."
+      - switch: { label: "Generate outbound", key: "s.lxmf.generate_stamps" }
+      - caption: "Pay a peer's advertised cost when sending. No cost advertised, no work and no delay."
+      - switch: { label: "Require inbound", key: "s.lxmf.enforce_stamps" }
+      - caption: "Drop incoming messages that lack a valid stamp for our advertised cost."
+      - section: "Notifications"
+      - switch: { label: "Sound", key: "s.lxmf.sound_enabled" }
+      - caption: "Play a sound out the speaker when a message arrives. Requires audio hardware; the file is s.lxmf.sound."
+      - section: "Propagation nodes"
+      - caption: "Classic LXMF store-and-forward nodes. Messages can be resent through one from a message's detail page; nodes with check on are polled for messages held for your identities."
+      - list:
+          key: s.lxmf.pn
+          id: hash
+          item: "{name}"
+          subtitle: "{hash}"
+          # lxmf.cpp publishes each node's pill — the last check's outcome in
+          # the words the row shows.
+          status: "lxmf.pnstat.{id}"
+          empty: "No propagation nodes configured."
+          orderable: true
+          cmd: lxmf.pnode
+          add:
+            - label: "Add node"
+              form:
+                title: "Add propagation node"
+                submit: "Add"
+                fields:
+                  - text: { label: "Destination hash", field: hash, placeholder: "32 hex characters" }
+                  - text: { label: "Name", field: name }
+          remove: { confirm: "Remove {name}?" }
+          edit:
+            - text:   { label: "Name", field: name }
+            - switch: { label: "Check for held messages", field: check }
+      - button:
+          label: "Check for messages now"
+          do: { set: { key: "lxmf.cmd.pn_sync", value: "all", edge: true } }
+      - slider: { label: "Check interval (s)", key: "s.lxmf.pn.check_interval_s", min: 0, max: 21600 }
+      - caption: "How often the checked nodes are polled. 0 = only when asked."

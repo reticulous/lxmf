@@ -5022,6 +5022,243 @@ static void rlpgClientTick(void)
 
 struct pn_node_t { std::string hex; std::string name; bool check; };
 
+/* ---- the propagation-node collection ----
+ *
+ * The settings surfaces never write s.lxmf.pn. They write lxmf.pnode.add /
+ * .remove / .set / .order and this file applies them, so one description drives
+ * both surfaces and the hash check lives in one place instead of being a regex
+ * in each. A rejection is a sentence on lxmf.pnode.error.
+ *
+ * The node's own 32-hex destination hash IS its id: it is what identifies the
+ * node everywhere else (the status keys, the sync queue), it is unique by
+ * construction, and it is safe as a key segment. */
+
+static void pnError(const char* why) { storageSet("lxmf.pnode.error", why); }
+
+/** Accepted-mutation ack, shared by the lxmf.pnode.* sentinels: the open form
+ *  closes when this moves. Monotonic per boot — never a read-increment, since
+ *  reads see the committed tree behind the actor's queue. */
+static void pnAck()
+{
+    static int ack = 0;
+    storageSet("lxmf.pnode.done", ++ack);
+}
+
+static std::string pnField(int idx, const char* field)
+{
+    char k[48];
+    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.%s", idx, field);
+    return storageGetStr(k, "");
+}
+
+static int pnIndexOfHash(const std::string& hex)
+{
+    if (hex.empty()) return -1;
+    for (int i = 0; i < LXMF_PN_MAX; ++i) if (pnField(i, "hash") == hex) return i;
+    return -1;
+}
+
+static int pnCount()
+{
+    int n = 0;
+    while (n < LXMF_PN_MAX && pnField(n, "hash").size() == 32) n++;
+    return n;
+}
+
+static void pnWrite(int idx, const std::string& hex, const std::string& name, bool check)
+{
+    char k[48];
+    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.hash",  idx); storageSet(k, hex.c_str());
+    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.name",  idx); storageSet(k, name.c_str());
+    std::snprintf(k, sizeof k, "s.lxmf.pn.%d.check", idx); storageSet(k, check ? 1 : 0);
+}
+
+/** Why this node is unacceptable, or "" if it is fine. */
+static std::string pnRejection(const std::string& hex)
+{
+    if (hex.empty()) return "A propagation node needs its destination hash.";
+    if (hex.size() != 32) return "A destination hash is exactly 32 hex characters.";
+    for (char c : hex)
+        if (!std::isxdigit((unsigned char)c)) return "A destination hash is hex only.";
+    return "";
+}
+
+/** One status pill per node, as packed "text|colour" — the last check's outcome
+ *  in the words the row shows, so neither surface formats a timestamp or maps
+ *  an error string to a colour. */
+static void pnPublishStatus(void)
+{
+    std::string syncing = storageGetStr("lxmf.pn.sync", "");
+    for (int i = 0; i < LXMF_PN_MAX; ++i) {
+        std::string hex = pnField(i, "hash");
+        if (hex.size() != 32) continue;
+        std::string err = storageGetStr(("lxmf.pn." + hex + ".last_err").c_str(), "");
+        const char* pill;
+        std::string composed;
+        if (hex == syncing)                                  pill = "checking|amber";
+        else if (!err.empty())    { composed = err + "|red"; pill = composed.c_str(); }
+        else if (pnField(i, "check") == "1")                 pill = "checked|green";
+        else                                                 pill = "";
+        setStrIfChanged("lxmf.pnstat." + hex, pill);
+    }
+}
+
+static void onPnodeAdd(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    cJSON* o = cJSON_Parse(payload.c_str());
+    cJSON* h = o ? cJSON_GetObjectItem(o, "hash") : nullptr;
+    cJSON* nm = o ? cJSON_GetObjectItem(o, "name") : nullptr;
+    std::string hex  = cJSON_IsString(h)  ? h->valuestring  : "";
+    std::string name = cJSON_IsString(nm) ? nm->valuestring : "";
+    if (o) cJSON_Delete(o);
+    for (char& c : hex) c = (char)std::tolower((unsigned char)c);
+    std::string why = pnRejection(hex);
+    if (!why.empty())              { pnError(why.c_str()); return; }
+    if (pnIndexOfHash(hex) >= 0)   { pnError("That node is already configured."); return; }
+    int n = pnCount();
+    if (n >= LXMF_PN_MAX)          { pnError("The node list is full."); return; }
+    storageBegin();
+    pnWrite(n, hex, name, true);
+    pnError("");
+    storageEnd();
+    pnAck();
+    info("pnode add: %s at %d", hex.c_str(), n);
+}
+
+static void onPnodeSet(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    cJSON* o = cJSON_Parse(payload.c_str());
+    cJSON* nm = o ? cJSON_GetObjectItem(o, "name") : nullptr;
+    cJSON* ck = o ? cJSON_GetObjectItem(o, "check") : nullptr;
+    cJSON* id = o ? cJSON_GetObjectItem(o, "_id") : nullptr;
+    std::string name  = cJSON_IsString(nm) ? nm->valuestring : "";
+    std::string check = cJSON_IsString(ck) ? ck->valuestring : "0";
+    std::string hex   = cJSON_IsString(id) ? id->valuestring : "";
+    if (o) cJSON_Delete(o);
+    int idx = pnIndexOfHash(hex);
+    if (idx < 0) { pnError("That node is no longer configured."); return; }
+    storageBegin();
+    /* The hash is the identity, so an editor changes the name and the check
+     * flag and nothing else — a different hash is a different node. */
+    pnWrite(idx, hex, name, check == "1");
+    pnError("");
+    storageEnd();
+    pnAck();
+}
+
+/** Drop a node, compacting the list so it stays contiguous. */
+static void onPnodeRemove(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string hex = val;
+    storageUnset(key);
+    int idx = pnIndexOfHash(hex), n = pnCount();
+    if (idx < 0) { pnError("That node is no longer configured."); return; }
+    storageBegin();
+    for (int i = idx; i < n - 1; i++)
+        pnWrite(i, pnField(i + 1, "hash"), pnField(i + 1, "name"),
+                pnField(i + 1, "check") == "1");
+    char tail[48];
+    std::snprintf(tail, sizeof tail, "s.lxmf.pn.%d", n - 1);
+    storageDeleteTree(tail);
+    pnError("");
+    storageEnd();
+    pnAck();
+    info("pnode remove: %s", hex.c_str());
+}
+
+/** An id order applied as a preference permutation — recognized hashes move
+ *  into that relative order, the rest keep their place. */
+static void onPnodeOrder(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string csv = val;
+    storageUnset(key);
+    int n = pnCount();
+    if (n <= 1) return;
+    std::vector<std::string> wanted;
+    for (size_t pos = 0; pos <= csv.size(); ) {
+        size_t comma = csv.find(',', pos);
+        wanted.push_back(csv.substr(pos, comma == std::string::npos ? comma : comma - pos));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    std::vector<pn_node_t> items(n);
+    for (int i = 0; i < n; i++) {
+        items[i].hex   = pnField(i, "hash");
+        items[i].name  = pnField(i, "name");
+        items[i].check = pnField(i, "check") == "1";
+    }
+    std::vector<int> slots, order;
+    for (int i = 0; i < n; i++)
+        for (const std::string& w : wanted)
+            if (items[i].hex == w) { slots.push_back(i); break; }
+    for (const std::string& w : wanted)
+        for (int i = 0; i < n; i++)
+            if (items[i].hex == w) { order.push_back(i); break; }
+    if (slots.size() != order.size() || slots.empty()) return;
+    storageBegin();
+    for (size_t s = 0; s < slots.size(); s++)
+        pnWrite(slots[s], items[order[s]].hex, items[order[s]].name, items[order[s]].check);
+    pnError("");
+    storageEnd();
+    pnAck();
+}
+
+/* ---- identity create / import, as validating sentinels ----
+ *
+ * The two forms submit here rather than at lxmf.cmd.identity_*, which take bare
+ * strings and answer only in the log. These take the form's field object, check
+ * it, and report on their own <cmd>.error — so "128 hex characters" is stated
+ * once, by the code that needs it, instead of as a regex in each UI. */
+
+static void onIdentityNew(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    cJSON* o = cJSON_Parse(payload.c_str());
+    cJSON* nm = o ? cJSON_GetObjectItem(o, "name") : nullptr;
+    std::string name = cJSON_IsString(nm) ? nm->valuestring : "";
+    if (o) cJSON_Delete(o);
+    if (name.empty()) { storageSet("lxmf.identity.new.error", "An identity needs a display name."); return; }
+    storageSet("lxmf.cmd.identity_new", name.c_str());
+    /* Accepted (queued for creation): the form closes on the bump. */
+    static int ack = 0;
+    storageSet("lxmf.identity.new.done", ++ack);
+}
+
+static void onIdentityImport(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string payload = val;
+    storageUnset(key);
+    cJSON* o = cJSON_Parse(payload.c_str());
+    cJSON* k = o ? cJSON_GetObjectItem(o, "privkey") : nullptr;
+    std::string hex = cJSON_IsString(k) ? k->valuestring : "";
+    if (o) cJSON_Delete(o);
+    for (char& c : hex) c = (char)std::tolower((unsigned char)c);
+    if (hex.size() != 128) {
+        storageSet("lxmf.identity.import.error", "A private key is exactly 128 hex characters.");
+        return;
+    }
+    for (char c : hex)
+        if (!std::isxdigit((unsigned char)c)) {
+            storageSet("lxmf.identity.import.error", "A private key is hex only.");
+            return;
+        }
+    storageSet("lxmf.cmd.identity_import", hex.c_str());
+    /* Accepted (queued for import): the form closes on the bump. */
+    static int ack = 0;
+    storageSet("lxmf.identity.import.done", ++ack);
+}
+
 /* The configured node list, in index order, malformed/empty slots skipped. */
 static std::vector<pn_node_t> pnNodeList()
 {
@@ -6469,8 +6706,25 @@ static void publishStats(void)
         setIntIfChanged(idEphPath(n, "stats.received"), (int)id.received);
         setIntIfChanged(idEphPath(n, "stats.pending"),  (int)id.pending);
         setIntIfChanged(idEphPath(n, "stats.failed"),   (int)id.failed);
+        /* The settings rows for this slot, as finished text: whether the slot
+         * is occupied at all (the gate every row of the block hangs on), the
+         * name to show, and the traffic counters as one line. Composing them
+         * here is what lets a static descriptor describe an identity block. */
+        setIntIfChanged(idEphPath(n, "used"), 1);
+        std::string label = storageGetStr(idPath(n, "display_name").c_str(), "");
+        if (label.empty()) label = storageGetStr(idPath(n, "label").c_str(), "");
+        if (label.empty()) label = "(unnamed)";
+        setStrIfChanged(idEphPath(n, "label_text"), label.c_str());
+        char traffic[80];
+        std::snprintf(traffic, sizeof traffic, "sent %u \xC2\xB7 received %u \xC2\xB7 pending %u \xC2\xB7 failed %u",
+                      (unsigned)id.sent, (unsigned)id.received,
+                      (unsigned)id.pending, (unsigned)id.failed);
+        setStrIfChanged(idEphPath(n, "traffic"), traffic);
+        setStrIfChanged(idEphPath(n, "state_text"),
+                        storageGetInt(idEphPath(n, "up").c_str(), 0) ? "up" : "down");
     }
     storageEnd();
+    pnPublishStatus();
 }
 
 /* Per-peer conversation-link state for the UIs, ephemeral and keyed by
@@ -7583,6 +7837,16 @@ static void lxmfTaskMain(void*)
      * per-identity command subs are added by createIdentityForSlot /
      * loadIdentityForSlot via subscribePerIdCmds. */
     storageSubscribeChanges("lxmf.cmd.", onIdentityLevelCmd);
+
+    /* The settings surfaces: the propagation-node collection and the two
+     * identity forms. Both validate here and answer on their own .error key,
+     * which is why no UI carries a hash or key-length rule of its own. */
+    storageSubscribeChanges("lxmf.pnode.add",       onPnodeAdd);
+    storageSubscribeChanges("lxmf.pnode.set",       onPnodeSet);
+    storageSubscribeChanges("lxmf.pnode.remove",    onPnodeRemove);
+    storageSubscribeChanges("lxmf.pnode.order",     onPnodeOrder);
+    storageSubscribeChanges("lxmf.identity.new",    onIdentityNew);
+    storageSubscribeChanges("lxmf.identity.import", onIdentityImport);
 
     /* Re-arm the 10 s announce-debounce window whenever rnsd brings an
      * iface up (rnsd writes rnsd.iface_event_seq on every iface-up

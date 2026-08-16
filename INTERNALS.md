@@ -787,9 +787,16 @@ human endpoint by reading the owning straddle's config off storage:
 
 ## 12. Frontends
 
+**Settings**: no panel and no pane — `straddle.yaml`'s `settings:` block
+describes them and the build lowers it to both surfaces. lxmf.cpp holds the
+other half: `lxmf.pnode.*` for the propagation-node collection (the 32-hex check
+and the compaction on delete live in `onPnodeAdd`/`onPnodeRemove`),
+`lxmf.identity.new` / `.import` for the two forms, and the finished strings the
+rows render — `lxmf.id.<n>.used` as the slot gate, `label_text`, `state_text`,
+`traffic`, and `lxmf.pnstat.<hash>` as each node's packed status pill.
+
 **Browser** (`browser/`, `registerLxmf`): `modules/lxmf.ts` (Pinia + RPC),
-`panels/LxmfPanel.vue` (Settings → LXMF), `panels/MessagesWindow.vue` (chat
-window), and `components/lxmf/` (`PeerAvatar`, `ConversationList`,
+`panels/MessagesWindow.vue` (chat window), and `components/lxmf/` (`PeerAvatar`, `ConversationList`,
 `ContactCard`, `MessageBubble`, `Composer`, `AnnouncesView`,
 `ConversationThread`). `MessageBubble.vue` renders the stage glyph and shows
 `last_error` as its tooltip.
@@ -819,24 +826,18 @@ to change, so opening an on-the-mesh peer writes nothing at all.
 **On-device LCD app** (`esp-idf/conditional/spangap-lcd/src/lxmf_lcd.cpp`):
 the **LXMF** app — `class LxmfApp : public LcdApp`, constructed
 `LcdApp({ .name = "LXMF", .iconBasename = "lxmf" })` and installed via
-`lcdInstall(new LxmfApp())`. A settings pane is registered with
-`lcdRegisterSettings("Mesh Network/LXMF", "LXMF Messages", lxmfSettingsPane,
-2)`. Both, plus the `lxmf.url_lcd` subscription, are wired by
-`lxmfLcdRegister()`, the `when: spangap/spangap-lcd` init hook. The whole
-file lives under `conditional/spangap-lcd/`, compiled only when the lcd
-straddle is staged, so **no `#if` guards anything**. The pane opens on its
-**Identities** section — one admin block per slot that has a `label`, then
-create/import — because an identity is what makes the rest of the knobs mean
-anything; the same order the browser `LxmfPanel` uses. The blocks sit in a
-container of their own so the set can be rebuilt in place while the pane stays
-open: a `s.lxmf.id` / `lxmf.id` subscription rebuilds on a slot appearing or
-disappearing, on the name it prints, and on its up/down edge, and on nothing
-deeper (message and contact traffic is not shown here, and `enabled` would
-delete the switch the user just flipped). The rebuild is deferred to a 150 ms
-timer rather than run inline — one create writes several keys in a bracket, and
-Destroy's own event would otherwise delete the block it is running on. The
-per-slot `dest_hash` / `enabled` keys come from static literal tables, since
-`lcdSettingSwitch` hands the key pointer to its event callback. The app reacts
+`lcdInstall(new LxmfApp())`. It and the `lxmf.url_lcd` subscription are wired by
+`LxmfApp::appInit()`. The whole file lives under `conditional/spangap-lcd/`,
+compiled only when the lcd straddle is staged, so **no `#if` guards anything**.
+
+The settings pane is NOT here — it is described in `straddle.yaml`. The identity
+blocks that used to be rebuilt in place by a `s.lxmf.id` subscription are now
+four static row blocks each gated on `when_key: lxmf.id.<n>.used`, which the
+runtime shows and hides from the same subscription without anything being
+destroyed under a live event. That is what removed the 150 ms deferred rebuild
+(one create writes several keys in a bracket, and Destroy's own event would
+otherwise have deleted the block it was running on) and the static literal key
+tables it needed. The app reacts
 to its `s.lxmf.id` / `lxmf.id` / `lxmf.announces` storage subscriptions and renders
 outbound bubble glyphs with `LV_SYMBOL_OK` / `LV_SYMBOL_CLOSE`. The
 `lxmf.url_lcd` handler calls `lcdShowProgram("LXMF")` then opens the thread,

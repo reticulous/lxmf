@@ -587,15 +587,22 @@ any of these on-device with `spangap cli "<command>"`.
 
 ## Frontends
 
+**Settings** (Settings → Mesh Network → LXMF Messages): described by the
+`settings:` block in `straddle.yaml` and lowered by the build to both surfaces.
+The four identity slots are rows gated on the slot being occupied; the
+propagation nodes are a collection over the `lxmf.pnode.*` sentinels; the create
+and import forms submit to `lxmf.identity.*`, where the 128-hex and 32-hex rules
+are stated once instead of as a regex per UI.
+
 **Browser** (`browser/`, registered via `registerLxmf`): a Pinia store + RPC
-(`modules/lxmf.ts`), the Settings panel (`panels/LxmfPanel.vue`), the chat
-window (`panels/MessagesWindow.vue`), and the chat components
+(`modules/lxmf.ts`), the chat window (`panels/MessagesWindow.vue`), and the chat
+components
 (`components/lxmf/`: `PeerAvatar`, `ConversationList`, `ContactCard`,
 `MessageBubble`, `Composer`, `AnnouncesView`, `ConversationThread`).
 
 **On-device LCD app** (`esp-idf/conditional/spangap-lcd/src/lxmf_lcd.cpp`):
-the **LXMF** app, an `LcdApp` installed via `lcdInstall(new LxmfApp())` and a
-settings pane registered under `Mesh Network/LXMF`. The whole file lives
+the **LXMF** app, an `LcdApp` installed via `lcdInstall(new LxmfApp())`. The
+whole file lives
 under `conditional/spangap-lcd/` and is compiled and registered only when
 the [spangap-lcd](../spangap-lcd) straddle is in the build (the
 `lxmfLcdRegister` init hook is `when:`-gated) — no `#if` anywhere.
