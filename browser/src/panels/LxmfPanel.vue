@@ -6,6 +6,46 @@
   <div class="q-gutter-y-md">
     <PanelHeading title="LXMF" />
 
+    <div class="text-caption text-grey-5">Identities</div>
+    <div v-if="lxmf.identities.value.length === 0" class="none">
+      No identities. Without one this device is a transport-only node
+      (it relays the mesh but has no mailbox). Create or import one below.
+    </div>
+    <div v-for="id in lxmf.identities.value" :key="id.n" class="ident">
+      <div class="irow">
+        <div>
+          <div class="ilabel">
+            {{ id.displayName }}
+            <span class="slot">slot {{ id.n }}</span>
+            <span class="up" :class="{ live: id.up }">{{ id.up ? 'up' : 'down' }}</span>
+          </div>
+          <div class="ihash">{{ id.destHash || '(announcing…)' }}</div>
+        </div>
+        <div class="iact">
+          <q-toggle
+            :model-value="id.enabled"
+            dense size="xs" color="green-5"
+            :title="id.enabled ? 'Enabled — participating' : 'Disabled — dark on mesh'"
+            @update:model-value="v => lxmf.setEnabled(id.n, v)"
+          />
+          <button class="del" @click="destroy(id.n)">Destroy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="text-caption text-grey-5">Add identity</div>
+    <div class="add">
+      <input v-model="newLabel" class="fld" placeholder="Display name" />
+      <button class="act" :disabled="busy" @click="create">Create new</button>
+    </div>
+    <div class="add">
+      <input v-model="importHex" class="fld mono" placeholder="128-hex private key" />
+      <button class="act" :disabled="busy || !validHex" @click="doImport">Import</button>
+    </div>
+    <div v-if="msg" class="msg">{{ msg }}</div>
+
+    <q-separator dark />
+
     <SettingSlider label="Re-announce interval (s)" k="s.lxmf.announce_interval_s"
                    :min="0" :max="21600" :step="300" />
     <div class="text-caption text-grey-5">0 = announce on demand only.</div>
@@ -87,48 +127,6 @@
     <div class="text-caption text-grey-5">
       How often the checked nodes are polled. 0 = only when asked.
     </div>
-
-    <q-separator dark />
-
-    <div class="text-caption text-grey-5">Identities</div>
-    <div v-if="lxmf.identities.value.length === 0" class="none">
-      No identities. Without one this device is a transport-only node
-      (it relays the mesh but has no mailbox). Create or import one below.
-    </div>
-    <div v-for="id in lxmf.identities.value" :key="id.n" class="ident">
-      <div class="irow">
-        <div>
-          <div class="ilabel">
-            {{ id.displayName }}
-            <span class="slot">slot {{ id.n }}</span>
-            <span class="up" :class="{ live: id.up }">{{ id.up ? 'up' : 'down' }}</span>
-          </div>
-          <div class="ihash">{{ id.destHash || '(announcing…)' }}</div>
-        </div>
-        <div class="iact">
-          <q-toggle
-            :model-value="id.enabled"
-            dense size="xs" color="green-5"
-            :title="id.enabled ? 'Enabled — participating' : 'Disabled — dark on mesh'"
-            @update:model-value="v => lxmf.setEnabled(id.n, v)"
-          />
-          <button class="del" @click="destroy(id.n)">Destroy</button>
-        </div>
-      </div>
-    </div>
-
-    <q-separator dark />
-
-    <div class="text-caption text-grey-5">Add identity</div>
-    <div class="add">
-      <input v-model="newLabel" class="fld" placeholder="Display name" />
-      <button class="act" :disabled="busy" @click="create">Create new</button>
-    </div>
-    <div class="add">
-      <input v-model="importHex" class="fld mono" placeholder="128-hex private key" />
-      <button class="act" :disabled="busy || !validHex" @click="doImport">Import</button>
-    </div>
-    <div v-if="msg" class="msg">{{ msg }}</div>
   </div>
 </template>
 

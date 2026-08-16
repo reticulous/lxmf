@@ -824,8 +824,20 @@ the **LXMF** app — `class LxmfApp : public LcdApp`, constructed
 2)`. Both, plus the `lxmf.url_lcd` subscription, are wired by
 `lxmfLcdRegister()`, the `when: spangap/spangap-lcd` init hook. The whole
 file lives under `conditional/spangap-lcd/`, compiled only when the lcd
-straddle is staged, so **no `#if` guards anything**. The app reacts to its
-`s.lxmf.id` / `lxmf.id` / `lxmf.announces` storage subscriptions and renders
+straddle is staged, so **no `#if` guards anything**. The pane opens on its
+**Identities** section — one admin block per slot that has a `label`, then
+create/import — because an identity is what makes the rest of the knobs mean
+anything; the same order the browser `LxmfPanel` uses. The blocks sit in a
+container of their own so the set can be rebuilt in place while the pane stays
+open: a `s.lxmf.id` / `lxmf.id` subscription rebuilds on a slot appearing or
+disappearing, on the name it prints, and on its up/down edge, and on nothing
+deeper (message and contact traffic is not shown here, and `enabled` would
+delete the switch the user just flipped). The rebuild is deferred to a 150 ms
+timer rather than run inline — one create writes several keys in a bracket, and
+Destroy's own event would otherwise delete the block it is running on. The
+per-slot `dest_hash` / `enabled` keys come from static literal tables, since
+`lcdSettingSwitch` hands the key pointer to its event callback. The app reacts
+to its `s.lxmf.id` / `lxmf.id` / `lxmf.announces` storage subscriptions and renders
 outbound bubble glyphs with `LV_SYMBOL_OK` / `LV_SYMBOL_CLOSE`. The
 `lxmf.url_lcd` handler calls `lcdShowProgram("LXMF")` then opens the thread,
 both on the lcd task.

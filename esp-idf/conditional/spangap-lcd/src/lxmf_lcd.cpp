@@ -326,6 +326,8 @@ lv_obj_t* s_collapsePill = nullptr;     /* collapse pill (↓), right by Send �
 bool      g_composeExpanded  = false;   /* fixed 8-line composer (vs the 1–4 line quick field) */
 lv_obj_t* s_newIdTa  = nullptr;         /* "Add identity" name field (settings pane) */
 lv_obj_t* s_importTa = nullptr;         /* "Import identity" hex field (settings pane) */
+lv_obj_t* s_idBox    = nullptr;         /* identity-block container (settings pane) */
+lv_timer_t* s_idTimer = nullptr;        /* coalesces identity-block rebuilds */
 
 void refreshMsgs();
 void refreshAnnounces();
@@ -731,8 +733,9 @@ void onDestroyDelete(lv_event_t* e) {
 
 /* One identity's admin block in the settings pane: name + up/down status, dest
  * (live), enabled toggle, and a two-tap Destroy. Mirrors the web LxmfPanel row.
- * destKey/enKey must be string literals — lcdSettingValue/Switch keep the key by
- * pointer — so the caller passes one literal pair per slot. */
+ * destKey/enKey must outlive the widgets — lcdSettingSwitch hands the key
+ * pointer to its event callback — so the caller passes the per-slot literals
+ * from kIdDestKey/kIdEnKey. */
 void lxmfIdentityBlock(lv_obj_t* p, int n, const char* destKey, const char* enKey) {
     char k[48];
 
@@ -4010,8 +4013,169 @@ void onPnAdd(lv_event_t*) {
 
 void onPnCheckNow(void*) { storageSet("lxmf.cmd.pn_sync", "all"); }
 
+/* ---- identities section (settings pane) ----
+ * The blocks live in their own container so the set can be rebuilt in place:
+ * a created identity appears and a destroyed one disappears while the pane
+ * stays open. Keys are literals from these tables — lcdSettingSwitch hands the
+ * key pointer to its event callback, so it must outlive the widget. */
+const char* const kIdDestKey[4] = {
+    "lxmf.id.0.dest_hash", "lxmf.id.1.dest_hash",
+    "lxmf.id.2.dest_hash", "lxmf.id.3.dest_hash",
+};
+const char* const kIdEnKey[4] = {
+    "s.lxmf.id.0.enabled", "s.lxmf.id.1.enabled",
+    "s.lxmf.id.2.enabled", "s.lxmf.id.3.enabled",
+};
+
+void idRebuildRows() {
+    if (!s_idBox) return;
+    lv_obj_clean(s_idBox);
+    bool any = false;
+    for (int n = 0; n < 4; n++) {
+        char k[48];
+        snprintf(k, sizeof k, "s.lxmf.id.%d.label", n);
+        if (!storageExists(k)) continue;
+        lxmfIdentityBlock(s_idBox, n, kIdDestKey[n], kIdEnKey[n]);
+        any = true;
+    }
+    if (!any)
+        lcdSettingCaption(s_idBox,
+            "No identities. Without one this device is a transport-only node "
+            "(it relays the mesh but has no mailbox). Create or import one below.");
+}
+
+/* Rebuild on the next tick rather than inline: one create writes several keys
+ * in a single bracket, and the rebuild must not run inside a widget's own event
+ * (the Destroy button deletes its block). */
+void idRebuildTick(lv_timer_t* tm) {
+    s_idTimer = nullptr;
+    lv_timer_delete(tm);
+    idRebuildRows();
+}
+void idRebuildSoon() {
+    if (!s_idBox || s_idTimer) return;
+    s_idTimer = lv_timer_create(idRebuildTick, 150, nullptr);
+}
+
+/* Identity-set edge: the slot itself (created, or destroyed — a delete reports
+ * the subtree key with an empty value), the name the block prints, or its
+ * up/down state. Anything deeper under a slot is message and contact traffic,
+ * which this pane doesn't show; `enabled` is deliberately absent too — its
+ * switch is storage-bound already, and rebuilding would delete the widget the
+ * user just flipped. */
+void onIdSetChange(const char* key, const char*) {
+    if (!s_idBox || !key) return;
+    const char* t = strstr(key, "lxmf.id.");
+    if (!t) return;
+    t += sizeof("lxmf.id.") - 1;
+    while (*t >= '0' && *t <= '9') t++;
+    if (*t == '\0' || !strcmp(t, ".label") ||
+        !strcmp(t, ".display_name") || !strcmp(t, ".up"))
+        idRebuildSoon();
+}
+
+void onIdBoxDelete(lv_event_t*) {
+    s_idBox = nullptr;
+    if (s_idTimer) { lv_timer_delete(s_idTimer); s_idTimer = nullptr; }
+}
+
+/* The identity admin surface: one block per existing slot, then create/import.
+ * Sits at the top of the pane — an identity is what makes the rest of these
+ * knobs mean anything. */
+void lxmfIdentitiesSection(lv_obj_t* p) {
+    lcdSettingSection(p, "Identities");
+    s_idBox = lv_obj_create(p);
+    lv_obj_remove_style_all(s_idBox);
+    lv_obj_set_width(s_idBox, lv_pct(100));
+    lv_obj_set_height(s_idBox, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_idBox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_idBox, 6, 0);   /* the settings page's own row rhythm */
+    lv_obj_remove_flag(s_idBox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_idBox, onIdBoxDelete, LV_EVENT_DELETE, nullptr);
+    idRebuildRows();
+    /* Subscribed on the lcd task (this pane builder runs there), so the rebuild
+     * may touch LVGL directly. Never unsubscribed: storageUnsubscribe drops
+     * every callback the task holds on that scope, which would take the app's
+     * own subscription with it — the s_idBox guard idles it instead. Re-running
+     * this on a later pane open is a no-op (same task + scope + callback). */
+    storageSubscribeChanges("s.lxmf.id", onIdSetChange);   /* slot create / destroy */
+    storageSubscribeChanges("lxmf.id",   onIdSetChange);   /* up / down edge */
+
+    lcdSettingSection(p, "Add identity");
+    if (lcdHasKeyboard()) {
+        /* Hardware keyboard: a name field + an explicit Create button. Enter in
+         * the field commits too, but pressing it is non-obvious, so the button
+         * is the discoverable affordance. */
+        lv_obj_t* row = lv_obj_create(p);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_newIdTa = lv_textarea_create(row);
+        lv_textarea_set_one_line(s_newIdTa, true);
+        lv_textarea_set_placeholder_text(s_newIdTa, "Name");
+        lv_obj_set_style_text_font(s_newIdTa, kFont, 0);
+        lv_obj_set_flex_grow(s_newIdTa, 1);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_newIdTa);
+        lv_obj_add_event_cb(s_newIdTa, onAddIdentity, LV_EVENT_READY, nullptr);   /* Enter commits */
+        lv_obj_add_event_cb(s_newIdTa, [](lv_event_t*){ s_newIdTa = nullptr; },   /* avoid a dangle on rebuild */
+                            LV_EVENT_DELETE, nullptr);
+
+        lv_obj_t* add = lv_button_create(row);
+        lv_obj_set_style_pad_ver(add, 2, 0);
+        lv_obj_set_style_pad_hor(add, 8, 0);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), add);
+        lv_obj_t* al = lv_label_create(add);
+        lv_obj_set_style_text_font(al, kFont, 0);
+        lv_label_set_text(al, "Create");
+        lv_obj_center(al);
+        lv_obj_add_event_cb(add, onAddIdentity, LV_EVENT_CLICKED, nullptr);
+
+        /* Second row: a 128-hex private key field + an Import button. */
+        lv_obj_t* irow = lv_obj_create(p);
+        lv_obj_remove_style_all(irow);
+        lv_obj_set_width(irow, lv_pct(100));
+        lv_obj_set_height(irow, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(irow, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(irow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(irow, 6, 0);
+        lv_obj_remove_flag(irow, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_importTa = lv_textarea_create(irow);
+        lv_textarea_set_one_line(s_importTa, true);
+        lv_textarea_set_placeholder_text(s_importTa, "128-hex private key");
+        lv_obj_set_style_text_font(s_importTa, kFont, 0);
+        lv_obj_set_flex_grow(s_importTa, 1);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_importTa);
+        lv_obj_add_event_cb(s_importTa, onImportIdentity, LV_EVENT_READY, nullptr);   /* Enter commits */
+        lv_obj_add_event_cb(s_importTa, [](lv_event_t*){ s_importTa = nullptr; },     /* avoid a dangle on rebuild */
+                            LV_EVENT_DELETE, nullptr);
+
+        lv_obj_t* imp = lv_button_create(irow);
+        lv_obj_set_style_pad_ver(imp, 2, 0);
+        lv_obj_set_style_pad_hor(imp, 8, 0);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), imp);
+        lv_obj_t* il = lv_label_create(imp);
+        lv_obj_set_style_text_font(il, kFont, 0);
+        lv_label_set_text(il, "Import");
+        lv_obj_center(il);
+        lv_obj_add_event_cb(imp, onImportIdentity, LV_EVENT_CLICKED, nullptr);
+    } else {
+        /* Touch-only: tapping a field opens the full-screen on-screen keyboard,
+         * which carries its own OK (commit) button. */
+        lcdSettingText(p, "New (name)",           "lxmf.cmd.identity_new");
+        lcdSettingText(p, "Import (128-hex key)", "lxmf.cmd.identity_import");
+    }
+}
+
 void lxmfSettingsPane(void* arg) {
     lv_obj_t* p = static_cast<lv_obj_t*>(arg);
+    lxmfIdentitiesSection(p);
+
     lcdSettingSection(p, "LXMF");
     lcdSettingSlider (p, "Re-announce interval (s)", "s.lxmf.announce_interval_s", 0, 21600);
     lcdSettingCaption(p, "0 = announce on demand only.");
@@ -4087,84 +4251,6 @@ void lxmfSettingsPane(void* arg) {
     lcdSettingButton(p, "Check for messages now", onPnCheckNow);
     lcdSettingSlider(p, "Check interval (s)", "s.lxmf.pn.check_interval_s", 0, 21600);
     lcdSettingCaption(p, "How often checked nodes are polled; 0 = only when asked.");
-
-    lcdSettingSection(p, "Identities");
-    /* One block per existing slot; literal dest/enabled keys (the helpers keep
-     * the key by pointer), the slot index drives name/status/Destroy. */
-    if (storageExists("s.lxmf.id.0.label")) lxmfIdentityBlock(p, 0, "lxmf.id.0.dest_hash", "s.lxmf.id.0.enabled");
-    if (storageExists("s.lxmf.id.1.label")) lxmfIdentityBlock(p, 1, "lxmf.id.1.dest_hash", "s.lxmf.id.1.enabled");
-    if (storageExists("s.lxmf.id.2.label")) lxmfIdentityBlock(p, 2, "lxmf.id.2.dest_hash", "s.lxmf.id.2.enabled");
-    if (storageExists("s.lxmf.id.3.label")) lxmfIdentityBlock(p, 3, "lxmf.id.3.dest_hash", "s.lxmf.id.3.enabled");
-
-    lcdSettingSection(p, "Add identity");
-    if (lcdHasKeyboard()) {
-        /* Hardware keyboard: a name field + an explicit Create button. Enter in
-         * the field commits too, but pressing it is non-obvious, so the button
-         * is the discoverable affordance. */
-        lv_obj_t* row = lv_obj_create(p);
-        lv_obj_remove_style_all(row);
-        lv_obj_set_width(row, lv_pct(100));
-        lv_obj_set_height(row, LV_SIZE_CONTENT);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(row, 6, 0);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-        s_newIdTa = lv_textarea_create(row);
-        lv_textarea_set_one_line(s_newIdTa, true);
-        lv_textarea_set_placeholder_text(s_newIdTa, "Name");
-        lv_obj_set_style_text_font(s_newIdTa, kFont, 0);
-        lv_obj_set_flex_grow(s_newIdTa, 1);
-        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_newIdTa);
-        lv_obj_add_event_cb(s_newIdTa, onAddIdentity, LV_EVENT_READY, nullptr);   /* Enter commits */
-        lv_obj_add_event_cb(s_newIdTa, [](lv_event_t*){ s_newIdTa = nullptr; },   /* avoid a dangle on rebuild */
-                            LV_EVENT_DELETE, nullptr);
-
-        lv_obj_t* add = lv_button_create(row);
-        lv_obj_set_style_pad_ver(add, 2, 0);
-        lv_obj_set_style_pad_hor(add, 8, 0);
-        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), add);
-        lv_obj_t* al = lv_label_create(add);
-        lv_obj_set_style_text_font(al, kFont, 0);
-        lv_label_set_text(al, "Create");
-        lv_obj_center(al);
-        lv_obj_add_event_cb(add, onAddIdentity, LV_EVENT_CLICKED, nullptr);
-
-        /* Second row: a 128-hex private key field + an Import button. */
-        lv_obj_t* irow = lv_obj_create(p);
-        lv_obj_remove_style_all(irow);
-        lv_obj_set_width(irow, lv_pct(100));
-        lv_obj_set_height(irow, LV_SIZE_CONTENT);
-        lv_obj_set_flex_flow(irow, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(irow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(irow, 6, 0);
-        lv_obj_remove_flag(irow, LV_OBJ_FLAG_SCROLLABLE);
-
-        s_importTa = lv_textarea_create(irow);
-        lv_textarea_set_one_line(s_importTa, true);
-        lv_textarea_set_placeholder_text(s_importTa, "128-hex private key");
-        lv_obj_set_style_text_font(s_importTa, kFont, 0);
-        lv_obj_set_flex_grow(s_importTa, 1);
-        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_importTa);
-        lv_obj_add_event_cb(s_importTa, onImportIdentity, LV_EVENT_READY, nullptr);   /* Enter commits */
-        lv_obj_add_event_cb(s_importTa, [](lv_event_t*){ s_importTa = nullptr; },     /* avoid a dangle on rebuild */
-                            LV_EVENT_DELETE, nullptr);
-
-        lv_obj_t* imp = lv_button_create(irow);
-        lv_obj_set_style_pad_ver(imp, 2, 0);
-        lv_obj_set_style_pad_hor(imp, 8, 0);
-        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), imp);
-        lv_obj_t* il = lv_label_create(imp);
-        lv_obj_set_style_text_font(il, kFont, 0);
-        lv_label_set_text(il, "Import");
-        lv_obj_center(il);
-        lv_obj_add_event_cb(imp, onImportIdentity, LV_EVENT_CLICKED, nullptr);
-    } else {
-        /* Touch-only: tapping a field opens the full-screen on-screen keyboard,
-         * which carries its own OK (commit) button. */
-        lcdSettingText(p, "New (name)",           "lxmf.cmd.identity_new");
-        lcdSettingText(p, "Import (128-hex key)", "lxmf.cmd.identity_import");
-    }
 }
 
 }  // namespace
