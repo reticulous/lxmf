@@ -587,7 +587,7 @@ any of these on-device with `spangap cli "<command>"`.
 
 ## Frontends
 
-**Settings** (Settings → Mesh Network → LXMF Messages): described by the
+**Settings** (Settings → Reticulum Mesh → LXMF Messages): described by the
 `settings:` block in `straddle.yaml` and lowered by the build to both surfaces.
 The four identity slots are rows gated on the slot being occupied; the
 propagation nodes are a collection over the `lxmf.pnode.*` sentinels; the create

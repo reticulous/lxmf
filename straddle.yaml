@@ -57,7 +57,7 @@ browser_register:
 # are stated once in the firmware rather than as a regex in each UI.
 settings:
   - at:
-      - { id: mesh, label: "Mesh Network", short: "Mesh", order: 3 }
+      - { id: reticulum }
       - { id: lxmf, label: "LXMF Messages", short: "LXMF", order: 2 }
     rows:
       - section: "Identities"
@@ -66,124 +66,122 @@ settings:
       # finished text, so the block is present only while the slot is.
       - section: "Identity 0"
         when_key: "lxmf.id.0.used"
-      - value:  { label: "Name", key: "lxmf.id.0.label_text" }
-        when_key: "lxmf.id.0.used"
-      - value:  { label: "Address", key: "lxmf.id.0.dest_hash", copyable: true }
-        when_key: "lxmf.id.0.used"
-      - value:  { label: "State", key: "lxmf.id.0.state_text" }
-        when_key: "lxmf.id.0.used"
-      - value:  { label: "Messages", key: "lxmf.id.0.traffic" }
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.0.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.0.dest_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.0.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.0.traffic" }
         when_key: "lxmf.id.0.used"
       - switch: { label: "Enabled", key: "s.lxmf.id.0.enabled" }
         when_key: "lxmf.id.0.used"
       - button:
           label: "Destroy identity 0"
-          danger: true
+          color: red
           do:
             dialog:
               text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
               buttons:
                 - { label: "Cancel" }
                 - label: "Destroy"
-                  danger: true
+                  color: red
                   do: { set: { key: "lxmf.cmd.identity_destroy", value: "0", edge: true } }
         when_key: "lxmf.id.0.used"
       # Identity slot 1. lxmf.cpp publishes `used` as the gate and the rest as
       # finished text, so the block is present only while the slot is.
       - section: "Identity 1"
         when_key: "lxmf.id.1.used"
-      - value:  { label: "Name", key: "lxmf.id.1.label_text" }
-        when_key: "lxmf.id.1.used"
-      - value:  { label: "Address", key: "lxmf.id.1.dest_hash", copyable: true }
-        when_key: "lxmf.id.1.used"
-      - value:  { label: "State", key: "lxmf.id.1.state_text" }
-        when_key: "lxmf.id.1.used"
-      - value:  { label: "Messages", key: "lxmf.id.1.traffic" }
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.1.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.1.dest_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.1.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.1.traffic" }
         when_key: "lxmf.id.1.used"
       - switch: { label: "Enabled", key: "s.lxmf.id.1.enabled" }
         when_key: "lxmf.id.1.used"
       - button:
           label: "Destroy identity 1"
-          danger: true
+          color: red
           do:
             dialog:
               text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
               buttons:
                 - { label: "Cancel" }
                 - label: "Destroy"
-                  danger: true
+                  color: red
                   do: { set: { key: "lxmf.cmd.identity_destroy", value: "1", edge: true } }
         when_key: "lxmf.id.1.used"
       # Identity slot 2. lxmf.cpp publishes `used` as the gate and the rest as
       # finished text, so the block is present only while the slot is.
       - section: "Identity 2"
         when_key: "lxmf.id.2.used"
-      - value:  { label: "Name", key: "lxmf.id.2.label_text" }
-        when_key: "lxmf.id.2.used"
-      - value:  { label: "Address", key: "lxmf.id.2.dest_hash", copyable: true }
-        when_key: "lxmf.id.2.used"
-      - value:  { label: "State", key: "lxmf.id.2.state_text" }
-        when_key: "lxmf.id.2.used"
-      - value:  { label: "Messages", key: "lxmf.id.2.traffic" }
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.2.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.2.dest_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.2.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.2.traffic" }
         when_key: "lxmf.id.2.used"
       - switch: { label: "Enabled", key: "s.lxmf.id.2.enabled" }
         when_key: "lxmf.id.2.used"
       - button:
           label: "Destroy identity 2"
-          danger: true
+          color: red
           do:
             dialog:
               text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
               buttons:
                 - { label: "Cancel" }
                 - label: "Destroy"
-                  danger: true
+                  color: red
                   do: { set: { key: "lxmf.cmd.identity_destroy", value: "2", edge: true } }
         when_key: "lxmf.id.2.used"
       # Identity slot 3. lxmf.cpp publishes `used` as the gate and the rest as
       # finished text, so the block is present only while the slot is.
       - section: "Identity 3"
         when_key: "lxmf.id.3.used"
-      - value:  { label: "Name", key: "lxmf.id.3.label_text" }
-        when_key: "lxmf.id.3.used"
-      - value:  { label: "Address", key: "lxmf.id.3.dest_hash", copyable: true }
-        when_key: "lxmf.id.3.used"
-      - value:  { label: "State", key: "lxmf.id.3.state_text" }
-        when_key: "lxmf.id.3.used"
-      - value:  { label: "Messages", key: "lxmf.id.3.traffic" }
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.3.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.3.dest_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.3.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.3.traffic" }
         when_key: "lxmf.id.3.used"
       - switch: { label: "Enabled", key: "s.lxmf.id.3.enabled" }
         when_key: "lxmf.id.3.used"
       - button:
           label: "Destroy identity 3"
-          danger: true
+          color: red
           do:
             dialog:
               text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
               buttons:
                 - { label: "Cancel" }
                 - label: "Destroy"
-                  danger: true
+                  color: red
                   do: { set: { key: "lxmf.cmd.identity_destroy", value: "3", edge: true } }
         when_key: "lxmf.id.3.used"
-      - button:
-          label: "Create identity"
-          do:
-            form:
-              title: "Create identity"
-              submit: "Create"
-              cmd: lxmf.identity.new
-              fields:
-                - text: { label: "Display name", field: name }
-      - button:
-          label: "Import identity"
-          do:
-            form:
-              title: "Import identity"
-              submit: "Import"
-              cmd: lxmf.identity.import
-              fields:
-                - text: { label: "Private key", field: privkey, secret: true, placeholder: "128 hex characters" }
+      # The two ways to get an identity are one choice, so they share a line
+      # rather than stacking as two full-width buttons.
+      - buttons:
+          items:
+            - label: "Create"
+              do:
+                form:
+                  title: "Create identity"
+                  submit: "Create"
+                  cmd: lxmf.identity.new
+                  fields:
+                    - text: { label: "Display name", field: name }
+            - label: "Import"
+              do:
+                form:
+                  title: "Import identity"
+                  submit: "Import"
+                  cmd: lxmf.identity.import
+                  fields:
+                    - text: { label: "Private key", field: privkey, secret: true, placeholder: "128 hex characters" }
       - section: "Announces"
       - slider: { label: "Re-announce (s)", key: "s.lxmf.announce_interval_s", min: 0, max: 21600 }
       - caption: "0 = announce on demand only."
