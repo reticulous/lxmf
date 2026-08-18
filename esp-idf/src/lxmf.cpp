@@ -5888,19 +5888,32 @@ static void pnSyncAdvance(uint32_t now_s)
     }
 }
 
+/* Deadline of the next periodic check; 0 = not armed yet (pnScheduleChecks
+ * arms it one grace window after bring-up). */
+static uint32_t s_pnNextCheck_s = 0;
+
 /* Periodic check of the nodes marked for checking. First pass ~2 min
  * after bring-up, then every s.lxmf.pn.check_interval_s (0 = manual only,
  * via lxmf.cmd.pn_sync). */
 static void pnScheduleChecks(uint32_t now_s)
 {
-    static uint32_t next_s = 0;
     int interval = storageGetInt("s.lxmf.pn.check_interval_s", 1800);
-    if (interval <= 0) { next_s = 0; return; }
-    if (next_s == 0) { next_s = now_s + 120; return; }
-    if ((int32_t)(now_s - next_s) < 0) return;
-    next_s = now_s + (uint32_t)interval;
+    if (interval <= 0) { s_pnNextCheck_s = 0; return; }
+    if (s_pnNextCheck_s == 0) { s_pnNextCheck_s = now_s + 120; return; }
+    if ((int32_t)(now_s - s_pnNextCheck_s) < 0) return;
+    s_pnNextCheck_s = now_s + (uint32_t)interval;
     for (auto& nd : pnNodeList())
         if (nd.check) pnEnqueueSync(nd.hex);
+}
+
+/* A manual check-everything (lxmf.cmd.pn_sync = all) stands in for the
+ * periodic one, so push the timer out a whole interval: pressing the button
+ * means "now", not "now and again in a minute". */
+static void pnRearmNextCheck(void)
+{
+    int interval = storageGetInt("s.lxmf.pn.check_interval_s", 1800);
+    if (interval <= 0) return;                     /* manual only — nothing armed */
+    s_pnNextCheck_s = (uint32_t)(nowUnixMs() / 1000) + (uint32_t)interval;
 }
 
 /* 1 Hz housekeeping: settle packet-class uploads off the link's proof
@@ -6470,13 +6483,22 @@ static void onIdentityLevelCmd(const char* key, const char* val)
         }
         else if (std::strcmp(tail, "pn_sync") == 0) {
             /* "all" → every check-marked node; a 32-hex value → that node
-             * (whether or not check-marked). Queued per usable identity. */
+             * (whether or not check-marked). Queued per usable identity.
+             * "all" stands in for this interval's periodic pass, so it
+             * re-arms the timer a whole interval out. */
             std::string v = val;
             if (v.size() == 32) {
                 pnEnqueueSync(v);
             } else {
-                for (auto& nd : pnNodeList())
-                    if (nd.check) pnEnqueueSync(nd.hex);
+                auto nodes = pnNodeList();
+                /* With nothing marked the timer never fires, so an explicit
+                 * check means every configured node — asking and getting
+                 * nothing is the one useless answer. */
+                bool any_marked = false;
+                for (auto& nd : nodes) if (nd.check) any_marked = true;
+                for (auto& nd : nodes)
+                    if (nd.check || !any_marked) pnEnqueueSync(nd.hex);
+                pnRearmNextCheck();
             }
         }
         else if (std::strcmp(tail, "pn_add") == 0) {
@@ -6666,31 +6688,17 @@ static uint32_t lxmfTickIntervalMs(void) {
     return uiTelemetryWanted() ? LXMF_PUBLISH_INTERVAL_MS : LXMF_PUBLISH_IDLE_MS;
 }
 
-/* When non-zero, the absolute tick at which any newly-armed announce
- * should fire. Armed once at task startup (covers the case where rnsd
- * brought interfaces up before we subscribed) and re-armed on every
- * `rnsd.iface_event_seq` change. Each re-arm extends the deadline by
- * the full debounce window, which naturally rate-limits a burst of
- * iface-up events (announce fires 10 s after the LAST iface came up,
- * not after each one). */
+/* When non-zero, the absolute tick at which the startup announce fires. Armed
+ * once at task startup and never by interface events: a NEW interface gets our
+ * last announce from rnsd's per-interface replay, pinned to that interface —
+ * re-announcing from here would broadcast, and a flapping peer's
+ * register/deregister cycle then spends every OTHER radio's airtime (LoRa most
+ * expensively) on its churn. After the startup announce, only the periodic
+ * schedule announces. */
 static TickType_t s_announce_due_tick = 0;
-#define LXMF_ANNOUNCE_DEBOUNCE_MS 10000
 /* The first announce of the session is held this long after task start, so rnsd
- * + the transports are up and stable before we advertise. Armed once at startup;
- * later announces use the 10 s iface-up debounce only. */
+ * + the transports are up and stable before we advertise. */
 #define LXMF_FIRST_ANNOUNCE_DELAY_MS 30000
-
-static void onRnsdIfaceEvent(const char* /*key*/, const char* /*val*/)
-{
-    /* Re-arm the debounce, but only ever push the announce LATER — never pull
-     * it in. This keeps the startup 30 s floor (set in lxmfTaskMain) intact
-     * when ifaces come up inside that window, while still extending the wait if
-     * an iface settles late. After the first announce fires (due reset to 0)
-     * this re-arms normally. */
-    TickType_t due = xTaskGetTickCount() + pdMS_TO_TICKS(LXMF_ANNOUNCE_DEBOUNCE_MS);
-    if (s_announce_due_tick == 0 || (int32_t)(due - s_announce_due_tick) > 0)
-        s_announce_due_tick = due;
-}
 
 static void publishStats(void)
 {
@@ -7848,10 +7856,8 @@ static void lxmfTaskMain(void*)
     storageSubscribeChanges("lxmf.identity.new",    onIdentityNew);
     storageSubscribeChanges("lxmf.identity.import", onIdentityImport);
 
-    /* Re-arm the 10 s announce-debounce window whenever rnsd brings an
-     * iface up (rnsd writes rnsd.iface_event_seq on every iface-up
-     * transition — narrow single-key subscription, no filtering). */
-    storageSubscribeChanges("rnsd.iface_event_seq", onRnsdIfaceEvent);
+    /* No iface-event announce subscription: rnsd's per-interface announce
+     * replay hands a new interface our last announce, pinned to it. */
 
     /* Open-a-conversation links from the nomad browser (web → lxmf.url_web,
      * on-device LCD → lxmf.url_lcd). We do the identity-independent path
@@ -7878,10 +7884,9 @@ static void lxmfTaskMain(void*)
     lxmfBringUp();
 
     /* Arm the first announce 30 s out (measured from bring-up) so the rest of
-     * the stack — rnsd + every transport — is up and
-     * stable before we advertise. onRnsdIfaceEvent only pushes this later, never
-     * earlier, so ifaces coming up inside the window can't pull it in. Covers
-     * the case where rnsd brought ifaces up before our subscription landed. */
+     * the stack — rnsd + every transport — is up and stable before we
+     * advertise. Interfaces registering later get this announce from rnsd's
+     * per-interface replay, pinned to them. */
     s_announce_due_tick = xTaskGetTickCount() + pdMS_TO_TICKS(LXMF_FIRST_ANNOUNCE_DELAY_MS);
 
     s_lastPublishTick = xTaskGetTickCount();
@@ -7949,10 +7954,7 @@ static void lxmfTaskMain(void*)
                 backfillContactNames();
             }
 
-            /* Debounced announce: fires once 10 s after the last iface
-             * came up (per onRnsdIfaceEvent). Re-armed by each
-             * iface-up; this branch runs at most once per debounce
-             * window. */
+            /* The startup announce, once. */
             if (s_announce_due_tick != 0 &&
                 (int32_t)(now - s_announce_due_tick) >= 0) {
                 s_announce_due_tick = 0;
@@ -7964,9 +7966,8 @@ static void lxmfTaskMain(void*)
 
             /* Periodic re-announce per identity. Interval read live
              * from storage; 0 disables periodic. Identities whose
-             * our-dest is currently down are skipped (they'll
-             * re-announce on the next iface_event_seq or once the
-             * our-dest comes back). */
+             * our-dest is currently down are skipped (they announce
+             * again once the our-dest comes back). */
             int announce_s = storageGetInt("s.lxmf.announce_interval_s", 1800);
             if (announce_s > 0) {
                 int32_t threshold = (int32_t)pdMS_TO_TICKS(announce_s * 1000);

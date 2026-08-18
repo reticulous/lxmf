@@ -277,8 +277,12 @@ wire-compatible with LXMF 0.9.8:
   option; nothing is sent to it automatically.
 - **Receiving.** Every node marked `check` is synced on a timer
   (`s.lxmf.pn.check_interval_s`, default 1800; `0` = manual only) and on
-  demand (`lxmf.cmd.pn_sync = all` or a node hash — the settings panels'
-  "Check for messages now"). A sync identifies over the link so the node
+  demand (`lxmf.cmd.pn_sync = all` or a node hash). By hand, that is the
+  **envelope button** the messenger shows while at least one node is
+  configured — right of the Contacts / On-the-Mesh tabs on the LCD, in the
+  window's top-right corner on the web. It says the check will happen in
+  the background and restarts the interval, so the next automatic pass is a
+  whole interval away. A sync identifies over the link so the node
   serves exactly this identity's mail, downloads the held messages
   through the normal verify/dedup/store pipeline, and confirms them so
   the node deletes its copies. Per-node results land in

@@ -16,6 +16,15 @@
     @update:visible="v => emit('update:visible', v)"
   >
     <template #titlebar-right>
+      <!-- Propagation-node check. Present only while a node is configured;
+           the check runs in the firmware, so the click only acknowledges. -->
+      <span
+        v-if="pnCount > 0" class="pn-btn"
+        title="Get mail from propagation node(s)"
+        @click="checkPropagation"
+      >
+        <q-icon :name="matMail" size="15px" />
+      </span>
       <span class="rfs-btn" title="Smaller" @click="zoomOut">-</span>
       <span class="rfs-btn" title="Larger" @click="zoomIn">+</span>
     </template>
@@ -108,6 +117,12 @@
           @resend="onResendVia"
         />
 
+        <!-- Propagation-node check acknowledgement: buttonless, clears itself
+             after PN_TOAST_MS or on a click anywhere over it. -->
+        <div v-if="pnToast" class="toast-bg" @click="closePnToast">
+          <div class="toast">{{ pnToast }}</div>
+        </div>
+
         <!-- message action sheet (Signal long-press analog) -->
         <div v-if="menuMsg" class="sheet-bg" @click="menuMsg = null">
           <div class="sheet" @click.stop>
@@ -125,7 +140,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, toRef } from 'vue'
+import { computed, onBeforeUnmount, ref, toRef } from 'vue'
+import { matMail } from '@quasar/extras/material-icons'
 import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import ConversationList from '../components/lxmf/ConversationList.vue'
 import ConversationThread from '../components/lxmf/ConversationThread.vue'
@@ -198,6 +214,31 @@ function ratchetOf(peer: string): string {
   return lxmf.announces.value.find(a => a.hash === peer)?.ratchet ?? ''
 }
 
+/* Propagation-node check. The firmware's sync machine does the work and
+ * resets its own poll interval, so this asks and says so — no result to
+ * wait for here; per-node outcomes show in the settings pane's node rows. */
+const PN_TOAST_MS = 3000
+const pnCount = computed(() => lxmf.pnNodes.value.length)
+const pnToast = ref('')
+let pnToastTimer: ReturnType<typeof setTimeout> | undefined
+
+function closePnToast() {
+  if (pnToastTimer) { clearTimeout(pnToastTimer); pnToastTimer = undefined }
+  pnToast.value = ''
+}
+
+function checkPropagation() {
+  if (pnCount.value === 0) return
+  void lxmf.pnSyncNow()
+  closePnToast()
+  pnToast.value = 'Checking your configured propagation ' +
+                  (pnCount.value === 1 ? 'node' : 'nodes') +
+                  ' will happen in the background'
+  pnToastTimer = setTimeout(closePnToast, PN_TOAST_MS)
+}
+
+onBeforeUnmount(closePnToast)
+
 function onResendVia(m: Message, via: string) {
   detailMsg.value = null
   lxmf.resendVia(m.peer, m.key, via)
@@ -260,6 +301,14 @@ function askDeleteMsg(m: Message) {
   user-select: none;
 }
 .rfs-btn:hover { color: rgba(255,255,255,0.9); background: rgba(255,255,255,0.1); }
+/* Propagation-node check — an action, not a window control, so it keeps the
+ * titlebar buttons' size but reads brighter than the zoom pair. */
+.pn-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 4px;
+  color: rgba(255,255,255,0.7); cursor: pointer; user-select: none;
+}
+.pn-btn:hover { color: #fff; background: rgba(255,255,255,0.1); }
 .panes { flex: 1; display: flex; min-height: 0; }
 .rail {
   flex: none;
@@ -310,4 +359,17 @@ function askDeleteMsg(m: Message) {
 .sheet button:last-child { border-bottom: none; }
 .sheet button:hover { background: rgba(255,255,255,0.05); }
 .sheet button.danger { color: #d98a8a; }
+
+/* Buttonless notice. The backdrop is transparent but covers the pane, so the
+ * click that dismisses it can't also land on a conversation row. */
+.toast-bg {
+  position: absolute; inset: 0; z-index: 9;
+  display: flex; align-items: center; justify-content: center;
+}
+.toast {
+  max-width: 320px; margin: 12px; padding: 12px 14px;
+  background: #262626; border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  color: #e2e2e2; font-size: 13px; line-height: 1.35; text-align: center;
+}
 </style>

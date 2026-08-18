@@ -58,7 +58,7 @@ browser_register:
 settings:
   - at:
       - { id: reticulum }
-      - { id: lxmf, label: "LXMF Messages", short: "LXMF", order: 2 }
+      - { id: lxmf, label: "LXMF Messages", short: "LXMF", order: 6 }
     rows:
       - section: "Identities"
       - caption: "Without an identity this device is a transport-only node — it relays the mesh but has no mailbox."
@@ -221,8 +221,5 @@ settings:
           edit:
             - text:   { label: "Name", field: name }
             - switch: { label: "Check for held messages", field: check }
-      - button:
-          label: "Check for messages now"
-          do: { set: { key: "lxmf.cmd.pn_sync", value: "all", edge: true } }
       - slider: { label: "Check interval (s)", key: "s.lxmf.pn.check_interval_s", min: 0, max: 21600 }
-      - caption: "How often the checked nodes are polled. 0 = only when asked."
+      - caption: "How often the checked nodes are polled. 0 = only when asked. Check now from the envelope button in LXMessenger; that also restarts this interval."

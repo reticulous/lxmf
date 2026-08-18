@@ -539,7 +539,13 @@ every one of them, so no caller has to.
 a (node × identity) queue, fed by the periodic scheduler
 (`s.lxmf.pn.check_interval_s`, default 1800, first pass ~2 min after
 bring-up; 0 = manual) and the `lxmf.cmd.pn_sync` sentinel ("all" =
-check-marked nodes, or one 32-hex node). Per session: open a link with
+check-marked nodes — or *every* configured node when none is marked, since
+asking and getting nothing is the one useless answer — or one 32-hex node).
+"all" stands in for this interval's periodic pass, so it re-arms
+`s_pnNextCheck_s` a whole interval out (`pnRearmNextCheck`); a single-node
+sync doesn't, being a partial check. The frontends' one manual trigger is
+the messenger's envelope button (shown while the list is non-empty); the
+settings pane owns the list and the interval only. Per session: open a link with
 the identity's key, wait for `rnsd.links.<tag>.state == active`,
 `rnsdLinkIdentify` (the node serves only the `lxmf.delivery` dest derived
 from the identified identity), then loop `/get` request rounds via

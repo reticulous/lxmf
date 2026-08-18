@@ -264,6 +264,10 @@ lv_obj_t* s_idpick   = nullptr;         /* identity picker (first screen, >1 ide
 lv_obj_t* s_contacts = nullptr;         /* list screen: tab bar + two tab pages */
 lv_obj_t* s_tabBtnC  = nullptr;         /* "Contacts" tab button */
 lv_obj_t* s_tabBtnM  = nullptr;         /* "On the Mesh" tab button */
+lv_obj_t* s_pnBtn    = nullptr;         /* envelope button right of the tabs: check the
+                                           propagation nodes now (hidden with none set) */
+lv_obj_t* s_pnToast   = nullptr;        /* its buttonless acknowledgement, self-closing */
+lv_timer_t* s_pnToastTimer = nullptr;
 lv_obj_t* s_tabContacts = nullptr;      /* Contacts page (search + list); shown when tab 0 */
 lv_obj_t* s_tabMesh  = nullptr;         /* On-the-Mesh page (search + list); shown when tab 1 */
 lv_obj_t* s_searchC  = nullptr;         /* search textarea atop the Contacts list */
@@ -3456,6 +3460,75 @@ lv_obj_t* mkTabButton(lv_obj_t* bar, const char* text, int idx) {
     return b;
 }
 
+/* ---- "check the propagation nodes now" (envelope, right of the tabs) ----
+ *
+ * The only by-hand check there is: the settings pane owns the node list and
+ * the poll interval, this owns "go and look". Present only while a node is
+ * configured, since with none there is nothing to ask. The check itself runs
+ * in the firmware's sync machine, so the acknowledgement is a buttonless
+ * notice that clears itself after PN_TOAST_MS or on a tap. */
+
+const uint32_t PN_TOAST_MS = 3000;
+
+void closePnToast() {
+    if (s_pnToastTimer) { lv_timer_delete(s_pnToastTimer); s_pnToastTimer = nullptr; }
+    if (s_pnToast)      { lv_obj_delete(s_pnToast);        s_pnToast = nullptr; }
+}
+
+void showPnToast(int nodes) {
+    if (!s_contacts) return;
+    closePnToast();
+
+    /* Transparent full-page catcher: a tap anywhere dismisses, and nothing
+     * underneath acts on the same tap. */
+    s_pnToast = lv_obj_create(s_contacts);
+    lv_obj_remove_style_all(s_pnToast);
+    lv_obj_set_size(s_pnToast, lv_pct(100), lv_pct(100));
+    lv_obj_add_flag(s_pnToast, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(s_pnToast, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_pnToast, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_pnToast, [](lv_event_t*) { closePnToast(); },
+                        LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* box = lv_obj_create(s_pnToast);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(85));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_all(box, 10, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* l = mkLabel(box, std::string("Checking your configured propagation ") +
+                               (nodes == 1 ? "node" : "nodes") +
+                               " will happen in the background", lv_color_white());
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, lv_pct(100));
+
+    s_pnToastTimer = lv_timer_create([](lv_timer_t*) {
+        s_pnToastTimer = nullptr;   /* one-shot: LVGL frees it after this returns */
+        closePnToast();
+    }, PN_TOAST_MS, nullptr);
+    lv_timer_set_repeat_count(s_pnToastTimer, 1);
+}
+
+void onPnCheckClick(lv_event_t*) {
+    int nodes = (int)pnList().size();
+    if (nodes == 0) return;
+    storageSet("lxmf.cmd.pn_sync", "all");
+    showPnToast(nodes);
+}
+
+/* Hide the button while the node list is empty — it is built once, so this
+ * runs on every s.lxmf.pn change too. */
+void reflectPnButton() {
+    if (!s_pnBtn) return;
+    if (pnList().empty()) lv_obj_add_flag   (s_pnBtn, LV_OBJ_FLAG_HIDDEN);
+    else                  lv_obj_remove_flag(s_pnBtn, LV_OBJ_FLAG_HIDDEN);
+}
+
 /* Record USER scrolls on the mesh list so the live announce-refresh backs off
  * while you're browsing (see refreshTimerCb's MESH_SCROLL_QUIET_MS gate). A user
  * drag is dispatched while an input device is being processed; the rebuild's own
@@ -3476,7 +3549,7 @@ void buildContactsScreen() {
     lv_obj_set_style_pad_ver(s_contacts, 1, 0);
     lv_obj_set_style_pad_row(s_contacts, 2, 0);
 
-    /* Tab bar: two equal buttons. */
+    /* Tab bar: two equal buttons, plus the narrow envelope check button. */
     lv_obj_t* bar = lv_obj_create(s_contacts);
     lv_obj_remove_style_all(bar);
     lv_obj_set_width(bar, lv_pct(100));
@@ -3486,6 +3559,22 @@ void buildContactsScreen() {
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
     s_tabBtnC = mkTabButton(bar, "Contacts",    0);
     s_tabBtnM = mkTabButton(bar, "On the Mesh", 1);
+
+    /* Not a tab: no flex-grow (it takes only the envelope's width), no active
+     * styling, and it never changes which page is shown. */
+    s_pnBtn = lv_button_create(bar);
+    lv_obj_remove_style_all(s_pnBtn);
+    lv_obj_set_size(s_pnBtn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_pnBtn, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_pnBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_pnBtn, 4, 0);
+    lv_obj_set_style_pad_ver(s_pnBtn, 3, 0);
+    lv_obj_set_style_pad_hor(s_pnBtn, 8, 0);
+    lv_obj_remove_flag(s_pnBtn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(mkLabel(s_pnBtn, LV_SYMBOL_ENVELOPE, lv_color_hex(0xc0c8d0)));
+    lv_obj_add_event_cb(s_pnBtn, onPnCheckClick, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_pnBtn);
+    reflectPnButton();
 
     s_listC = buildTabPage(s_tabContacts, s_searchC, "Search contacts or 32-hex");
     s_listM = buildTabPage(s_tabMesh,     s_searchM, "Search the mesh");
@@ -3670,6 +3759,13 @@ void onStorageChange(const char* key, const char*) {
     scheduleRefresh();
 }
 
+/* The node list changed in settings: the envelope button appears with the
+ * first node and goes away with the last. */
+void onPnListChange(const char*, const char*) {
+    if (!s_layer) return;
+    reflectPnButton();
+}
+
 /* Screen woke: if the open thread is scrolled to the newest, the messages that
  * arrived while asleep are now in view — clear their unread. */
 void onStandbyChange(const char* /*key*/, const char* val) {
@@ -3683,6 +3779,8 @@ void onStandbyChange(const char* /*key*/, const char* val) {
 void onLayerDelete(lv_event_t*) {
     s_layer = nullptr; s_idpick = nullptr; s_contacts = nullptr;
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
+    s_pnBtn = nullptr; s_pnToast = nullptr;   /* widgets went with the layer */
+    if (s_pnToastTimer) { lv_timer_delete(s_pnToastTimer); s_pnToastTimer = nullptr; }
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
     s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
@@ -3717,6 +3815,7 @@ void lxmfApp(void* arg) {
     s_layer = static_cast<lv_obj_t*>(arg);
     s_idpick = nullptr; s_contacts = nullptr;
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
+    s_pnBtn = nullptr; s_pnToast = nullptr; s_pnToastTimer = nullptr;   /* prior onLayerDelete freed the timer */
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
     s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
@@ -3754,6 +3853,7 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity up/dest edge */
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
         storageSubscribeChanges("lxmf.msgmeta",   onStorageChange);   /* per-message routing (LoRa pill) */
+        storageSubscribeChanges("s.lxmf.pn",      onPnListChange);    /* show/hide the envelope button */
         storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
