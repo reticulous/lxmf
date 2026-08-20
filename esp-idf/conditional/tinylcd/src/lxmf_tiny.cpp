@@ -41,7 +41,7 @@ static bool drawLxmfPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t)
     }
 
     u8g2_SetFont(g, u8g2_font_6x10_tf);
-    u8g2_DrawStr(g, 0, 17, "LXMF unread");
+    u8g2_DrawStr(g, 0, TINYLCD_TITLE_Y, "LXMF unread");
 
     char num[8];
     int n = s_unread;
