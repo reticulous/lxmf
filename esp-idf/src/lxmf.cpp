@@ -6700,8 +6700,18 @@ static TickType_t s_announce_due_tick = 0;
  * + the transports are up and stable before we advertise. */
 #define LXMF_FIRST_ANNOUNCE_DELAY_MS 30000
 
+/* Both publishers below exist for readers — an on-device pane or a browser —
+ * and with neither present every key they write is one nobody will ever read.
+ * The cost is not the key: it is the storage window, the compare-read per key,
+ * the string building, and the change fan-out that wakes the storage actor and
+ * the notify task behind it. So they stand down entirely on a headless,
+ * WiFi-down node, and the tick they hang off becomes a walk over a few small
+ * arrays. A UI appearing means WiFi came up (or the build has a screen, where
+ * the gate is always open), so the next tick repopulates the keys — the same
+ * contract iface-lora and rnsd publish under. */
 static void publishStats(void)
 {
+    if (!uiTelemetryWanted()) return;
     storageBegin();
     storageSet("lxmf.up", 1);
     for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
@@ -6746,6 +6756,7 @@ static void publishStats(void)
 static std::vector<std::string> s_pubLinkKeys;
 static void publishLinks(void)
 {
+    if (!uiTelemetryWanted()) return;   /* header icons, for a reader that isn't there */
     std::vector<std::string> keys, vals;
     auto note = [&](int n, const std::string& peer, const char* state) {
         if (peer.size() != 32) return;

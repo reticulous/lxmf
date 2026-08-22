@@ -522,7 +522,8 @@ explicit-only — no automatic fallback):
    RLPG's 0x10000+ range). rnsd's pre-active outbox buffers either.
 
 Settle: the node's packet proof (the `rnsd.links.<tag>.tx_proven`
-counter, baselined at send and polled at 1 Hz + checked in the disconnect
+counter, baselined at send and polled on the maintenance tick — 1 Hz with a UI
+watching, 5 s without — plus checked in the disconnect
 callback — the node proves then drops the link) or the Resource
 OUTBOUND_DONE → **`ON_PN`** (terminal, tries=255 via `msgFail`, counts as
 `sent`): a propagation node never proves delivery to the sender, the
