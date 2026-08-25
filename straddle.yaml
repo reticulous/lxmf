@@ -183,11 +183,11 @@ settings:
                   fields:
                     - text: { label: "Private key", field: privkey, secret: true, placeholder: "128 hex characters" }
       - section: "Announces"
-      - slider: { label: "Re-announce (s)", key: "s.lxmf.announce_interval_s", min: 0, max: 21600 }
+      - integer: { label: "Re-announce", unit: "s", key: "s.lxmf.announce_interval_s", min: 0, max: 21600 }
       - caption: "0 = announce on demand only."
-      - slider: { label: "Catalogue cap", key: "s.lxmf.max_announces", min: 256, max: 8192 }
+      - integer: { label: "Catalogue cap", key: "s.lxmf.max_announces", min: 256, max: 8192 }
       - section: "Stamps"
-      - slider: { label: "Advertised cost", key: "s.lxmf.stamp_cost", min: 0, max: 18 }
+      - integer: { label: "Advertised cost", key: "s.lxmf.stamp_cost", min: 0, max: 18 }
       - caption: "Proof-of-work cost (bits) we ask senders to pay. 0 advertises none; higher costs take senders longer to compute."
       - switch: { label: "Generate outbound", key: "s.lxmf.generate_stamps" }
       - caption: "Pay a peer's advertised cost when sending. No cost advertised, no work and no delay."
@@ -207,7 +207,7 @@ settings:
           # the words the row shows.
           status: "lxmf.pnstat.{id}"
           empty: "No propagation nodes configured."
-          orderable: true
+          reorder: true
           cmd: lxmf.pnode
           add:
             - label: "Add node"
@@ -221,5 +221,5 @@ settings:
           edit:
             - text:   { label: "Name", field: name }
             - switch: { label: "Check for held messages", field: check }
-      - slider: { label: "Check interval (s)", key: "s.lxmf.pn.check_interval_s", min: 0, max: 21600 }
+      - integer: { label: "Check interval", unit: "s", key: "s.lxmf.pn.check_interval_s", min: 0, max: 21600 }
       - caption: "How often the checked nodes are polled. 0 = only when asked. Check now from the envelope button in LXMessenger; that also restarts this interval."
