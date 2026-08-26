@@ -19,7 +19,9 @@
  * LXMF field to the sender), not by the mailbox.
  *
  * The envelope `blob` is always an mR Identity token (rnsdEncryptFor)
- * for the final recipient — opaque to the mailbox. Its SHA-256 is the
+ * for the final recipient — to their announced ratchet where they have
+ * one, so a later leak of their identity key does not open mail the
+ * mailbox held — and opaque to the mailbox either way. Its SHA-256 is the
  * transient id, the handle all bookkeeping uses; the mailbox
  * never sees inner LXMF message ids.
  */

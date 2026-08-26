@@ -491,6 +491,7 @@ export interface UseLxmf {
   activePeer: WritableComputedRef<string>
   identities: ComputedRef<Identity[]>
   usableIdentities: ComputedRef<Identity[]>
+  identitiesKnown: ComputedRef<boolean>
   activeIdentityUp: ComputedRef<boolean>
   conversations: ComputedRef<Conversation[]>
   activeConversation: ComputedRef<{ day: string; messages: Message[] }[]>
@@ -579,6 +580,14 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
    *  presenting it as one lets a send hang on an unprocessable sentinel. */
   const usableIdentities = computed<Identity[]>(() =>
     identities.value.filter(i => i.up && i.destHash))
+
+  /** Whether `identities` is an ANSWER yet. Until the first full storage dump
+   *  lands, `s.lxmf.id` is simply absent from the mirror and the list is empty
+   *  for want of data — indistinguishable, to a `.length === 0` test, from a
+   *  device that genuinely has no identity. Any surface that tells the user to
+   *  go and create one must gate on this, or it says so for a second on every
+   *  page load and invites them to make a second identity they do not want. */
+  const identitiesKnown = computed(() => device.synced)
 
   // For the shared cursor only: default activeIdentity to the lowest *usable*
   // slot; fall back to the lowest existing slot so history stays viewable.
@@ -1073,7 +1082,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   return {
     activeIdentity: _activeIdentity,
     activePeer,
-    identities, usableIdentities, activeIdentityUp,
+    identities, usableIdentities, identitiesKnown, activeIdentityUp,
     conversations, activeConversation, contacts, announces,
     peerDirectory, unreadTotal,
     displayName, reachability, contactOf, draftFor, setDraft, openPeer,

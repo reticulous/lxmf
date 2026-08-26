@@ -32,7 +32,14 @@
     <template #default>
       <div class="msg-root" :style="{ '--rfs': scale }">
         <div v-if="lxmf.usableIdentities.value.length === 0" class="noident">
-          <template v-if="lxmf.identities.value.length === 0">
+          <!-- An empty list is not an answer until the first storage dump has
+               landed: before that it is empty for want of data, and telling
+               the user to go and create an identity invites them to make a
+               second one they already have. -->
+          <template v-if="!lxmf.identitiesKnown.value">
+            Loading…
+          </template>
+          <template v-else-if="lxmf.identities.value.length === 0">
             No LXMF identity yet. Create one in
             <em>Settings → Reticulum Mesh → LXMF Messages</em> to send and receive messages.
           </template>

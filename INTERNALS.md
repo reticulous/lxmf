@@ -114,7 +114,6 @@ convention (§3).
 itsServerInit(); open LXMF_LINK_INBOX_PORT (100) + LXMF_LINK_RESOURCE_AUX_PORT (101)
 itsClientInit(LXMF_MAX_IDENTITIES + 1);            // +1 announce subscription
 storageSubscribeChanges("lxmf.cmd.",        onIdentityLevelCmd);
-storageSubscribeChanges("rnsd.iface_event_seq", onRnsdIfaceEvent);
 storageSubscribeChanges("lxmf.url_web",     onOpenContactUrl);
 storageSubscribeChanges("lxmf.url_lcd",     onOpenContactUrl);
 loadAllIdentities();                               // load/create slots + per-id cmd subs
@@ -126,16 +125,17 @@ for (;;) {
     publishStats(); resolveDirectSends(); convReap();
     retry deferred queued sends; reconnect dropped our-dests / announce sub;
     drainAllPendingVerify (replay buffered inbound on now-known senders);
-    periodic + debounced announce
+    the one-shot startup announce, when its arming tick has come round
   }
 }
 ```
 
 It waits on `rns.ready` (bounded ~120 s) before starting, and `waitForTime`
-before connecting, so the first announce is never 1970-stamped. The first
-announce is armed ~30 s out; an interface-up debounce
-(`rnsd.iface_event_seq`) re-arms a `now+10 s` window so a burst of ifaces
-yields one announce.
+before connecting, so the first announce is never 1970-stamped. That announce
+is armed ~30 s out from bring-up and is the only one this task schedules:
+setting the stored announce is all lxmf does, and airing it belongs to each
+interface (§9). An interface that registers later needs nothing from here —
+rnsd replays the stored announce onto it, pinned.
 
 Callbacks (mailbox recv, announce-sub recv, cmd handlers, resource aux) run
 inline from `itsPoll` dispatch on the lxmf task — there is no event-pending
@@ -165,7 +165,6 @@ is deliberately narrow:
 | `lxmf.cmd.` | once in `lxmfTaskMain` | `identity_new` / `identity_import` / `identity_destroy` | `onIdentityLevelCmd` |
 | `lxmf.id.<n>.cmd.` | per slot, by `createIdentityForSlot`/`loadIdentityForSlot`; removed by `destroyIdentity` | `send` / `cancel` / `delete` / `announce` | static `onIdCmd<n>` → `handleIdCmd(n,…)` |
 | `lxmf.url_web`, `lxmf.url_lcd` | once | a tapped `lxmf@<hash>` link | `onOpenContactUrl` (path request only) |
-| `rnsd.iface_event_seq` | once | an interface coming up | `onRnsdIfaceEvent` (announce debounce) |
 | `s.lxmf.debug.only_local` | once | live debug-verbosity toggle | inline lambda |
 
 The slot index is captured at compile time in four static stubs
@@ -214,8 +213,8 @@ as raw 32 B on the wire (`lxmPackPayload` converts both ways).
 
 | Mode | Code | Single-packet content | Mechanics |
 |---|---|---|---|
-| OPPORTUNISTIC | 0x01 | payload ≤ 383 B (ENCRYPTED_MDU); ~290 B title+content after src16+sig64+msgpack | one RNS encrypted packet, ECDH AES-128 per packet |
-| DIRECT | 0x02 | ~319 B/pkt, larger via Resource | RNS Link, ratcheted |
+| OPPORTUNISTIC | 0x01 | payload ≤ 383 B (ENCRYPTED_MDU); ~290 B title+content after src16+sig64+msgpack | one RNS encrypted packet, ECDH AES-128 per packet, to the recipient's announced ratchet when they advertise one |
+| DIRECT | 0x02 | ~319 B/pkt, larger via Resource | RNS Link — its own ephemeral exchange per link, so ratchets do not apply |
 | PROPAGATED | 0x03 | — | not implemented here |
 | PAPER | 0x05 | — | not implemented here |
 
@@ -229,11 +228,17 @@ RENDERER, 0xFB-0xFD CUSTOM_*, 0xFE NON_SPECIFIC, 0xFF DEBUG`.
 
 ### Identity & destinations
 
-LXMF uses an `RNS.Destination.SINGLE` (Ed25519 + X25519, ratchets enforced)
-on aspect `lxmf.delivery`. The identity is the standard RNS Identity — there
+LXMF uses an `RNS.Destination.SINGLE` (Ed25519 + X25519) on aspect
+`lxmf.delivery`. The identity is the standard RNS Identity — there
 is no LXMF-specific keypair. lxmf only computes `Destination::hash(id,
 "lxmf", "delivery")` as a static pre-computation for storage publishing;
 rnsd hosts the actual IN `Destination`.
+
+Ratchets ride on that hosting and cost lxmf nothing: rnsd rotates the
+destination's ratchets, advertises the current one, and tries all retained ones
+when decrypting (rns/INTERNALS §4.2). Senders that heard no ratchet still reach
+us — nothing here enforces them, unlike upstream's optional
+`enforce_ratchets`.
 
 ## 5. ITS framing — `RNSD_PORT_DEST` (the mailbox)
 
@@ -501,8 +506,11 @@ explicit-only — no automatic fallback):
 
 1. Resolve the wire via `resolveOutboundWire` (shared with `processReady`:
    RAM-outbox reuse, else pack + delivery-stamp + one-time record persist).
-2. `lxmf_data = wire[0:16] || rnsdEncryptFor(peer_pubkey, wire[16:])`;
-   `transient_id = SHA-256(lxmf_data)`.
+2. `lxmf_data = wire[0:16] || rnsdEncryptFor(peer_pubkey, peer_dest, wire[16:])`;
+   `transient_id = SHA-256(lxmf_data)`. Passing the dest hash is what makes
+   this encrypt to the recipient's announced ratchet: the blob sits on the
+   node until they collect it, so a later leak of their identity key must not
+   open it.
 3. Pay the node's announced propagation stamp: cost is element `[5][0]`
    of the node's 7-element announce app_data (`pnParseNodeAppData`; the
    whole shape is `[legacy_false, timebase, active, per_transfer_kb,
@@ -564,7 +572,8 @@ resource logic in `onResourceAux`):
   into the next list round until a round yields nothing new.
 
 Each blob (`pnIngestBlob`): leading dest16 must match the session
-identity, `rnsdDecryptSelf` the rest (the node strips the stamp before
+identity, `rnsdDecryptSelf` the rest with that identity's own dest hash so the
+destination's retained ratchets are tried (the node strips the stamp before
 serving), rebuild `dest16 || plaintext` = the normal LXMF wire, and feed
 `onInboundLxm` — verify/dedup/store as any inbound. `s_pnSeenTids` (RAM,
 capped 512) filters re-served ids out of later wants; the message-id
@@ -576,16 +585,23 @@ node to `lxmf.pn.sync`.
 
 `sendAnnounce(id)` builds msgpack `[display_name_or_nil, stamp_cost]` and
 pushes `ANNOUNCE | app_data`; rnsd calls `listener_dest.announce(app_data)`.
-Two triggers, both per used identity with a live mailbox: an interface-up
-debounce (`rnsd.iface_event_seq` arms `now+10 s`, re-arming on each iface-up;
-armed once ~30 s after startup) and a periodic re-announce (1 Hz check vs
-`s.lxmf.announce_interval_s`, default 1800; `0` disables).
+That call SETS the identity's stored announce and nothing more — rnsd holds the
+bytes and every interface's own beat airs them (rns/INTERNALS §4.1). lxmf has no
+announce timer and no interval setting: it calls this once ~30 s after
+bring-up, on `lxmf.id.<n>.cmd.announce`, and whenever what it advertises
+changes — creating or importing an identity included, which is the one case
+where nothing else would ever say the destination exists.
 
 Inbound: lxmf subscribes rnsd's `RNSD_PORT_ANNOUNCES` fan-out filtered to
 `lxmf.delivery`. rnsd forwards matches as
-`hops(1)|dest(16)|identity(16)|app_data(N)`; `onAnnounceFromRnsd` parses
-(`parseLxmfAnnounce` handles the shapes seen in the wild), skips own dests,
-and writes **one record per destination** into the announce catalogue store:
+`hops(1)|dest(16)|identity(16)|pubkey(64)|ratchet(32)|app_data(N)`;
+`onAnnounceFromRnsd` parses (`parseLxmfAnnounce` handles the app_data shapes
+seen in the wild), skips own dests, and writes **one record per destination**
+into the announce catalogue store. The ratchet is a frame field of its own —
+all-zero when the peer advertises none — never something to pick out of
+app_data; rnsd owns that slicing (rns/INTERNALS §4.2), and lxmf only mirrors
+the value for the browser. What it is *for* — encrypting to it — needs no value
+here: `rnsdEncryptFor` takes the peer's dest hash and looks it up itself.
 
 ```
 lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (schema 3)
@@ -593,7 +609,10 @@ lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (schema 3)
 
 `last`/`hops` are fixed-width and mutate in place on a re-announce (no record
 rebuild); `cost` is a `SDB_FIXSTR` so its `-1` "unknown" sentinel round-trips;
-`ratchet`/`name` are text. The store is RAM-only (`persist=null` — gone on
+`ratchet`/`name` are text. `ratchet` is written on every announce, empty
+included — a peer that stops advertising one must stop showing one — while
+`name`/`cost`/`rlpg` are only written when present, so a nil-name announce
+never blanks a name we already hold. The store is RAM-only (`persist=null` — gone on
 reboot), browser-mirrored (the web On-the-Mesh view + ContactCard read it), and
 **self-capping**: `STORAGE_DB_DROP` with `s.lxmf.max_announces` (default 2048)
 drops the oldest-inserted record when a brand-new dest would exceed the cap — no
@@ -664,9 +683,10 @@ bytes. rnsd never needs to know lxmf has multiple identities.
 In-RAM per-slot state (`s_ids[LXMF_MAX_IDENTITIES]`): the `identity_key`
 string (a storage path, *not* an `RNS::Identity`), the precomputed
 `dest_hash[16]`, the ITS handle, the 8-deep outbox (`send_id → message key`),
-counters, and `last_announce_tick`. `bootstrapFirstBoot` loads every slot
-from secrets; if none load it auto-creates slot 0 ("main"). There is **no**
-auto-announce at boot.
+and counters. `bootstrapFirstBoot` loads every slot from secrets; if none load
+it auto-creates slot 0 ("main"). There is **no** auto-announce at boot: the
+task arms one ~30 s after bring-up (§2), and a slot created or imported later
+announces as it comes up, because nothing else would ever say it exists.
 
 ## 11. Storage schema
 
@@ -678,7 +698,6 @@ the conversation subtree).
 ### Global (`s.lxmf.*`)
 
 ```
-announce_interval_s  1800   periodic re-announce s (0 = on demand only)
 max_announces        2048   announce-catalogue cap (0 = no eviction)
 stamp_cost           8      advertised PoW cost (0–18; 0 = none)
 generate_stamps      1      pay a peer's advertised cost when sending
@@ -888,11 +907,11 @@ both on the lcd task.
 - **No `thread_local`.** Plain `static` is correct — an ITS recv callback for
   a port dispatches only on the registering task — and libgcc's lazy TLS init
   has corrupted the FreeRTOS scheduler at boot.
-- **Announce-due comparisons must be signed.** `sendAnnounce` rewrites
-  `last_announce_tick` after the rnsd call, which can land just past the
-  loop's captured `now`; an unsigned `TickType_t` subtraction underflows and
-  re-fires immediately. The code casts to `int32_t` before the `>= 0` test —
-  keep it.
+- **Tick-deadline comparisons must be signed.** A deadline stamped inside the
+  work of a 1 Hz pass can land just past the `now` that pass captured; an
+  unsigned `TickType_t` subtraction underflows and the deadline fires
+  immediately, every pass. Cast to `int32_t` before the `>= 0` test — the
+  startup announce's `s_announce_due_tick` does.
 - **Reset the build-tracking statics on every fresh open.** The list is drawn
   into a brand-new (empty) program layer each time the app is opened, but plain
   file statics survive the layer teardown. `g_listBuiltId` ("the list is already

@@ -263,10 +263,6 @@ struct lxmf_id_t {
     uint32_t      pending;
     uint32_t      failed;
 
-    /* Monotonic tick of last successful announce. 0 = never announced
-     * this session. Used to schedule periodic re-announces. */
-    TickType_t    last_announce_tick;
-
     /* Inbound messages waiting on their sender's identity. Touched only
      * on the lxmf task (onInboundLxm / onAnnounceFromRnsd), no locking. */
     std::vector<pending_verify_t> pending_verify;
@@ -1300,7 +1296,9 @@ static bool mpReadStrOrBin(mpScan& s, std::string& out)
 struct LxmfAnnounceInfo {
     std::string name;          /* utf-8 display name, possibly empty */
     int         stamp_cost;    /* -1 = unknown */
-    std::string ratchet_hex;   /* empty if not present */
+    std::string ratchet_hex;   /* announce field, filled by the caller from the
+                                * fan-out frame; empty if the peer advertises
+                                * none */
     std::string rlpg_hex;      /* element [2]: 32-hex rlpg.mailbox dest hash of
                                 * the announcer's RLPG mailbox node; empty if none */
     int         caps;          /* element [2]: capability bitfield, -1 = unknown.
@@ -1308,17 +1306,17 @@ struct LxmfAnnounceInfo {
                                 * bit1 = accepts rx-report proofs */
 };
 
-/* LXMF announce app_data shapes seen in the wild (LXMF reference 0.9.8):
+/* LXMF announce app_data shapes seen in the wild (LXMF reference 0.9.8).
+ * A ratchet is never among them: it is an RNS announce field, delivered as
+ * its own field on the fan-out frame.
  *
- *   [a] 32B ratchet || msgpack([display_name_bytes_or_nil, stamp_cost])
- *   [b] msgpack([display_name_bytes_or_nil, stamp_cost])   (older clients)
- *   [c] msgpack([display_name_bytes_or_nil])               (no cost yet)
- *   [d] 32B ratchet || raw_utf8_name                       (very old)
- *   [e] raw_utf8_name                                      (very old)
+ *   [a] msgpack([display_name_bytes_or_nil, stamp_cost])
+ *   [b] msgpack([display_name_bytes_or_nil])               (no cost yet)
+ *   [c] raw_utf8_name                                      (very old)
  *
- * Reticulous peers extend [b] positionally (array-length-as-version):
+ * Reticulous peers extend [a] positionally (array-length-as-version):
  *
- *   [f] msgpack([name_bin_or_nil, stamp_cost, caps_uint,
+ *   [d] msgpack([name_bin_or_nil, stamp_cost, caps_uint,
  *                rlpg_mailbox_bin16_or_nil])
  *
  * Element [2] is the caps bitfield (bit0 = accepts double-encrypted
@@ -1378,17 +1376,10 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
         return true;
     };
 
-    /* [a] ratchet + msgpack */
-    if (n >= 32 + 2 && tryArrayAt(32)) {
-        info.ratchet_hex = bytesToHex(p, 32);
-        return info;
-    }
-    /* [b]/[c] msgpack at start */
+    /* [a]/[b]/[d] msgpack array */
     if (tryArrayAt(0)) return info;
 
-    /* [d]/[e] raw UTF-8 name. Heuristic: if the first 32 bytes look
-     * like random ratchet material (any control char in 0x00..0x1F
-     * other than tab/cr/lf), assume ratchet prefix is present. */
+    /* [c] raw UTF-8 name */
     auto plausibleText = [&](size_t off, size_t len) {
         if (off >= n || len == 0) return false;
         for (size_t k = 0; k < len && off + k < n; ++k) {
@@ -1398,11 +1389,6 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
         }
         return true;
     };
-    if (n > 32 && plausibleText(32, n - 32)) {
-        info.name.assign((const char*)(p + 32), n - 32);
-        info.ratchet_hex = bytesToHex(p, 32);
-        return info;
-    }
     if (plausibleText(0, n)) {
         info.name.assign((const char*)p, n);
     }
@@ -1759,11 +1745,15 @@ static bool isOwnDest(const uint8_t dh[LXMF_DEST_HASH_LEN])
 static int s_announce_sub_handle = -1;
 
 /* RNSD_PORT_ANNOUNCES frame:
- *   hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | app_data(N)
+ *   hops(1) | dest_hash(16) | identity_hash(16) | pubkey(64) | ratchet(32) |
+ *   app_data(N)
  * The public key rides along so a subscriber can act on an announce without
- * calling back into rnsd for the identity. */
-constexpr size_t LXMF_ANNOUNCE_PUBKEY_OFF = 1 + 16 + 16;
-constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16 + 64;
+ * calling back into rnsd for the identity. The ratchet is an announce field of
+ * its own — all-zero when the peer advertises none — and is NOT part of
+ * app_data, whatever the byte order on the wire may suggest. */
+constexpr size_t LXMF_ANNOUNCE_PUBKEY_OFF  = 1 + 16 + 16;
+constexpr size_t LXMF_ANNOUNCE_RATCHET_OFF = 1 + 16 + 16 + 64;
+constexpr size_t LXMF_ANNOUNCE_HDR = 1 + 16 + 16 + 64 + 32;
 
 /* ── lxmf.announces.<hex> record fields (store schema 3) ──
  *
@@ -1862,6 +1852,7 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     const uint8_t* dh       = buf + 1;
     /* buf + 17 is the announce identity hash — unused but
      * available if a consumer ever wants it. */
+    const uint8_t* ratchet  = buf + LXMF_ANNOUNCE_RATCHET_OFF;
     const uint8_t* app_data = buf + LXMF_ANNOUNCE_HDR;
     size_t         app_len  = n - LXMF_ANNOUNCE_HDR;
 
@@ -1870,6 +1861,9 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     if (isOwnDest(dh)) return;
 
     LxmfAnnounceInfo info = parseLxmfAnnounce(app_data, app_len);
+    bool has_ratchet = false;
+    for (size_t k = 0; k < 32; ++k) if (ratchet[k]) { has_ratchet = true; break; }
+    if (has_ratchet) info.ratchet_hex = bytesToHex(ratchet, 32);
     std::string dh_hex = bytesToHex(dh, LXMF_DEST_HASH_LEN);
 
     /* When the array parse yields no name/cost the raw bytes are the only
@@ -1894,14 +1888,17 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     storageSet((base + ".hops").c_str(), hops);
     storageSet((base + ".cost").c_str(), cbuf);
     storageSet((base + ".caps").c_str(), capsbuf);
-    if (!info.ratchet_hex.empty()) storageSet((base + ".ratchet").c_str(), info.ratchet_hex.c_str());
+    /* Written even when empty, unlike the fields below: a peer that stops
+     * advertising a ratchet must stop showing one. */
+    storageSet((base + ".ratchet").c_str(), info.ratchet_hex.c_str());
     if (!info.rlpg_hex.empty())    storageSet((base + ".rlpg").c_str(),    info.rlpg_hex.c_str());
     if (!info.name.empty())        storageSet((base + ".name").c_str(),    info.name.c_str());
     storageEnd();
 
-    DBG_REMOTE("announces: %s name=\"%s\" cost=%d hops=%d",
+    DBG_REMOTE("announces: %s name=\"%s\" cost=%d hops=%d ratchet=%s",
         dh_hex.c_str(), sanitizeForLog(info.name).c_str(),
-        info.stamp_cost, hops);
+        info.stamp_cost, hops,
+        info.ratchet_hex.empty() ? "-" : info.ratchet_hex.substr(0, 16).c_str());
 
     /* This sender's pubkey is now cached. Replay anything we buffered
      * waiting on it (event-driven — the path request we issued on the
@@ -2219,13 +2216,10 @@ static bool sendFrame(lxmf_id_t& id, const uint8_t* frame, size_t n)
  * msgpack([display_name, stamp_cost, supported_functionality]). The ratchet
  * is a separate field in the RNS announce packet (public_key · name_hash ·
  * random_hash · [ratchet] · signature · app_data), its presence signalled by
- * the packet context_flag (FLAG_SET) and covered by the announce signature,
- * handled at the RNS/Identity layer (LXMF just calls enable_ratchets). We do
- * not advertise a ratchet: RNS-layer ratchets are not implemented here, and
- * advertising one without also implementing ratchet-based decryption would
- * make peers encrypt to a key we cannot read. Without one, senders fall back
- * to our static identity key (no forward secrecy, but delivery is unaffected).
- * The earlier "prefix a 32-byte ratchet to app_data" note was wrong. */
+ * the packet context_flag (FLAG_SET) and covered by the announce signature.
+ * It is entirely rnsd's business: rnsd holds the destination, rotates its
+ * ratchets and puts the current one on the air (s.rnsd.ratchets), so nothing
+ * here has to ask for it or know it happened. */
 static std::vector<uint8_t> buildAnnounceAppData(int id_n)
 {
     std::string name = storageGetStr(idPath(id_n, "display_name").c_str(), "");
@@ -2299,12 +2293,10 @@ static void sendAnnounce(lxmf_id_t& id)
     }
     storageSet(idEphPath(id.index, "last_announce_s").c_str(),
                (int)(nowUnixMs() / 1000));
-    id.last_announce_tick = xTaskGetTickCount();
-    if (id.last_announce_tick == 0) id.last_announce_tick = 1;  /* 0 means "never" */
     /* Present tense: we've handed the announce to rnsd, which decides whether it
      * actually reaches the air (it logs "announcing …" or "announce held …") —
      * so don't claim "sent" here. Pretty-print the app_data we built: name + cost
-     * (the [f] shape from parseLxmfAnnounce), keeping the line self-contained. */
+     * (the [d] shape from parseLxmfAnnounce), keeping the line self-contained. */
     std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
     int cost = storageGetInt("s.lxmf.stamp_cost", 8);
     info("id %d: announcing name=\"%s\" cost=%d (%zu B app_data)",
@@ -3798,7 +3790,8 @@ static bool tryDoubleEncrypted(const uint8_t* payload, size_t n,
     for (auto& id : s_ids) {
         if (!id.used) continue;
         size_t pt_len = n;
-        if (!rnsdDecryptSelf(id.identity_key.c_str(), payload, n, pt, &pt_len))
+        if (!rnsdDecryptSelf(id.identity_key.c_str(), id.dest_hash,
+                             payload, n, pt, &pt_len))
             continue;
         if (pt_len < LXMF_OVERHEAD ||
             std::memcmp(pt, id.dest_hash, LXMF_DEST_HASH_LEN) != 0)
@@ -3866,7 +3859,9 @@ static void onLinkInboxDisconnect(int ref)
  *    mailbox.
  *
  * Envelope blobs are mR Identity tokens: rnsdEncryptFor(peer_pubkey,
- * full_lxmf_wire); transient_id = SHA-256 of the ciphertext, recorded in
+ * peer_dest, full_lxmf_wire) — to the recipient's announced ratchet when
+ * they advertise one, since the blob rests on a third party's node until
+ * they collect it; transient_id = SHA-256 of the ciphertext, recorded in
  * the message's rlpg_tid field so receipts can be matched back. All state
  * is plain statics touched only on the lxmf task. */
 
@@ -4151,7 +4146,10 @@ static void rlpgDepSendEnvelope(rlpg_dep_t& s, lxmf_id_t& id,
     const std::vector<uint8_t>& wire = wit->second.wire;
     std::vector<uint8_t> ct(wire.size() + RNSD_ENCRYPT_OVERHEAD);
     size_t ct_len = ct.size();
-    if (!rnsdEncryptFor(pk, wire.data(), wire.size(), ct.data(), &ct_len)) {
+    /* peer_dh, not just the pubkey: an envelope encrypted to the recipient's
+     * announced ratchet stays unreadable if their identity key later leaks —
+     * and this one sits on someone else's node until they collect it. */
+    if (!rnsdEncryptFor(pk, peer_dh, wire.data(), wire.size(), ct.data(), &ct_len)) {
         rlpgDepFail(s);
         return;
     }
@@ -4508,7 +4506,7 @@ static void rlpgRelayFlush(uint32_t now_s)
             const std::vector<uint8_t>& wire = wit->second.wire;
             e.ct.resize(wire.size() + RNSD_ENCRYPT_OVERHEAD);
             size_t ct_len = e.ct.size();
-            if (!rnsdEncryptFor(pk, wire.data(), wire.size(), e.ct.data(), &ct_len)) {
+            if (!rnsdEncryptFor(pk, dh, wire.data(), wire.size(), e.ct.data(), &ct_len)) {
                 dbg("id %d: relay %s dropped: encrypt failed", e.id_index, e.mid.c_str());
                 msgFail(e.id_index, e.peer, e.mid, e.fail_status);
                 it = s_rlpgRelayQ.erase(it);
@@ -4643,7 +4641,7 @@ static void rlpgOwnHandleFrame(int n, const RlpgFrame& fr)
         if (!fr.blob.empty()) {
             std::vector<uint8_t> pt(fr.blob.size());
             size_t pt_len = pt.size();
-            if (rnsdDecryptSelf(id.identity_key.c_str(),
+            if (rnsdDecryptSelf(id.identity_key.c_str(), id.dest_hash,
                                 fr.blob.data(), fr.blob.size(),
                                 pt.data(), &pt_len) &&
                 pt_len >= LXMF_OVERHEAD) {
@@ -5218,8 +5216,17 @@ static void onPnodeOrder(const char* key, const char* val)
  * it, and report on their own <cmd>.error — so "128 hex characters" is stated
  * once, by the code that needs it, instead of as a regex in each UI. */
 
+/* Both identity forms answer on their own `<cmd>.error` / `<cmd>.done`, and a
+ * storage subscription is PREFIX-matched — so those two writes land right back
+ * in the handler that made them. Without the exact-key test the first rejection
+ * re-enters here with the error sentence as its payload, fails to parse a name
+ * out of it, writes the same sentence again, and the device spends the rest of
+ * its uptime doing that: an unbroken run of "notify drop: lxmf.identity.new.error"
+ * in the log, and a form that never closes. The ack loops the same way, so a
+ * SUCCESSFUL submission jams too. Same guard as ntp.tz.set (spangap-net). */
 static void onIdentityNew(const char* key, const char* val)
 {
+    if (!key || std::strcmp(key, "lxmf.identity.new") != 0) return;
     if (!val || !*val) return;
     std::string payload = val;
     storageUnset(key);
@@ -5236,6 +5243,7 @@ static void onIdentityNew(const char* key, const char* val)
 
 static void onIdentityImport(const char* key, const char* val)
 {
+    if (!key || std::strcmp(key, "lxmf.identity.import") != 0) return;   /* see onIdentityNew */
     if (!val || !*val) return;
     std::string payload = val;
     storageUnset(key);
@@ -5453,7 +5461,7 @@ static void pnUploadStart(lxmf_id_t& id, const std::string& peer_hex,
                                    RNSD_ENCRYPT_OVERHEAD);
     std::memcpy(lxmf_data.data(), wire.data(), LXMF_DEST_HASH_LEN);
     size_t ct_len = lxmf_data.size() - LXMF_DEST_HASH_LEN;
-    if (!rnsdEncryptFor(pk, wire.data() + LXMF_DEST_HASH_LEN,
+    if (!rnsdEncryptFor(pk, dh, wire.data() + LXMF_DEST_HASH_LEN,
                         wire.size() - LXMF_DEST_HASH_LEN,
                         lxmf_data.data() + LXMF_DEST_HASH_LEN, &ct_len)) {
         msgFail(id.index, peer_hex, mid, LXMF_ST_PN_FAIL);
@@ -5672,8 +5680,8 @@ static bool pnIngestBlob(lxmf_id_t& id, const uint8_t* p, size_t n)
     std::vector<uint8_t> wire(n);         /* plaintext is smaller than the ct */
     std::memcpy(wire.data(), p, LXMF_DEST_HASH_LEN);
     size_t pt_len = wire.size() - LXMF_DEST_HASH_LEN;
-    if (!rnsdDecryptSelf(id.identity_key.c_str(), p + LXMF_DEST_HASH_LEN,
-                         n - LXMF_DEST_HASH_LEN,
+    if (!rnsdDecryptSelf(id.identity_key.c_str(), id.dest_hash,
+                         p + LXMF_DEST_HASH_LEN, n - LXMF_DEST_HASH_LEN,
                          wire.data() + LXMF_DEST_HASH_LEN, &pt_len)) {
         verb("pn sync: blob decrypt failed (%zu B)", n);
         return false;
@@ -6445,6 +6453,12 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                 err("identity_new: createIdentityForSlot failed");
             } else {
                 connectOurDest(s_ids[n]);
+                /* An identity nobody has ever announced does not exist as far
+                 * as the mesh is concerned, and the one-shot startup announce
+                 * fired long before this slot did. Set the stored announce
+                 * here; rnsd coalesces it with anything else set in the same
+                 * minute and airs it on every interface. */
+                sendAnnounce(s_ids[n]);
             }
         }
         else if (std::strcmp(tail, "identity_import") == 0) {
@@ -6468,6 +6482,7 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                         storageDefault(idPath(n, "default_method").c_str(), "auto");
                         storageEnd();
                         connectOurDest(s_ids[n]);
+                        sendAnnounce(s_ids[n]);   /* as for identity_new */
                     }
                 }
             }
@@ -7857,6 +7872,24 @@ static void lxmfTaskMain(void*)
      * loadIdentityForSlot via subscribePerIdCmds. */
     storageSubscribeChanges("lxmf.cmd.", onIdentityLevelCmd);
 
+    /* Catch up on a sentinel written before this subscription existed. Storage
+     * delivers CHANGES, not state, so a write that lands before the subscriber
+     * is registered is heard by nobody — and the LCD onboarding wizard writes
+     * lxmf.cmd.identity_new from the boot screen, while this task is still
+     * waiting for the RNS orchestrator to start it. That is a device the
+     * operator named during setup and which then has no identity at all, with
+     * nothing on any surface to say why.
+     *
+     * Only the two creation commands: every other lxmf.cmd.* addresses an
+     * identity that must already exist, so an unconsumed one is stale rather
+     * than pending. The handler unsets the key, so this runs at most once. */
+    for (const char* pend : { "lxmf.cmd.identity_new", "lxmf.cmd.identity_import" }) {
+        std::string v = storageGetStr(pend, "");
+        if (v.empty()) continue;
+        info("%s was written before we were listening — running it now", pend);
+        onIdentityLevelCmd(pend, v.c_str());
+    }
+
     /* The settings surfaces: the propagation-node collection and the two
      * identity forms. Both validate here and answer on their own .error key,
      * which is why no UI carries a hash or key-length rule of its own. */
@@ -7890,8 +7923,8 @@ static void lxmfTaskMain(void*)
     /* Connect each loaded identity's delivery dest, and the two announce
      * fan-out subscriptions (lxmf.delivery + rlpg.mailbox). This is the step
      * that actually needs rnsd; the identities themselves (keys + dest hashes)
-     * were loaded before the loop. We do NOT announce here — that's driven by
-     * iface_event_seq + the periodic schedule, both checked from the 1 Hz tick. */
+     * were loaded before the loop. We do NOT announce here — the one-shot
+     * startup announce is armed below and fires from the 1 Hz tick. */
     lxmfBringUp();
 
     /* Arm the first announce 30 s out (measured from bring-up) so the rest of
@@ -7975,26 +8008,12 @@ static void lxmfTaskMain(void*)
                 }
             }
 
-            /* Periodic re-announce per identity. Interval read live
-             * from storage; 0 disables periodic. Identities whose
-             * our-dest is currently down are skipped (they announce
-             * again once the our-dest comes back). */
-            int announce_s = storageGetInt("s.lxmf.announce_interval_s", 1800);
-            if (announce_s > 0) {
-                int32_t threshold = (int32_t)pdMS_TO_TICKS(announce_s * 1000);
-                for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
-                    lxmf_id_t& id = s_ids[n];
-                    if (!id.used || id.handle < 0) continue;
-                    if (id.last_announce_tick == 0) continue;   /* never — wait for trigger */
-                    /* Signed compare: sendAnnounce() updates
-                     * last_announce_tick via a fresh xTaskGetTickCount()
-                     * after the rnsd our-dest call, which can land
-                     * *past* the outer `now`. Unsigned compare would
-                     * underflow and re-fire immediately. */
-                    if ((int32_t)(now - id.last_announce_tick) >= threshold)
-                        sendAnnounce(id);
-                }
-            }
+            /* No periodic re-announce here, and no interval setting for one.
+             * lxmf's job is to keep its stored announce CURRENT with rnsd —
+             * sendAnnounce() sets it, and rnsd holds the bytes; how often those
+             * bytes go on the air belongs to each interface, which is the only
+             * thing that knows what airtime costs on its own medium. See
+             * rnsd.h, "the announce beat". */
 
             s_lastPublishTick = now;
         }
@@ -8483,7 +8502,6 @@ void LxmfService::onInit()
         storageBegin();
         storageDefault("s.lxmf.enforce_stamps",         0);
         storageDefault("s.lxmf.auto_ticket",            1);
-        storageDefault("s.lxmf.announce_interval_s",    1800);  /* periodic re-announce; 0 disables */
         storageDefault("s.lxmf.max_announces",          2048);  /* announce-catalogue cap; 0 disables eviction */
         storageDefault("s.lxmf.max_msgmeta",            2048);  /* per-message routing-telemetry cap (RAM-only) */
         storageDefault("s.lxmf.debug.only_local",       0);     /* demote announce dbg lines to verb */

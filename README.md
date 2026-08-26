@@ -41,8 +41,9 @@ format and the per-byte deltas from upstream are in
   warm Link, else opportunistic) and `link-if-big` down to
   `opportunistic-or-fail`. The conversation header shows the live Link state
   and toggles it open/closed on tap.
-- **Announces.** Each enabled identity periodically announces its delivery
-  destination. Every inbound `lxmf.delivery` announce on the mesh is
+- **Announces.** Each enabled identity keeps its delivery destination's announce
+  current with rnsd; each interface decides how often it goes on the air. Every
+  inbound `lxmf.delivery` announce on the mesh is
   collected into a shared, cross-identity **announce catalogue** of everyone
   the device has heard of.
 - **Stamps.** Pays and (optionally) enforces LXMF proof-of-work stamps as
@@ -434,15 +435,19 @@ still in flight.
 
 ## Announces
 
-- Each enabled identity announces ~30 s after startup and after each
-  interface-up debounce, then every `s.lxmf.announce_interval_s` seconds
-  (default 1800; `0` disables periodic). Force one with
-  `lxmf.id.<n>.cmd.announce`.
+- Each enabled identity **sets** its announce with rnsd ~30 s after startup, and
+  again whenever what it advertises changes — including the moment it is created
+  or imported. There is no periodic re-announce here and no interval setting for
+  one: how often those bytes go on the air belongs to each interface, which is
+  the only thing that knows what airtime costs on its medium. Every interface
+  pane carries the interval and an **Announce now** button; see
+  [rns/README.md](../rns/README.md), "The announce beat". Force one identity's
+  announce with `lxmf.id.<n>.cmd.announce`.
 - Every `lxmf.delivery` announce the device hears is written to the
-  **announce catalogue**, one packed leaf per destination:
+  **announce catalogue**, one record per destination:
 
   ```
-  lxmf.announces.<dest_hex> = "<last_s>|<cost>|<hops>|<ratchet>|<name>"
+  lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
   ```
 
   It is ephemeral (RAM), bounded by `s.lxmf.max_announces` (default 2048,
@@ -487,7 +492,6 @@ cost, and it may reject it (`PN_REJECTED`).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `s.lxmf.announce_interval_s` | `1800` | Periodic re-announce seconds; `0` = on demand only. |
 | `s.lxmf.max_announces` | `2048` | Announce-catalogue entry cap; `0` = no eviction. |
 | `s.lxmf.stamp_cost` | `8` | Advertised PoW cost (bits, 0–18; `0` = none). |
 | `s.lxmf.generate_stamps` | `1` | Pay a peer's advertised stamp cost when sending. |
@@ -528,7 +532,8 @@ lxmf.id.<n>.up                   identity's mailbox connected
 lxmf.id.<n>.dest_hash            hex16 lxmf.delivery address
 lxmf.id.<n>.last_announce_s      unix seconds of last announce
 lxmf.id.<n>.stats.{sent,received,pending,failed}
-lxmf.announces.<dest_hex>        "<last_s>|<cost>|<hops>|<ratchet>|<name>"
+lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
+                                 heard-peer catalogue (RAM, browser-mirrored)
 lxmf.msgmeta.<message_id>.{last,hops,first_hop,dir,iface,rssi,snr,remote_rssi,remote_snr}
                                  per-message routing + radio-signal telemetry (RAM, browser-mirrored).
                                  rssi/snr = our rx — of the message (inbound) or of its delivery proof

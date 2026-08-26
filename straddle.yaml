@@ -183,8 +183,11 @@ settings:
                   fields:
                     - text: { label: "Private key", field: privkey, secret: true, placeholder: "128 hex characters" }
       - section: "Announces"
-      - integer: { label: "Re-announce", unit: "s", key: "s.lxmf.announce_interval_s", min: 0, max: 21600 }
-      - caption: "0 = announce on demand only."
+      # No re-announce interval here. lxmf keeps its announce current with rnsd
+      # — creating an identity, renaming it, changing what it advertises — and
+      # how often those bytes go on the air belongs to each interface, which is
+      # the only thing that knows what airtime costs on its medium. Each
+      # interface's pane carries the interval and an "Announce now" button.
       - integer: { label: "Catalogue cap", key: "s.lxmf.max_announces", min: 256, max: 8192 }
       - section: "Stamps"
       - integer: { label: "Advertised cost", key: "s.lxmf.stamp_cost", min: 0, max: 18 }

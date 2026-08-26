@@ -46,7 +46,7 @@ const props = withDefaults(defineProps<{
   variant: 'sent' | 'delivered' | 'read'
   size?: number
   bg?: string        // bubble background — rim / occlusion / read knockout colour
-}>(), { size: 15, bg: '#2c6bed' })
+}>(), { size: 19, bg: '#2c6bed' })
 
 /* Open circles carry a white check; filled (read) circles knock it out in bg. */
 const checkColor = computed(() => props.variant === 'read' ? props.bg : 'currentColor')

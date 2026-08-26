@@ -41,7 +41,7 @@
  *   s.lxmf.id.<n>.msgs.<peer>.<key>.{dir,content,ts,read,stage}   messages
  *   s.lxmf.id.<n>.contacts.<peer>.display_name                    names
  *   lxmf.id.<n>.up / .dest_hash                                   identity live
- *   lxmf.announces.<hex> = "<last>|<cost>|<hops>|<ratchet>|<name>" heard peers
+ *   lxmf.announces.<hex>.{last,hops,cost,ratchet,name}            heard peers
  *   lxmf.id.<n>.cmd.send = "<peer>/<key>"                         send sentinel
  * Everything runs on the lcd task; storage subscriptions are dispatched there,
  * so we touch LVGL straight from the change callback.
@@ -746,17 +746,59 @@ void updateThreadLink() {
     applyIcon(s_threadLink, up ? "link" : "link-off", linkIconPx(), col);
 }
 
-/* Re-apply the thread's icons (send + header link), requesting any not yet
- * rasterized. Returns true once every icon this screen needs is cached, so the
- * settle timer can stop. Both link variants are warmed so a toggle is instant. */
+/* Delivery ticks (tick-sent / tick-delivered / tick-read). Unlike the other
+ * icons these are NOT recoloured: the pair's backing discs are painted in the
+ * outbound bubble colour inside the SVG, so the seam between the two rings is
+ * real bubble colour and the raster ships both tones. The viewBox is square and
+ * the rings sit flush with its BOTTOM, which is what drops them onto the
+ * timestamp's digits — flex centres the widget on the meta row's line box, and
+ * that box sits high of the ink. Keeping the drop inside the asset keeps the
+ * widget exactly the raster's size: nothing spills past the meta row, so no
+ * partial redraw (a trackball pointer crossing the bubble, say) can repaint
+ * over a tick without the tick being in the redraw. Raise or lower them by
+ * moving the viewBox's y origin, not with a translate here. */
+int tickIconPx() { return lcdPx(16); }
+
+/* Point a tick widget at its raster, requesting it when the cache misses. The
+ * basename rides in the widget's user_data, so a re-apply needs no other state. */
+void applyTickIcon(lv_obj_t* img) {
+    const char* base = (const char*)lv_obj_get_user_data(img);
+    if (!base) return;
+    const lv_image_dsc_t* dsc = lcdIconDsc(base, tickIconPx());
+    if (dsc) lv_image_set_src(img, dsc);
+    else     lcdIconRequest(base, tickIconPx());
+}
+
+/* Re-source every bubble's tick, for the window between a thread opening and
+ * the rasters landing. The only lv_image in a meta row is a delivery tick. */
+void applyBubbleTicks() {
+    for (auto& r : g_bubbles) {
+        if (!r.meta) continue;
+        uint32_t n = lv_obj_get_child_count(r.meta);
+        for (uint32_t i = 0; i < n; i++) {
+            lv_obj_t* c = lv_obj_get_child(r.meta, (int32_t)i);
+            if (lv_obj_check_type(c, &lv_image_class)) applyTickIcon(c);
+        }
+    }
+}
+
+/* Re-apply the thread's icons (send + header link + bubble ticks), requesting
+ * any not yet rasterized. Returns true once every icon this screen needs is
+ * cached, so the settle timer can stop. Both link variants and both tick
+ * variants are warmed so a state change is instant. */
 bool applyThreadIcons() {
     if (s_sendIcon) applyIcon(s_sendIcon, "send", sendIconPx(), lv_color_white());
     updateThreadLink();
+    applyBubbleTicks();
     lcdIconRequest("link", linkIconPx());
     lcdIconRequest("link-off", linkIconPx());
+    lcdIconRequest("tick-sent", tickIconPx());
+    lcdIconRequest("tick-delivered", tickIconPx());
     return lcdIconReady("send", sendIconPx())
         && lcdIconReady("link", linkIconPx())
-        && lcdIconReady("link-off", linkIconPx());
+        && lcdIconReady("link-off", linkIconPx())
+        && lcdIconReady("tick-sent", tickIconPx())
+        && lcdIconReady("tick-delivered", tickIconPx());
 }
 
 /* Icons rasterize off-task, so they may not be ready the instant a thread opens.
@@ -1705,64 +1747,22 @@ lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color) {
     return box;
 }
 
-/* Signal-style delivery ticks, LVGL-drawn (the web SVG can't cross to the
- * device): one open circle (reached a mailbox) or two overlapping open
- * circles (delivered), each with its own check, in `color` (the bubble text)
- * with the front circle occluding the back one in `bg` (the bubble
- * background) — so the thin bubble-coloured seam reads between the two.
- * Content-positioned; each check's heap points free on delete. */
-static lv_obj_t* makeDeliveryTicks(lv_obj_t* parent, bool two,
-                                   lv_color_t color, lv_color_t bg)
+/* Signal-style delivery ticks: one open circle (reached a mailbox) or two
+ * overlapping open circles (delivered), each with its own check, with the front
+ * circle occluding the back one in the bubble background — so the thin
+ * bubble-coloured seam reads between the two. The shapes carry the same
+ * geometry as the web's DeliveryTicks component on a thinner stroke, and ship
+ * as /fixed/icons/tick-<variant>.svg so nanosvg anti-aliases them at exactly
+ * the size they are drawn. `base` is a string literal: it is kept in the
+ * widget's user_data for the re-source pass, so it must outlive the widget. */
+static lv_obj_t* makeDeliveryTicks(lv_obj_t* parent, const char* base)
 {
-    int d   = lcdPx(12);         /* circle diameter */
-    int bw  = lcdPx(2);          /* ring stroke */
-    int off = lcdPx(7);          /* 2nd-circle overlap offset */
-
-    lv_obj_t* box = lv_obj_create(parent);
-    lv_obj_remove_style_all(box);
-    lv_obj_set_size(box, two ? d + off : d, d);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
-
-    auto circleAt = [&](int x, bool backing) {
-        lv_obj_t* c = lv_obj_create(box);
-        lv_obj_remove_style_all(c);
-        lv_obj_set_size(c, d, d);
-        lv_obj_set_pos(c, x, 0);
-        lv_obj_set_style_radius(c, LV_RADIUS_CIRCLE, 0);
-        lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-        if (backing) {                       /* filled bubble-colour occluder */
-            lv_obj_set_style_bg_color(c, bg, 0);
-            lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
-        } else {                             /* open ring */
-            lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(c, bw, 0);
-            lv_obj_set_style_border_color(c, color, 0);
-        }
-    };
-    auto checkAt = [&](int x) {              /* V check centred in the circle at x */
-        int ccx = x + d / 2, ccy = d / 2;
-        auto* pts = new lv_point_precise_t[3];
-        pts[0] = { (lv_value_precise_t)(ccx - lcdPx(3)), (lv_value_precise_t)(ccy) };
-        pts[1] = { (lv_value_precise_t)(ccx - lcdPx(1)), (lv_value_precise_t)(ccy + lcdPx(2)) };
-        pts[2] = { (lv_value_precise_t)(ccx + lcdPx(3)), (lv_value_precise_t)(ccy - lcdPx(2)) };
-        lv_obj_t* ln = lv_line_create(box);
-        lv_line_set_points(ln, pts, 3);
-        lv_obj_set_style_line_width(ln, lcdPx(2), 0);
-        lv_obj_set_style_line_color(ln, color, 0);
-        lv_obj_set_style_line_rounded(ln, true, 0);
-        lv_obj_remove_flag(ln, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_event_cb(ln, [](lv_event_t* e) {
-            delete[] static_cast<lv_point_precise_t*>(lv_event_get_user_data(e));
-        }, LV_EVENT_DELETE, pts);
-    };
-
-    circleAt(0, false); checkAt(0);          /* back (or only) circle + check */
-    if (two) {
-        circleAt(off, true);                 /* occlude the overlap in bubble bg */
-        circleAt(off, false); checkAt(off);  /* front circle + check on top */
-    }
-    return box;
+    lv_obj_t* img = lv_image_create(parent);
+    lv_obj_set_size(img, tickIconPx(), tickIconPx());
+    lv_obj_set_user_data(img, (void*)base);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+    applyTickIcon(img);
+    return img;
 }
 
 /* System status-bar RLPG indicator: the selected identity's own
@@ -1795,11 +1795,11 @@ void rlpgStatusUpdate(const char*, const char*) {
 
 /* Make an object and its whole subtree transparent to touch, so a press falls
  * through to the clickable ancestor beneath it. A plain lv_obj is CLICKABLE by
- * default; the meta row's grow-spacer, delivery-tick circles and signal-bar
- * boxes would otherwise win the hit-test over the bubble and swallow the
- * long-press that opens the message detail — leaving only the (non-clickable)
- * text labels pressable. Links live in the bubble body, never in meta, so this
- * strips no real tap target. */
+ * default; the meta row's grow-spacer and signal-bar boxes would otherwise win
+ * the hit-test over the bubble and swallow the long-press that opens the
+ * message detail — leaving only the (non-clickable) text labels pressable.
+ * Links live in the bubble body, never in meta, so this strips no real tap
+ * target. */
 void passThroughInput(lv_obj_t* o) {
     lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
     uint32_t n = lv_obj_get_child_count(o);
@@ -1845,16 +1845,14 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
     lv_label_set_text(tl, tbuf);
 
     if (!m.in) {
-        /* Signal-style ticks in the bubble's own text colour, occluded by the
-         * outbound bubble bg: two open circles = delivered, one = reached a
+        /* Signal-style ticks: two open circles = delivered, one = reached a
          * mailbox (own/remote RLPG, awaiting pickup). A real failure/refusal
          * (FULL/ERR/gave-up) is ✕; cancelled a grey ✕; else in flight. */
-        lv_color_t tick = lv_color_hex(0xe8eef6), bubBg = lv_color_hex(0x2563a0);
         if (m.status == LXMF_ST_DELIVERED) {
-            makeDeliveryTicks(meta, /*two=*/true, tick, bubBg);
+            makeDeliveryTicks(meta, "tick-delivered");
         } else if (m.status == LXMF_ST_REMOTE_RLPG || m.status == LXMF_ST_OUR_RLPG ||
                    m.status == LXMF_ST_ON_PN) {
-            makeDeliveryTicks(meta, /*two=*/false, tick, bubBg);
+            makeDeliveryTicks(meta, "tick-sent");
         } else {
             const char* sym = "...";                 /* in flight */
             lv_color_t  col = lv_color_hex(0x8a93a0);
@@ -2007,6 +2005,11 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     lv_obj_set_flex_flow(meta, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(meta, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(meta, 4, 0);
+    /* Sit the line 3px right of the text column, into the bubble's own right
+     * padding — the delivery tick is the last item at ALL widths, and 6px of
+     * pad reads as too much air between it and the balloon's edge. Inside the
+     * bubble, so nothing clips. */
+    lv_obj_set_style_translate_x(meta, lcdPx(3), 0);
     lv_obj_set_style_margin_top(meta, lv_font_get_line_height(kFont) / 3, 0);   /* ~⅓-line gap above */
     lv_obj_remove_flag(meta, LV_OBJ_FLAG_SCROLLABLE);
     fillMeta(meta, m);
