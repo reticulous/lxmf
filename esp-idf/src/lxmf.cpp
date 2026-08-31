@@ -1971,6 +1971,25 @@ static bool connectAnnounceSub(void)
     return true;
 }
 
+/* Publish the two addresses of a slot: the `lxmf.delivery` DESTINATION peers
+ * write to, and the IDENTITY hash underneath it — what a Reticulum node sees
+ * when this account identifies on a link, and what an operator matches against
+ * an allow list or against the same key's address in another app. Both derive
+ * from the private key and nothing else, so they are publishable the moment
+ * the slot loads, long before its mailbox is up. */
+static void publishIdentityAddresses(int n, const std::string& ikey,
+                                     const uint8_t dest_hash[LXMF_DEST_HASH_LEN])
+{
+    uint8_t id_hash[RNSD_IDENT_HASH_LEN] = {};
+    storageBegin();
+    storageSet(idEphPath(n, "dest_hash").c_str(),
+               bytesToHex(dest_hash, LXMF_DEST_HASH_LEN).c_str());
+    if (rnsdIdentityHash(ikey.c_str(), id_hash))
+        storageSet(idEphPath(n, "identity_hash").c_str(),
+                   bytesToHex(id_hash, RNSD_IDENT_HASH_LEN).c_str());
+    storageEnd();
+}
+
 /* ─────────────── connect to our hosted rnsd destination ─────────────── */
 
 /* Forward decl — onIts callbacks live below. */
@@ -1999,11 +2018,8 @@ static bool connectOurDest(lxmf_id_t& id)
     if (!rnsdDestListenLinks(h, LXMF_LINK_INBOX_PORT))
         warn("id %d: rnsdDestListenLinks failed", id.index);
 
-    storageBegin();
     storageSet(idEphPath(id.index, "up").c_str(), 1);
-    storageSet(idEphPath(id.index, "dest_hash").c_str(),
-               bytesToHex(id.dest_hash, LXMF_DEST_HASH_LEN).c_str());
-    storageEnd();
+    publishIdentityAddresses(id.index, id.identity_key, id.dest_hash);
     return true;
 }
 
@@ -2056,6 +2072,7 @@ static bool createIdentityForSlot(int n, const std::string& display_name)
     storageEnd();
 
     subscribePerIdCmds(n);
+    publishIdentityAddresses(n, ikey, slot.dest_hash);
 
     uint8_t id_hash[RNSD_IDENT_HASH_LEN] = {};
     rnsdIdentityHash(ikey.c_str(), id_hash);
@@ -2092,12 +2109,11 @@ static bool loadIdentityForSlot(int n)
 
     subscribePerIdCmds(n);
 
-    /* Publish the delivery address now. It's pure local crypto — no rnsd, no
-     * clock, no network — so the UI can show this identity and its stored
-     * history the instant we boot, long before connectOurDest brings the
-     * mailbox up. `up` stays unset until then, which is what gates sending. */
-    storageSet(idEphPath(n, "dest_hash").c_str(),
-               bytesToHex(slot.dest_hash, LXMF_DEST_HASH_LEN).c_str());
+    /* Publish the addresses now. Pure local crypto — no rnsd, no clock, no
+     * network — so the UI can show this identity and its stored history the
+     * instant we boot, long before connectOurDest brings the mailbox up. `up`
+     * stays unset until then, which is what gates sending. */
+    publishIdentityAddresses(n, ikey, slot.dest_hash);
 
     uint8_t id_hash[RNSD_IDENT_HASH_LEN] = {};
     rnsdIdentityHash(ikey.c_str(), id_hash);
@@ -7042,14 +7058,23 @@ static void cliId(const char* rest)
     while (*rest == ' ') rest++;
     if (!*rest) {
         int sel = selectedId();
-        cliPrintf("%-3s %-12s %s\n", "id", "label", "destination");
+        /* The leading column is the selection mark, and the header carries it
+         * too (as a blank) or every column below sits two characters right of
+         * its own title. Both hashes: peers write to the DESTINATION, while
+         * the IDENTITY is what a node sees when this account identifies on a
+         * link — an operator matching an allow list needs that one. */
+        cliPrintf("%s %-3s %-12s %-32s %s\n", " ", "id", "label",
+                  "destination", "identity");
         for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
             lxmf_id_t& id = s_ids[n];
             if (!id.used) continue;
             std::string lbl = storageGetStr(idPath(n, "label").c_str(), "");
-            cliPrintf("%s %-3d %-12s %s\n",
+            uint8_t ih[RNSD_IDENT_HASH_LEN] = {};
+            bool have_ih = rnsdIdentityHash(id.identity_key.c_str(), ih);
+            cliPrintf("%s %-3d %-12s %-32s %s\n",
                       n == sel ? "*" : " ", n, lbl.c_str(),
-                      bytesToHex(id.dest_hash, LXMF_DEST_HASH_LEN).c_str());
+                      bytesToHex(id.dest_hash, LXMF_DEST_HASH_LEN).c_str(),
+                      have_ih ? bytesToHex(ih, RNSD_IDENT_HASH_LEN).c_str() : "?");
         }
         return;
     }
@@ -7058,8 +7083,11 @@ static void cliId(const char* rest)
     lxmf_id_t* id = idAt(n);
     if (!id || !id->used) { cliPrintf("no identity at slot %d\n", n); return; }
     storageSet("s.lxmf.cli.selected_id", n);
-    cliPrintf("selected id %d (%s)\n", n,
-              bytesToHex(id->dest_hash, LXMF_DEST_HASH_LEN).c_str());
+    uint8_t ih[RNSD_IDENT_HASH_LEN] = {};
+    bool have_ih = rnsdIdentityHash(id->identity_key.c_str(), ih);
+    cliPrintf("selected id %d (dest %s, identity %s)\n", n,
+              bytesToHex(id->dest_hash, LXMF_DEST_HASH_LEN).c_str(),
+              have_ih ? bytesToHex(ih, RNSD_IDENT_HASH_LEN).c_str() : "?");
 }
 
 /* ── `lxmf chats` / `lxmf msgs [<peer>|<status>]` ──

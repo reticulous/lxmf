@@ -40,7 +40,7 @@
  * Storage is the API (same keys the browser uses):
  *   s.lxmf.id.<n>.msgs.<peer>.<key>.{dir,content,ts,read,stage}   messages
  *   s.lxmf.id.<n>.contacts.<peer>.display_name                    names
- *   lxmf.id.<n>.up / .dest_hash                                   identity live
+ *   lxmf.id.<n>.up / .dest_hash / .identity_hash                  identity live
  *   lxmf.announces.<hex>.{last,hops,cost,ratchet,name}            heard peers
  *   lxmf.id.<n>.cmd.send = "<peer>/<key>"                         send sentinel
  * Everything runs on the lcd task; storage subscriptions are dispatched there,
@@ -3633,10 +3633,20 @@ void showIdPicker(const std::vector<int>& ids) {
         if (!first) first = b;
 
         mkLabel(b, idLabel(n), lv_color_white());
+        /* Both addresses this account has: the delivery destination peers
+         * write to, and the identity underneath it — what a node sees when
+         * this account identifies on a link, and what an operator matches
+         * against an allow list. */
         char dk[40];
         snprintf(dk, sizeof dk, "lxmf.id.%d.dest_hash", n);
         std::string dh = storageGetStr(dk, "");
-        mkLabel(b, dh.empty() ? "(announcing…)" : (dh.substr(0, 16) + "…"), lv_color_hex(0x8a93a0));
+        mkLabel(b, dh.empty() ? std::string("(announcing…)")
+                              : "addr " + dh.substr(0, 16) + "…",
+                lv_color_hex(0x8a93a0));
+        snprintf(dk, sizeof dk, "lxmf.id.%d.identity_hash", n);
+        std::string ih = storageGetStr(dk, "");
+        if (!ih.empty())
+            mkLabel(b, "id   " + ih.substr(0, 16) + "…", lv_color_hex(0x6b7480));
     }
     lv_obj_remove_flag(s_idpick, LV_OBJ_FLAG_HIDDEN);
     deferFocus(first);

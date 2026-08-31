@@ -778,7 +778,8 @@ op) is a real option but a wider blast radius — considered and deferred.
 ```
 secrets.lxmf.id.<n>.privkey   128-hex Ed25519+X25519 (wiped by identity_destroy)
 
-lxmf.up · lxmf.id.<n>.up · lxmf.id.<n>.dest_hash · lxmf.id.<n>.last_announce_s ·
+lxmf.up · lxmf.id.<n>.up · lxmf.id.<n>.dest_hash · lxmf.id.<n>.identity_hash ·
+lxmf.id.<n>.last_announce_s ·
 lxmf.id.<n>.stats.{sent,received,pending,failed}
 
 lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (RAM-only record store, §9 — not cfgRoot)

@@ -70,6 +70,7 @@ settings:
           rows:
             - value:  { label: "Name", key: "lxmf.id.0.label_text" }
             - value:  { label: "Address", key: "lxmf.id.0.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.0.identity_hash", copyable: true }
             - value:  { label: "State", key: "lxmf.id.0.state_text" }
             - value:  { label: "Messages", key: "lxmf.id.0.traffic" }
         when_key: "lxmf.id.0.used"
@@ -95,6 +96,7 @@ settings:
           rows:
             - value:  { label: "Name", key: "lxmf.id.1.label_text" }
             - value:  { label: "Address", key: "lxmf.id.1.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.1.identity_hash", copyable: true }
             - value:  { label: "State", key: "lxmf.id.1.state_text" }
             - value:  { label: "Messages", key: "lxmf.id.1.traffic" }
         when_key: "lxmf.id.1.used"
@@ -120,6 +122,7 @@ settings:
           rows:
             - value:  { label: "Name", key: "lxmf.id.2.label_text" }
             - value:  { label: "Address", key: "lxmf.id.2.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.2.identity_hash", copyable: true }
             - value:  { label: "State", key: "lxmf.id.2.state_text" }
             - value:  { label: "Messages", key: "lxmf.id.2.traffic" }
         when_key: "lxmf.id.2.used"
@@ -145,6 +148,7 @@ settings:
           rows:
             - value:  { label: "Name", key: "lxmf.id.3.label_text" }
             - value:  { label: "Address", key: "lxmf.id.3.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.3.identity_hash", copyable: true }
             - value:  { label: "State", key: "lxmf.id.3.state_text" }
             - value:  { label: "Messages", key: "lxmf.id.3.traffic" }
         when_key: "lxmf.id.3.used"

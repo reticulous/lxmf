@@ -166,6 +166,9 @@ s.lxmf.id.<n>.default_method  per-identity delivery method (see below); falls
                              back to the global s.lxmf.default_method
 lxmf.id.<n>.up               1 once the mailbox is connected
 lxmf.id.<n>.dest_hash        hex16 — this identity's lxmf.delivery address
+lxmf.id.<n>.identity_hash    hex16 — the identity under it: what a node sees
+                             when this account identifies on a link, and what
+                             its other aspects are derived from
 lxmf.id.<n>.link.<peer>      conversation-link state to <peer>, ephemeral:
                              absent (down) | establishing | active
 ```
@@ -530,6 +533,7 @@ msgs.<peer>.<key>.{dir,status,tries,peer,title,content,thread,method,ts,recv_ts,
 lxmf.up                          task alive
 lxmf.id.<n>.up                   identity's mailbox connected
 lxmf.id.<n>.dest_hash            hex16 lxmf.delivery address
+lxmf.id.<n>.identity_hash        hex16 identity hash behind that address
 lxmf.id.<n>.last_announce_s      unix seconds of last announce
 lxmf.id.<n>.stats.{sent,received,pending,failed}
 lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
@@ -567,7 +571,9 @@ default 0) unless noted.
 ```
 lxmf create <name>          generate a new identity (prints the slot, or failure)
 lxmf destroy <n>            wipe identity at slot <n> (secrets + storage)
-lxmf id                     list identities (* = selected)
+lxmf id                     list identities (* = selected): slot, label, the
+                            lxmf.delivery destination, and the identity hash
+                            behind it
 lxmf id <n>                 switch selected identity
 lxmf chats                  list conversations (one row per peer; numbered)
 lxmf msgs [<arg>]           no arg = chats; <peer> = that thread (newest first);
