@@ -5664,7 +5664,7 @@ static bool pnSyncRequest(const std::vector<uint8_t>& data, int next_phase)
 {
     int rid = rnsdLinkRequest(s_pnSync.tag.c_str(), "/get",
                               data.data(), data.size(),
-                              LXMF_LINK_RESOURCE_AUX_PORT, /*data_packed=*/true);
+                              RNSD_LINK_RESOURCE_AUX_PORT, /*data_packed=*/true);
     if (rid < 0) return false;
     s_pnSync.req_id = rid;
     s_pnSync.phase  = next_phase;
@@ -5982,7 +5982,7 @@ static void pnTeardown(void)
 /* ─────────────── Resource aux (rnsd → lxmf) ───────────────
  *
  * rnsd sends one rnsd_link_resource_done_t aux frame to
- * LXMF_LINK_RESOURCE_AUX_PORT when a Resource transfer concludes:
+ * RNSD_LINK_RESOURCE_AUX_PORT when a Resource transfer concludes:
  *   INBOUND_DONE  — buf holds the reassembled LXM wire; we own it and
  *                   must rnsdResourceRelease() it.
  *   OUTBOUND_DONE — our big DIRECT send was proven; settle the outbox.
@@ -7886,9 +7886,9 @@ static void lxmfTaskMain(void*)
     /* Resource hand-off is a one-shot aux frame from rnsd
      * (not a connection) — open the port aux-only and register the
      * handler. */
-    itsServerPortOpen(LXMF_LINK_RESOURCE_AUX_PORT, /*packetBased=*/false,
+    itsServerPortOpen(RNSD_LINK_RESOURCE_AUX_PORT, /*packetBased=*/false,
                       /*maxHandles=*/1, /*toSize=*/0, /*fromSize=*/0);
-    itsOnAux(LXMF_LINK_RESOURCE_AUX_PORT, onResourceAux);
+    itsOnAux(RNSD_LINK_RESOURCE_AUX_PORT, onResourceAux);
 
     /* itsClient initialisation — one connection per identity, the two
      * announce-fanout subscriptions, the conversation-link pool, and the

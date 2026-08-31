@@ -45,8 +45,10 @@ architecture and resolves several behaviours the storage model forces.
    Link payload verbatim both ways (prepending on the Link path doubles the
    dest and the signature fails).
 5. **Resource hand-off is a shared-memory aux, not in-band.** Large messages
-   go via `rnsdLinkSendResource` + the `LXMF_LINK_RESOURCE_AUX_PORT (101)`
-   completion aux, keeping the data path type-byte-free.
+   go via `rnsdLinkSendResource` + the `RNSD_LINK_RESOURCE_AUX_PORT (101)`
+   completion aux, keeping the data path type-byte-free. The port is rnsd's
+   and every link consumer opens the same number — rnsd reports the Resource
+   lifecycle there by task handle, so it carries no consumer's name.
 6. **`OUT_RESULT status=0 ≡ sent`, never `delivered`.** Opportunistic gets
    no native ack; only a proven DIRECT/Resource transfer is `delivered`.
    `applyOutResult` must not optimistically upgrade.
@@ -111,7 +113,7 @@ subscription — "do X now, no persistent state" — uses the self-clearing-key
 convention (§3).
 
 ```cpp
-itsServerInit(); open LXMF_LINK_INBOX_PORT (100) + LXMF_LINK_RESOURCE_AUX_PORT (101)
+itsServerInit(); open LXMF_LINK_INBOX_PORT (100) + RNSD_LINK_RESOURCE_AUX_PORT (101)
 itsClientInit(LXMF_MAX_IDENTITIES + 1);            // +1 announce subscription
 storageSubscribeChanges("lxmf.cmd.",        onIdentityLevelCmd);
 storageSubscribeChanges("lxmf.url_web",     onOpenContactUrl);
@@ -330,7 +332,7 @@ to the message key via `outboundFindBySendId`. The same port serves
 `accepts_links(true)` on the `lxmf.delivery` dest and back-connects each
 accepted inbound Link to that port, feeding bytes into the shared
 `onInboundLxm`. Large transfers complete on
-`LXMF_LINK_RESOURCE_AUX_PORT = 101` with `rnsd_link_resource_done_t`
+`RNSD_LINK_RESOURCE_AUX_PORT = 101` with `rnsd_link_resource_done_t`
 opcodes `RNSD_LINK_RESOURCE_{INBOUND_DONE,OUTBOUND_DONE,FAILED}`
 (`onResourceAux`); the inbound buffer is rnsd-owned and released via
 `rnsdResourceRelease` even on the drop path. An inbound resource can
@@ -559,7 +561,7 @@ the identity's key, wait for `rnsd.links.<tag>.state == active`,
 `rnsdLinkIdentify` (the node serves only the `lxmf.delivery` dest derived
 from the identified identity), then loop `/get` request rounds via
 `rnsdLinkRequest` (responses land as `RNSD_LINK_REQUEST_RESPONSE` auxes
-on the shared `LXMF_LINK_RESOURCE_AUX_PORT`, dispatched ahead of the
+on the shared `RNSD_LINK_RESOURCE_AUX_PORT`, dispatched ahead of the
 resource logic in `onResourceAux`):
 
 - `[nil, nil]` → the node's held transient-id list (or a bare msgpack
