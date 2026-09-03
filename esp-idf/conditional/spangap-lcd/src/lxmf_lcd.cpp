@@ -8,8 +8,10 @@
  *     the list — the web spawns one Messages window per identity; on a single
  *     launcher tile we pick up front instead. One usable identity skips it;
  *     none falls through to the list's "create an identity" guidance.
- *   - List: two tabs, each with its own search box on top (focused on entry so
- *     a hardware keyboard types straight into it). Contacts is selected first.
+ *   - List: two tabs, each with its own search box on top (focused on entry
+ *     where the device has keys, so typing goes straight into it; where it has
+ *     none the box is left alone and a tap on it raises the on-screen
+ *     keyboard). Contacts is selected first.
  *       Contacts:    peers you've messaged, newest-comms first; name +
  *                     last-message preview, a last-heard-announce age badge at
  *                     the right, and a circled-i button opening the contact
@@ -24,8 +26,11 @@
  *     it opens the contact info page; a scroll-to-bottom chevron at the right
  *     appears only while the view isn't already at the bottom), the message
  *     bubbles (in left / out right), and a compose row (textarea + Send) at
- *     the end of the chat. The compose field is focused when the thread opens.
- *     The thread runs fullscreen (no system status bar).
+ *     the end of the chat. The compose field is focused when the thread opens
+ *     on a device with keys; on one without, a tap on it raises the on-screen
+ *     keyboard, which types into that same field — so the expand pill and the
+ *     Send button mean what they mean everywhere. The thread runs fullscreen (no
+ *     system status bar).
  *   - Contact info: peer name + the destination hash grouped in fours + a
  *     last-heard line + a Delete-conversation button behind an explicit
  *     "Are you sure?" confirm. Opened from a contact row's circled-i or the
@@ -375,8 +380,19 @@ void focusTimerCb(lv_timer_t*) {
     if (g_focusTarget && lv_obj_is_valid(g_focusTarget) && lcdInputGroup())
         lv_group_focus_obj(g_focusTarget);
 }
+
+/* Resting focus on a TEXT field means "start typing" — worth having where there
+ * are keys, worth nothing where the answer is a tap. On a device typing off the
+ * panel the field is left unfocused: a caret that cannot be written into reads
+ * as a screen that is waiting for something, and putting the keyboard up unasked
+ * would take half the conversation the operator just opened.
+ * Buttons keep their focus on every device; this is about fields alone. */
+bool focusWorthPlacing(lv_obj_t* o) {
+    return !(lcdKeyboardOnScreen() && lv_obj_check_type(o, &lv_textarea_class));
+}
+
 void deferFocus(lv_obj_t* o) {
-    if (!o) return;
+    if (!o || !focusWorthPlacing(o)) return;
     g_focusTarget = o;
     lv_timer_t* ft = lv_timer_create(focusTimerCb, 40, nullptr);
     lv_timer_set_repeat_count(ft, 1);
@@ -395,7 +411,7 @@ void pinFocusCb(lv_timer_t*) {
         lv_obj_scroll_to_y(g_pinList, g_pinScrollY, LV_ANIM_OFF);
 }
 void deferFocusPinScroll(lv_obj_t* o, lv_obj_t* list) {
-    if (!o) return;
+    if (!o || !focusWorthPlacing(o)) return;
     g_focusTarget = o;
     g_pinList     = list;
     g_pinScrollY  = list ? lv_obj_get_scroll_y(list) : 0;
@@ -998,7 +1014,12 @@ void onLoadNewer(lv_event_t*) {
  *   collapsed: 1–4 line quick field, expand pill ↑ on the LEFT, Enter sends.
  *   expanded:  fixed 8-line composer, collapse pill ↓ + Send on the RIGHT,
  *              Enter = newline.
- * Either pill toggles the mode; a send reverts to collapsed. */
+ * Either pill toggles the mode; a send reverts to collapsed.
+ *
+ * The mode means the same thing on every device: the on-screen keyboard types
+ * into this field like any other keyboard does, so Enter there has to be a
+ * newline sometimes and a send the rest of the time, exactly as it does under
+ * real keys. */
 void applyComposeMode() {
     if (!s_compose) return;
     lcdInputBoxSetLines(s_compose, g_composeExpanded ? 8 : 1, g_composeExpanded ? 8 : 4);
@@ -3442,6 +3463,7 @@ lv_obj_t* buildTabPage(lv_obj_t*& page, lv_obj_t*& search, const char* placehold
     lv_obj_set_style_pad_hor(search, 6, 0);
     lv_obj_set_width(search, lv_pct(100));
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), search);
+    lcdKeyboardAttach(search);                  /* no keys on the device → tap types */
     lv_obj_add_event_cb(search, onSearchChanged, LV_EVENT_VALUE_CHANGED, nullptr);
     lv_obj_add_event_cb(search, onSearchEnter,   LV_EVENT_READY,         nullptr);
 
