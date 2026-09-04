@@ -682,6 +682,13 @@ void onSend(lv_event_t*) {
          * bubble only appeared after the storm. One inline refresh makes both
          * paths visually identical: bubble first, then the echoes. */
         lv_refr_now(nullptr);
+        /* The message is gone, so the keys have nothing left to type into: they
+         * go away and give the thread back the half of the screen they were
+         * standing on, which is where the bubble just landed. Enter in the quick
+         * field has already taken them down by the time this runs (the entry does
+         * that for any submit); this is the Send button's half of the same rule,
+         * and it costs nothing when they are already down. */
+        lcdKeyboardClose();
         deferFocus(s_compose);   /* keep the cursor in the entry box for the next message */
         g_composeExpanded = false;               /* a send reverts to the quick field */
         applyComposeMode();
@@ -1012,8 +1019,9 @@ void onLoadNewer(lv_event_t*) {
 
 /* Reflect the compose mode onto the widgets. Two states:
  *   collapsed: 1–4 line quick field, expand pill ↑ on the LEFT, Enter sends.
- *   expanded:  fixed 8-line composer, collapse pill ↓ + Send on the RIGHT,
- *              Enter = newline.
+ *   expanded:  8-line composer — fewer on a panel with no room for eight above
+ *              the keyboard, which the entry settles for itself — collapse pill
+ *              ↓ + Send on the RIGHT, Enter = newline.
  * Either pill toggles the mode; a send reverts to collapsed.
  *
  * The mode means the same thing on every device: the on-screen keyboard types
@@ -1034,13 +1042,8 @@ void applyComposeMode() {
     show(s_composePill,  !g_composeExpanded);
     show(s_collapsePill,  g_composeExpanded);
     show(s_send,          g_composeExpanded);
-    /* Size the controls column to the entry so the collapse pill rides its top and
-     * the Send its bottom; collapsed, the column is empty (both hidden). */
-    if (s_rc) {
-        if (g_composeExpanded) { lv_obj_update_layout(s_compose);
-                                 lv_obj_set_height(s_rc, lv_obj_get_height(s_compose)); }
-        else                     lv_obj_set_height(s_rc, LV_SIZE_CONTENT);
-    }
+    /* The controls column is not sized here: it rides the entry's own height,
+     * whatever sets it (see the size binding where the column is built). */
 }
 
 void buildThreadShell() {
@@ -1259,9 +1262,8 @@ void buildThreadShell() {
 
     /* Controls column on the RIGHT — the collapse pill on top, the round Send below
      * it, distributed top-and-bottom (SPACE_BETWEEN). Both show only when expanded
-     * (the left expand pill takes over when collapsed). The column is sized to the
-     * entry by applyComposeMode. Not in the input group; the compose keeps keypad
-     * focus for the thread's life. */
+     * (the left expand pill takes over when collapsed). Not in the input group;
+     * the compose keeps keypad focus for the thread's life. */
     lv_obj_t* rc = lv_obj_create(comp);
     s_rc = rc;
     lv_obj_remove_style_all(rc);
@@ -1269,6 +1271,18 @@ void buildThreadShell() {
     lv_obj_set_flex_flow(rc, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(rc, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(rc, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* THE COLUMN RIDES THE ENTRY. Its height is bound to the entry's, so the
+     * collapse pill sits on the entry's top edge and Send on its bottom however
+     * the entry came by that height — the expand toggle, a line typed into it, or
+     * the cap that keeps a grown field on the screen with the keyboard up. A
+     * height copied at the moment the mode changes is right until the next thing
+     * resizes the entry; a binding is right always, and nothing that resizes the
+     * entry has to know this column exists. */
+    lv_obj_add_event_cb(s_compose, [](lv_event_t*) {
+        if (s_rc && s_compose && lv_obj_is_valid(s_rc) && lv_obj_is_valid(s_compose))
+            lv_obj_set_height(s_rc, lv_obj_get_height(s_compose));
+    }, LV_EVENT_SIZE_CHANGED, nullptr);
 
     /* Collapse pill (↓): shrinks the 8-line composer back to the quick field. */
     s_collapsePill = lv_button_create(rc);
