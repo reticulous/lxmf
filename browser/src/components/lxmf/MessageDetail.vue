@@ -1,6 +1,5 @@
-<!-- Per-message detail overlay: every field we store about a message, plus the
-     routing telemetry from the lxmf.msgmeta store (interface, RNS first hop,
-     hops). Opened by clicking a bubble. Presentational: data in, close out. -->
+<!-- Per-message detail overlay: every field we store about a message. Opened by
+     clicking a bubble. Presentational: data in, close out. -->
 <template>
   <div class="card">
     <div class="chead">
@@ -14,12 +13,6 @@
       <div class="hero">
         <span class="dir" :class="m.dir">{{ m.dir === 'in' ? 'Incoming' : 'Outgoing' }}</span>
         <span class="status">{{ statusName }}</span>
-        <!-- Bars XOR "L": direct → signal bars (valley when the peer reported a
-             remote reading); relayed → "L". -->
-        <span v-if="lora && (relayed || bars || hasRemote)" class="lora" :title="m.iface">
-          <span v-if="relayed" class="l">L</span>
-          <SignalBars v-else :local="bars" :remote="hasRemote ? remoteBars : undefined" />
-        </span>
       </div>
 
       <template v-if="m.title">
@@ -29,30 +22,6 @@
 
       <div class="sect">Content</div>
       <div class="sn text">{{ m.content || '—' }}</div>
-
-      <!-- Routing telemetry (msgmeta). Absent for DIRECT/Resource transfers. -->
-      <div class="sect">Routing</div>
-      <div v-if="meta" class="kv">
-        <div class="k">Interface</div><div class="v">{{ meta.iface || '—' }}</div>
-        <div class="k">Hops</div><div class="v">{{ meta.hops }}</div>
-        <div class="k">First hop</div>
-        <div class="v mono">{{ firstHop }}</div>
-        <template v-if="meta.rssi">
-          <div class="k">{{ m.dir === 'in' ? 'RSSI' : 'RSSI (proof)' }}</div><div class="v">{{ meta.rssi }} dBm</div>
-        </template>
-        <template v-if="meta.snr">
-          <div class="k">{{ m.dir === 'in' ? 'SNR' : 'SNR (proof)' }}</div><div class="v">{{ meta.snr }} dB</div>
-        </template>
-        <!-- Remote reading: the peer's own rx of the message we sent (rx-report
-             proof); outbound only, and only when the peer is reticulous. -->
-        <template v-if="meta.remoteRssi">
-          <div class="k">Remote RSSI</div><div class="v">{{ meta.remoteRssi }} dBm</div>
-        </template>
-        <template v-if="meta.remoteSnr">
-          <div class="k">Remote SNR</div><div class="v">{{ meta.remoteSnr }} dB</div>
-        </template>
-      </div>
-      <div v-else class="sn small">No routing data recorded (DIRECT/Resource, or pre-dating this message).</div>
 
       <div class="sect">Peer</div>
       <div class="addr">
@@ -112,13 +81,11 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
-import { type Message, type MsgMeta, type PnNode, lxmfStatusName, loraBars,
+import { type Message, type PnNode, lxmfStatusName,
          hasDest, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
-import SignalBars from './SignalBars.vue'
 
 const props = defineProps<{
   m: Message
-  meta: MsgMeta | null
   peerName: string
   pnNodes: PnNode[]
   contactPn: string
@@ -158,29 +125,8 @@ function doResend() {
 }
 
 const statusName = computed(() => lxmfStatusName(props.m.status))
-const lora = computed(() => (props.m.iface ?? '').startsWith('LoRa'))
-const bars = computed(() => loraBars(
-  props.meta?.rssi ? parseFloat(props.meta.rssi) : undefined,
-  props.meta?.snr  ? parseFloat(props.meta.snr)  : undefined,
-))
-/* Remote reading (peer's rx of our outbound message, from an rx-report proof):
- * the second, descending set of the valley. Present only for a reticulous peer. */
-const hasRemote = computed(() => !!(props.meta?.remoteRssi || props.meta?.remoteSnr))
-const remoteBars = computed(() => loraBars(
-  props.meta?.remoteRssi ? parseFloat(props.meta.remoteRssi) : undefined,
-  props.meta?.remoteSnr  ? parseFloat(props.meta.remoteSnr)  : undefined,
-))
-/* hops is the raw RNS count (1 = directly received, >1 = relayed): "L" for
- * relayed, bars for direct. */
-const relayed = computed(() => (props.meta?.hops ?? props.m.hops ?? 0) > 1)
 
 const grouped = (hex: string) => (hex.match(/.{1,4}/g) ?? []).join(' ')
-
-/* first_hop is 64-hex; all-zero (or empty) means a direct neighbour. */
-const firstHop = computed(() => {
-  const fh = props.meta?.firstHop ?? ''
-  return fh && !/^0+$/.test(fh) ? grouped(fh) : 'direct (no transit node)'
-})
 
 const isReply = computed(() => {
   const r = props.m.replyTo ?? ''
@@ -217,12 +163,6 @@ async function copy(key: string, val: string) {
 .dir.in  { color: #9ec9ff; }
 .dir.out { color: #9fe0b0; }
 .status { color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase; letter-spacing: 0.04em; }
-/* Quiet LoRa indicator: ghost amber "L" + link-quality bars. Matches the bubble. */
-.lora { display: inline-flex; align-items: flex-end; gap: 3px; line-height: 1; }
-.lora .l { font-weight: 700; font-size: calc(10px * var(--rfs, 1)); color: #e0b422; }
-.bars { display: inline-flex; align-items: flex-end; gap: 1px; height: 10px; }
-.bars i { width: 2px; border-radius: 1px; background: rgba(224, 180, 34, 0.28); }
-.bars i.on { background: #ffd400; }
 .bars i:nth-child(1) { height: 4px; }
 .bars i:nth-child(2) { height: 6px; }
 .bars i:nth-child(3) { height: 8px; }

@@ -1,9 +1,9 @@
-<!-- ContactSignal — amber link-quality bars for a peer's own direct signal
-     (lxmf.contactsig.<peer>.*, the RSSI/SNR of the last zero-hop radio packet
-     from them). With `fallback-gw`, falls back to the gateway signal (rnsd.gw.*)
-     when we have no direct sample for the peer — the conversation-header rule
-     where a contact's own signal OVERRULES the gateway one. Collapses to nothing
-     when there's no signal to show. -->
+<!-- ContactSignal — amber link-quality bars for a peer, from the radio's own
+     record of it (SUPE's lora.<n>.meas.*: the strongest level heard from the
+     node that answers to the peer's destination hash). With `fallback-gw`,
+     falls back to the gateway signal (rnsd.gw.*) when no radio has heard the
+     peer — the conversation-header rule where a peer's own signal OVERRULES the
+     gateway one. Collapses to nothing when there's no signal to show. -->
 <template>
   <span v-if="bars > 0 && opacity > 0" class="csig" :style="{ opacity }" :aria-label="`signal ${bars} of 4`">
     <i v-for="n in 4" :key="n" :class="{ on: n <= bars }"></i>
@@ -13,7 +13,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
-import { loraBars } from '../../modules/lxmf'
+import { loraBars, peerMeasOf } from '../../modules/lxmf'
 
 const props = defineProps<{ peer: string; fallbackGw?: boolean }>()
 const device = useDeviceStore()
@@ -23,12 +23,13 @@ function pf(v: unknown): number | undefined {
   const n = Number(v)
   return Number.isFinite(n) ? n : undefined
 }
-function barsAt(prefix: string): number {
-  return loraBars(pf(device.get(`${prefix}.rssi`)), pf(device.get(`${prefix}.snr`)))
-}
 
-const directBars = computed(() => (props.peer ? barsAt(`lxmf.contactsig.${props.peer}`) : 0))
-const gwBars = computed(() => (props.fallbackGw ? barsAt('rnsd.gw') : 0))
+const directBars = computed(() => {
+  const m = props.peer ? peerMeasOf(props.peer) : null
+  return m ? loraBars(m.rssi, m.snr) : 0
+})
+const gwBars = computed(() => (props.fallbackGw
+  ? loraBars(pf(device.get('rnsd.gw.rssi')), pf(device.get('rnsd.gw.snr'))) : 0))
 // The peer's own signal overrules the gateway; only the gateway fallback fades.
 const usingGw = computed(() => directBars.value <= 0 && gwBars.value > 0)
 const bars = computed(() => (directBars.value > 0 ? directBars.value : gwBars.value))

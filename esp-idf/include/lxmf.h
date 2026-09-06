@@ -87,6 +87,8 @@ enum LxmfStatus : uint8_t {
     LXMF_ST_ON_PN             = 35,  /* uploaded to a propagation node */
     LXMF_ST_PN_FAIL           = 36,  /* propagation upload failed (link/transfer) */
     LXMF_ST_PN_REJECTED       = 37,  /* the node refused the upload (stamp/access) */
+    LXMF_ST_DELIVERY_TIMEOUT  = 38,  /* not delivered within s.lxmf.delivery_timeout
+                                      * minutes of attempts from the delivery queue */
 };
 
 /* status code → its ALL-CAPS enum name for display (meta line, CLI). This is the
@@ -131,6 +133,7 @@ static inline const char* lxmfStatusName(uint8_t s) {
         case LXMF_ST_ON_PN:             return "ON_PN";
         case LXMF_ST_PN_FAIL:           return "PN_FAIL";
         case LXMF_ST_PN_REJECTED:       return "PN_REJECTED";
+        case LXMF_ST_DELIVERY_TIMEOUT:  return "DELIVERY_TIMEOUT";
         default:                        return "";
     }
 }

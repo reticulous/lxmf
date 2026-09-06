@@ -87,6 +87,9 @@ export enum LxmfStatus {
   /* Classic lxmf.propagation node states. OnPn is final — a propagation
    * node issues no delivery proof; the recipient pulls on its next sync. */
   OnPn = 35, PnFail = 36, PnRejected = 37,
+  /* Not delivered within s.lxmf.delivery_timeout minutes of attempts from the
+   * delivery queue. */
+  DeliveryTimeout = 38,
 }
 /* tries === 255 is the one definitive terminal marker (gave up). */
 export const LXMF_TRIES_GAVEUP = 255
@@ -106,49 +109,30 @@ export interface Message {
   replyTo?: string     // FIELD_REPLY_TO hex64, '' / all-zero if not a reply
   method?: string      // delivery method override
   read?: number        // inbound read flag
-  // Routing telemetry, joined from the lxmf.msgmeta store by messageId. Present
-  // only for opportunistic in/out (the DIRECT/Resource paths aren't instrumented).
-  iface?: string       // beautified endpoint, e.g. "LoRa 869.475 …" / "tcp_out/host:port"
-  hops?: number
-  firstHop?: string    // RNS transport-node hash (64-hex), '' = direct
-  rssi?: number        // dBm, NaN/undefined if not a radio receive (inbound: msg rx; outbound: proof rx)
-  snr?: number         // dB, NaN/undefined if not a radio receive
-  // REMOTE reading: the peer's own rx of an outbound message we sent, reported in
-  // its rx-report delivery proof. Present only on outbound msgs to a reticulous peer.
-  remoteRssi?: number  // dBm
-  remoteSnr?: number   // dB
-}
-
-/* One record from the RAM-only lxmf.msgmeta store, keyed by message_id. */
-export interface MsgMeta {
-  last: number         // unix seconds the record was written
-  hops: number
-  firstHop: string     // 64-hex transport-node hash, '' = direct
-  dir: string          // 'in' | 'out'
-  iface: string
-  rssi: string         // dBm as text, '' if not a radio receive
-  snr: string          // dB as text, '' if not a radio receive
-  remoteRssi: string   // dBm as text, '' if the peer didn't report (non-reticulous)
-  remoteSnr: string    // dB as text, '' if the peer didn't report
 }
 
 /* One probe outcome from lxmf.ping.<peer>.*, RAM-only and overwritten by the
  * next probe. `state` is the only field always present: 'probing' / 'path' while
- * in flight, then 'ok' or a reason it stopped. Every measurement is a string
- * exactly as the firmware wrote it (dBm, dB) and is '' when that side reported
- * nothing — a vanilla peer reports neither of its own, and a non-radio hop has
- * no signal to report at either end. */
+ * in flight, then 'ok' or a reason it stopped. The path losses are the radio's
+ * own measurement of the peer (SUPE, lora.<n>.meas.*), in dB as the firmware
+ * wrote them, '' when that direction has not been measured. */
 export interface PingResult {
   state: string        // probing | path | ok | no-proof | no-route | timeout | cancelled | failed | offline
   ts: number           // unix seconds of the last state change
   rttMs: number        // round trip, 0 unless state is 'ok'
   hops: number
-  tx: string           // our antenna tx power, dBm
-  rssi: string         // our rx of the delivery proof, dBm
-  snr: string          // our rx of the delivery proof, dB
-  peerTx: string       // the peer's antenna tx power, dBm
-  peerRssi: string     // the peer's rx of our probe, dBm
-  peerSnr: string      // the peer's rx of our probe, dB
+  lossTo: string       // path loss us→them, dB
+  lossFrom: string     // path loss them→us, dB
+}
+
+/* The radio's own record of a peer, from SUPE's per-peer publication
+ * lora.<n>.meas.<slot>.* (iface-lora README). rssi dBm, snr dB; each undefined
+ * when the radio holds no level; the losses '' when that direction is unmeasured. */
+export interface PeerMeas {
+  rssi: number | undefined
+  snr: number | undefined
+  lossTo: string
+  lossFrom: string
 }
 
 export interface Conversation {
@@ -264,9 +248,34 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.RadioBusy]: 'RADIO_BUSY',
   [LxmfStatus.OnPn]: 'ON_PN', [LxmfStatus.PnFail]: 'PN_FAIL',
   [LxmfStatus.PnRejected]: 'PN_REJECTED',
+  [LxmfStatus.DeliveryTimeout]: 'DELIVERY_TIMEOUT',
 }
 export function lxmfStatusName(status: number): string {
   return STATUS_NAME[status] ?? ''
+}
+
+/* The radio's own record of a peer, from SUPE's per-peer publication
+ * lora.<n>.meas.<slot>.* (iface-lora README): the slot whose `tags` holds the
+ * first six hex characters of the peer's destination hash. Null when no radio
+ * has heard the peer. Reactive through device.get(), so a computed built on it
+ * follows the 15 s republish. Module-level rather than part of useLxmf so a
+ * per-row bars component can call it without standing up a messaging store. */
+export function peerMeasOf(peer: string): PeerMeas | null {
+  if (!peer || peer.length < 6) return null
+  const device = useDeviceStore()
+  const tag = peer.slice(0, 6)
+  for (let n = 0; n < 4; n++) {
+    const slots = device.get(`lora.${n}.meas`)
+    if (!slots || typeof slots !== 'object') continue
+    for (const k of Object.keys(slots)) {
+      const r = slots[k] ?? {}
+      if (!str(r.tags).includes(tag)) continue
+      const rssi = r.rssi === undefined || r.rssi === '' ? undefined : num(r.rssi)
+      const snr  = r.snr  === undefined || r.snr  === '' ? undefined : num(r.snr) / 10
+      return { rssi, snr, lossTo: str(r.loss_to), lossFrom: str(r.loss_from) }
+    }
+  }
+  return null
 }
 
 /* Fold a LoRa link's RSSI (dBm) + SNR (dB) into a 1..4 bar count; 0 = no signal
@@ -524,8 +533,6 @@ export interface UseLxmf {
   deleteMessage: (peer: string, key: string) => Promise<void>
   deleteConversation: (peer: string) => Promise<void>
   markConversationRead: (peer: string) => void
-  /** Routing telemetry for a message_id (lxmf.msgmeta store), or null if none. */
-  msgMeta: (messageId: string) => MsgMeta | null
   announceNow: () => Promise<void>
   /** Reactive conversation-link state to this peer: '' (down), 'establishing', 'active'. */
   linkState: (peer: string) => '' | 'establishing' | 'active'
@@ -536,6 +543,9 @@ export interface UseLxmf {
   ping: (peer: string) => Promise<void>
   /** Latest probe outcome for a peer (lxmf.ping.<peer>.*), null if never probed. */
   pingResult: (peer: string) => PingResult | null
+  /** The radio's own record of a peer (SUPE's lora.<n>.meas.*): its signal and
+   *  path loss both ways. Null when no radio has heard the peer. */
+  peerMeas: (peer: string) => PeerMeas | null
   createIdentity: (label: string) => Promise<void>
   importIdentity: (privHex: string) => Promise<void>
   destroyIdentity: (n: number) => Promise<void>
@@ -625,29 +635,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   watch(() => device.synced, (ok) => {
     if (ok) device.sendCommand({ fetch: 'lxmf.announces' })
   }, { immediate: true })
-  /* Per-message routing telemetry: global RAM-only store, same fetch-on-sync +
-   * live-mirror discipline as announces. */
-  watch(() => device.synced, (ok) => {
-    if (ok) device.sendCommand({ fetch: 'lxmf.msgmeta' })
-  }, { immediate: true })
-
-  const msgMeta = (messageId: string): MsgMeta | null => {
-    if (!messageId) return null
-    const r = device.get(`lxmf.msgmeta.${messageId}`)
-    if (!r) return null
-    return {
-      last: num(r.last),
-      hops: num(r.hops),
-      firstHop: str(r.first_hop),
-      dir: str(r.dir),
-      iface: str(r.iface),
-      rssi: str(r.rssi),
-      snr: str(r.snr),
-      remoteRssi: str(r.remote_rssi),
-      remoteSnr: str(r.remote_snr),
-    }
-  }
-
   const contacts = computed<Record<string, Contact>>(() => {
     const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
     const out: Record<string, Contact> = {}
@@ -764,19 +751,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     // drifts too far to order reliably, and insertion order is exactly "as
     // received/sent".
     const msgs = Object.keys(thread)
-      .map(key => {
-        const m = readMsg(peer, key, thread[key] ?? {})
-        // Join routing telemetry (reactive: streams in after the message).
-        const meta = msgMeta(m.messageId)
-        if (meta) {
-          m.iface = meta.iface; m.hops = meta.hops; m.firstHop = meta.firstHop
-          if (meta.rssi !== '') m.rssi = parseFloat(meta.rssi)
-          if (meta.snr !== '')  m.snr = parseFloat(meta.snr)
-          if (meta.remoteRssi !== '') m.remoteRssi = parseFloat(meta.remoteRssi)
-          if (meta.remoteSnr !== '')  m.remoteSnr = parseFloat(meta.remoteSnr)
-        }
-        return m
-      })
+      .map(key => readMsg(peer, key, thread[key] ?? {}))
       .filter(m => m.status !== LxmfStatus.Draft)
     // Day separators anchor to recvTs (monotonic receive time), NOT the sender's
     // ts — a message with a skewed clock can't shove a separator to the wrong day
@@ -924,14 +899,12 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       ts: num(r.ts),
       rttMs: num(r.rtt_ms),
       hops: num(r.hops),
-      tx: str(r.tx),
-      rssi: str(r.rssi),
-      snr: str(r.snr),
-      peerTx: str(r.peer_tx),
-      peerRssi: str(r.peer_rssi),
-      peerSnr: str(r.peer_snr),
+      lossTo: str(r.loss_to),
+      lossFrom: str(r.loss_from),
     }
   }
+
+  const peerMeas = (peer: string): PeerMeas | null => peerMeasOf(peer)
 
   /** One per-conversation watermark write, never a set() per message: record
    *  the newest message ts as "read up to here". Unread is derived from it. */
@@ -1089,8 +1062,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     send, resend, resendVia, cancel, deleteMessage, deleteConversation,
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
     pnStatus, setContactPn,
-    markConversationRead, msgMeta, announceNow, linkState, toggleLink,
-    ping, pingResult,
+    markConversationRead, announceNow, linkState, toggleLink,
+    ping, pingResult, peerMeas,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }
 }

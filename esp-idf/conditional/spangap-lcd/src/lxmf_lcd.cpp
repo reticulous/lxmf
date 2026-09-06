@@ -177,8 +177,7 @@ lv_obj_t* mkLabel(lv_obj_t* parent, const std::string& txt, lv_color_t color) {
 
 struct Msg {
     std::string peer, key, content;
-    std::string message_id;   /* SHA-256 hex64; join key into lxmf.msgmeta */
-    std::string iface;        /* beautified interface from msgmeta ("" = none recorded) */
+    std::string message_id;   /* SHA-256 hex64 */
     uint8_t status = 0;    /* LxmfStatus code */
     uint8_t tries  = 0;    /* try count; 255 = gave up (terminal) */
     long ts = 0;           /* sender's clock (display) */
@@ -360,7 +359,8 @@ void updateThreadSignal();
 lv_obj_t* makeSignalBars(lv_obj_t* parent);
 void setSignalBars(lv_obj_t* box, int local, int remote = -1, int heightPct = 100);
 int signalBarsAt(const std::string& prefix);
-int signalRemoteBarsAt(const std::string& prefix);
+std::string peerMeasBase(const std::string& peer);
+int peerSignalBars(const std::string& peer);
 lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color);
 void tintRlpgArrow(lv_obj_t* box, lv_color_t c);
 void rlpgStatusUpdate(const char* = nullptr, const char* = nullptr);
@@ -559,12 +559,6 @@ void refreshMsgs() {
     g_msgs.erase(std::remove_if(g_msgs.begin(), g_msgs.end(),
                                 [](const Msg& m) { return m.status == LXMF_ST_DRAFT; }),
                  g_msgs.end());
-    /* Join routing telemetry from the RAM-only msgmeta store (keyed by
-     * message_id) — just the interface string, for the LoRa bubble pill; the
-     * detail screen reads the rest on open. */
-    for (auto& m : g_msgs)
-        m.iface = m.message_id.empty() ? std::string()
-                : storageGetStr(("lxmf.msgmeta." + m.message_id + ".iface").c_str(), "");
 }
 
 /* ---- announce catalogue: per-field records "lxmf.announces.<hex>.<field>" ---- */
@@ -1630,9 +1624,8 @@ void setSignalBars(lv_obj_t* box, int local, int remote /* = -1 */, int heightPc
     lv_obj_remove_flag(box, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* Local bars for a signal record at <prefix>.{rssi,snr} (dBm / dB), 0 when
- * neither field is present. Shared by the gw, per-contact and per-message
- * surfaces so a link scores identically everywhere. */
+/* Bars for the gateway signal record rnsd.gw.{rssi,snr} (dBm / dB as text), 0
+ * when neither field is present. */
 int signalBarsAt(const std::string& prefix) {
     std::string r = storageGetStr((prefix + ".rssi").c_str(), "");
     std::string s = storageGetStr((prefix + ".snr").c_str(),  "");
@@ -1640,35 +1633,47 @@ int signalBarsAt(const std::string& prefix) {
     return loraBars(!r.empty(), atof(r.c_str()), !s.empty(), atof(s.c_str()));
 }
 
-/* Remote bars for <prefix>.{remote_rssi,remote_snr}; -1 when no remote reading
- * is present (so setSignalBars renders a single, local-only set). */
-int signalRemoteBarsAt(const std::string& prefix) {
-    std::string r = storageGetStr((prefix + ".remote_rssi").c_str(), "");
-    std::string s = storageGetStr((prefix + ".remote_snr").c_str(),  "");
-    if (r.empty() && s.empty()) return -1;
-    return loraBars(!r.empty(), atof(r.c_str()), !s.empty(), atof(s.c_str()));
+/* The radio's own record of a peer, from SUPE's per-peer publication
+ * `lora.<n>.meas.<slot>.*` (iface-lora README): the slot whose `tags` holds the
+ * first six hex characters of the peer's destination hash. Returns the record's
+ * key prefix, or "" when no radio has measured this peer. The publication is
+ * republished every 15 s and the contact list asks once per row, so the
+ * tag→slot index is walked at most once per second and cached between. */
+struct MeasIdx { std::string base, tags; };
+static std::vector<MeasIdx> s_measIdx;
+static uint32_t s_measIdxMs = 0;
+static void measIdxLeaf(const char* key, const char* val) {
+    const char* d = strrchr(key, '.');
+    if (!d || strcmp(d + 1, "tags") != 0) return;
+    s_measIdx.push_back({ std::string(key, d - key), val ? val : "" });
+}
+std::string peerMeasBase(const std::string& peer) {
+    if (peer.size() < 6) return "";
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (s_measIdx.empty() || now - s_measIdxMs > 1000) {
+        s_measIdx.clear();
+        for (int n = 0; n < 4; n++) {
+            char pre[24];
+            snprintf(pre, sizeof pre, "lora.%d.meas", n);
+            storageForEach(pre, measIdxLeaf);
+        }
+        s_measIdxMs = now;
+    }
+    std::string tag = peer.substr(0, 6);
+    for (auto& e : s_measIdx)
+        if (e.tags.find(tag) != std::string::npos) return e.base;
+    return "";
 }
 
-/* Per-message radio indicator, appended rightmost to a bubble's meta row when
- * the message travelled a LoRa interface. Bars XOR "L", never both: signal bars
- * when the message reached us / was proved DIRECT, else a ghost amber "L"
- * meaning it was relayed. When a remote reading is present (a reticulous peer
- * reported its own rx), the bars render as the two-set valley. hops is the raw
- * RNS count (1 = direct), so RELAYED is hops > 1, DIRECT is hops <= 1. */
-void addLoraInd(lv_obj_t* meta, const std::string& mid) {
-    std::string mm     = "lxmf.msgmeta." + mid;
-    int hops   = mid.empty() ? 0 : storageGetInt((mm + ".hops").c_str(), 0);
-    int local  = mid.empty() ? 0 : signalBarsAt(mm);
-    int remote = mid.empty() ? -1 : signalRemoteBarsAt(mm);
-
-    if (hops > 1) {
-        lv_obj_t* l = lv_label_create(meta);
-        lv_obj_set_style_text_font(l, kFontTiny, 0);
-        lv_obj_set_style_text_color(l, lv_color_hex(0xe0b422), 0);
-        lv_label_set_text(l, "L");
-    } else if (local > 0 || remote >= 0) {
-        setSignalBars(makeSignalBars(meta), local, remote);
-    }
+/* Bars for a peer from the radio's measurement of it (rssi dBm, snr dB×10), 0
+ * when no radio has heard it. */
+int peerSignalBars(const std::string& peer) {
+    std::string base = peerMeasBase(peer);
+    if (base.empty()) return 0;
+    std::string r = storageGetStr((base + ".rssi").c_str(), "");
+    std::string s = storageGetStr((base + ".snr").c_str(),  "");
+    if (r.empty() && s.empty()) return 0;
+    return loraBars(!r.empty(), atof(r.c_str()), !s.empty(), atof(s.c_str()) / 10.0);
 }
 
 /* Age-fade for the gateway bars: full opacity fresh, linearly to 0 over 30 min
@@ -1699,15 +1704,15 @@ void gwSignalUpdate(const char* = nullptr, const char* = nullptr) {
     if (s_gwBars) lv_obj_set_style_opa(s_gwBars, (lv_opa_t)opa, 0);
 }
 
-/* Conversation-header bars: the open peer's own last-seen direct signal
- * (lxmf.contactsig.<peer>), which OVERRULES the gateway signal; when we have no
- * direct sample for them, fall back to the (age-faded) gateway signal. The
- * contact's own signal never fades — it's dropped outright when it goes stale. */
+/* Conversation-header bars: the radio's own measurement of the open peer
+ * (SUPE's lora.<n>.meas.*), which OVERRULES the gateway signal; when no radio
+ * has heard them, fall back to the (age-faded) gateway signal. The peer's own
+ * record never fades — the radio drops it when the peer is gone. */
 void updateThreadSignal() {
     if (!s_threadSig) return;
     int bars = 0, opa = 255;
     if (!g_curPeer.empty()) {
-        bars = signalBarsAt("lxmf.contactsig." + g_curPeer);
+        bars = peerSignalBars(g_curPeer);
         if (bars <= 0) { bars = signalBarsAt("rnsd.gw"); opa = gwOpa(); }
     }
     if (bars <= 0 || opa <= 0) { setSignalBars(s_threadSig, 0); return; }
@@ -1715,13 +1720,14 @@ void updateThreadSignal() {
     lv_obj_set_style_opa(s_threadSig, (lv_opa_t)opa, 0);
 }
 
-/* A gw or per-contact signal record changed: refresh the status-bar bars and the
- * open thread's header, and (for a contact record) mark the contact list dirty so
- * its per-row bars redraw. Registered on the lcd task so it may touch LVGL. */
+/* The gw record or a radio's peer measurements changed: refresh the status-bar
+ * bars and the open thread's header, and (for a measurement) mark the contact
+ * list dirty so its per-row bars redraw. Registered on the lcd task so it may
+ * touch LVGL. */
 void onSignalChange(const char* key, const char*) {
     gwSignalUpdate();
     updateThreadSignal();
-    if (s_layer && key && strncmp(key, "lxmf.contactsig", 15) == 0) {
+    if (s_layer && key && strncmp(key, "lora.", 5) == 0) {
         g_listDirty = true;
         scheduleRefresh();
     }
@@ -1899,9 +1905,6 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
             lv_label_set_text(ic, sym);
         }
     }
-
-    /* LoRa indicator — rightmost, after time + delivery glyph. */
-    if (m.iface.rfind("LoRa", 0) == 0) addLoraInd(meta, m.message_id);
 
     /* The whole meta row must let the bubble's long-press through. */
     passThroughInput(meta);
@@ -2529,38 +2532,15 @@ void showDeleteConfirm(lv_event_t*) {
 
 /* ---- Ping (contact info page) ----
  * `lxmf.id.<n>.cmd.ping = <peer>` sends one probe packet and the firmware
- * publishes the round trip under lxmf.ping.<peer>.*. The result sits inline
- * under the button row rather than in a popover: the button stays reachable, so
- * re-measuring is one press. */
+ * publishes the round trip under lxmf.ping.<peer>.*, with the radio's path loss
+ * to and from the peer beside it. The result sits inline under the button row
+ * rather than in a popover: the button stays reachable, so re-measuring is one
+ * press. */
 
-/* One direction of the link: the power the sending end transmitted at, and what
- * the receiving end heard of it — so `tx` pairs with the OTHER end's rssi,
- * which is what makes the pair a path loss. Halves nobody reported read as "?"
- * rather than as a measurement. */
-std::string pingSide(const std::string& tx, const std::string& rssi,
-                     const std::string& snr) {
-    std::string sent = tx.empty() ? "? dBm" : tx + " dBm";
-    if (rssi.empty()) return sent + " -> not heard";
-    return sent + " -> " + rssi + " dBm" + (snr.empty() ? "" : " / " + snr + " dB");
-}
-
-/* Our half alone, for a proof that carried no rx report: the peer never said
- * what it heard or what it answered at, so both directions would render mostly
- * as "?" — which reads as a failed measurement rather than one that was never
- * offered. State what we do know as one sentence, round trip included, and it
- * replaces the whole reading rather than sitting under a header repeating it. */
-std::string pingOurHalf(const std::string& tx, const std::string& rssi,
-                        const std::string& snr, const std::string& hops,
-                        const std::string& rtt) {
-    std::string s = "Probe sent at "
-                  + (tx.empty() ? std::string("unknown power") : tx + " dBm");
-    if (!rssi.empty()) {
-        s += ", proof RSSI " + rssi + " dBm";
-        if (!snr.empty()) s += " / SNR " + snr + " dB";
-    }
-    if (!hops.empty()) s += ", " + hops + (hops == "1" ? " hop" : " hops");
-    if (!rtt.empty())  s += ", round trip " + rtt + " ms";
-    return s + ".";
+/* One direction's path loss, or that the radio has not measured it — never a
+ * zero standing in for an absent reading. */
+std::string pingLoss(const std::string& loss) {
+    return loss.empty() ? std::string("not measured") : loss + " dB";
 }
 
 /* Render the published record into the inline label. Called on open and on
@@ -2575,14 +2555,10 @@ void pingLabelUpdate() {
     else if (st == "probing") text = "Probing...";
     else if (st == "path")    text = "Finding a path...";
     else if (st == "ok") {
-        std::string ptx = fld("peer_tx"), prssi = fld("peer_rssi");
-        if (ptx.empty() && prssi.empty())
-            text = pingOurHalf(fld("tx"), fld("rssi"), fld("snr"),
-                               fld("hops"), fld("rtt_ms"));
-        else
-            text = fld("rtt_ms") + " ms, " + fld("hops") + " hops\n"
-                 + "us->them " + pingSide(fld("tx"), prssi, fld("peer_snr")) + "\n"
-                 + "them->us " + pingSide(ptx, fld("rssi"), fld("snr"));
+        std::string hops = fld("hops");
+        text = fld("rtt_ms") + " ms, " + hops + (hops == "1" ? " hop\n" : " hops\n")
+             + "path loss us->them " + pingLoss(fld("loss_to")) + "\n"
+             + "path loss them->us " + pingLoss(fld("loss_from"));
     }
     else if (st == "no-proof") text = "Delivered, but no proof came back.";
     else if (st == "no-route") text = "No route to this contact.";
@@ -2891,7 +2867,7 @@ void showMsgDetail(const std::string& mkey) {
     if (s_msgDetail) closeMsgDetail();
     if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
 
-    /* Point-read the record's leaves + the msgmeta join (keyed by message_id). */
+    /* Point-read the record's leaves. */
     std::string base = g_msgsPrefix + "." + g_curPeer + "." + mkey;
     auto rd = [&](const char* f) { return storageGetStr((base + "." + f).c_str(), ""); };
     bool        in      = rd("dir") == "in";
@@ -2904,16 +2880,6 @@ void showMsgDetail(const std::string& mkey) {
     bool        readf   = storageGetInt((base + ".read").c_str(), 0) != 0;
     std::string reply   = rd("reply_to");
     std::string mid     = rd("message_id");
-
-    std::string mm = "lxmf.msgmeta." + mid;
-    std::string iface = mid.empty() ? "" : storageGetStr((mm + ".iface").c_str(), "");
-    int         hops  = mid.empty() ? -1 : storageGetInt((mm + ".hops").c_str(), -1);
-    std::string fhop  = mid.empty() ? "" : storageGetStr((mm + ".first_hop").c_str(), "");
-    std::string rssi  = mid.empty() ? "" : storageGetStr((mm + ".rssi").c_str(), "");
-    std::string snr   = mid.empty() ? "" : storageGetStr((mm + ".snr").c_str(), "");
-    std::string rrssi = mid.empty() ? "" : storageGetStr((mm + ".remote_rssi").c_str(), "");
-    std::string rsnr  = mid.empty() ? "" : storageGetStr((mm + ".remote_snr").c_str(), "");
-    bool haveMeta = !iface.empty() || hops >= 0 || !fhop.empty() || !rrssi.empty();
 
     s_msgDetail = lv_obj_create(s_layer);
     lv_obj_remove_style_all(s_msgDetail);
@@ -2946,20 +2912,6 @@ void showMsgDetail(const std::string& mkey) {
     lv_obj_set_style_pad_row(body, 3, 0);
 
     detailRow(body, "Status", lxmfStatusName((uint8_t)status));
-    if (haveMeta) {
-        detailRow(body, "Interface", iface);
-        detailRow(body, "Hops", hops >= 0 ? std::to_string(hops) : std::string());
-        bool direct = fhop.empty() || fhop.find_first_not_of('0') == std::string::npos;
-        detailRow(body, "First hop", direct ? "direct (no transit node)" : groupHash(fhop));
-        if (!rssi.empty()) detailRow(body, in ? "RSSI" : "RSSI (proof)", rssi + " dBm");
-        if (!snr.empty())  detailRow(body, in ? "SNR"  : "SNR (proof)",  snr + " dB");
-        /* Remote reading: the peer's own rx of the message WE sent (rx-report
-         * proof); outbound only, and only when the peer is reticulous. */
-        if (!rrssi.empty()) detailRow(body, "Remote RSSI", rrssi + " dBm");
-        if (!rsnr.empty())  detailRow(body, "Remote SNR",  rsnr + " dB");
-    } else {
-        detailRow(body, "Routing", "not recorded (DIRECT/Resource, or pre-dating)");
-    }
     if (ts > 0) {
         char tb[64] = "";
         time_t tt = ts; struct tm tmv{}; localtime_r(&tt, &tmv);
@@ -3107,9 +3059,9 @@ lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
         lv_obj_set_style_pad_left(mb, 4, 0);
     }
 
-    /* Per-contact signal bars, shown when we've seen this peer DIRECT (a
-     * lxmf.contactsig.<peer> record exists, i.e. a zero-hop radio packet). */
-    int cbars = signalBarsAt("lxmf.contactsig." + s.peer);
+    /* Per-contact signal bars, shown when a radio has heard this peer (SUPE's
+     * lora.<n>.meas.* holds a record for it). */
+    int cbars = peerSignalBars(s.peer);
     if (cbars > 0) {
         lv_obj_t* sig = makeSignalBars(row);
         lv_obj_set_style_pad_left(sig, 4, 0);
@@ -3783,12 +3735,7 @@ void onStorageChange(const char* key, const char*) {
     /* Flag which walk the change dirtied and coalesce; refreshTimerCb does the
        expensive work once per window. Announce churn touches only the mesh
        column, never the msg walk or the open thread. */
-    if (key && strncmp(key, "lxmf.msgmeta", 12) == 0) {
-        /* Routing telemetry for the open thread (the LoRa pill's iface). Refresh
-           the msg walk so rebuildThread re-renders pills; the contact list is
-           untouched by msgmeta, so don't dirty it. */
-        g_refreshMsgs = true;
-    } else if (key && strncmp(key, "lxmf.announces", 14) == 0) {
+    if (key && strncmp(key, "lxmf.announces", 14) == 0) {
         g_refreshAnns = true;
         /* Announce-only change: it feeds the On-the-Mesh column and nothing else.
            A rebuild walks + sorts the whole (up to thousands) announce catalogue
@@ -3901,7 +3848,6 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("s.lxmf.id",      onStorageChange);   /* msgs + contacts */
         storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity up/dest edge */
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
-        storageSubscribeChanges("lxmf.msgmeta",   onStorageChange);   /* per-message routing (LoRa pill) */
         storageSubscribeChanges("s.lxmf.pn",      onPnListChange);    /* show/hide the envelope button */
         storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
@@ -3943,8 +3889,13 @@ void LxmfApp::appInit() {
         lv_obj_t* slot = lcdStatusbarAddIndicator();
         s_gwBars = slot ? makeSignalBars(slot) : nullptr;
         setSignalBars(s_gwBars, 0);                       /* hidden until a sample lands */
-        storageSubscribeChanges("rnsd.gw",         onSignalChange);
-        storageSubscribeChanges("lxmf.contactsig", onSignalChange);
+        storageSubscribeChanges("rnsd.gw",     onSignalChange);
+        /* The radios' per-peer measurements, one prefix per slot (the
+         * subscription is a prefix, and "lora." would fire on every stat). */
+        storageSubscribeChanges("lora.0.meas", onSignalChange);
+        storageSubscribeChanges("lora.1.meas", onSignalChange);
+        storageSubscribeChanges("lora.2.meas", onSignalChange);
+        storageSubscribeChanges("lora.3.meas", onSignalChange);
         gwSignalUpdate();
         /* RLPG mailbox arrow: the selected identity's own store-and-forward
          * connection state, hidden while no mailbox is configured. Rides the

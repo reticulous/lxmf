@@ -92,10 +92,10 @@ State these as absent, not "coming":
 - **Group conversations** (`FIELD_GROUP = 0x0B` reserved), **audio
   messages** (`FIELD_AUDIO = 0x07`; such messages display
   "[audio — unsupported]"), and **externalised blob attachments**.
-- **Auto-give-up.** `applyOutStatus` counts `RETRY` aux frames against a
-  per-message budget but the automatic `OUT_CANCEL` at
-  `MAX_DELIVERY_ATTEMPTS` is not wired (user-initiated cancel is); a failed
-  send is re-issued by the client writing `cmd.send` again.
+- **Per-attempt give-up.** There is no `MAX_DELIVERY_ATTEMPTS`; the delivery
+  queue (§6) bounds a message by wall clock (`s.lxmf.delivery_timeout`), not
+  by a count, and a message that timed out is re-issued by the client writing
+  `cmd.send` again.
 - **Multi-identity UX.** The schema is an array from day one
   (`LXMF_MAX_IDENTITIES = 4`); single-identity simply runs at `n = 0`. There
   is no picker / generate / import flow beyond the settings panes.
@@ -119,13 +119,15 @@ storageSubscribeChanges("lxmf.cmd.",        onIdentityLevelCmd);
 storageSubscribeChanges("lxmf.url_web",     onOpenContactUrl);
 storageSubscribeChanges("lxmf.url_lcd",     onOpenContactUrl);
 loadAllIdentities();                               // load/create slots + per-id cmd subs
+queueScanStorage();                                // in-progress outbounds back on the delivery queue
 for n used: connectOurDest();
 connectAnnounceSub();                              // RNSD_PORT_ANNOUNCES, "lxmf.delivery"
 for (;;) {
   itsPoll(nextDeadline());                         // ITS callbacks OR 1 Hz deadline
   if (1 s elapsed) {
     publishStats(); resolveDirectSends(); convReap();
-    retry deferred queued sends; reconnect dropped our-dests / announce sub;
+    queueSweep() when its interval has come round (§6);
+    reconnect dropped our-dests / announce sub;
     drainAllPendingVerify (replay buffered inbound on now-known senders);
     the one-shot startup announce, when its arming tick has come round
   }
@@ -257,64 +259,20 @@ In-band frames (first byte = opcode):
 | Opcode | Dir | Payload | Handler |
 |---|---|---|---|
 | `0x01 OUT_PACKET` | lxmf→rnsd | `send_id(2) \| lxm_wire` | `processSend` |
-| `0x02 OUT_RESULT` | rnsd→lxmf | `send_id(2) \| status(1) \| rtt_ms(4 BE) \| hops(1)` + a status-specific trailer: SENT `[\| first_hop(16) \| iface_len(1) \| iface]`; DELIVERED `[\| local_rssi(2) \| local_snr(2) \| remote_rssi(2) \| remote_snr(2)]` (int16 BE, `INT16_MIN` = absent) | `applyOutResult` |
+| `0x02 OUT_RESULT` | rnsd→lxmf | `send_id(2) \| status(1) \| rtt_ms(4 BE) \| hops(1)` | `applyOutResult` |
 | `0x03 OUT_CANCEL` | lxmf→rnsd | `send_id(2)` | `processCancel` |
-| `0x04 IN_PACKET` | rnsd→lxmf | `hops(1) \| rssi(2 BE) \| snr(2 BE) \| first_hop(16) \| iface_len(1) \| iface \| full LXM plaintext` | `onInboundLxm` |
+| `0x04 IN_PACKET` | rnsd→lxmf | `full LXM plaintext` (`dest(16)` re-prepended by rnsd) | `onInboundLxm` |
 | `0x05 OUT_STATUS` | rnsd→lxmf | `send_id(2) \| type(1) \| tail` | `applyOutStatus` |
 | `0x06 ANNOUNCE` | lxmf→rnsd | `app_data` | `sendAnnounce` |
 
-Both `OUT_RESULT` and `IN_PACKET` carry **routing telemetry** for the msgmeta
-store (§11): `hops` (RNS hop count), `first_hop` (the 16-byte transport-node
-hash this packet last transited / will next transit — all-zero = no transit
-node, i.e. a direct neighbour), and `iface` (the raw mR interface name, ≤24 B).
-The `OUT_RESULT` trailer is present only on the SENT result, where rnsd knows
-the outgoing path (`Transport::next_hop`/`next_hop_interface`); other results
-omit it and consumers read the fixed 9-byte head and ignore the rest, so
-rnprobe is unaffected. `IN_PACKET` sources hops/first-hop/iface from the
-received `RNS::Packet` (`hops()`/`transport_id()`/`receiving_interface()`).
-
-**Every path is instrumented.** Inbound: opportunistic (`IN_PACKET`), DIRECT (the
-inbound-Link forward `onLinkPacketCb` prepends the same telemetry header ahead of
-the wire, parsed by `parseRxMeta`), and Resource (fields on
-`rnsd_link_resource_done_t`). Outbound: opportunistic via the `OUT_RESULT` trailer;
-DIRECT/Resource via `rnsd.links.<tag>.{iface,hops}` — rnsd publishes the link's
-interface + hop count at link-active (`onLinkEstablishedCb`), and lxmf's
-`resolveDirectSends` reads them and writes msgmeta (`recordOutLinkMeta`) when the
-send settles. Outbound carries no `rssi` (a TX side has no receive metric) and no
-`first_hop` for the link path; inbound Resource carries no `hops`/`first_hop`
-(no `Packet` at conclusion).
-
-**Radio signal (`rssi`/`snr`).** The receive RSSI (dBm) and SNR (dB×10) ride the
-decoded `RNS::Packet`: a radio iface sets `rnsd_iface_t.rx_signal = 1` and
-**prefixes each inbound ITS data frame** with `int16 rssi | int16 snr*10`
-(iface-lora `deliverInbound`); rnsd's `onTransportRecv` strips the prefix and
-sets it on the receiving `RNS::Interface` (`r_stat_rssi/r_stat_snr`); mR's
-`Transport::inbound` copies interface→packet (`packet.rssi()/snr()`), and
-`Link.cpp` copies packet→Link — so it reaches Link and Resource callbacks, not
-just the opportunistic packet. rnsd reads `packet.rssi()` (opportunistic /
-per-link-packet) or `link.rssi()` (resource conclusion, last part) and folds it
-into the frame; `IN_PACKET` carries it as two `int16` BE fields (`rssi ==
-INT16_MIN` = none). This restores the upstream `interface.r_stat_* → packet.rssi`
-plumbing (the `Transport::inbound` copy that shipped commented-out, plus the
-missing `InterfaceImpl` members). Receive-only, LoRa-only.
-
-**Remote signal & per-contact signal.** For an outbound message, the DELIVERED
-`OUT_RESULT` trailer carries two readings rnsd took at proof time: `local` (our
-rx of the delivery proof) and `remote` (the peer's rx of *our* message, decoded
-from the reticulous rx-report proof — see [rns §5.7](../rns/INTERNALS.md)). Two
-antenna tx powers ride behind them (`rx_meta_t.txp` / `.remote_txp`, `INT8_MIN`
-= unknown); only Ping surfaces those, since a power belongs beside the *other*
-end's rssi and a message bubble has room for one reading, not a link budget.
-`applyOutResult` writes the two signals into the message's msgmeta record
-(`msgmetaWriteSignal`, signal-only so it never clobbers the SENT iface/hops);
-`remote_*` is present only for a reticulous peer. Separately, `contactSigUpdate`
-(in `onInboundLxm`, the single inbound choke point) maintains an in-RAM
-`std::map` of each peer's *direct* signal — set from a zero-hop radio packet,
-deleted on a relayed/non-radio one — mirrored to `lxmf.contactsig.<peer>.{rssi,
-snr}` for the contacts list and conversation header. `hops` is the raw RNS count
-(1 = direct, since `Transport::inbound` increments on receive), so "direct" is
-`hops ≤ 1` everywhere the UI decides bars-vs-"L". The msgmeta schema
-(`lxmfMsgMetaSchema`) gained `remote_rssi`/`remote_snr` (schema_ver 2).
+Every frame carries its payload and nothing about the radio: an inbound Link
+packet forwarded by rnsd's `onLinkPacketCb` is the Link plaintext verbatim, a
+concluded Resource is its bytes, and every link consumer here (inbound-Link
+inbox, conversation links, the RLPG deposit/own-node links, the propagation
+upload link) parses from byte 0. Radio measurements — a peer's signal and the
+path loss in both directions — are the radio interface's business: iface-lora's
+SUPE publishes them per peer as `lora.<n>.meas.<slot>.*`, and `lxmfPeerMeas`
+(§6, Ping) is the one reader here.
 
 `OUT_RESULT.status`: `0` sent (opportunistic egress acknowledged) · `1`
 delivered (DIRECT/Resource proof) · `2` cancelled (after our `OUT_CANCEL`) ·
@@ -404,7 +362,65 @@ directly by `message_id`, both under the `<peer>` subtree. The outbox slot
 (`outbound_t`) carries `peer` alongside `msg_key`, so
 `applyOutResult`/`applyOutStatus`/`resolveDirectSends`/`onResourceAux`
 rebuild the path from a `send_id` without re-reading storage. The outbox is
-8 deep; a 9th in-flight send → `last_error = "outbox full"`.
+8 deep; a send with no free slot waits in the delivery queue.
+
+### The delivery queue
+
+```
+cmd.send ──► processReady (attempt) ──ok──► outbox slot ──► DELIVERED
+                 │  can't yet                    │ attempt failed
+                 ▼                               ▼
+             s_queue ◄───────────────────────────┘
+                 │  every s.lxmf.delivery_interval min (default 10), while non-empty
+                 ▼
+            queueSweep: queued ≥ s.lxmf.delivery_timeout min (default 60)
+                        → DELIVERY_TIMEOUT, else processReady again
+```
+
+Every outbound that could not be delivered *yet* waits in `s_queue`
+(`queued_t`: slot, peer, key, and the monotonic second it was first queued)
+holding nothing — no outbox slot, nothing rnsd-side. `queueSweep` runs from the
+1 Hz tick when `s_queueNextSweep_s` has come round, only while the queue is
+non-empty, on this task: every piece of outbound state is task-local and
+lock-free, and a task of its own would need locking on all of it for no gain.
+Per entry: a status outside the in-progress set or `tries == 255` means it
+settled elsewhere and is dropped; an outbox slot holding it means an attempt is
+in flight and it is skipped; past the timeout it fails `DELIVERY_TIMEOUT`
+through `msgFail` (an RLPG mailbox may take custody first,
+`rlpgFailToMailbox`); else `processReady` makes one more attempt. `msgSetStatus`
+(DELIVERED / CANCELLED) and `msgFail` remove the entry, so a message leaves the
+queue the moment it settles.
+
+What returns a message to the queue (`queueRequeue`: status, `tries++`,
+`queueAdd`), and with which status:
+
+| outcome | requeued as |
+|---|---|
+| no free outbox slot; the conversation Link is busy with an earlier send; rnsd answered `QUEUE_FULL` | `QUEUED` |
+| rnsd still searching for a path after `LXMF_PATH_GRACE_S` (60 s); rnsd gave up its search (`FAILED`) | `REQUESTING_PATH` |
+| opportunistic proof timeout (rnsd's second `OUT_RESULT`, or the local backstop); the mailbox connection refused the frame | `RETRYING_DELIVERY` |
+| Link failed to establish, closed before the send, died or timed out; no proof on a Link packet; a Resource transfer failed; no Link to be had; the Link refused the frame | `RETRYING_LINK` |
+
+The path grace is what keeps rnsd's four-slot per-connection path table from
+filling: `applyOutStatus` stamps `outbound_t.path_deadline_s` on
+`REQUESTING_PATH` (cleared on `PATH_KNOWN`), and `resolveDirectSends` cancels
+the send rnsd-side (`sendCancel`; the `CANCELLED` result meets a freed send_id
+and no-ops) and requeues when it passes. Nothing drops a cached path. A proof
+timeout resends the identical wire from `g_wireOutbox` — same `message_id`, the
+recipient dedups — so a proof that was merely lost costs nothing. Every RLPG
+hand-off (`rlpgTryPark` / `rlpgFailToMailbox` / `rlpgPreemptOutbound`) stands
+where it always did and takes precedence over a requeue. Local errors another
+attempt cannot fix — pack/sign, malformed peer, disabled identity, mailbox not
+up, body too large for the method, resource malloc/hand-off refused — fail at
+once.
+
+`cmd.send` is a fresh delivery: `processSend` removes any queue entry, resets
+`tries`, and attempts at once. `queueScanStorage` at task start walks every
+identity's conversations and queues each outbound whose status is in progress
+with `tries < 255`, so a reboot mid-delivery resumes with a fresh timeout rather
+than leaving the message QUEUED on screen forever; `resolveOutboundWire` bumps
+the conversation directory only for a record with no `message_id` yet, so the
+re-pack such a message needs (the RAM outbox is empty) is not counted twice.
 
 DIRECT uses **persistent per-peer conversation Links**: the first DIRECT send
 to a peer opens a Link (`rnsdLinkOpen(peer, "lxmf.delivery", …,
@@ -420,10 +436,14 @@ both directions, reaped by `convReap` past `s.lxmf.link.idle_s` (default
 
 `cmd.ping` rides the same `OUT_PACKET` path with a 32-byte wire (`peer_dest ‖
 our_dest`), so rnsd strips the leading destination and the peer's plaintext is
-exactly our `lxmf.delivery` hash — which is where the peer's rnsd reads the
-sender from when it decides whether to extend the proof. That is the whole
-reason the probe is an lxmf send and not `rnprobe`: rnprobe sends from rnsd's
-identity with a zero payload, so the peer resolves no contact and answers plain.
+exactly our `lxmf.delivery` hash: the peer's lxmf names it as a probe and drops
+it after its rnsd has proved it. The probe measures the round trip and hop
+count; `pingSettle` writes beside them the radio's path loss to and from the
+peer, read by `lxmfPeerMeas` from iface-lora's per-peer publication
+(`lora.<n>.meas.<slot>.*`: the slot whose `tags` holds the first six hex
+characters of the peer's destination hash — `loss_to`, `loss_from`, each only
+when SUPE has measured that direction). The record is
+`lxmf.ping.<peer>.{state,ts,rtt_ms,hops,loss_to,loss_from}`.
 
 The in-flight probe is one `ping_t` per identity, drawing its `send_id` from the
 same counter as messages; `pingApplyOutResult` / `pingApplyOutStatus` claim that
@@ -640,13 +660,10 @@ interop-safe.
 | bit | meaning |
 |---|---|
 | 0 `DOUBLE_ENC` | a link/resource payload to us may be a destination-encrypted envelope blob rather than plaintext LXMF wire |
-| 1 `RX_REPORT` | we accept the extended delivery proof carrying the prover's rx rssi/snr and its antenna tx power |
+| 1 | reserved — never to be reused, since nodes in the field may still assert it |
 
-Both are advertised. Bit 1 gates a *foreign* implementation, not an older one of
-ours: stock Reticulum length-rejects the longer proof, so it must never see one.
-`lxmfContactRxReportCapable` reads a peer's bit and `lxmfPushRxReportCap` pushes
-it to rnsd on contact creation, on each re-announce, and from stored contacts at
-boot.
+Bit 0 is advertised; a peer's bits are persisted on its contact record
+(`contacts.<peer>.caps`) from each announce that carries the element.
 
 **Concurrency:** `AnnounceFanout::received_announce` runs on the **rnsd**
 task (inside `Transport::inbound`) but only does `memcpy + itsSend(timeout=0)`
@@ -707,6 +724,8 @@ enforce_stamps       0      drop inbound without a valid stamp for our cost
 auto_ticket          1      no effect (tickets unimplemented; read by nothing)
 link_timeout         0      conversation-Link establishment budget s (0 = rnsd derives)
 link.idle_s          600    close a conversation Link idle past N s (0 = keep open)
+delivery_interval    10     minutes between delivery-queue sweeps (§6)
+delivery_timeout     60     minutes a message may stay queued before DELIVERY_TIMEOUT (§6)
 sound                /fixed/lxmf/ding.wav   notification WAV
 sound_enabled        1      play the notification sound on inbound delivery
 debug.only_local     0      demote per-announce dbg lines to verbose
@@ -789,30 +808,10 @@ lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (RAM-only record store
 lxmf.pn.sync                        node hash currently being synced, "" idle (§8b)
 lxmf.pn.<hash>.{last_check_s,last_err,last_got}   per-node sync results (RAM)
 
-lxmf.msgmeta.<message_id_hex>.{last,hops,first_hop,dir,rssi,snr,iface}   (RAM-only record store — not cfgRoot)
+lxmf.ping.<peer>.{state,ts,rtt_ms,hops,loss_to,loss_from}   latest probe (RAM, §6 Ping)
 ```
 
-**Per-message routing telemetry (`lxmf.msgmeta`).** A global RAM-only record
-store (schema 4), keyed by the `message_id` hash (globally unique — no
-per-identity namespacing), holding the interface / RNS first-hop / hop count
-each delivered or received message travelled. Deliberately **not** a field on
-the persistent message record so the on-disk conversation DBs don't grow; it is
-ephemeral (gone on reboot), self-capping (`STORAGE_DB_DROP`,
-`s.lxmf.max_msgmeta` default 2048) and browser-mirrored — same discipline as the
-announce catalogue (§9). Written by `msgmetaWrite` for every path (§5): from
-`onInboundLxm` (inbound opportunistic / DIRECT / Resource), `applyOutResult`
-(outbound opportunistic SENT), and `recordOutLinkMeta` via `resolveDirectSends`
-(outbound DIRECT / Resource). `first_hop` is a raw 16-byte DATA field (absent =
-direct; not recorded for the Resource or outbound-link paths); `dir` is
-`in`/`out`; `iface` is the beautified endpoint string; `rssi`/`snr` (fixstr,
-radio receive only — LoRa inbound) are the signal metric strings, absent
-otherwise.
-
-`formatIface()` (lxmf-local, ad-hoc) rewrites the raw mR interface name into a
-human endpoint by reading the owning straddle's config off storage:
-`tcp/<id>` → `tcp_out/<host>:<port>` (from `s.tcp.peers.<id>`), `tcp_in/<ip>#<n>`
-→ `tcp_in/<ip>`, `lora/<i>` → `LoRa <MHz> <kHz> SF<sf> 4/<cr> txpwr <dBm>` (from
-`s.lora.<i>.*`), anything else verbatim.
+Record store schema id 4 is reserved and must not be assigned to a new store.
 
 ## 12. Frontends
 

@@ -116,7 +116,6 @@
         <MessageDetail
           v-if="detailMsg"
           :m="detailMsg"
-          :meta="lxmf.msgMeta(detailMsg.messageId)"
           :peer-name="lxmf.displayName(detailMsg.peer)"
           :pn-nodes="lxmf.pnNodes.value"
           :contact-pn="lxmf.contactOf(detailMsg.peer)?.pn ?? ''"

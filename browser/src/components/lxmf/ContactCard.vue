@@ -24,12 +24,9 @@
             <template v-if="!ping || ping.state === 'probing'">Probing…</template>
             <template v-else-if="ping.state === 'path'">Finding a path…</template>
             <template v-else-if="ping.state === 'ok'">
-              <template v-if="peerReported">
-                <div class="pingrtt">{{ ping.rttMs }} ms · {{ ping.hops }} hop{{ ping.hops === 1 ? '' : 's' }}</div>
-                <div class="pingrow"><span>us→them</span>{{ sideText(ping.tx, ping.peerRssi, ping.peerSnr) }}</div>
-                <div class="pingrow"><span>them→us</span>{{ sideText(ping.peerTx, ping.rssi, ping.snr) }}</div>
-              </template>
-              <div v-else>{{ ourHalfText }}</div>
+              <div class="pingrtt">{{ ping.rttMs }} ms · {{ ping.hops }} hop{{ ping.hops === 1 ? '' : 's' }}</div>
+              <div class="pingrow"><span>us→them</span>{{ lossText(ping.lossTo) }}</div>
+              <div class="pingrow"><span>them→us</span>{{ lossText(ping.lossFrom) }}</div>
             </template>
             <template v-else>{{ pingFailText }}</template>
           </div>
@@ -134,32 +131,12 @@ function onPing() {
   emit('ping', props.peer)
 }
 
-/* One direction of the link as a sentence: the power the sending end
- * transmitted at, and what the receiving end heard of it — so `tx` pairs with
- * the OTHER end's rssi, which is what makes the pair a path loss. A missing
- * half stays honest rather than reading as a measurement. */
-function sideText(tx: string, rssi: string, snr: string): string {
-  const sent = tx ? `${tx} dBm` : 'unknown power'
-  if (!rssi) return `${sent}, not heard back`
-  return `${sent} → ${rssi} dBm${snr ? ` / ${snr} dB` : ''}`
+/* One direction's path loss — the radio's own measurement of this peer (SUPE),
+ * published beside the probe's round trip — or that it has not been measured,
+ * which stays honest rather than reading as a zero. */
+function lossText(loss: string): string {
+  return loss ? `${loss} dB path loss` : 'not measured'
 }
-
-/* A proof that carries no rx report — any peer that doesn't answer with its own
- * reading — measures neither end of the us→them direction and leaves ours
- * half-known. Both rows would then be mostly placeholders, which reads as a
- * failed measurement rather than one that was never offered, so collapse to one
- * sentence of what we do know. It carries the round trip, so it replaces the
- * reading entirely rather than sitting under a header repeating it. */
-const peerReported = computed(() => !!(props.ping?.peerRssi || props.ping?.peerTx))
-const ourHalfText = computed(() => {
-  const p = props.ping
-  if (!p) return ''
-  const bits = [p.tx ? `Probe sent at ${p.tx} dBm` : 'Probe sent at unknown power']
-  if (p.rssi) bits.push(`proof RSSI ${p.rssi} dBm${p.snr ? ` / SNR ${p.snr} dB` : ''}`)
-  if (p.hops > 0) bits.push(`${p.hops} hop${p.hops === 1 ? '' : 's'}`)
-  if (p.rttMs) bits.push(`round trip ${p.rttMs} ms`)
-  return `${bits.join(', ')}.`
-})
 
 const pingFailText = computed(() => {
   switch (props.ping?.state) {

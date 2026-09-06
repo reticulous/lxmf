@@ -215,15 +215,27 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
 
    ```
    DRAFT → QUEUED → REQUESTING_PATH → SENDING → AWAITING_PROOF → DELIVERED
-                                              ↘ RETRYING_LINK / RETRYING_DELIVERY
-                                              ↘ NO_ROUTE | LINK_FAIL | … | CANCELLED
+                 ↖ RETRYING_LINK / RETRYING_DELIVERY / REQUESTING_PATH ↙   (back in the queue)
+                                              ↘ DELIVERY_TIMEOUT | TOO_LARGE | … | CANCELLED
    ```
 
-   The companion `…tries` byte is the try count for the current phase, and
-   `tries == 255` is the **one** definitive terminal marker: below it the
-   message is still in play and a sweep may retry it, whatever the status says.
+   The companion `…tries` byte counts delivery attempts, and `tries == 255`
+   is the **one** definitive terminal marker: below it the message is still
+   in play and the delivery queue will try again, whatever the status says.
    `DELIVERED` means a cryptographic delivery proof (or the proof-grade
    Resource transfer acknowledgement) arrived — nothing else does.
+
+**The delivery queue.** An attempt that cannot deliver *yet* — no path found
+within a minute, no proof back, a conversation Link that failed or is busy, no
+free outbox slot — puts the message in the delivery queue rather than failing
+it. The queue is swept every `s.lxmf.delivery_interval` minutes (default 10)
+while it holds anything; each sweep makes one more attempt per message, and a
+message queued for longer than `s.lxmf.delivery_timeout` minutes (default 60)
+settles `DELIVERY_TIMEOUT`. A reboot resumes every in-progress outbound it
+finds in storage. Between attempts nothing is held open: no outbox slot, no
+path search in rnsd, so an unreachable peer costs one packet per sweep. Local
+errors that another attempt cannot fix — a body too large for the chosen
+method, a malformed peer, a disabled identity — fail at once.
 
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
@@ -250,7 +262,8 @@ It reflects a Link torn down for any reason, tracking the per-second
 `lxmf.id.<n>.link.<peer>` state.
 
 A message that gave up (`tries == 255`) is not retried on its own — write
-`cmd.send` again to re-send it.
+`cmd.send` again to re-send it, which restarts its try count and its
+delivery timeout.
 
 ## Propagation nodes
 
@@ -332,9 +345,9 @@ both frontends print; the numbers are persisted, so the list is append-only
 
 | group | statuses | meaning |
 |---|---|---|
-| progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` | still in play; a sweep may act |
+| progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` | still in play; the delivery queue will try again |
 | settled | `DELIVERED` `CANCELLED` `RECEIVED` | proof received / user cancelled / inbound |
-| gave up | `NO_PROOF` `NO_ROUTE` `TOO_LARGE` `LINK_FAIL` `LINK_OPEN_FAIL` `RES_SEND` `RADIO_BUSY` `OUTBOX_FULL` … | why it stopped |
+| gave up | `DELIVERY_TIMEOUT` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` … | why it stopped: out of time, or a local error another attempt cannot fix |
 | in someone else's custody | `REMOTE_RLPG` `OUR_RLPG` `ON_PN` `REMOTE_RLPG_FULL` `REMOTE_RLPG_ERR` `PN_FAIL` `PN_REJECTED` | mailbox / propagation-node states |
 
 The companion `tries` byte, not the status, is the definitive terminal marker:
@@ -343,9 +356,13 @@ the status reads. A one-shot status sets it to 255 the moment it occurs.
 
 **Egress is not delivery.** Opportunistic packets get no native
 acknowledgement, so a proof timeout is *not* a failure — the message may well
-have arrived, the peer may not prove inbound, or the proof was lost. That
-settles as `NO_PROOF`, distinct from `DELIVERED`, which only a cryptographic
-delivery proof (or the proof-grade Resource transfer acknowledgement) produces.
+have arrived, the peer may not prove inbound, or the proof was lost. The
+message goes back to the delivery queue as `RETRYING_DELIVERY` (or
+`RETRYING_LINK` for a Link send) and the identical wire goes out again at the
+next sweep — the recipient dedups on `message_id`, so a proof that was merely
+lost costs nothing — until the delivery timeout. Only a cryptographic delivery
+proof (or the proof-grade Resource transfer acknowledgement) produces
+`DELIVERED`.
 
 Both frontends render this on outbound bubbles as the ALL-CAPS status name
 plus a glyph: grey `…` while in play, two green checks for `DELIVERED` (which
@@ -358,26 +375,20 @@ single open-circle tick: stored for pickup, no proof of arrival.
 
 ```
 us ──probe packet (peer_dest | our_dest)──►  peer
-us ◄──────── delivery proof (+ rx report) ── peer
+us ◄──────────── delivery proof ─────────── peer
 ```
 
 The contact detail page's **Ping** button (web and LCD, plus `lxmf ping <peer>`)
-measures a contact: round-trip time, hop count, and — when the link is a direct
-radio one — the transmit power and received signal at *both* ends, from one
-packet each way.
+measures a contact: round-trip time and hop count from the probe itself, and —
+when a radio has heard the peer — the path loss in both directions from the
+radio's own measurements (SUPE, published as `lora.<n>.meas.*`; see
+[iface-lora](../iface-lora)).
 
-It is `rnprobe lxmf.delivery <hash>` with the one difference that matters, which
-is who it comes from. `rnprobe` sends from rnsd's own identity with a zero
-payload, so the far end sees a sender it holds no contact record for and answers
-with a plain proof. The probe here goes out on the identity's own destination
-with our `lxmf.delivery` hash as the first sixteen bytes of the plaintext —
-exactly where the peer's rnsd looks for the sender — so we are recognised as a
-contact that advertised the rx-report capability and the proof comes back
-**extended**, carrying the peer's own rx of us and the power it answered at (see
-[rns](../rns)). The payload is that source hash and nothing else: it is not a
-valid LXM wire, and the peer's lxmf names it as a probe and drops it *after* its
-rnsd has already proved it, since proving happens on hand-off and before any
-parsing.
+It is `rnprobe lxmf.delivery <hash>` sent from the identity's own destination,
+with our `lxmf.delivery` hash as the plaintext so the far end sees which contact
+is asking. The payload is that source hash and nothing else: it is not a valid
+LXM wire, and the peer's lxmf names it as a probe and drops it *after* its rnsd
+has already proved it, since proving happens on hand-off and before any parsing.
 
 Results are published per peer, RAM-only, overwritten by the next probe:
 
@@ -387,35 +398,17 @@ lxmf.ping.<peer>.state       probing | path | ok | no-proof | no-route |
 lxmf.ping.<peer>.ts          unix seconds of the last state change
 lxmf.ping.<peer>.rtt_ms      round trip; present on `ok`
 lxmf.ping.<peer>.hops
-lxmf.ping.<peer>.tx          our antenna tx power, dBm
-lxmf.ping.<peer>.rssi/.snr   our rx of the delivery proof
-lxmf.ping.<peer>.peer_tx     the peer's antenna tx power, dBm
-lxmf.ping.<peer>.peer_rssi/.peer_snr   the peer's rx of our probe
+lxmf.ping.<peer>.loss_to     path loss us→them, dB — the peer's report of how our frame landed
+lxmf.ping.<peer>.loss_from   path loss them→us, dB — a frame heard here against the power the peer stated
 ```
 
-Each side's `tx` pairs with the *other* side's `rssi`, which is what makes the
-pair a path loss rather than two unrelated numbers. Every surface renders the
-two directions on that pairing — `us->them` is our `tx` with the peer's
-`peer_rssi`, `them->us` is `peer_tx` with our `rssi` — never a side's own tx
-next to its own rx, which measures nothing. Only `state` is always present: a
-hop that isn't radio has no signal to report at either end, and those keys are
-simply absent rather than zero.
-
-A peer that appends no rx report (any client that isn't ours) leaves the
-`peer_*` half unmeasured, so both directions would render mostly as
-placeholders — which reads as a measurement that failed rather than one that
-was never offered. Every surface collapses that case to one sentence of what we
-do hold, round trip included, so it replaces the reading rather than sitting
-under a header that repeats it:
+Only `state` is always present. A direction the radio has not measured — a
+peer that does not speak SUPE states no power, so no level of it is a loss —
+is an absent key, and every surface prints "not measured" for it rather than
+a zero. In the CLI the reading follows the command's own outcome and wait:
 
 ```
-Probe sent at 17 dBm, proof RSSI -94 dBm / SNR 8.5 dB, 1 hop, round trip 1102 ms.
-```
-
-In the CLI it follows the command's own outcome and wait:
-
-```
-ok after 1204 ms | Probe sent at 17 dBm, proof RSSI -94 dBm / SNR 8.5 dB, 1 hop, round trip 1102 ms.
+ok after 1204 ms | rtt=1102 ms hops=1 | path loss us->them 97 dB  them->us 95 dB
 ```
 
 One ping per identity is in flight at a time; pressing again supersedes rather
@@ -501,6 +494,8 @@ cost, and it may reject it (`PN_REJECTED`).
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
+| `s.lxmf.delivery_interval` | `10` | Minutes between sweeps of the delivery queue — how often a message that could not be delivered yet gets another attempt. |
+| `s.lxmf.delivery_timeout` | `60` | Minutes a message may sit in the delivery queue before it settles `DELIVERY_TIMEOUT`. Measured from when it was first queued; a reboot restarts it. |
 | `s.lxmf.pn.<i>.hash` | — | Propagation-node list, index-ordered (`i` = 0–7); non-32-hex = free slot. |
 | `s.lxmf.pn.<i>.name` | `""` | Optional display name for that node. |
 | `s.lxmf.pn.<i>.check` | `1` | Poll this node for held messages. |
@@ -527,7 +522,7 @@ msgs.<peer>.<key>.{dir,status,tries,peer,title,content,thread,method,ts,recv_ts,
                    read,wire,message_id}    per-conversation message records
 ```
 
-### Runtime & telemetry (`lxmf.*`, RAM)
+### Runtime (`lxmf.*`, RAM)
 
 ```
 lxmf.up                          task alive
@@ -538,24 +533,15 @@ lxmf.id.<n>.last_announce_s      unix seconds of last announce
 lxmf.id.<n>.stats.{sent,received,pending,failed}
 lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
                                  heard-peer catalogue (RAM, browser-mirrored)
-lxmf.msgmeta.<message_id>.{last,hops,first_hop,dir,iface,rssi,snr,remote_rssi,remote_snr}
-                                 per-message routing + radio-signal telemetry (RAM, browser-mirrored).
-                                 rssi/snr = our rx — of the message (inbound) or of its delivery proof
-                                 (outbound). remote_rssi/remote_snr = the peer's rx of an outbound
-                                 message we sent, from its rx-report proof (reticulous peers only).
-lxmf.contactsig.<peer>.{rssi,snr}   per-contact direct signal: our rx of the last zero-hop radio packet
-                                 from that peer; deleted when a relayed or non-radio packet supersedes it.
 lxmf.ping.<peer>.*               latest probe result for that contact — see Ping above.
 ```
 
-**Signal display.** A received message shows either its radio signal (amber bars)
-when it reached us direct, or an "L" when it was relayed — never both. When a
-reticulous peer has reported its own rx of an outbound message (via the rx-report
-proof), the bars render as a two-set "valley" (remote descending, then local
-ascending). The contacts list and conversation header show the per-contact
-direct signal (`lxmf.contactsig.*`), the header falling back to the gateway
-signal (`rnsd.gw.*`) when there's no direct sample. The message-info page lists
-the numeric rssi/snr (and remote rssi/snr when present).
+**Signal display.** The contacts list and the conversation header show amber
+bars for a peer a radio has heard, from SUPE's per-peer record of it
+(`lora.<n>.meas.*` — the slot whose `tags` holds the first six hex characters
+of the peer's destination hash); the header falls back to the gateway signal
+(`rnsd.gw.*`) when no radio has heard the peer. Messages themselves carry no
+radio data.
 
 ### Secrets
 
