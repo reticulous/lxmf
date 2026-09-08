@@ -25,6 +25,12 @@ class LxmfApp : public LcdApp {
 public:
     LxmfApp();
     void onCreate(lv_obj_t* root) override;
+    /** A tap on the launcher tile re-offers the identity picker when more than
+     *  one identity is loaded; a recents switch or an `lxmf@` link does not. */
+    void onShow() override;
+    /** Back dismisses that picker (returning to the work it covered) and is
+     *  otherwise the shell's default fall-through to Home. */
+    bool onBack() override;
 
 protected:
     void appInit() override;

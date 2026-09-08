@@ -55,18 +55,9 @@
         </button>
       </div>
 
-      <!-- RLPG: what the peer's announces told us — capability first, then the
-           stored mailbox dest (line omitted while none is known). -->
+      <!-- What the peer's announces told us about what it can take. -->
       <div class="sect">Accepts long messages (double-encrypted)</div>
       <div class="capval">{{ capsText }}</div>
-
-      <template v-if="mailbox">
-        <div class="sect">RLPG mailbox</div>
-        <div class="addr" title="Peer has an RLPG store-and-forward mailbox">
-          <span class="mbicon"><RlpgIcon /></span>
-          <span class="addrhex">{{ groupedRlpg }}</span>
-        </div>
-      </template>
 
       <!-- Per-contact propagation node: offered as the second option of the
            resend dialog for this contact's messages. -->
@@ -100,8 +91,7 @@ import { computed, ref } from 'vue'
 import { matArrowBack, matVerifiedUser, matContentCopy, matCheck }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
-import RlpgIcon from './RlpgIcon.vue'
-import { hasRlpg, hasDest,
+import { hasDest,
          type Contact, type PingResult, type PnNode, type Reachability }
   from '../../modules/lxmf'
 
@@ -173,7 +163,6 @@ function applyCustomPn() {
 }
 
 const verified = computed(() => (props.contact?.trust ?? 0) >= 1)
-const mailbox = computed(() => hasRlpg(props.contact?.rlpg ?? ''))
 
 /* caps bit0 = the peer accepts double-encrypted payloads; -1 (no caps leaf on
  * the contact record — pre-caps peer or no announce yet) = unknown. */
@@ -193,8 +182,6 @@ async function copyHash() {
 
 const groupedHash = computed(() =>
   (props.peer.match(/.{1,4}/g) ?? []).join(' '))
-const groupedRlpg = computed(() =>
-  ((props.contact?.rlpg ?? '').match(/.{1,4}/g) ?? []).join(' '))
 
 const reachLine = computed(() => {
   const r = props.reach
@@ -229,7 +216,6 @@ const reachLine = computed(() => {
 }
 .unverified { color: #888; font-size: calc(12px * var(--rfs, 1)); }
 .capval { color: #b8c0b8; font-size: calc(13px * var(--rfs, 1)); }
-.mbicon { flex: none; display: inline-flex; color: #8a93a0; }
 .reach { text-align: center; color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); margin-bottom: 12px; }
 .sect {
   color: #aaa; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase;

@@ -84,6 +84,7 @@
                 @msg-menu="m => (menuMsg = m)"
                 @msg-delete="askDeleteMsg"
                 @msg-open="m => (detailMsg = m)"
+                @msg-fetch="m => lxmf.fetchBody(m.peer, m.key)"
                 @open-contact="showContact = true"
                 @toggle-link="p => lxmf.toggleLink(p)"
                 @back="lxmf.activePeer.value = ''"

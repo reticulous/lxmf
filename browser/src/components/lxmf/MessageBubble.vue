@@ -26,7 +26,14 @@
     <div class="bubble" :class="{ muted: m.status === LxmfStatus.Cancelled }"
          @click="emit('open', m)"
          @contextmenu.prevent="emit('menu', m)">
-      <div class="content"><template v-for="(seg, i) in segments" :key="i"><a
+      <!-- A proxy server withheld this body — it is over the link's inline
+           threshold. Offer the download instead of the text; the bubble fills
+           in when it lands. The size is why the offer is worth making rather
+           than pushing it unasked. -->
+      <button v-if="m.bodyAbsent" class="download" @click.stop="emit('fetch', m)">
+        <q-icon :name="matDownload" size="15px" /> Download {{ m.bodySize }} bytes
+      </button>
+      <div v-else class="content"><template v-for="(seg, i) in segments" :key="i"><a
           v-if="seg.link" class="nomad-link"
           @click.stop="openNomad(seg.link.hash, seg.link.path)"
         >{{ seg.text }}</a><a
@@ -35,8 +42,9 @@
         >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></div>
 
       <!-- meta: ALL-CAPS status name (outbound, left, smaller) · time · glyph.
-           glyph: … in flight · ✓✓ delivered (green) · ✓ at a mailbox (grey,
-           REMOTE/OUR_RLPG) · ✕ cancelled (grey) / gave-up tries==255 (red). -->
+           glyph: … in flight · ✓✓ delivered (green) · ✓ a machine that is not
+           mine has it (grey, ON_PROXY / ON_PN) · ✕ cancelled (grey) / gave-up
+           tries==255 (red). -->
       <div class="meta">
         <span v-if="m.dir === 'out' && m.status !== LxmfStatus.Delivered"
               class="statusName">{{ statusName }}</span>
@@ -46,14 +54,13 @@
                 title="delivered — cryptographic proof received">
             <DeliveryTicks variant="delivered" />
           </span>
-          <!-- Parked at a mailbox (own/remote RLPG) or uploaded to a
-               propagation node: one open circle + check — stored for pickup.
-               Before the gave-up test, since these carry tries==255.
-               FULL/ERR/PN_FAIL fall through ✕. -->
-          <span v-else-if="m.status === LxmfStatus.RemoteRlpg ||
-                           m.status === LxmfStatus.OurRlpg ||
+          <!-- Held by a proxy server, or uploaded to a propagation node: one
+               open circle + check — a machine that is not mine has it. Before
+               the gave-up test, since these carry tries==255. A refusal or a
+               real failure falls through to ✕. -->
+          <span v-else-if="m.status === LxmfStatus.OnProxy ||
                            m.status === LxmfStatus.OnPn" class="chip ticks"
-                title="stored for pickup (mailbox / propagation node)">
+                title="a machine that is not mine has it (proxy server / propagation node)">
             <DeliveryTicks variant="sent" />
           </span>
           <span v-else-if="m.status === LxmfStatus.Cancelled" class="chip">
@@ -71,7 +78,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { matClose, matMoreVert, matDelete }
+import { matClose, matMoreVert, matDelete, matDownload }
   from '@quasar/extras/material-icons'
 import DeliveryTicks from './DeliveryTicks.vue'
 import { type Message, segmentMessage, openNomad, formatMsgTime,
@@ -86,6 +93,7 @@ const emit = defineEmits<{
   menu: [m: Message]
   delete: [m: Message]
   open: [m: Message]
+  fetch: [m: Message]
 }>()
 
 const menuOpen = ref(false)
@@ -132,6 +140,14 @@ const statusName = computed(() => lxmfStatusName(props.m.status))
 .mi:hover { background: rgba(255,255,255,0.07); }
 .mi.danger { color: #d98a8a; }
 .mi.danger:hover { background: rgba(217,138,138,0.14); }
+.download {
+  display: flex; align-items: center; gap: 6px;
+  background: rgba(255,255,255,0.08); border: none; border-radius: 6px;
+  color: #cfe0f5; font-size: calc(12px * var(--rfs, 1));
+  padding: 5px 8px; margin: 1px 0 3px; cursor: pointer;
+}
+.download:hover { background: rgba(255,255,255,0.14); }
+
 .bubble {
   max-width: 78%;
   padding: 6px 10px 4px;

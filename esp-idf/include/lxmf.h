@@ -14,7 +14,11 @@
  * subtree and reacts.
  *
  * Consumer of rnsd over RNSD_PORT_DEST: one hosted-destination (our-dest) connection per
- * identity.
+ * identity — except one whose `s.lxmf.id.<n>.proxy_role` is `client`, which
+ * registers nothing and exchanges messages with the always-on device holding
+ * its account over a permanently-held Channel instead (lxmproxy_wire.h, and
+ * the proxy-client section of lxmf.cpp). At every moment exactly one device
+ * registers and announces an account's lxmf.delivery — never zero, never two.
  */
 #pragma once
 
@@ -70,14 +74,15 @@ enum LxmfStatus : uint8_t {
                                       * proof came back — the peer may simply be offline,
                                       * so we can't claim it was received. Distinct from
                                       * NO_PROOF, which is a link send that went unproven. */
-    /* RLPG mailbox states (tries == 255 — out of our hands — yet still
-     * movable: RLPG service messages upgrade/downgrade them, e.g.
-     * OUR_RLPG → REMOTE_RLPG → DELIVERED). */
-    LXMF_ST_REMOTE_RLPG       = 29,  /* deposited at the recipient's RLPG mailbox */
-    LXMF_ST_OUR_RLPG          = 30,  /* handed to our own RLPG node for relay */
-    LXMF_ST_REMOTE_RLPG_FULL  = 31,  /* recipient's mailbox refused: quota full */
-    LXMF_ST_REMOTE_RLPG_ERR   = 32,  /* recipient's mailbox refused: error */
-    /* 33 retired (was RLPG_EXPIRED) */
+    /* Proxy states, on a client whose account is served by an lxmproxy server
+     * (tries == 255 — out of our hands — yet still movable, since the server
+     * relays the account's real status back over the Channel: ON_PROXY →
+     * DELIVERED, or ON_PROXY → whatever the server's own send settled). */
+    LXMF_ST_ON_PROXY          = 29,  /* the proxy server holds it and is sending it */
+    LXMF_ST_PROXY_REFUSED     = 30,  /* the server refused it: over quota, or the
+                                      * account is not one it serves */
+    /* 31, 32 free */
+    /* 33 retired */
     LXMF_ST_RADIO_BUSY        = 34,  /* send failed while the local LoRa radio was
                                       * shedding frames to channel contention — the
                                       * own channel is jammed, not the peer silent */
@@ -125,10 +130,8 @@ static inline const char* lxmfStatusName(uint8_t s) {
         case LXMF_ST_LINK_CLOSED:       return "LINK_CLOSED";
         case LXMF_ST_UNKNOWN:           return "UNKNOWN";
         case LXMF_ST_NO_RESPONSE:       return "NO_RESPONSE";
-        case LXMF_ST_REMOTE_RLPG:       return "REMOTE_RLPG";
-        case LXMF_ST_OUR_RLPG:          return "OUR_RLPG";
-        case LXMF_ST_REMOTE_RLPG_FULL:  return "REMOTE_RLPG_FULL";
-        case LXMF_ST_REMOTE_RLPG_ERR:   return "REMOTE_RLPG_ERR";
+        case LXMF_ST_ON_PROXY:          return "ON_PROXY";
+        case LXMF_ST_PROXY_REFUSED:     return "PROXY_REFUSED";
         case LXMF_ST_RADIO_BUSY:        return "RADIO_BUSY";
         case LXMF_ST_ON_PN:             return "ON_PN";
         case LXMF_ST_PN_FAIL:           return "PN_FAIL";
@@ -161,6 +164,24 @@ public:
  *                 success, -1 on validation error, lxmf-side failure,
  *                 or 5 s timeout */
 int lxmfCreateIdentity(const char* display_name, bool sync = false);
+
+/** Import an existing account into a free slot: `privkey_hex` is its 128-hex
+ *  Ed25519+X25519 private key, `display_name` the name it already advertises
+ *  (may be null/empty), `role` the value for `s.lxmf.id.<n>.proxy_role` — null
+ *  or "" leaves it `off`, "server" marks a slot this device hosts on somebody
+ *  else's behalf. The slot registers and announces `lxmf.delivery` at once,
+ *  because nothing else would ever say the destination is here now.
+ *
+ *  Both modes write the `lxmf.cmd.identity_import` sentinel. Sync mode waits
+ *  (≤ 5 s) and returns the allocated slot, or -1; async returns 0 on a
+ *  well-formed request. */
+int lxmfImportIdentity(const char* privkey_hex, const char* display_name,
+                       const char* role, bool sync);
+
+/** Which slot holds the identity behind `dest_hash` (its `lxmf.delivery`
+ *  destination), or -1 when none does. Reads the published addresses, so it is
+ *  safe from any task and answers from the moment the slot loads. */
+int lxmfSlotForDest(const uint8_t dest_hash[16]);
 
 /** Destroy the identity at slot `n`. Wipes secrets.lxmf.id.<n>.privkey
  *  + every s.lxmf.id.<n>.* and lxmf.id.<n>.* storage key, closes the

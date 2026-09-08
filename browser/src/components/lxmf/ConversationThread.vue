@@ -46,6 +46,7 @@
           @menu="m2 => emit('msg-menu', m2)"
           @delete="m2 => emit('msg-delete', m2)"
           @open="m2 => emit('msg-open', m2)"
+          @fetch="m2 => emit('msg-fetch', m2)"
         />
       </template>
     </div>
@@ -76,6 +77,8 @@ const emit = defineEmits<{
   'msg-menu': [m: Message]
   'msg-delete': [m: Message]
   'msg-open': [m: Message]
+  /* Ask the proxy server for a body it withheld. */
+  'msg-fetch': [m: Message]
   'open-contact': [peer: string]
   'toggle-link': [peer: string]
   back: []

@@ -70,27 +70,27 @@ class Schema:
 
 def msg_current():
     s = Schema(1, 4)
-    (s.u8("tries").u8("status").u32("recv_ts").fixstr("dir", 4).fixstr("method", 16)
+    (s.u8("tries").u8("status").u8("body_absent").u8("handed")
+      .u32("body_size").u32("recv_ts").fixstr("dir", 4).fixstr("method", 16)
       .u32("ts").u32("delivered_ts").data("message_id", 32).data("reply_to", 32)
-      .data("rlpg_tid", 32).text("title").text("content"))
+      .text("title").text("content"))
     return s
 
 
 def contact_current():
     s = Schema(2, 2)
     (s.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
-      .u8("trust").data("hash", 16).data("pubkey", 64).data("rlpg", 16)
-      .data("rlpg_svc", 16).u8("rlpg_active").u8("caps")
+      .u8("trust").data("hash", 16).u8("caps").data("pn", 16)
       .text("display_name").text("nick").text("preview"))
     return s
 
 
-# Every id=2 layout from v2a (hdr 109) onward shares this exact fixed prefix — the
-# RLPG fields were appended — so these offsets decode any contacts file hdr>=109.
+# Every id=2 layout from v2a (hdr 109) onward shares this exact fixed prefix, so
+# these offsets decode any contacts file hdr>=109.
 CONTACT_PREFIX = contact_current()
-# id=1: delivered_ts was inserted before message_id at hdr 140, so only the
-# hdr-140 layout matches the current schema's fixed offsets; older msg files
-# (hdr 104) share the prefix up to `ts`.
+# id=1: only a file written by the current layout matches these fixed offsets
+# exactly; an older msg file (hdr 104) shares the prefix up to `tries`/`status`
+# and nothing after it.
 MSG_CURRENT = msg_current()
 
 

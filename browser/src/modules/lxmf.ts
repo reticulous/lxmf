@@ -15,7 +15,7 @@ import { ref, reactive, computed, watch,
          type ComputedRef, type Ref, type WritableComputedRef } from 'vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
 import { useMenuStore } from 'spangap-browser/stores/menu'
-import RlpgStatus from '../panels/RlpgStatus.vue'
+import ProxyStatus from '../panels/ProxyStatus.vue'
 import { registerApp } from 'spangap-browser/lib/apps'
 import { registerWindowMount } from 'spangap-browser/lib/windowMounts'
 import { registerTopbarIcon } from 'spangap-browser/lib/topbarIcons'
@@ -34,6 +34,12 @@ import MessagesWindows from '../panels/MessagesWindows.vue'
 export const FALLBACK_ID = -1
 export const messagesVisibleById = reactive<Record<number, boolean>>({})
 export const messagesFocusById = reactive<Record<number, number>>({})
+
+/** The dock icon is a question once there is more than one account: which one.
+ *  Answering it shows (or raises) that identity's own window, and the windows
+ *  are independent — two accounts sit side by side, both live. Rendered by
+ *  MessagesWindows, which already owns the per-identity window records. */
+export const identityChooserOpen = ref(false)
 
 /* Menu action for an identity's window: only ever show + raise, never hide. */
 export function showMessages(n: number = FALLBACK_ID) {
@@ -77,10 +83,12 @@ export enum LxmfStatus {
   LinkOpenFail = 19, ResMalloc = 20, ResSend = 21, LinkSendDrop = 22,
   PacketSendDrop = 23, ResTransfer = 24, LinkFail = 25, LinkClosed = 26,
   Unknown = 27, NoResponse = 28,
-  /* RLPG mailbox states (tries 255 yet still movable by RLPG service msgs:
-   * OurRlpg → RemoteRlpg → Delivered). */
-  RemoteRlpg = 29, OurRlpg = 30, RemoteRlpgFull = 31, RemoteRlpgErr = 32,
-  /* 33 retired (was RlpgExpired) */
+  /* Proxy states, on a client whose account is served by an lxmproxy server
+   * (tries 255 yet still movable, since the server relays the account's real
+   * status back over the Channel: OnProxy → Delivered, or OnProxy → whatever
+   * the server's own send settled). */
+  OnProxy = 29, ProxyRefused = 30,
+  /* 31, 32 free; 33 retired */
   /* Send failed while the local LoRa radio was shedding frames to channel
    * contention — the own channel is jammed, not the peer silent. */
   RadioBusy = 34,
@@ -109,6 +117,12 @@ export interface Message {
   replyTo?: string     // FIELD_REPLY_TO hex64, '' / all-zero if not a reply
   method?: string      // delivery method override
   read?: number        // inbound read flag
+  // A proxy server withheld this body: the bubble offers the download rather
+  // than the text, and `bodySize` is what makes the offer worth making. Empty
+  // content is a legitimate message, so absence is a stored field and never
+  // inferred from an empty string.
+  bodyAbsent: boolean
+  bodySize: number
 }
 
 /* One probe outcome from lxmf.ping.<peer>.*, RAM-only and overwritten by the
@@ -148,7 +162,12 @@ export interface Identity {
   n: number
   label: string
   displayName: string
+  /** This slot's own delivery destination is registered with rnsd. False for a
+   *  proxied account, which is served from somebody else's box. */
   up: boolean
+  /** The firmware says this slot can take a message — `up`, or proxied. This,
+   *  not `up`, is what a window or a composer gates on. */
+  ready: boolean
   destHash: string
   enabled: boolean
 }
@@ -159,7 +178,6 @@ export interface Contact {
   nick: string
   trust: number
   lastSeen: number
-  rlpg: string         // peer's RLPG mailbox dest (32-hex); '' / all-zero = none known
   caps: number         // announce capability bits (bit0 = accepts double-encrypted payloads); -1 = leaf absent (unknown)
   pn: string           // per-contact propagation node (32-hex); '' / all-zero = none set
 }
@@ -210,12 +228,6 @@ export function peerAvatar(peer: string, name: string): { hue: number; glyph: st
 function num(v: unknown, d = 0): number { const n = Number(v); return Number.isFinite(n) ? n : d }
 function str(v: unknown): string { return v == null ? '' : String(v) }
 
-/** True when a stored `rlpg` value names a real mailbox — non-empty and not
- *  the all-zero placeholder. */
-export function hasRlpg(rlpg: string): boolean {
-  return /[1-9a-f]/i.test(rlpg)
-}
-
 /** True when a stored destination field (e.g. a contact's `pn`) names a real
  *  dest — non-empty and not the all-zero placeholder. */
 export function hasDest(v: string): boolean {
@@ -242,9 +254,7 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.ResTransfer]: 'RES_TRANSFER', [LxmfStatus.LinkFail]: 'LINK_FAIL',
   [LxmfStatus.LinkClosed]: 'LINK_CLOSED', [LxmfStatus.Unknown]: 'UNKNOWN',
   [LxmfStatus.NoResponse]: 'NO_RESPONSE',
-  [LxmfStatus.RemoteRlpg]: 'REMOTE_RLPG', [LxmfStatus.OurRlpg]: 'OUR_RLPG',
-  [LxmfStatus.RemoteRlpgFull]: 'REMOTE_RLPG_FULL',
-  [LxmfStatus.RemoteRlpgErr]: 'REMOTE_RLPG_ERR',
+  [LxmfStatus.OnProxy]: 'ON_PROXY', [LxmfStatus.ProxyRefused]: 'PROXY_REFUSED',
   [LxmfStatus.RadioBusy]: 'RADIO_BUSY',
   [LxmfStatus.OnPn]: 'ON_PN', [LxmfStatus.PnFail]: 'PN_FAIL',
   [LxmfStatus.PnRejected]: 'PN_REJECTED',
@@ -329,14 +339,6 @@ export function formatMsgTime(ts: number): string {
   if (!ts) return ''
   const fmt = str(useDeviceStore().get('s.lxmf.msg_time_format')) || '%H:%M'
   return strftime(new Date(ts * 1000), fmt)
-}
-
-/* Format an RLPG certificate expiry (unix seconds) as a local date + time —
- * a cert validity is days/weeks out, so it needs the date, not just the clock
- * formatMsgTime uses. Never a raw epoch. 0 / unset → "—". */
-export function formatCertExpiry(ts: number): string {
-  if (!ts) return '—'
-  return strftime(new Date(ts * 1000), '%Y-%m-%d %H:%M')
 }
 
 /* ── Per-sentinel command queues (§3.2) ─────────────────────────────────
@@ -501,12 +503,12 @@ export interface UseLxmf {
   identities: ComputedRef<Identity[]>
   usableIdentities: ComputedRef<Identity[]>
   identitiesKnown: ComputedRef<boolean>
-  activeIdentityUp: ComputedRef<boolean>
+  activeIdentityReady: ComputedRef<boolean>
   conversations: ComputedRef<Conversation[]>
   activeConversation: ComputedRef<{ day: string; messages: Message[] }[]>
   contacts: ComputedRef<Record<string, Contact>>
   announces: ComputedRef<Announce[]>
-  peerDirectory: ComputedRef<{ peer: string; name: string; known: boolean; rlpg: boolean }[]>
+  peerDirectory: ComputedRef<{ peer: string; name: string; known: boolean }[]>
   unreadTotal: ComputedRef<number>
   displayName: (peer: string) => string
   reachability: (peer: string) => Reachability | null
@@ -543,6 +545,9 @@ export interface UseLxmf {
   ping: (peer: string) => Promise<void>
   /** Latest probe outcome for a peer (lxmf.ping.<peer>.*), null if never probed. */
   pingResult: (peer: string) => PingResult | null
+  /** Ask the proxy server for a body it withheld. Resolves once the body has
+   *  landed in the record. Only meaningful on a message with `bodyAbsent`. */
+  fetchBody: (peer: string, key: string) => Promise<void>
   /** The radio's own record of a peer (SUPE's lora.<n>.meas.*): its signal and
    *  path loss both ways. Null when no radio has heard the peer. */
   peerMeas: (peer: string) => PeerMeas | null
@@ -579,6 +584,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
           label: str(s.label),
           displayName: str(s.display_name) || str(s.label) || `identity ${n}`,
           up: num(live.up) === 1,
+          ready: num(live.ready) === 1,
           destHash: str(live.dest_hash),
           enabled: num(s.enabled, 1) === 1,   // default on; absent ⇒ enabled
         }
@@ -587,9 +593,12 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   /** Only identities the firmware has actually brought up can send or
    *  receive. A config-only slot (e.g. `s.lxmf.id.N.*` written by a test
    *  or import with no `secrets.lxmf.id.N.privkey`) is NOT usable —
-   *  presenting it as one lets a send hang on an unprocessable sentinel. */
+   *  presenting it as one lets a send hang on an unprocessable sentinel.
+   *  The test is `ready`, not `up`: a proxied account is permanently not up
+   *  (its server is the registrant) and works perfectly, so filtering on `up`
+   *  leaves it with no window at all. */
   const usableIdentities = computed<Identity[]>(() =>
-    identities.value.filter(i => i.up && i.destHash))
+    identities.value.filter(i => i.ready && i.destHash))
 
   /** Whether `identities` is an ANSWER yet. Until the first full storage dump
    *  lands, `s.lxmf.id` is simply absent from the mirror and the list is empty
@@ -615,7 +624,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const activeId = computed(() =>
     pinned ? (typeof identity === 'number' ? identity : identity!.value)
            : _activeIdentity.value)
-  const activeIdentityUp = computed(() =>
+  const activeIdentityReady = computed(() =>
     usableIdentities.value.some(i => i.n === activeId.value))
 
   /* Selection for this instance's identity slot (writable). */
@@ -646,7 +655,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         nick: str(c.nick),
         trust: num(c.trust),
         lastSeen: num(c.last_seen),
-        rlpg: str(c.rlpg),
         caps: num(c.caps, -1),   // mirrored as a decimal string like trust; an absent leaf stays -1 (unknown)
         pn: str(c.pn),
       }
@@ -717,6 +725,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       replyTo: str(r.reply_to),
       method: str(r.method),
       read: num(r.read),
+      bodyAbsent: num(r.body_absent) !== 0,
+      bodySize: num(r.body_size),
     }
   }
 
@@ -776,19 +786,16 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
 
   const peerDirectory = computed(() => {
     const seen = new Set<string>()
-    const rows: { peer: string; name: string; known: boolean; rlpg: boolean }[] = []
+    const rows: { peer: string; name: string; known: boolean }[] = []
     for (const c of Object.values(contacts.value)) {
       if (!contactPeers.value.has(c.peer)) continue   // record, but no messages
       seen.add(c.peer)
-      rows.push({ peer: c.peer, name: displayName(c.peer), known: true, rlpg: hasRlpg(c.rlpg) })
+      rows.push({ peer: c.peer, name: displayName(c.peer), known: true })
     }
     for (const a of announces.value) {
       if (seen.has(a.hash)) continue
       seen.add(a.hash)
-      /* An on-the-mesh peer can still have a record (announce name, a set pn) —
-       * its RLPG mailbox is worth showing even before any message. */
-      rows.push({ peer: a.hash, name: displayName(a.hash), known: false,
-                  rlpg: hasRlpg(contacts.value[a.hash]?.rlpg ?? '') })
+      rows.push({ peer: a.hash, name: displayName(a.hash), known: false })
     }
     return rows
   })
@@ -807,7 +814,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const n = activeId.value
     // Fail fast on a down/keyless identity rather than writing a
     // sentinel nothing will ever process (6 s CmdQueue timeout).
-    if (!activeIdentityUp.value)
+    if (!activeIdentityReady.value)
       throw new Error('identity not connected — cannot send')
     const key = `o_${Date.now()}_${rand4()}`
     const rec: Patch = {
@@ -890,6 +897,17 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
    * as long as the mesh takes, and the caller watches pingResult for that. */
   const ping = (peer: string): Promise<void> =>
     queue(`lxmf.id.${activeId.value}.cmd.ping`).enqueue(peer)
+
+  /* Ask the proxy server for a body it withheld. Settles on the record's own
+   * effect — the body arriving — never on the sentinel, since ephemeral
+   * deletions are not propagated back over the storage channel. */
+  const fetchBody = (peer: string, key: string): Promise<void> => {
+    const n = activeId.value
+    return queue(`lxmf.id.${n}.cmd.fetch`).enqueue(`${peer}/${key}`, {
+      settle: () => num(device.get(
+        `s.lxmf.id.${n}.msgs.${peer}.${key}.body_absent`)) === 0,
+    })
+  }
 
   const pingResult = (peer: string): PingResult | null => {
     const r = device.get(`lxmf.ping.${peer}`)
@@ -1055,7 +1073,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   return {
     activeIdentity: _activeIdentity,
     activePeer,
-    identities, usableIdentities, identitiesKnown, activeIdentityUp,
+    identities, usableIdentities, identitiesKnown, activeIdentityReady,
     conversations, activeConversation, contacts, announces,
     peerDirectory, unreadTotal,
     displayName, reachability, contactOf, draftFor, setDraft, openPeer,
@@ -1063,7 +1081,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
     pnStatus, setContactPn,
     markConversationRead, announceNow, linkState, toggleLink,
-    ping, pingResult, peerMeas,
+    ping, pingResult, fetchBody, peerMeas,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }
 }
@@ -1074,9 +1092,10 @@ export function registerLxmf() {
   const menu = useMenuStore()
   const lx = useLxmf()
 
-  /* Own-mailbox state in the app header: the selected identity's RLPG
-   * store-and-forward mailbox connection (hidden while none is configured). */
-  registerTopbarIcon({ id: 'lxmf-rlpg', component: RlpgStatus })
+  /* Proxy state in the app header: the selected identity's Channel to the
+   * server holding its account (hidden while this device answers on its own
+   * address, which is the common case). */
+  registerTopbarIcon({ id: 'lxmf-proxy', component: ProxyStatus })
 
   /* A contact tapped in the nomad web browser arrives as `lxmf.url_web`
    * (written by the nomad module). Bring the right identity's Messages window
@@ -1127,17 +1146,16 @@ export function registerLxmf() {
    * stream lives inside the LXMF window.) */
   registerApp({ id: 'lxmf', label: 'LXMF', icon: 'lxmf', placement: 5,
                 open: () => {
-                  /* Open the active identity's window (or the first usable one);
-                   * MessagesWindows only mounts a window per usable identity,
-                   * so defaulting to FALLBACK_ID would target an unmounted
-                   * window when identities exist. showMessages bumps the focus
-                   * token, which raises an already-open window to the front. */
+                  /* More than one account: ask which, and let as many windows
+                   * be open at once as the user opens. One account (or none):
+                   * straight in. MessagesWindows only mounts a window per
+                   * usable identity, so defaulting to FALLBACK_ID would target
+                   * an unmounted window when identities exist. showMessages
+                   * bumps the focus token, raising an open window to the
+                   * front. */
                   const usable = lx.usableIdentities.value
-                  const active = lx.activeIdentity.value
-                  const n = usable.length
-                    ? (usable.some(i => i.n === active) ? active : usable[0]!.n)
-                    : FALLBACK_ID
-                  showMessages(n)
+                  if (usable.length > 1) { identityChooserOpen.value = true; return }
+                  showMessages(usable[0]?.n ?? FALLBACK_ID)
                 },
                 isOpen: () => Object.values(messagesVisibleById).some(Boolean) })
 

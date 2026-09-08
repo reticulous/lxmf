@@ -125,6 +125,10 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — one packet out, its delivery proof back (see **Ping**) |
+| `lxmf.id.<n>.cmd.fetch` | `<peer>/<message_id>` | ask the proxy server for a body it withheld (see **Being proxied**) |
+| `lxmf.id.<n>.cmd.proxy_on` | `<32-hex>` | ask that `lxmproxy.server` to take this account; this device stays registered until the server confirms |
+| `lxmf.id.<n>.cmd.proxy_off` | any | hand the account back; this device stays proxied and working until the server answers |
+| `lxmf.id.<n>.cmd.proxy_force_off` | any | the dead-server override — read what it costs first |
 
 To make a sentinel atomic with its data, write the data fields and the
 sentinel in one `storageBegin()/storageEnd()` transaction — the firmware
@@ -164,7 +168,13 @@ s.lxmf.id.<n>.enabled        1 (default) — 0 = identity dark: no announce, no 
 s.lxmf.id.<n>.display_name   utf-8, advertised in announces
 s.lxmf.id.<n>.default_method  per-identity delivery method (see below); falls
                              back to the global s.lxmf.default_method
-lxmf.id.<n>.up               1 once the mailbox is connected
+lxmf.id.<n>.up               1 once the mailbox is connected — this device's own
+                             delivery destination is registered with rnsd
+lxmf.id.<n>.ready            1 once the slot can take a message: `up`, or the
+                             account is proxied (see **Being proxied**), where
+                             sends ride the Channel and `up` is permanently 0.
+                             This is what a composer, a window and a send gate
+                             on; `up` alone would strand a proxied account
 lxmf.id.<n>.dest_hash        hex16 — this identity's lxmf.delivery address
 lxmf.id.<n>.identity_hash    hex16 — the identity under it: what a node sees
                              when this account identifies on a link, and what
@@ -313,6 +323,161 @@ on-device pane).
 
 This device does not *run* a propagation node — it is a client only.
 
+## Being proxied — an always-on device holds the account
+
+```
+this device                            the server
+  cmd.proxy_on <server dest> ─ CHANNEL ─►    (identifies with the account key)
+                             ◄─ HELLO        label, limits, serving?
+  HANDOVER [key, name, ratchets] ─────►
+                             ◄─ SERVING      it is registered and announcing
+  deregister our own destination, role := client
+                             ◄─ MSG …        mail, live, while we are online
+  SEND … ────────────────────────────►
+                             ◄─ STATUS       the account's real status, verbatim
+```
+
+An account normally lives on the device in front of you: it registers its
+`lxmf.delivery` destination, announces it, and can only receive while it is
+switched on. A **proxy server** ([lxmproxy](../lxmproxy)) takes that over. It
+holds the same keys, registers and announces the same address, receives the
+mail and sends the outbound; this device holds a permanently-open Channel to it
+and exchanges messages over that. The rest of the network sees an ordinary
+always-online LXMF node.
+
+The cost is stated plainly and not designed around: **both devices hold the
+account key and the cleartext.**
+
+What it buys: messages arrive while this device is off, and the server delivers
+its outbound while it is away. A proxied device advertises nothing, so there is
+no announce beat from a moving radio and no waiting for paths to propagate to
+it — it initiates every link it needs and the answers ride home on them.
+
+What it assumes is that the server's uplink is better than this device's. When
+both sit on the same LoRa mesh every message crosses the air twice, once to the
+server and once here, and only the offline half is bought.
+
+**Exactly one registrant.** At every moment exactly one device registers and
+announces the account's `lxmf.delivery` — never zero, never two. One
+per-identity key holds it:
+
+```
+s.lxmf.id.<n>.proxy_role = off | server | client
+```
+
+A `client` slot is therefore **never `up`** — it has no destination of its own
+registered here, and that is the correct steady state, not a stage it is
+waiting to leave. Everything that asks "can I send from this account?" asks
+`lxmf.id.<n>.ready` instead, which is true for a proxied slot the moment it
+loads: with the Channel up the send goes to the server, and without it the
+message waits in the local delivery queue, exactly as it would for an
+unreachable peer.
+
+`off` is the ordinary case: this device answers on the address. `server` means
+this device is hosting somebody *else's* account (lxmproxy set it) and still
+registers and announces. `client` means the account belongs to a server: this
+device registers nothing, announces nothing, and hands its delivery queue to
+the Channel. Making it one enum is what makes the both-ends-registered state
+unreachable.
+
+Both transitions are handshakes, never a local flag flip:
+
+- **Turning it on** — this device keeps its own destination registered until the
+  server confirms it is serving.
+- **Turning it off** — this device stays proxied, fully working, with the server
+  still delivering, until the server hands the account back. It never enters a
+  state where it is neither.
+
+Deregistering tells the network nothing: the old registrant's announces keep
+bouncing around until they age out, and peers keep their cached path until it
+expires. The new registrant announces at once and the network converges as that
+announce spreads. There is a window; nothing detects or corrects it.
+
+**Where the address does and does not disappear.** The moment the server
+confirms, this device deregisters the destination — it stops being in
+`rnsdHostedDestsForEach`, `rnsd.dest.<n>` goes, and nothing announces it from
+here again. What does *not* change is anybody's memory of having heard it: other
+nodes' announce caches and path tables age out on their own schedule, and
+`lora n` builds its own rows from announces this radio was heard transmitting
+and never retires a local one. That listing asks rnsd what is hosted *now*
+before printing a row under "us", so a handed-over address drops off it — but
+the underlying observation is still there, and a peer that has not yet heard the
+server's announce will still try this device for a while.
+
+**Talking to an account this device hosts.** If this device is a proxy server
+and you message the account it holds from another identity here, the message
+never touches the network: Reticulum has no path to its own destinations, so it
+is packed, signed, and handed straight to the recipient slot's inbound
+pipeline — stored, and pushed on to the owner's roaming device over their
+Channel like any other inbound. It settles `DELIVERED` because it genuinely is.
+
+**Dead-server override.** If the server is physically gone the release never
+lands, and **Force off** is the way out. What it costs:
+
+- if the server ever returns it will register and announce the same address, and
+  nothing on the network can tell the two apart;
+- anything it still holds is stranded — undelivered outbound, and inbound it
+  accepted but never handed over;
+- the key is still on that box, and there is no revocation short of a new
+  identity, which is a new address;
+- the ratchet state is stranded with it: until peers hear this device's fresh
+  announce, what they send is encrypted to ratchets it does not hold.
+
+**Picking a server.** Nobody types a hash. Every `lxmproxy.server` announce this
+device hears is catalogued (`lxmf.proxies.<dest>.{label,last}`) and offered by
+the operator's label — `lxmf proxy servers` on the CLI, the **Heard** line in
+the settings form. What is stored per identity is the one you chose:
+
+```
+s.lxmf.id.<n>.proxy_dest    32-hex lxmproxy.server destination
+```
+
+**While proxied.** Outbound goes over the Channel and the server's real
+`LxmfStatus` comes back verbatim, so a failure shows the true error rather than
+a proxy-flavoured one. One check (`ON_PROXY`) means the server has it; two
+(`DELIVERED`) still means a real LXMF delivery proof. With no Channel, outbound
+sits `QUEUED` locally with **no checkmark** — nothing has it but this device.
+
+Inbound arrives as ordinary message records. A body over the link's own
+threshold is **withheld**: the bubble offers a download instead of the text, and
+`cmd.fetch` (the button) asks for it. That state is durable, so a reboot
+mid-decision still knows the body is missing:
+
+```
+msgs.<peer>.<id>.body_absent   1 = the body is still on the server
+msgs.<peer>.<id>.body_size     the body's length either way
+```
+
+**A direct link still works.** Opening a conversation Link to a peer needs only
+the identity key, not a registered destination, and we identify on our own links
+so peers reply over them. So a proxied device can open one deliberately and talk
+to a peer with the proxy out of the way — it just never does so on its own
+initiative, because the proxy is the default path. Anything that rides the
+mailbox handle — `cmd.ping`, `opportunistic-or-fail` — is unavailable while
+proxied, and messages sent or received over a direct link leave holes in the
+server's copy of the thread.
+
+**Settings.** Account-scoped settings — display name, stamp cost, stamp
+enforcement, the propagation-node list, whether the identity is enabled — live
+on the server, because it is the end that faces the world, but are only ever
+*edited* here, because this is the end with a UI. They are pushed on change and reconciled on connect. The
+server pushes back what only it knows (real announce state, quota use), so the
+UI shows truth rather than intent. **Contacts are not synced**: both ends
+auto-create on first contact and are allowed to diverge, and each pushed message
+carries the peer's display name as a hint for a peer this device never heard
+announce.
+
+Turn it on from Settings → Reticulum Mesh → LXMF Messages (per identity), or
+from the CLI:
+
+```
+lxmf proxy                   role, server, Channel state, quota
+lxmf proxy servers           the lxmproxy.server announces we have heard
+lxmf proxy on <32-hex>       ask that server to take this account
+lxmf proxy off               hand it back (stays working until it answers)
+lxmf proxy force-off         the dead-server override, with the costs above
+```
+
 ## Receiving a message
 
 Inbound messages are verified, de-duplicated, and stored at
@@ -348,7 +513,7 @@ both frontends print; the numbers are persisted, so the list is append-only
 | progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` | still in play; the delivery queue will try again |
 | settled | `DELIVERED` `CANCELLED` `RECEIVED` | proof received / user cancelled / inbound |
 | gave up | `DELIVERY_TIMEOUT` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` … | why it stopped: out of time, or a local error another attempt cannot fix |
-| in someone else's custody | `REMOTE_RLPG` `OUR_RLPG` `ON_PN` `REMOTE_RLPG_FULL` `REMOTE_RLPG_ERR` `PN_FAIL` `PN_REJECTED` | mailbox / propagation-node states |
+| in someone else's custody | `ON_PROXY` `ON_PN` `PROXY_REFUSED` `PN_FAIL` `PN_REJECTED` | proxy-server / propagation-node states |
 
 The companion `tries` byte, not the status, is the definitive terminal marker:
 `tries == 255` means gave up, and below that the message is still live whatever
@@ -367,9 +532,9 @@ proof (or the proof-grade Resource transfer acknowledgement) produces
 Both frontends render this on outbound bubbles as the ALL-CAPS status name
 plus a glyph: grey `…` while in play, two green checks for `DELIVERED` (which
 needs no name), a grey ✕ for `CANCELLED`, a red ✕ once `tries` hits 255. A
-message sitting in someone else's custody — parked at an RLPG mailbox
-(`REMOTE_RLPG`/`OUR_RLPG`) or uploaded to a propagation node (`ON_PN`) — gets a
-single open-circle tick: stored for pickup, no proof of arrival.
+message sitting in someone else's custody — handed to a proxy server
+(`ON_PROXY`) or uploaded to a propagation node (`ON_PN`) — gets a single
+open-circle tick: a machine that is not mine has it, no proof of arrival.
 
 ## Ping
 
@@ -517,9 +682,13 @@ enabled          1 (default); 0 = dark
 display_name     utf-8, advertised in announces
 default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
                  (empty ⇒ inherit global s.lxmf.default_method, default link-if-one-exists)
-contacts.<peer>.{hash,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
-msgs.<peer>.<key>.{dir,status,tries,peer,title,content,thread,method,ts,recv_ts,
-                   read,wire,message_id}    per-conversation message records
+proxy_role       off (default) | server | client — which device registers and
+                 announces this account (see Being proxied)
+proxy_dest       32-hex lxmproxy.server destination, while proxied
+contacts.<peer>.{hash,nick,display_name,trust,last_seen,caps,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
+msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,method,ts,recv_ts,
+                   read,message_id,body_absent,body_size,handed}
+                                 per-conversation message records
 ```
 
 ### Runtime (`lxmf.*`, RAM)
@@ -527,12 +696,24 @@ msgs.<peer>.<key>.{dir,status,tries,peer,title,content,thread,method,ts,recv_ts,
 ```
 lxmf.up                          task alive
 lxmf.id.<n>.up                   identity's mailbox connected
+lxmf.id.<n>.ready                the slot can take a message (up, or proxied)
 lxmf.id.<n>.dest_hash            hex16 lxmf.delivery address
 lxmf.id.<n>.identity_hash        hex16 identity hash behind that address
 lxmf.id.<n>.last_announce_s      unix seconds of last announce
 lxmf.id.<n>.stats.{sent,received,pending,failed}
-lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
+lxmf.id.<n>.proxy_state          "" | provisioning | client | releasing | server
+lxmf.id.<n>.proxy_link           down | connecting | active — the Channel to the
+                                 server; "" while this device answers itself
+lxmf.id.<n>.proxy_text           the pane's one line, composed by the firmware
+lxmf.id.<n>.proxy_label          the server's operator label
+lxmf.id.<n>.proxy_quota          what the server reports it is holding for us
+lxmf.id.<n>.accept               0 gates this destination's inbound in rnsd —
+                                 dropped WITHOUT a proof, so the sender retries.
+                                 Set by whatever ran out of room; a boot accepts.
+lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,caps,name}
                                  heard-peer catalogue (RAM, browser-mirrored)
+lxmf.proxies.<dest_hex>.{label,last}   heard lxmproxy.server catalogue
+lxmf.proxies_text                the same, as one finished line each
 lxmf.ping.<peer>.*               latest probe result for that contact — see Ping above.
 ```
 
@@ -577,6 +758,9 @@ lxmf p[ing] <peer>          probe <peer> (same forms as `send`); holds the promp
                             until the probe settles, its 20 s timeout expires, or
                             Ctrl-C, then prints the outcome, the wait, and both
                             ends' signal
+lxmf proxy [<cmd>]          no arg = this identity's proxy state; `servers` =
+                            the lxmproxy.server announces heard; `on <32-hex>`,
+                            `off`, `force-off` (see **Being proxied**)
 ```
 
 Numbered listings (`chats`, `msgs`, `contacts`, `announces`) feed the index
@@ -608,6 +792,23 @@ under `conditional/spangap-lcd/` and is compiled and registered only when
 the [spangap-lcd](../spangap-lcd) straddle is in the build (the
 `lxmfLcdRegister` init hook is `when:`-gated) — no `#if` anywhere.
 
+**Picking an account.** With one identity neither surface asks. With more than
+one, both ask on the way in and nowhere else — there is no in-window identity
+switcher on either.
+
+- **Web:** the dock icon raises a chooser listing every ready account; picking
+  one opens or raises *that account's own window*. Each identity has its own
+  independent window, so two accounts sit side by side, both live, each with
+  its own conversation open. The **LXMF Messages** menu lists them the same
+  way, one item per identity, as a second route to the same windows.
+- **LCD:** every tap on the launcher tile re-offers the picker, so the second
+  and further accounts are reachable without stopping the app; picking the one
+  already in view goes back to the conversation the picker covered. The other
+  two ways in carry their own answer and skip it — a recents switch resumes
+  work in progress, and a tapped `lxmf@` link (`lcdShowProgram`) means a
+  specific conversation under the identity already chosen. One app, one
+  identity at a time.
+
 Both frontends share the contact-info pattern: clicking anywhere on a
 conversation's header (or, on the LCD, a contact row's circled-i — the info
 icon is a cue, not the sole target) opens a per-peer info page showing the
@@ -628,11 +829,14 @@ is one press.
 lxmf/
 ├── esp-idf/
 │   ├── include/
-│   │   ├── lxmf.h          public API (lxmfInit, lxmfCreateIdentity, lxmfDestroyIdentity)
-│   │   └── lxmf_stamp.h    stamp generate/validate
+│   │   ├── lxmf.h            public API (identity create / import / destroy)
+│   │   ├── lxmf_stamp.h      stamp generate/validate
+│   │   └── lxmproxy_wire.h   the LXMF-proxy frames, shared with the server
 │   ├── src/
-│   │   ├── lxmf.cpp        the lxmf task: identities, mailbox, send/recv, announces
-│   │   └── lxmf_stamp.cpp  LXStamper-compatible PoW (self-contained SHA-256/HMAC/HKDF)
+│   │   ├── lxmf.cpp          the lxmf task: identities, mailbox, send/recv,
+│   │   │                     announces, and the proxy CLIENT
+│   │   ├── lxmf_stamp.cpp    LXStamper-compatible PoW (self-contained SHA-256/HMAC/HKDF)
+│   │   └── lxmproxy_wire.cpp the proxy frame codec (own minimal msgpack)
 │   ├── conditional/spangap-lcd/src/lxmf_lcd.cpp   on-device LXMF app (LVGL)
 │   └── data/lxmf/ding.wav                          notification sound → /fixed/lxmf/ding.wav
 └── browser/
@@ -647,6 +851,10 @@ lxmf/
 - [audio](../audio) — soft, default-on dependency (`spangap/audio`) for the
   notification sound; pruned silently when absent (every call site is gated,
   so a build without it still links, just with no sound).
+
+The other direction: [lxmproxy](../lxmproxy) — the proxy SERVER — requires this
+straddle. The client half and the shared frame codec are here, so every node can
+be proxied without carrying the server code.
 
 ## Read next
 

@@ -183,6 +183,11 @@ struct Msg {
     long ts = 0;           /* sender's clock (display) */
     long recv_ts = 0;      /* monotonic receive time (date-separator anchor) */
     bool in = false;
+    /* A proxy server withheld this body: the bubble offers the download rather
+     * than the text. Empty content is a legitimate message, so this is a field
+     * on the record and never inferred. */
+    bool body_absent = false;
+    long body_size = 0;
 };
 
 struct Ann { std::string hash, name; long last = 0; };   /* a heard announce */
@@ -218,7 +223,6 @@ struct RowSpec {
     std::string peer, title, sub, age;
     lv_color_t  titleColor{};
     int         unread = 0;
-    bool        rlpg = false;           /* contact has a stored RLPG mailbox → arrow glyph */
 };
 struct ListRow { std::string key, sig; lv_obj_t* obj = nullptr; };   /* one live row */
 std::vector<ListRow> g_rowsC;           /* Contacts rows in render order (search box excluded) */
@@ -317,7 +321,7 @@ lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidd
 lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle image (chain=up, broken-chain=down) */
 lv_obj_t* s_threadSig  = nullptr;       /* header signal bars (contact rssi/snr, falling back to gw) */
 lv_obj_t* s_gwBars     = nullptr;       /* system status-bar signal bars (rnsd.gw.*), created once */
-lv_obj_t* s_rlpgInd    = nullptr;       /* system status-bar RLPG mailbox arrow (lxmf.id.<n>.rlpg_state), created once */
+lv_obj_t* s_proxyInd   = nullptr;       /* system status-bar proxy arrow (lxmf.id.<n>.proxy_link), created once */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_msgDetail = nullptr;        /* per-message detail page (covers the thread; rebuilt per open) */
 lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
@@ -361,9 +365,10 @@ void setSignalBars(lv_obj_t* box, int local, int remote = -1, int heightPct = 10
 int signalBarsAt(const std::string& prefix);
 std::string peerMeasBase(const std::string& peer);
 int peerSignalBars(const std::string& peer);
-lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color);
-void tintRlpgArrow(lv_obj_t* box, lv_color_t c);
-void rlpgStatusUpdate(const char* = nullptr, const char* = nullptr);
+lv_obj_t* makeProxyArrow(lv_obj_t* parent, lv_color_t color);
+void tintProxyArrow(lv_obj_t* box, lv_color_t c);
+void proxyStatusUpdate(const char* = nullptr, const char* = nullptr);
+void bindPeer(lv_obj_t* o, lv_event_cb_t cb, const std::string& peer);
 void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
@@ -459,12 +464,15 @@ void loadedIds(std::vector<int>& out) {
     }
 }
 
-/* Fully up = the firmware has connected this slot's delivery dest, so it can
- * send/receive. Sending is gated on this even once history is already shown. */
-bool idUp(int n) {
+/* Ready = the firmware says this slot can take a message: its delivery dest is
+ * connected, or the account is proxied and sends go to the server over the
+ * Channel. Sending is gated on this even once history is already shown. Not
+ * `up`, which a proxied slot never is — it registers nothing here, and gating
+ * on it strands a working account behind the composer's waiting message. */
+bool idReady(int n) {
     if (n < 0) return false;
     char k[40];
-    snprintf(k, sizeof k, "lxmf.id.%d.up", n);
+    snprintf(k, sizeof k, "lxmf.id.%d.ready", n);
     return storageGetInt(k, 0) == 1;
 }
 
@@ -498,7 +506,7 @@ void selectId(int n) {
     g_id = n;
     g_msgsPrefix = (n >= 0) ? ("s.lxmf.id." + std::to_string(n) + ".msgs") : "";
     refreshMsgs();
-    rlpgStatusUpdate();   /* the status-bar mailbox arrow follows the selected slot */
+    proxyStatusUpdate();  /* the status-bar proxy arrow follows the selected slot */
 }
 
 std::string peerName(const std::string& peer) {
@@ -543,6 +551,8 @@ void msgCb(const char* key, const char* val) {
     else if (!strcmp(field, "status"))  m->status = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "tries"))   m->tries  = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "message_id")) m->message_id = val ? val : "";
+    else if (!strcmp(field, "body_absent")) m->body_absent = val && atoi(val) != 0;
+    else if (!strcmp(field, "body_size"))   m->body_size   = val ? atol(val) : 0;
 }
 
 void refreshMsgs() {
@@ -591,7 +601,7 @@ void refreshAnnounces() {
 /* ---- compose / send ---- */
 
 void sendMessage(const std::string& peer, const std::string& text) {
-    if (g_id < 0 || !idUp(g_id) || peer.empty() || text.empty()) return;
+    if (g_id < 0 || !idReady(g_id) || peer.empty() || text.empty()) return;
     static unsigned seq = 0;
     char key[40];
     snprintf(key, sizeof key, "o_%u_%u", (unsigned)millis(), ++seq);
@@ -661,7 +671,7 @@ void loadDraft(const std::string& peer) {
 
 void onSend(lv_event_t*) {
     if (!s_compose || g_curPeer.empty()) return;
-    if (g_id < 0 || !idUp(g_id)) return;   /* mailbox not up yet — sending is held */
+    if (g_id < 0 || !idReady(g_id)) return;   /* slot can't take it yet — sending is held */
     const char* t = lcdInputBoxText(s_compose);   /* trailing whitespace stripped */
     if (t && *t) {
         sendMessage(g_curPeer, t);
@@ -1397,12 +1407,12 @@ void buildThreadShell() {
 }
 
 /* Reflect the active identity's connection state onto the compose field. Until
- * its mailbox is up (the post-reset window while rnsd connects), history is
+ * the slot is ready (the post-reset window while rnsd connects), history is
  * readable but a send would be held — so disable the field and say why, rather
- * than take text that can't go out. Re-run whenever `up` may have flipped. */
+ * than take text that can't go out. Re-run whenever `ready` may have flipped. */
 void composeReflectUp() {
     if (!s_compose) return;
-    if (g_id >= 0 && idUp(g_id)) {
+    if (g_id >= 0 && idReady(g_id)) {
         lv_obj_remove_state(s_compose, LV_STATE_DISABLED);
         lv_textarea_set_placeholder_text(s_compose, "LXMF Message");
     } else {
@@ -1733,12 +1743,12 @@ void onSignalChange(const char* key, const char*) {
     }
 }
 
-/* ---- RLPG mailbox glyph: a small dotted right-arrow (store-and-forward) ---- */
+/* ---- proxy glyph: a small dotted right-arrow (mail going somewhere else) ---- */
 
-/* Recolour every part of an arrow built by makeRlpgArrow. Setting both bg and
+/* Recolour every part of an arrow built by makeProxyArrow. Setting both bg and
  * line colour on each child is harmless — the dashes render bg only, the
  * chevron line only. */
-void tintRlpgArrow(lv_obj_t* box, lv_color_t c) {
+void tintProxyArrow(lv_obj_t* box, lv_color_t c) {
     if (!box) return;
     uint32_t n = lv_obj_get_child_count(box);
     for (uint32_t i = 0; i < n; i++) {
@@ -1750,8 +1760,8 @@ void tintRlpgArrow(lv_obj_t* box, lv_color_t c) {
 
 /* Build the glyph into `parent` (caller positions it): three square dashes as
  * the shaft + an lv_line chevron as the head, vertically centred in a
- * content-sized flex row. ~13×6 px at zoom 1. Recolour with tintRlpgArrow(). */
-lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color) {
+ * content-sized flex row. ~13×6 px at zoom 1. Recolour with tintProxyArrow(). */
+lv_obj_t* makeProxyArrow(lv_obj_t* parent, lv_color_t color) {
     lv_obj_t* box = lv_obj_create(parent);
     lv_obj_remove_style_all(box);
     lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -1784,7 +1794,7 @@ lv_obj_t* makeRlpgArrow(lv_obj_t* parent, lv_color_t color) {
     lv_obj_add_event_cb(head, [](lv_event_t* e) {     /* the line keeps the points by pointer */
         delete[] static_cast<lv_point_precise_t*>(lv_event_get_user_data(e));
     }, LV_EVENT_DELETE, pts);
-    tintRlpgArrow(box, color);
+    tintProxyArrow(box, color);
     return box;
 }
 
@@ -1806,15 +1816,17 @@ static lv_obj_t* makeDeliveryTicks(lv_obj_t* parent, const char* base)
     return img;
 }
 
-/* System status-bar RLPG indicator: the selected identity's own
- * store-and-forward mailbox state (lxmf.id.<n>.rlpg_state). Key absent/"" =
- * no mailbox configured → hidden; "idle" grey, "connecting" yellow,
- * "connected" green. Before the messenger has picked a slot (g_id < 0) it
- * follows the lowest loaded identity. s_rlpgInd lives in the shell status bar
- * (created once in appInit), so it persists across app opens; a null handle
- * (status bar not up) no-ops. */
-void rlpgStatusUpdate(const char*, const char*) {
-    if (!s_rlpgInd) return;
+/* System status-bar proxy indicator: the selected identity's Channel to the
+ * server holding its account (lxmf.id.<n>.proxy_link). Key absent/"" = this
+ * device answers on its own address → hidden; "down" grey, "connecting"
+ * amber, "active" green. That is the whole state a proxied user needs at a
+ * glance: while it is not green, mail is arriving at the server and not here.
+ * Before the messenger has picked a slot (g_id < 0) it follows the lowest
+ * loaded identity. s_proxyInd lives in the shell status bar (created once in
+ * appInit), so it persists across app opens; a null handle (status bar not up)
+ * no-ops. */
+void proxyStatusUpdate(const char*, const char*) {
+    if (!s_proxyInd) return;
     int n = g_id;
     if (n < 0) {
         std::vector<int> ids;
@@ -1824,14 +1836,14 @@ void rlpgStatusUpdate(const char*, const char*) {
     std::string st;
     if (n >= 0) {
         char k[48];
-        snprintf(k, sizeof k, "lxmf.id.%d.rlpg_state", n);
+        snprintf(k, sizeof k, "lxmf.id.%d.proxy_link", n);
         st = storageGetStr(k, "");
     }
-    if (st.empty()) { lv_obj_add_flag(s_rlpgInd, LV_OBJ_FLAG_HIDDEN); return; }
-    uint32_t c = st == "connected"  ? 0x3fa34du :
+    if (st.empty()) { lv_obj_add_flag(s_proxyInd, LV_OBJ_FLAG_HIDDEN); return; }
+    uint32_t c = st == "active"     ? 0x3fa34du :
                  st == "connecting" ? 0xd4a017u : 0x888888u;
-    tintRlpgArrow(s_rlpgInd, lv_color_hex(c));
-    lv_obj_remove_flag(s_rlpgInd, LV_OBJ_FLAG_HIDDEN);
+    tintProxyArrow(s_proxyInd, lv_color_hex(c));
+    lv_obj_remove_flag(s_proxyInd, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* Make an object and its whole subtree transparent to touch, so a press falls
@@ -1886,13 +1898,13 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
     lv_label_set_text(tl, tbuf);
 
     if (!m.in) {
-        /* Signal-style ticks: two open circles = delivered, one = reached a
-         * mailbox (own/remote RLPG, awaiting pickup). A real failure/refusal
-         * (FULL/ERR/gave-up) is ✕; cancelled a grey ✕; else in flight. */
+        /* Signal-style ticks: two open circles = delivered, one = a machine
+         * that is not mine has it (a proxy server, or a propagation node
+         * awaiting pickup). A real failure or refusal is ✕; cancelled a grey ✕;
+         * else in flight. */
         if (m.status == LXMF_ST_DELIVERED) {
             makeDeliveryTicks(meta, "tick-delivered");
-        } else if (m.status == LXMF_ST_REMOTE_RLPG || m.status == LXMF_ST_OUR_RLPG ||
-                   m.status == LXMF_ST_ON_PN) {
+        } else if (m.status == LXMF_ST_ON_PROXY || m.status == LXMF_ST_ON_PN) {
             makeDeliveryTicks(meta, "tick-sent");
         } else {
             const char* sym = "...";                 /* in flight */
@@ -2030,7 +2042,31 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     lv_obj_set_flex_align(bub, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_remove_flag(bub, LV_OBJ_FLAG_SCROLLABLE);
 
-    addBubbleText(bub, m.content);                    /* text + tappable Nomad links, wrapped to 228 */
+    if (m.body_absent) {
+        /* The proxy server withheld this body — it is over the link's inline
+         * threshold. Offer the download instead of the text: a tap asks for it,
+         * and the bubble fills in when it lands. The size is why the offer is
+         * worth making rather than pushing it unasked. */
+        char lbl[64];
+        std::snprintf(lbl, sizeof lbl, LV_SYMBOL_DOWNLOAD "  Download %ld bytes",
+                      m.body_size);
+        lv_obj_t* dl = lv_label_create(bub);
+        lv_obj_set_style_text_font(dl, kFontSmall, 0);
+        lv_obj_set_style_text_color(dl, lv_color_hex(0xc0d8f0), 0);
+        lv_label_set_text(dl, lbl);
+        lv_obj_add_flag(dl, LV_OBJ_FLAG_CLICKABLE);
+        /* An inbound record is keyed by its message id, so peer/key is all the
+         * fetch needs. */
+        bindPeer(dl, [](lv_event_t* e) {
+            auto* pk = (std::string*)lv_event_get_user_data(e);
+            if (!pk || g_id < 0) return;
+            char k[48];
+            std::snprintf(k, sizeof k, "lxmf.id.%d.cmd.fetch", g_id);
+            storageSet(k, pk->c_str());
+        }, m.peer + "/" + m.key);
+    } else {
+        addBubbleText(bub, m.content);                /* text + tappable Nomad links, wrapped to 228 */
+    }
 
     /* Meta row: status name + timestamp + delivery glyph. CONTENT-sized (not
      * full-width) so it becomes a lower bound on the bubble width — a bubble under
@@ -2319,8 +2355,7 @@ void closeHistory() {
 
 /* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
 
-struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; int count = 0;
-              bool rlpg = false; /* a non-trivial contacts.<peer>.rlpg = stored mailbox dest */ };
+struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; int count = 0; };
 
 /* Conversation list built from the maintained directory (contacts.<peer>.*),
    NOT by walking messages — O(conversations), and it touches only the small
@@ -2347,8 +2382,6 @@ void convCb(const char* key, const char* val) {
     else if (!strcmp(field, "unread"))  c->unread  = val ? atoi(val) : 0;
     else if (!strcmp(field, "read_ts")) c->read_ts = val ? atol(val) : 0;
     else if (!strcmp(field, "preview")) c->preview = val ? val : "";
-    /* rlpg: the peer's mailbox dest (32-hex); empty / all-zero = none known. */
-    else if (!strcmp(field, "rlpg"))    c->rlpg    = val && *val && strspn(val, "0") != strlen(val);
 }
 
 /* Compact "time since" badge shown at the right of every row: how long ago we
@@ -3052,13 +3085,6 @@ lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
 
     fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);   /* row → flex: [body][age] */
 
-    /* Dotted-arrow mailbox glyph: this contact has a stored RLPG mailbox, so a
-     * message to them can be parked for store-and-forward pickup. */
-    if (s.rlpg) {
-        lv_obj_t* mb = makeRlpgArrow(row, lv_color_hex(0x8a93a0));
-        lv_obj_set_style_pad_left(mb, 4, 0);
-    }
-
     /* Per-contact signal bars, shown when a radio has heard this peer (SUPE's
      * lora.<n>.meas.* holds a record for it). */
     int cbars = peerSignalBars(s.peer);
@@ -3297,9 +3323,8 @@ void rebuildList(bool keepScroll) {
         RowSpec s; s.kind = RK_CONTACT; s.key = c.peer; s.peer = c.peer;
         s.title = nm; s.sub = printable(c.preview, true);
         s.age = la > 0 ? relAge(now - la) : std::string();
-        s.titleColor = lv_color_white(); s.unread = c.unread; s.rlpg = c.rlpg;
-        s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread)
-              + (c.rlpg ? "|R" : "");                                       /* age excluded on purpose */
+        s.titleColor = lv_color_white(); s.unread = c.unread;
+        s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread);   /* age excluded on purpose */
         tC.push_back(std::move(s));
         cRows++;
     }
@@ -3578,6 +3603,14 @@ void buildContactsScreen() {
 
 void onIdPick(lv_event_t* e) {
     int n = (int)(intptr_t)lv_event_get_user_data(e);
+    /* Re-picking the identity already in view is a "never mind": go back to the
+     * conversation the picker covered rather than dropping the user at the top
+     * of its contact list. Only reachable from the tile-tap picker — the
+     * first-open one has nothing behind it. */
+    if (n == g_id && !g_curPeer.empty()) {
+        openThread(g_curPeer);
+        return;
+    }
     selectId(n);
     showContacts();
     maybeOpenPending();       /* resume a nomad-tapped open under the chosen identity */
@@ -3638,6 +3671,32 @@ void showIdPicker(const std::vector<int>& ids) {
     }
     lv_obj_remove_flag(s_idpick, LV_OBJ_FLAG_HIDDEN);
     deferFocus(first);
+}
+
+/* Every tap on the launcher tile asks which account again, so the second and
+ * further identities stay reachable without stopping the app. The other two
+ * ways in already carry their answer: a recents switch resumes work in
+ * progress, and lcdShowProgram() (a tapped `lxmf@` link) means a specific
+ * conversation under the identity already chosen. */
+void offerIdPickerOnLaunch(ShowFrom from) {
+    if (!s_layer || from != ShowFrom::LAUNCHER) return;
+    if (s_idpick && !lv_obj_has_flag(s_idpick, LV_OBJ_FLAG_HIDDEN)) return;  /* already asking */
+    std::vector<int> ids;
+    loadedIds(ids);
+    if (ids.size() > 1) showIdPicker(ids);
+}
+
+/* Back out of the tile-tap picker. It is an overlay on work already in
+ * progress, so dismissing it returns to that work; with nothing chosen yet
+ * there is nothing behind it and Back falls through to Home as before. Without
+ * this, backing out of the picker leaves every screen hidden and a later
+ * recents switch lands on a blank app. */
+bool dismissIdPicker() {
+    if (!s_idpick || lv_obj_has_flag(s_idpick, LV_OBJ_FLAG_HIDDEN)) return false;
+    if (g_id < 0) return false;
+    if (!g_curPeer.empty()) openThread(g_curPeer);
+    else                    showContacts();
+    return true;
 }
 
 /* Route to the right first screen for the current identity set: picker (>1),
@@ -3722,14 +3781,23 @@ void scheduleRefreshIn(uint32_t ms) {
 }
 void scheduleRefresh() { scheduleRefreshIn(200); }
 
+/* Keys that can change WHICH identities exist, as against traffic inside one.
+ * Re-routing rebuilds the picker and re-grabs focus, so an arriving message
+ * (also under `s.lxmf.id.<n>.`) must not read as an identity appearing. */
+bool identitySetKey(const char* key) {
+    const char* dot = strrchr(key, '.');
+    if (!dot) return false;
+    const char* f = dot + 1;
+    return !strcmp(f, "dest_hash") || !strcmp(f, "ready") ||
+           !strcmp(f, "label")     || !strcmp(f, "enabled");
+}
+
 void onStorageChange(const char* key, const char*) {
     if (!s_layer) return;
     /* Not yet committed to a slot: re-route only when the identity set itself
-     * may have changed (ignore the announce firehose so the picker doesn't
-     * thrash / steal focus on every heard announce). */
+     * may have changed. */
     if (g_id < 0) {
-        if (key && (strncmp(key, "lxmf.id", 7) == 0 || strncmp(key, "s.lxmf.id", 9) == 0))
-            routeByIdentity();
+        if (key && identitySetKey(key)) routeByIdentity();
         return;
     }
     /* Flag which walk the change dirtied and coalesce; refreshTimerCb does the
@@ -3842,17 +3910,24 @@ void lxmfApp(void* arg) {
     lv_obj_add_event_cb(s_layer, onLayerDelete, LV_EVENT_DELETE, nullptr);
 
     buildContactsScreen();      /* built once; hidden/shown by the router */
-    routeByIdentity();          /* picker (>1) else straight into the list */
 
+    /* Subscribe BEFORE the first route, not after. routeByIdentity reads the
+     * identity set out of storage, and lxmf publishes it from its own task: a
+     * dest_hash landing between that read and this subscription is a
+     * notification nobody asked for yet, and the app then sits on "waiting for
+     * initialization" until it is closed and reopened. Callbacks are delivered
+     * on the lcd task's pump, so none can run inside this function. */
     if (!g_subscribed) {
         storageSubscribeChanges("s.lxmf.id",      onStorageChange);   /* msgs + contacts */
-        storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity up/dest edge */
+        storageSubscribeChanges("lxmf.id",        onStorageChange);   /* identity ready/dest edge */
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
         storageSubscribeChanges("s.lxmf.pn",      onPnListChange);    /* show/hide the envelope button */
         storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }
+
+    routeByIdentity();          /* picker (>1) else straight into the list */
 }
 
 }  // namespace
@@ -3866,6 +3941,10 @@ void lxmfApp(void* arg) {
 LxmfApp::LxmfApp() : LcdApp({ .name = "LXMF", .iconBasename = "lxmf" }) {}
 
 void LxmfApp::onCreate(lv_obj_t* root) { lxmfApp(root); }
+
+void LxmfApp::onShow() { offerIdPickerOnLaunch(shownFrom()); }
+
+bool LxmfApp::onBack() { return dismissIdPicker(); }
 
 /* LxmfApp::appInit — the boot-task half of bring-up, run once by LcdApp::onInit()
  * right after it hops the launcher-tile install onto the lcd task. This whole
@@ -3897,14 +3976,14 @@ void LxmfApp::appInit() {
         storageSubscribeChanges("lora.2.meas", onSignalChange);
         storageSubscribeChanges("lora.3.meas", onSignalChange);
         gwSignalUpdate();
-        /* RLPG mailbox arrow: the selected identity's own store-and-forward
-         * connection state, hidden while no mailbox is configured. Rides the
-         * lxmf.id live tree (rlpg_state / up edges), same lcd-task discipline. */
+        /* Proxy arrow: the Channel to the server holding this identity's
+         * account, hidden while this device answers on its own address. Rides
+         * the lxmf.id live tree (proxy_link edges), same lcd-task discipline. */
         lv_obj_t* rslot = lcdStatusbarAddIndicator();
-        s_rlpgInd = rslot ? makeRlpgArrow(rslot, lv_color_hex(0x888888)) : nullptr;
-        if (s_rlpgInd) lv_obj_add_flag(s_rlpgInd, LV_OBJ_FLAG_HIDDEN);
-        storageSubscribeChanges("lxmf.id", rlpgStatusUpdate);
-        rlpgStatusUpdate();
+        s_proxyInd = rslot ? makeProxyArrow(rslot, lv_color_hex(0x888888)) : nullptr;
+        if (s_proxyInd) lv_obj_add_flag(s_proxyInd, LV_OBJ_FLAG_HIDDEN);
+        storageSubscribeChanges("lxmf.id", proxyStatusUpdate);
+        proxyStatusUpdate();
         /* Drive the age-fade between packets: re-evaluate the gw bars' opacity
          * every 20 s (≈90 steps across the 30-min fade), which also drops them
          * once fully faded. Cheap; the storage callbacks handle value changes. */
