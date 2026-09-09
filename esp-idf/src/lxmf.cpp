@@ -361,6 +361,7 @@ static std::string outboxKey(const std::string& peer, const std::string& mid) { 
 
 static uint64_t nowUnixMs();                                     /* fwd */
 static void queueRemove(int n, const std::string& peer, const std::string& mid);   /* fwd */
+static void queueKickConversation(int n, const std::string& peer);                 /* fwd */
 
 /* Set a message's unified status (u8 record field), overwritten in place. The
  * cached wire is kept while the message is in play so every attempt resends
@@ -385,6 +386,13 @@ static void msgSetStatus(int n, const std::string& peer, const std::string& mid,
         g_wireOutbox.erase(outboxKey(peer, mid));
         queueRemove(n, peer, mid);
     }
+    /* A delivery is proof the peer is reachable RIGHT NOW, and — on the Link a
+     * retry uses — that the Link is up and just went idle. Anything else queued
+     * for this conversation goes next, instead of waiting out an interval sized
+     * for a peer that may be gone for hours and finding the Link closed when it
+     * gets there. Every settle path funnels through here, so this is the one
+     * place it needs saying. */
+    if (status == LXMF_ST_DELIVERED) queueKickConversation(n, peer);
 }
 
 /* Terminal failure: status = the gave-up reason, tries = 255 (the one definitive
@@ -2210,16 +2218,19 @@ static void directLinkSettle(const std::string& tag, bool ok, uint32_t now_s)
  * grace, no proof back, a conversation link that failed or is busy, an outbox
  * with no free slot, rnsd's path table full — waits here for its next attempt.
  * Nothing rnsd-side and no outbox slot is held while a message is queued, so a
- * peer that is away for an hour costs one packet per sweep and nothing else.
+ * peer that is away for an hour costs one Link attempt per sweep and nothing
+ * else, however much mail is waiting for them.
  *
  *   cmd.send ──► processReady (attempt) ──ok──► outbox slot ──► DELIVERED
- *                    │  can't yet                    │ attempt failed
- *                    ▼                               ▼
- *                 s_queue ◄──────────────────────────┘
- *                    │  every s.lxmf.delivery_interval min (default 10), while non-empty
+ *                    │  can't yet                    │ attempt failed  │
+ *                    ▼                               ▼                 │
+ *                 s_queue ◄──────────────────────────┘                 │
+ *                    │  every s.lxmf.delivery_interval min (default 10),│
+ *                    │  or at once for this peer on a delivery ◄────────┘
  *                    ▼
  *               queueSweep: queued ≥ s.lxmf.delivery_timeout min (default 60)
- *                           → DELIVERY_TIMEOUT, else processReady again
+ *                           → DELIVERY_TIMEOUT, else ONE Link attempt per
+ *                             conversation (processReady, retry = true)
  *
  * The sweep runs on this task from the 1 Hz tick: every piece of outbound state
  * (outbox, wire cache, conversation links) is task-local and lock-free, and a
@@ -2241,6 +2252,10 @@ struct queued_t {
 };
 static std::vector<queued_t> s_queue;
 static uint32_t s_queueNextSweep_s = 0;    /* 0 = no sweep armed (queue empty) */
+/* A settle asked for an immediate follow-up sweep. Read and cleared by the
+ * sweep, which must not push its own arming back out to a whole interval over
+ * a kick raised while it was running (a delivery that settles inline). */
+static bool s_queueKicked = false;
 
 /* Seconds rnsd may search for a path on one attempt before the message goes
  * back to the queue: covers its first two path-request retries (5 s, 30 s). A
@@ -2277,6 +2292,20 @@ static void queueAdd(int n, const std::string& peer, const std::string& mid)
     if (!s_queueNextSweep_s) s_queueNextSweep_s = now_s + deliveryIntervalS();
 }
 
+/* Bring the next sweep forward to now if the queue still holds anything for
+ * this conversation. Arms nothing on an empty queue — a sweep with no work is
+ * a walk over nothing, and `s_queueNextSweep_s == 0` is what says the queue is
+ * idle. The sweep itself runs later in the same 1 Hz pass. */
+static void queueKickConversation(int n, const std::string& peer)
+{
+    for (auto& e : s_queue)
+        if (e.id_index == n && e.peer == peer) {
+            s_queueNextSweep_s = (uint32_t)(nowUnixMs() / 1000);
+            s_queueKicked      = true;
+            return;
+        }
+}
+
 /* Drop a message from the queue; `mid` empty = every message to `peer`. */
 static void queueRemove(int n, const std::string& peer, const std::string& mid)
 {
@@ -2310,6 +2339,17 @@ static bool outboxHolds(const lxmf_id_t& id, const std::string& peer, const std:
     return false;
 }
 
+/* Any attempt at all in flight to this peer. A sweep's unit is the
+ * conversation, so a conversation with a send still settling has its attempt
+ * already running and is left alone — sends to one peer serialize on the Link
+ * anyway, and starting a second here would only bounce off linkTagBusy. */
+static bool outboxHoldsPeer(const lxmf_id_t& id, const std::string& peer)
+{
+    for (auto& o : id.outboxes)
+        if (o.used && o.peer == peer) return true;
+    return false;
+}
+
 /* OUT_CANCEL for a send rnsd still holds. The CANCELLED result it answers with
  * meets a freed send_id and no-ops in applyOutResult. */
 static void sendCancel(lxmf_id_t& id, uint16_t send_id)
@@ -2321,15 +2361,38 @@ static void sendCancel(lxmf_id_t& id, uint16_t send_id)
 }
 
 static void processReady(lxmf_id_t& id, const std::string& peer_hex,
-                         const std::string& mid);   /* fwd */
+                         const std::string& mid, bool retry = false);   /* fwd */
 
 /* One pass over the queue. Runs from the 1 Hz tick when the interval has
- * elapsed, only while the queue holds something. */
+ * elapsed, only while the queue holds something.
+ *
+ * A sweep makes **one attempt per conversation**, not one per message. The
+ * unit of a retry is the Link to the peer (see processReady's `retry`), and a
+ * Link is a property of the conversation: seven messages waiting for the same
+ * peer are seven passengers for one attempt, not seven attempts. Sweeping
+ * per-message instead put seven whole messages on the air every interval to
+ * ask a question — is this peer reachable — that one Link open answers for all
+ * of them. The oldest queued message goes first (queue order is insertion
+ * order); the rest follow it over the Link as each delivery settles, without
+ * waiting for another interval.
+ *
+ * The timeout check stays per-message: each carries its own `queued_s`, and a
+ * message that has waited out `s.lxmf.delivery_timeout` is given up on whether
+ * or not its conversation got this sweep's attempt. */
 static void queueSweep(void)
 {
     uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    s_queueKicked  = false;
     std::vector<queued_t> q;
     q.swap(s_queue);
+    /* Conversations already attempted in this pass, as (identity, peer). Small
+     * and linear on purpose: it is bounded by the peers with mail waiting. */
+    std::vector<std::pair<int, std::string>> attempted;
+    auto claimAttempt = [&](int n, const std::string& peer) {
+        for (auto& a : attempted) if (a.first == n && a.second == peer) return false;
+        attempted.emplace_back(n, peer);
+        return true;
+    };
     for (auto& e : q) {
         if (e.id_index < 0 || e.id_index >= LXMF_MAX_IDENTITIES ||
             !s_ids[e.id_index].used) continue;
@@ -2347,9 +2410,14 @@ static void queueSweep(void)
             continue;
         }
         s_queue.push_back(e);          /* stays until it settles; a failed attempt finds it here */
-        processReady(id, e.peer, e.mid);
+        /* One attempt per conversation per sweep: this peer's turn is already
+         * spent, and this message rides the same Link when that one settles. */
+        if (!claimAttempt(e.id_index, e.peer)) continue;
+        if (outboxHoldsPeer(id, e.peer)) continue;   /* its attempt is in flight */
+        processReady(id, e.peer, e.mid, /*retry=*/true);
     }
-    s_queueNextSweep_s = s_queue.empty() ? 0 : now_s + deliveryIntervalS();
+    if (s_queue.empty())         s_queueNextSweep_s = 0;
+    else if (!s_queueKicked)     s_queueNextSweep_s = now_s + deliveryIntervalS();
 }
 
 /* Boot scan: every stored outbound still in progress goes on the queue, so a
@@ -2496,8 +2564,10 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
     return true;
 }
 
+/* `retry` = this is a sweep's attempt, not the first one. It changes exactly
+ * one thing: the message rides a Link (see the method block below). */
 static void processReady(lxmf_id_t& id, const std::string& peer_hex,
-                         const std::string& mid)
+                         const std::string& mid, bool retry)
 {
     /* peer arrives from the cmd.send sentinel (<peer>/<key>) — it *is*
      * the record's path segment, so it is authoritative, not read back
@@ -2606,6 +2676,16 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * Oversize forces a Link in every mode except opportunistic-or-fail,
      * which hard-fails instead — the only mode that can fail on size.
      *
+     * A RETRY forces a Link on the same terms. The first attempt is the cheap
+     * one — a single packet, no handshake, and for a peer that is there it is
+     * usually the only one needed. Once that has failed, the method's premise
+     * has too: an opportunistic packet is fire-and-forget, so repeating it
+     * re-sends the whole message to learn nothing, while a Link asks whether
+     * the peer is reachable ONCE and then carries every message waiting for
+     * them. opportunistic-or-fail is the exception here as it is for oversize:
+     * it is an explicit instruction never to open a Link, and a retry does not
+     * overrule it.
+     *
      * Oversize is measured on the real opportunistic payload — the wire
      * minus the dest16 that rnsd strips and re-derives — against the RNS
      * single-packet plaintext ceiling. Get this wrong on the low side and
@@ -2628,17 +2708,19 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             return;
         }
         use_direct = false;
+    } else if (oversize || retry) {
+        use_direct = true;
     } else if (method == "link-always") {
         use_direct = true;
     } else if (method == "link-if-big") {
-        use_direct = oversize;
+        use_direct = false;                   /* oversize is already handled above */
     } else {                                  /* link-if-one-exists (default) */
         /* Prefer the Link when our own conversation link to this peer is
          * already warm — an active chat rides a link for every message.
          * A peer's inbound link into us never counts: not every client
          * accepts our outgoing traffic on the link it opened, so we only
          * ride links we opened ourselves. */
-        use_direct = oversize || convFind(id.index, peer_hex) != nullptr;
+        use_direct = convFind(id.index, peer_hex) != nullptr;
     }
 
     /* Reserve an outbox slot. None free is a full moment, not a failure: the
@@ -5972,6 +6054,38 @@ static void processCancel(lxmf_id_t& id, const std::string& peer_hex,
     msgSetStatus(id.index, peer_hex, mid, LXMF_ST_CANCELLED);
 }
 
+/* cmd.cancel = "all" — every outbound of this identity that has not settled.
+ *
+ * The fan-out is here rather than in the caller because `cmd.cancel` is a
+ * self-clearing sentinel: a writer looping over N messages would overwrite the
+ * key before this task had drained the previous value, and all but the last
+ * would simply be lost. One write, one pass, on the task that owns the data.
+ *
+ * The set is read from storage rather than from s_queue, which holds only what
+ * is WAITING for another attempt — a message on its first attempt is settling
+ * against an outbox slot and is not in it, and that is exactly a send somebody
+ * would want to call back. The predicate is queueSweep's, so "all" cancels
+ * precisely what `lxmf unsettled` listed. */
+static void processCancelAll(lxmf_id_t& id)
+{
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.", id.index);
+    /* Collected before acting: processCancel writes through storage, and
+     * mutating the tree under its own walk is not a thing to rely on. */
+    std::vector<std::pair<std::string, std::string>> hits;
+    for (const auto& peer : collectTokens(prefix))
+        for (const auto& key : collectTokens(msgPrefix(id.index, peer))) {
+            if (storageGetStr(msgPath(id.index, peer, key, "dir").c_str(), "") != "out")
+                continue;
+            const int st    = storageGetInt(msgPath(id.index, peer, key, "status").c_str(), 0);
+            const int tries = storageGetInt(msgPath(id.index, peer, key, "tries").c_str(), 0);
+            if (!statusInProgress(st) || tries == LXMF_TRIES_GAVEUP) continue;
+            hits.emplace_back(peer, key);
+        }
+    for (const auto& h : hits) processCancel(id, h.first, h.second);
+    info("id %d: cancelled %zu unsettled outbound", id.index, hits.size());
+}
+
 /* cmd.delete — wipe a message record (frees `wire` storage), or, when
  * `mid` is empty (sentinel value was "<peer>/" or "<peer>"), the whole
  * conversation subtree. The whole-conversation form is the primitive
@@ -6258,8 +6372,10 @@ static void handleIdCmd(int n, const char* key, const char* val)
             }
         }
         else if (std::strcmp(verb, "cancel") == 0) {
-            if (mid.empty())
-                warn("id %d: cmd.cancel needs <peer>/<key> (got \"%s\")", n, val);
+            if (peer_hex == "all" && mid.empty())
+                processCancelAll(id);
+            else if (mid.empty())
+                warn("id %d: cmd.cancel needs <peer>/<key> or \"all\" (got \"%s\")", n, val);
             else
                 processCancel(id, peer_hex, mid);
         }
@@ -6765,7 +6881,11 @@ static std::string statusWordCanon(const std::string& s)
     if (s.empty()) return "";
     std::string up = s;
     for (char& c : up) c = (char)std::toupper((unsigned char)c);
-    for (int code = 0; code <= LXMF_ST_PN_REJECTED; code++) {
+    /* The whole byte, not up to some named member: the enum has gaps in it and
+     * grows at the end, and a bound written as the last name it had goes stale
+     * silently — the filter simply stops matching the newest statuses. Unused
+     * codes name nothing, so walking all of them costs a null check each. */
+    for (int code = 0; code < 256; code++) {
         const char* name = lxmfStatusName((uint8_t)code);
         if (*name && up == name) return name;
     }
@@ -6884,6 +7004,43 @@ static void cliMsgs(const char* rest)
 
     if (arg.empty()) { cliChats(sel); return; }
 
+    /* The filter takes any status name, and there was no way to find out which
+     * from here — a filter whose vocabulary is only in the source is a filter
+     * for whoever wrote it. Grouped by what the name tells you about the
+     * message, since that is what a reader is choosing between. */
+    if (arg == "?" || arg == "statuses") {
+        /* Named, not ranged: the enum has gaps and a range would quietly take in
+         * whatever is added between its ends. Anything not named below still
+         * matches as a filter — it falls into "gave up" and is listed there. */
+        static const uint8_t kSettled[] = { LXMF_ST_DELIVERED, LXMF_ST_CANCELLED,
+                                            LXMF_ST_RECEIVED };
+        static const uint8_t kElsewhere[] = { LXMF_ST_ON_PROXY, LXMF_ST_ON_PN };
+        auto line = [](const char* label, const uint8_t* v, size_t n) {
+            cliPrintf("%s:\n ", label);
+            for (size_t i = 0; i < n; i++) cliPrintf(" %s", lxmfStatusName(v[i]));
+            cliPrintf("\n");
+        };
+        cliPrintf("in progress (the delivery queue will try again):\n ");
+        for (int c = 0; c < 256; c++)
+            if (statusInProgress(c)) cliPrintf(" %s", lxmfStatusName((uint8_t)c));
+        cliPrintf("\n");
+        line("settled",        kSettled,   sizeof kSettled);
+        line("held elsewhere (another node is sending it; not ours to retry)",
+                               kElsewhere, sizeof kElsewhere);
+        cliPrintf("gave up or never started:\n ");
+        for (int c = 0; c < 256; c++) {
+            if (statusInProgress(c) || c == LXMF_ST_DRAFT) continue;
+            bool named = false;
+            for (uint8_t v : kSettled)   if (v == c) named = true;
+            for (uint8_t v : kElsewhere) if (v == c) named = true;
+            if (named) continue;
+            const char* nm = lxmfStatusName((uint8_t)c);
+            if (*nm) cliPrintf(" %s", nm);
+        }
+        cliPrintf("\nalso DRAFT. Case-insensitive: `lxmf msgs delivered`.\n");
+        return;
+    }
+
     const std::string want = statusWordCanon(arg);
     if (!want.empty()) {
         /* Cross-conversation filter — walk every peer subtree. */
@@ -6915,6 +7072,164 @@ static void cliMsgs(const char* rest)
               name.empty() ? "" : " (", name.empty() ? "" : (peer + ")").c_str(),
               rows.size());
     printMsgRows(sel, rows, /*show_peer=*/false);
+}
+
+/* ── `lxmf unsettled` / `lxmf cancel` ──
+ *
+ * Unsettled = outbound this identity has not finished with: the delivery queue
+ * will attempt it again. The test is `statusInProgress() && tries != GAVEUP` —
+ * the SAME one queueResume uses to decide what to pick up after a reboot, and
+ * deliberately not a second opinion about it, because a listing that disagreed
+ * with the queue about what is still in play would be worse than no listing.
+ *
+ * Two things that look terminal are not, and one that looks live is not:
+ *   - `AWAITING_PROOF` is unsettled. The message is on the air and nothing has
+ *     answered; that is exactly the state worth seeing.
+ *   - `CANCELLED` does NOT set tries = GAVEUP, so `tries == 255` alone is not an
+ *     is-it-finished test. statusInProgress excludes it by status instead.
+ *   - `ON_PROXY` / `ON_PN` are excluded: another node holds the message and is
+ *     sending it, and OUR queue will not retry it. Cancelling here would settle
+ *     a local record while the holder went on delivering, so the two would
+ *     disagree about what happened — and there is no frame to tell it to stop.
+ */
+struct UnsettledRow {
+    std::string peer, key, status, title;
+    int         ts = 0, tries = 0;
+};
+
+static std::vector<UnsettledRow> collectUnsettled(int sel)
+{
+    char prefix[64];
+    std::snprintf(prefix, sizeof(prefix), "s.lxmf.id.%d.msgs.", sel);
+    std::vector<UnsettledRow> rows;
+    for (const auto& peer : collectTokens(prefix))
+        for (const auto& key : collectTokens(msgPrefix(sel, peer))) {
+            if (storageGetStr(msgPath(sel, peer, key, "dir").c_str(), "") != "out") continue;
+            const int st    = storageGetInt(msgPath(sel, peer, key, "status").c_str(), 0);
+            const int tries = storageGetInt(msgPath(sel, peer, key, "tries").c_str(), 0);
+            if (!statusInProgress(st) || tries == LXMF_TRIES_GAVEUP) continue;
+            UnsettledRow r;
+            r.peer   = peer;
+            r.key    = key;
+            r.status = lxmfStatusName((uint8_t)st);
+            r.title  = storageGetStr(msgPath(sel, peer, key, "title").c_str(), "");
+            r.ts     = storageGetInt(msgPath(sel, peer, key, "ts").c_str(), 0);
+            r.tries  = tries;
+            rows.push_back(std::move(r));
+        }
+    /* Oldest first: that is the order the queue works them in, and the one at
+     * the top is the one holding its conversation up. */
+    std::sort(rows.begin(), rows.end(),
+              [](const UnsettledRow& a, const UnsettledRow& b) { return a.ts < b.ts; });
+    return rows;
+}
+
+/* "18m" / "42s" / "3h" — a span is read at a glance or not at all. */
+static std::string briefDur(long s)
+{
+    if (s < 0) s = 0;
+    char b[16];
+    if      (s < 90)      std::snprintf(b, sizeof b, "%lds", s);
+    else if (s < 90 * 60) std::snprintf(b, sizeof b, "%ldm", s / 60);
+    else                  std::snprintf(b, sizeof b, "%ldh", s / 3600);
+    return b;
+}
+
+static std::string briefAge(int ts)
+{
+    if (ts <= 0) return "-";
+    return briefDur((long)(nowUnixMs() / 1000) - (long)ts);
+}
+
+static void cliUnsettled(void)
+{
+    const int sel = selectedId();
+    lxmf_id_t* id = idAt(sel);
+    if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
+
+    std::vector<UnsettledRow> rows = collectUnsettled(sel);
+    s_msgs_list.clear();
+    if (rows.empty()) { cliPrintf("id %d  nothing unsettled\n", sel); return; }
+
+    cliPrintf("%-3s %-16s %-17s %-5s %-5s %s\n",
+              "#", "peer", "status", "tries", "age", "title");
+    int n = 1;
+    for (const auto& r : rows) {
+        s_msgs_list.push_back({ r.peer, r.key });
+        std::string nm = peerDisplayName(sel, r.peer);
+        std::string who = nm.empty() ? r.peer.substr(0, 16) : sanitizeForLog(nm);
+        if (who.size() > 16) who.resize(16);
+        cliPrintf("%-3d %-16s %-17s %-5d %-5s %s\n",
+                  n++, who.c_str(), r.status.c_str(), r.tries,
+                  briefAge(r.ts).c_str(),
+                  r.title.empty() ? "(no title)" : r.title.c_str());
+    }
+    /* When the queue will next walk them, since that is the question the
+     * listing raises. Zero means the queue is idle and holds nothing. */
+    const uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    if (!s_queueNextSweep_s)
+        cliPrintf("%zu unsettled, oldest %s — none queued for a sweep\n",
+                  rows.size(), briefAge(rows.front().ts).c_str());
+    else
+        cliPrintf("%zu unsettled, oldest %s — next sweep in %s\n",
+                  rows.size(), briefAge(rows.front().ts).c_str(),
+                  briefDur(s_queueNextSweep_s > now_s
+                           ? (long)(s_queueNextSweep_s - now_s) : 0).c_str());
+}
+
+/* `lxmf cancel <n>|all` — settle those CANCELLED through lxmf's own sentinel,
+ * so the outbox slot, the delivery queue and rnsd's in-flight send are all
+ * unwound by the one path that already knows how (processCancel). */
+static void cliCancel(const char* rest)
+{
+    while (*rest == ' ') rest++;
+    const int sel = selectedId();
+    lxmf_id_t* id = idAt(sel);
+    if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
+    if (!*rest) { cliPrintf("usage: lxmf cancel <n>|all  (see `lxmf unsettled`)\n"); return; }
+
+    auto cancelOne = [&](const std::string& peer, const std::string& key) {
+        char k[64];
+        std::snprintf(k, sizeof k, "lxmf.id.%d.cmd.cancel", sel);
+        /* "all" goes bare; a single message is "<peer>/<key>". */
+        storageSet(k, key.empty() ? peer.c_str() : (peer + "/" + key).c_str());
+    };
+
+    if (std::strcmp(rest, "all") == 0) {
+        /* One sentinel write, fanned out on lxmf's own task (processCancelAll):
+         * writing this key once per message would overwrite it before the task
+         * drained the previous value. The count is read back rather than
+         * predicted, since the set is re-derived there and a message may settle
+         * on its own between the two. */
+        const size_t before = collectUnsettled(sel).size();
+        if (!before) { cliPrintf("nothing unsettled\n"); return; }
+        cancelOne("all", "");
+        cliPrintf("cancelling %zu unsettled — `lxmf unsettled` to confirm\n", before);
+        return;
+    }
+
+    const int n = std::atoi(rest);
+    if (n < 1 || (size_t)n > s_msgs_list.size()) {
+        cliPrintf("cancel: index out of range (run `lxmf unsettled` first)\n");
+        return;
+    }
+    const MsgRef ref = s_msgs_list[(size_t)n - 1];
+    /* The index space is shared with `msgs`, which lists inbound and settled
+     * records too, so the row is re-read rather than trusted: cancelling
+     * something already finished would overwrite a real outcome with CANCELLED. */
+    const int st    = storageGetInt(msgPath(sel, ref.peer, ref.key, "status").c_str(), 0);
+    const int tries = storageGetInt(msgPath(sel, ref.peer, ref.key, "tries").c_str(), 0);
+    if (storageGetStr(msgPath(sel, ref.peer, ref.key, "dir").c_str(), "") != "out") {
+        cliPrintf("cancel: #%d is inbound — only an outbound send can be cancelled\n", n);
+        return;
+    }
+    if (!statusInProgress(st) || tries == LXMF_TRIES_GAVEUP) {
+        cliPrintf("cancel: #%d has already settled (%s) — nothing to cancel\n",
+                  n, lxmfStatusName((uint8_t)st));
+        return;
+    }
+    cancelOne(ref.peer, ref.key);
+    cliPrintf("cancelled %s → %s\n", ref.key.c_str(), ref.peer.substr(0, 16).c_str());
 }
 
 /* ── `lxmf read <n>` ── */
@@ -7195,7 +7510,10 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf id                 list identities (* = selected)\n");
         cliPrintf("lxmf id <n>             switch selected identity\n");
         cliPrintf("lxmf chats              list conversations for selected id (numbered)\n");
-        cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <status> = filter\n");
+        cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <status> = filter;\n");
+        cliPrintf("                      `?` = the status names the filter takes\n");
+        cliPrintf("lxmf unsettled          outbound not yet settled — what the queue will retry\n");
+        cliPrintf("lxmf cancel <n>|all     settle those CANCELLED (<n> from the last listing)\n");
         cliPrintf("lxmf read <n>           print msg n from last listing; marks read\n");
         cliPrintf("lxmf c[ontacts] [<arg>] list contacts for selected id (numbered);\n");
         cliPrintf("                      arg = name/nick substring filter\n");
@@ -7262,7 +7580,10 @@ static void cliLxmf(const char* args)
     }
     if (verb == "id")        { cliId(rest); return; }
     /* `ch…` is chats, `c…` is contacts — checked in that order so the
-     * one-letter abbreviation lands on contacts. */
+     * one-letter abbreviation lands on contacts. `cancel` is spelled in full
+     * and must stay ABOVE the contacts line for the same reason: contacts
+     * matches on one letter, so a `cancel` tested after it would be read as a
+     * contact listing and silently do nothing it was asked to. */
     if (cliVerbIs(verb.c_str(), "chats", 2))
                              { int s = selectedId();
                                lxmf_id_t* i = idAt(s);
@@ -7270,6 +7591,8 @@ static void cliLxmf(const char* args)
                                else cliChats(s);
                                return; }
     if (verb == "msgs")      { cliMsgs(rest); return; }
+    if (verb == "unsettled") { cliUnsettled(); return; }
+    if (verb == "cancel")    { cliCancel(rest); return; }
     if (verb == "read")      { cliRead(rest); return; }
     if (cliVerbIs(verb.c_str(), "contacts", 1)) { cliContacts(rest); return; }
     if (verb == "announces") { cliAnnounces(rest); return; }

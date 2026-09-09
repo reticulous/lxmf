@@ -388,13 +388,15 @@ rebuild the path from a `send_id` without re-reading storage. The outbox is
 
 ```
 cmd.send ──► processReady (attempt) ──ok──► outbox slot ──► DELIVERED
-                 │  can't yet                    │ attempt failed
-                 ▼                               ▼
-             s_queue ◄───────────────────────────┘
-                 │  every s.lxmf.delivery_interval min (default 10), while non-empty
+                 │  can't yet                    │ attempt failed  │
+                 ▼                               ▼                 │
+             s_queue ◄───────────────────────────┘                 │
+                 │  every s.lxmf.delivery_interval min (default 10),│
+                 │  or at once for this peer on a delivery ◄────────┘
                  ▼
             queueSweep: queued ≥ s.lxmf.delivery_timeout min (default 60)
-                        → DELIVERY_TIMEOUT, else processReady again
+                        → DELIVERY_TIMEOUT, else ONE Link attempt per
+                          conversation (processReady, retry = true)
 ```
 
 Every outbound that could not be delivered *yet* waits in `s_queue`
@@ -409,9 +411,33 @@ in flight and it is skipped; past the timeout it fails `DELIVERY_TIMEOUT`
 through `msgFail` — or `RADIO_BUSY`, when the summed LoRa contention-drop
 counter grew while the message sat there (`radioBusyOr` against the baseline
 `queueAdd` stamped): the own transmitter never got it out, which is a different
-fault from a silent recipient. Else `processReady` makes one more attempt. `msgSetStatus`
-(DELIVERED / CANCELLED) and `msgFail` remove the entry, so a message leaves the
-queue the moment it settles.
+fault from a silent recipient. Else `processReady` makes one more attempt.
+`msgSetStatus` (DELIVERED / CANCELLED) and `msgFail` remove the entry, so a
+message leaves the queue the moment it settles.
+
+**A sweep's unit is the conversation, not the message.** `processReady`'s
+`retry` argument forces the Link (same exemption as oversize:
+`opportunistic-or-fail` is an explicit instruction not to open one), and a Link
+belongs to the pair, not to one message — so the sweep attempts each
+`(identity, peer)` once and pushes the rest of that conversation's mail back
+untouched, oldest first. Two things follow. The airtime of a retry is one Link
+open regardless of how many messages are waiting, and no body goes out until
+the peer has answered — where the per-message sweep re-sent every whole message
+into the void each interval to re-learn the one fact a Link establishes once.
+And `tries` stays honest: only the message actually attempted has one counted
+against it.
+
+**A delivery pulls the next message through.** Draining seven messages at one
+per interval would be its own defect, so `msgSetStatus` calls
+`queueKickConversation` on every DELIVERED: if the queue still holds anything
+for that peer, `s_queueNextSweep_s` moves to now and the next message goes on
+the following 1 Hz pass — over the Link that is still warm and still open,
+which is the whole reason not to wait. It is the one choke point every settle
+path funnels through, so it is stated once rather than at each of them. The
+sweep clears `s_queueKicked` on entry and honours it on exit: a delivery that
+settles *inline* (a peer that is another identity on this box) must not have
+its follow-up pushed back out to a whole interval by the tail that arms the
+next ordinary sweep.
 
 What returns a message to the queue (`queueRequeue`: status, `tries++`,
 `queueAdd`), and with which status:

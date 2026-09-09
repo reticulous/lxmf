@@ -121,7 +121,7 @@ key. Presence = request in flight; absence = done.
 | Key | Value | Effect |
 |---|---|---|
 | `lxmf.id.<n>.cmd.send` | `<peer>/<key>[/pn:<hash>]` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>`; the optional `pn:` segment uploads to that propagation node instead |
-| `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>` | cancel an in-flight send |
+| `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` settles every outbound of this identity that has not settled. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — one packet out, its delivery proof back (see **Ping**) |
@@ -239,13 +239,26 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
 within a minute, no proof back, a conversation Link that failed or is busy, no
 free outbox slot — puts the message in the delivery queue rather than failing
 it. The queue is swept every `s.lxmf.delivery_interval` minutes (default 10)
-while it holds anything; each sweep makes one more attempt per message, and a
-message queued for longer than `s.lxmf.delivery_timeout` minutes (default 60)
-settles `DELIVERY_TIMEOUT`. A reboot resumes every in-progress outbound it
-finds in storage. Between attempts nothing is held open: no outbox slot, no
-path search in rnsd, so an unreachable peer costs one packet per sweep. Local
-errors that another attempt cannot fix — a body too large for the chosen
-method, a malformed peer, a disabled identity — fail at once.
+while it holds anything, and a message queued for longer than
+`s.lxmf.delivery_timeout` minutes (default 60) settles `DELIVERY_TIMEOUT`. A
+reboot resumes every in-progress outbound it finds in storage. Between attempts
+nothing is held open: no outbox slot, no path search in rnsd. Local errors that
+another attempt cannot fix — a body too large for the chosen method, a
+malformed peer, a disabled identity — fail at once.
+
+**A sweep makes one attempt per conversation, over a Link.** The first attempt
+is the cheap one: a single opportunistic packet, no handshake, and for a peer
+who is there that is the end of it. Once that has failed, repeating it re-sends
+the whole message to learn nothing — an opportunistic packet is
+fire-and-forget. So every attempt after the first opens a Link instead, and the
+Link is what gets attempted: seven messages waiting for one peer are seven
+passengers on one attempt, not seven attempts. An unreachable peer therefore
+costs one Link open per sweep however much mail is waiting for them, and no
+body goes on the air until they have answered. As each delivery settles, the
+next message for that peer follows it over the still-warm Link at once rather
+than waiting out another interval — so a conversation that comes back drains in
+seconds, not in one message per ten minutes. `opportunistic-or-fail` is
+exempt, being an explicit instruction never to open a Link.
 
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
@@ -261,7 +274,9 @@ method, a malformed peer, a disabled identity — fail at once.
 A message fits opportunistic when `title + content + ~32 B` is within one
 packet (budget ~311 B). Oversize forces a Link in every mode **except**
 `opportunistic-or-fail`, and a Link carries large bodies as a Resource
-transfer. The legacy names still parse: `auto`→`link-if-one-exists`,
+transfer. **A retry forces a Link on exactly the same terms** — the method
+describes the first attempt; the delivery queue decides the rest (above). The
+legacy names still parse: `auto`→`link-if-one-exists`,
 `direct`→`link-always`, `opportunistic`→`opportunistic-or-fail`.
 
 **Link toggle.** The conversation header (web and LCD) shows a link icon —
@@ -745,7 +760,27 @@ lxmf id <n>                 switch selected identity
 lxmf chats                  list conversations (one row per peer; numbered)
 lxmf msgs [<arg>]           no arg = chats; <peer> = that thread (newest first);
                             a bare status name = cross-conversation filter
-                            (case-insensitive, e.g. `lxmf msgs delivered`)
+                            (case-insensitive, e.g. `lxmf msgs delivered`);
+                            `?` lists the names it takes, grouped by what each
+                            one says about the message
+lxmf unsettled              outbound from this identity that has not settled,
+                            oldest first: peer, status, tries, age, title, and
+                            when the delivery queue next sweeps. The test is the
+                            one queueResume uses — `statusInProgress()` and
+                            `tries != 255` — so the listing is exactly what the
+                            queue will attempt again, never a second opinion
+                            about it. ON_PROXY and ON_PN are absent by that
+                            definition: another node holds those and ours will
+                            not retry them.
+lxmf cancel <n>|all         settle those CANCELLED, through the same
+                            `cmd.cancel` a UI uses — an outbox slot is unwound
+                            with OUT_CANCEL, anything else is stamped and leaves
+                            the queue. `<n>` is from the last numbered listing
+                            and is re-read before acting, so an index that has
+                            since settled is refused rather than overwritten;
+                            `all` is one sentinel write that lxmf's own task
+                            fans out, so it means what is unsettled when that
+                            task reads it, not when the listing was printed.
 lxmf read <n>               print message #n from the last `lxmf msgs`; marks it read
 lxmf c[ontacts] [<arg>]     list this identity's contacts (numbered); <arg> =
                             case-insensitive substring of display_name or nick
@@ -763,8 +798,10 @@ lxmf proxy [<cmd>]          no arg = this identity's proxy state; `servers` =
                             `off`, `force-off` (see **Being proxied**)
 ```
 
-Numbered listings (`chats`, `msgs`, `contacts`, `announces`) feed the index
-arguments of `read` / `send` / `ping` / `msgs <#>`. A `<peer>` substring is
+Numbered listings (`chats`, `msgs`, `unsettled`, `contacts`, `announces`) feed
+the index arguments of `read` / `send` / `ping` / `cancel` / `msgs <#>`. One
+index space serves them all, which is why `cancel` re-reads the record it lands
+on rather than trusting that the last listing was `unsettled`. A `<peer>` substring is
 matched case-insensitively against this identity's contacts (display_name and
 nick) first, then the announce catalogue; multiple matches print a numbered
 disambiguation list instead of acting, so the retry can pick a line number. Run
