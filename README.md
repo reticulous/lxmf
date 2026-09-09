@@ -31,20 +31,20 @@ format and the per-byte deltas from upstream are in
   silently.
 - **Identities.** Up to `LXMF_MAX_IDENTITIES = 4` independent mailboxes
   (`lxmf.delivery` destinations), each with its own keypair, contacts, and
-  message history, fully siloed. **No identity is created automatically** — a
+  message history, fully separate. **No identity is created automatically** — a
   device with none runs as a transport-only node (it relays and tracks the
   mesh but has no mailbox of its own).
 - **Selectable delivery mode.** Per message, lxmf picks a single
   opportunistic packet, a Reticulum Link (DIRECT), or a Resource transfer for
   large bodies. A per-identity/global method chooses how eagerly to hold a
   Link — from `link-always` through the default `link-if-one-exists` (ride a
-  warm Link, else opportunistic) and `link-if-big` down to
+  already-open Link, else opportunistic) and `link-if-big` down to
   `opportunistic-or-fail`. The conversation header shows the live Link state
   and toggles it open/closed on tap.
 - **Announces.** Each enabled identity keeps its delivery destination's announce
   current with rnsd; each interface decides how often it goes on the air. Every
   inbound `lxmf.delivery` announce on the mesh is
-  collected into a shared, cross-identity **announce catalogue** of everyone
+  collected into a shared, cross-identity **heard-peer list** of everyone
   the device has heard of.
 - **Stamps.** Pays and (optionally) enforces LXMF proof-of-work stamps as
   spam friction.
@@ -97,12 +97,12 @@ command handlers are live.
 |---|---|---|---|
 | `s.lxmf.*` | survives reboot | client + firmware (disjoint fields) | identities, messages, contacts, config |
 | `secrets.lxmf.*` | survives reboot | firmware | private keys (never leave the device) |
-| `lxmf.*` | RAM, re-published ~1 Hz | firmware | live status, stats, announce catalogue |
+| `lxmf.*` | RAM, re-published ~1 Hz | firmware | live status, stats, heard-peer list |
 | `lxmf.cmd.*`, `lxmf.id.<n>.cmd.*`, `lxmf.url_*` | transient | client writes | imperative actions (below) |
 
 ## Commands — self-clearing keys
 
-Imperative actions are **sentinels**: you write the key, the firmware
+Imperative actions are **command keys**: you write the key, the firmware
 performs the action and (for the identity/per-identity commands) deletes the
 key. Presence = request in flight; absence = done.
 
@@ -121,7 +121,7 @@ key. Presence = request in flight; absence = done.
 | Key | Value | Effect |
 |---|---|---|
 | `lxmf.id.<n>.cmd.send` | `<peer>/<key>[/pn:<hash>]` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>`; the optional `pn:` segment uploads to that propagation node instead |
-| `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` settles every outbound of this identity that has not settled. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
+| `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` finishes every outbound of this identity that has not finished. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — one packet out, its delivery proof back (see **Ping**) |
@@ -130,15 +130,15 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.proxy_off` | any | hand the account back; this device stays proxied and working until the server answers |
 | `lxmf.id.<n>.cmd.proxy_force_off` | any | the dead-server override — read what it costs first |
 
-To make a sentinel atomic with its data, write the data fields and the
-sentinel in one `storageBegin()/storageEnd()` transaction — the firmware
-then sees a fully-populated record the instant the sentinel fires.
+To make a command key atomic with its data, write the data fields and the
+command key in one `storageBegin()/storageEnd()` transaction — the firmware
+then sees a fully-populated record the instant the command key fires.
 
 ### Clickable `lxmf@<hash>` links
 
 Micron pages rendered by [nomad](../nomad)'s browser turn an `lxmf@<32-hex>`
 token into a clickable link. Activating one writes the destination hash to
-one of two ephemeral sentinels:
+one of two ephemeral command keys:
 
 | Key | Written by | Reaction |
 |---|---|---|
@@ -164,7 +164,7 @@ Per loaded identity you can observe:
 
 ```
 s.lxmf.id.<n>.label          "main" | "imported" | user-set
-s.lxmf.id.<n>.enabled        1 (default) — 0 = identity dark: no announce, no send, inbound dropped
+s.lxmf.id.<n>.enabled        1 (default) — 0 = identity disabled: no announce, no send, inbound dropped
 s.lxmf.id.<n>.display_name   utf-8, advertised in announces
 s.lxmf.id.<n>.default_method  per-identity delivery method (see below); falls
                              back to the global s.lxmf.default_method
@@ -190,7 +190,7 @@ int  lxmfCreateIdentity (const char* display_name, bool sync = false);
 bool lxmfDestroyIdentity(int n,                    bool sync = false);
 ```
 
-These write the corresponding `lxmf.cmd.*` sentinel. With `sync = true` the
+These write the corresponding `lxmf.cmd.*` command key. With `sync = true` the
 call blocks (≤ 5 s) until the firmware finishes, then returns the allocated
 slot (create) or success (destroy). The CLI's `lxmf create` / `lxmf destroy`
 use the sync form so they can report the outcome.
@@ -240,7 +240,7 @@ within a minute, no proof back, a conversation Link that failed or is busy, no
 free outbox slot — puts the message in the delivery queue rather than failing
 it. The queue is swept every `s.lxmf.delivery_interval` minutes (default 10)
 while it holds anything, and a message queued for longer than
-`s.lxmf.delivery_timeout` minutes (default 60) settles `DELIVERY_TIMEOUT`. A
+`s.lxmf.delivery_timeout` minutes (default 60) ends as `DELIVERY_TIMEOUT`. A
 reboot resumes every in-progress outbound it finds in storage. Between attempts
 nothing is held open: no outbox slot, no path search in rnsd. Local errors that
 another attempt cannot fix — a body too large for the chosen method, a
@@ -254,8 +254,8 @@ fire-and-forget. So every attempt after the first opens a Link instead, and the
 Link is what gets attempted: seven messages waiting for one peer are seven
 passengers on one attempt, not seven attempts. An unreachable peer therefore
 costs one Link open per sweep however much mail is waiting for them, and no
-body goes on the air until they have answered. As each delivery settles, the
-next message for that peer follows it over the still-warm Link at once rather
+body goes on the air until they have answered. As each delivery finishes, the
+next message for that peer follows it over the still-already-open Link at once rather
 than waiting out another interval — so a conversation that comes back drains in
 seconds, not in one message per ten minutes. `opportunistic-or-fail` is
 exempt, being an explicit instruction never to open a Link.
@@ -267,7 +267,7 @@ exempt, being an explicit instruction never to open a Link.
 | method | behaviour |
 | --- | --- |
 | `link-always` | always a Reticulum Link. |
-| `link-if-one-exists` *(default)* | ride our own warm conversation Link to the peer if one exists, else opportunistic. A peer's inbound Link into us never counts — we only ride Links we opened. |
+| `link-if-one-exists` *(default)* | ride our own already-open conversation Link to the peer if one exists, else opportunistic. A peer's inbound Link into us never counts — we only ride Links we opened. |
 | `link-if-big` | opportunistic when the wire fits one packet, a Link only when it's oversize. |
 | `opportunistic-or-fail` | never a Link; oversize hard-fails with `last_error = "too large for opportunistic"`. |
 
@@ -308,9 +308,9 @@ wire-compatible with LXMF 0.9.8:
   nodes**. A node resend encrypts the wire to the recipient, pays the node's
   announced propagation stamp (a separate, smaller proof-of-work than the
   recipient delivery stamp), and uploads over an `lxmf.propagation` link.
-  Success settles the message **`ON_PN`** — final, shown as the single
+  Success ends the message as **`ON_PN`** — final, shown as the single
   "stored for pickup" tick: a propagation node never proves delivery; the
-  recipient collects the message on its own next sync. Failures settle
+  recipient collects the message on its own next sync. Failures end as
   `PN_FAIL` (link/transfer) or `PN_REJECTED` (the node refused, e.g. an
   under-paid stamp).
 - **Per-contact node.** Each contact's details page can name that
@@ -331,7 +331,7 @@ wire-compatible with LXMF 0.9.8:
   `lxmf.pn.<hash>.{last_check_s,last_err,last_got}` (RAM);
   `lxmf.pn.sync` holds the node currently being checked.
 
-Command sentinels: `lxmf.id.<n>.cmd.send = <peer>/<key>/pn:<hash>`
+Command keys: `lxmf.id.<n>.cmd.send = <peer>/<key>/pn:<hash>`
 (resend via node), `lxmf.cmd.pn_sync`, and
 `lxmf.cmd.pn_add = <hash>[|<name>]` (append to the list — used by the
 on-device pane).
@@ -365,7 +365,7 @@ account key and the cleartext.**
 
 What it buys: messages arrive while this device is off, and the server delivers
 its outbound while it is away. A proxied device advertises nothing, so there is
-no announce beat from a moving radio and no waiting for paths to propagate to
+no announce tick from a moving radio and no waiting for paths to propagate to
 it — it initiates every link it needs and the answers ride home on them.
 
 What it assumes is that the server's uplink is better than this device's. When
@@ -424,7 +424,7 @@ and you message the account it holds from another identity here, the message
 never touches the network: Reticulum has no path to its own destinations, so it
 is packed, signed, and handed straight to the recipient slot's inbound
 pipeline — stored, and pushed on to the owner's roaming device over their
-Channel like any other inbound. It settles `DELIVERED` because it genuinely is.
+Channel like any other inbound. It ends as `DELIVERED` because it genuinely is.
 
 **Dead-server override.** If the server is physically gone the release never
 lands, and **Force off** is the way out. What it costs:
@@ -439,7 +439,7 @@ lands, and **Force off** is the way out. What it costs:
   announce, what they send is encrypted to ratchets it does not hold.
 
 **Picking a server.** Nobody types a hash. Every `lxmproxy.server` announce this
-device hears is catalogued (`lxmf.proxies.<dest>.{label,last}`) and offered by
+device hears is recorded (`lxmf.proxies.<dest>.{label,last}`) and offered by
 the operator's label — `lxmf proxy servers` on the CLI, the **Heard** line in
 the settings form. What is stored per identity is the one you chose:
 
@@ -526,9 +526,9 @@ both frontends print; the numbers are persisted, so the list is append-only
 | group | statuses | meaning |
 |---|---|---|
 | progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` | still in play; the delivery queue will try again |
-| settled | `DELIVERED` `CANCELLED` `RECEIVED` | proof received / user cancelled / inbound |
+| finished | `DELIVERED` `CANCELLED` `RECEIVED` | proof received / user cancelled / inbound |
 | gave up | `DELIVERY_TIMEOUT` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` … | why it stopped: out of time, or a local error another attempt cannot fix |
-| in someone else's custody | `ON_PROXY` `ON_PN` `PROXY_REFUSED` `PN_FAIL` `PN_REJECTED` | proxy-server / propagation-node states |
+| held by another node | `ON_PROXY` `ON_PN` `PROXY_REFUSED` `PN_FAIL` `PN_REJECTED` | proxy-server / propagation-node states |
 
 The companion `tries` byte, not the status, is the definitive terminal marker:
 `tries == 255` means gave up, and below that the message is still live whatever
@@ -547,7 +547,7 @@ proof (or the proof-grade Resource transfer acknowledgement) produces
 Both frontends render this on outbound bubbles as the ALL-CAPS status name
 plus a glyph: grey `…` while in play, two green checks for `DELIVERED` (which
 needs no name), a grey ✕ for `CANCELLED`, a red ✕ once `tries` hits 255. A
-message sitting in someone else's custody — handed to a proxy server
+message held by another node — handed to a proxy server
 (`ON_PROXY`) or uploaded to a propagation node (`ON_PN`) — gets a single
 open-circle tick: a machine that is not mine has it, no proof of arrival.
 
@@ -592,11 +592,11 @@ ok after 1204 ms | rtt=1102 ms hops=1 | path loss us->them 97 dB  them->us 95 dB
 ```
 
 One ping per identity is in flight at a time; pressing again supersedes rather
-than queues, and a probe that draws no result at all settles `timeout` after
+than queues, and a probe that draws no result at all ends as `timeout` after
 20 s so the display never sticks on `probing`.
 
 The buttons fire and forget — the keys above are what they render. `lxmf ping`
-instead holds the prompt until `state` settles, then prints the outcome with
+instead holds the prompt until `state` finishes, then prints the outcome with
 the time it waited. It waits by reading the client's input in 100 ms slices,
 which is what makes **Ctrl-C** (or Ctrl-D) end the wait, keeps the cli task's
 ITS inbox serviced so new CLI connections aren't refused for the probe's
@@ -605,7 +605,7 @@ duration, and ends the wait when the session closes. Cancelling ends the
 `lxmf.ping.<peer>`. Without an interactive session (cron, `spangap cli`) there
 is nothing to read, and a plain delay paces the loop instead.
 
-The 20 s settle must stay inside rnsd's proof window (`s.rnsd.proof_timeout_s`):
+The 20 s timeout must stay inside rnsd's proof window (`s.rnsd.proof_timeout_s`):
 a probe that gives up before the transport does reports `no-proof` for a proof
 still in flight.
 
@@ -617,10 +617,10 @@ still in flight.
   one: how often those bytes go on the air belongs to each interface, which is
   the only thing that knows what airtime costs on its medium. Every interface
   pane carries the interval and an **Announce now** button; see
-  [rns/README.md](../rns/README.md), "The announce beat". Force one identity's
+  [rns/README.md](../rns/README.md), "The announce tick". Force one identity's
   announce with `lxmf.id.<n>.cmd.announce`.
 - Every `lxmf.delivery` announce the device hears is written to the
-  **announce catalogue**, one record per destination:
+  **heard-peer list**, one record per destination:
 
   ```
   lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
@@ -668,21 +668,21 @@ cost, and it may reject it (`PN_REJECTED`).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `s.lxmf.max_announces` | `2048` | Announce-catalogue entry cap; `0` = no eviction. |
+| `s.lxmf.max_announces` | `2048` | Heard-peer list entry cap; `0` = no eviction. |
 | `s.lxmf.stamp_cost` | `8` | Advertised PoW cost (bits, 0–18; `0` = none). |
 | `s.lxmf.generate_stamps` | `1` | Pay a peer's advertised stamp cost when sending. |
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
 | `s.lxmf.delivery_interval` | `10` | Minutes between sweeps of the delivery queue — how often a message that could not be delivered yet gets another attempt. |
-| `s.lxmf.delivery_timeout` | `60` | Minutes a message may sit in the delivery queue before it settles `DELIVERY_TIMEOUT`. Measured from when it was first queued; a reboot restarts it. |
+| `s.lxmf.delivery_timeout` | `60` | Minutes a message may sit in the delivery queue before it ends as `DELIVERY_TIMEOUT`. Measured from when it was first queued; a reboot restarts it. |
 | `s.lxmf.pn.<i>.hash` | — | Propagation-node list, index-ordered (`i` = 0–7); non-32-hex = free slot. |
 | `s.lxmf.pn.<i>.name` | `""` | Optional display name for that node. |
 | `s.lxmf.pn.<i>.check` | `1` | Poll this node for held messages. |
 | `s.lxmf.pn.check_interval_s` | `1800` | Propagation-node check cadence; `0` = manual only. |
 | `s.lxmf.sound` | `/fixed/lxmf/ding.wav` | Message-notification WAV (point at your own device-rate file if you like). |
 | `s.lxmf.sound_enabled` | `1` | Play the notification sound on inbound delivery. |
-| `s.lxmf.debug.only_local` | `0` | Demote per-announce catalogue debug logs to verbose. |
+| `s.lxmf.debug.only_local` | `0` | Demote per-heard-peer list debug logs to verbose. |
 | `s.lxmf.cli.selected_id` | `0` | The CLI's selected identity. |
 
 `s.lxmf.max_resource_size` (default 262144) gates the largest inbound
@@ -693,7 +693,7 @@ Resource and is consumed by rnsd, not lxmf — it is documented in
 
 ```
 label            "main" | "imported" | user-set
-enabled          1 (default); 0 = dark
+enabled          1 (default); 0 = disabled
 display_name     utf-8, advertised in announces
 default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
                  (empty ⇒ inherit global s.lxmf.default_method, default link-if-one-exists)
@@ -726,8 +726,8 @@ lxmf.id.<n>.accept               0 gates this destination's inbound in rnsd —
                                  dropped WITHOUT a proof, so the sender retries.
                                  Set by whatever ran out of room; a boot accepts.
 lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,caps,name}
-                                 heard-peer catalogue (RAM, browser-mirrored)
-lxmf.proxies.<dest_hex>.{label,last}   heard lxmproxy.server catalogue
+                                 heard-peer list (RAM, browser-mirrored)
+lxmf.proxies.<dest_hex>.{label,last}   heard lxmproxy.server list
 lxmf.proxies_text                the same, as one finished line each
 lxmf.ping.<peer>.*               latest probe result for that contact — see Ping above.
 ```
@@ -763,7 +763,7 @@ lxmf msgs [<arg>]           no arg = chats; <peer> = that thread (newest first);
                             (case-insensitive, e.g. `lxmf msgs delivered`);
                             `?` lists the names it takes, grouped by what each
                             one says about the message
-lxmf unsettled              outbound from this identity that has not settled,
+lxmf unfinished              outbound from this identity that has not finished,
                             oldest first: peer, status, tries, age, title, and
                             when the delivery queue next sweeps. The test is the
                             one queueResume uses — `statusInProgress()` and
@@ -772,25 +772,25 @@ lxmf unsettled              outbound from this identity that has not settled,
                             about it. ON_PROXY and ON_PN are absent by that
                             definition: another node holds those and ours will
                             not retry them.
-lxmf cancel <n>|all         settle those CANCELLED, through the same
+lxmf cancel <n>|all         end those as CANCELLED, through the same
                             `cmd.cancel` a UI uses — an outbox slot is unwound
                             with OUT_CANCEL, anything else is stamped and leaves
                             the queue. `<n>` is from the last numbered listing
                             and is re-read before acting, so an index that has
-                            since settled is refused rather than overwritten;
-                            `all` is one sentinel write that lxmf's own task
-                            fans out, so it means what is unsettled when that
+                            since finished is refused rather than overwritten;
+                            `all` is one command key write that lxmf's own task
+                            fans out, so it means what is unfinished when that
                             task reads it, not when the listing was printed.
 lxmf read <n>               print message #n from the last `lxmf msgs`; marks it read
 lxmf c[ontacts] [<arg>]     list this identity's contacts (numbered); <arg> =
                             case-insensitive substring of display_name or nick
-lxmf announces [<arg>]      cross-identity announce catalogue; <arg> = 32-hex
+lxmf announces [<arg>]      cross-identity heard-peer list; <arg> = 32-hex
                             (one row) or a name substring; no arg = full dump
 lxmf send <peer> <msg>      send; <peer> = 32-hex, a number from the last numbered
                             listing, or a name/nick substring
 lxmf a[nnounce]             announce the selected identity now
 lxmf p[ing] <peer>          probe <peer> (same forms as `send`); holds the prompt
-                            until the probe settles, its 20 s timeout expires, or
+                            until the probe finishes, its 20 s timeout expires, or
                             Ctrl-C, then prints the outcome, the wait, and both
                             ends' signal
 lxmf proxy [<cmd>]          no arg = this identity's proxy state; `servers` =
@@ -798,12 +798,12 @@ lxmf proxy [<cmd>]          no arg = this identity's proxy state; `servers` =
                             `off`, `force-off` (see **Being proxied**)
 ```
 
-Numbered listings (`chats`, `msgs`, `unsettled`, `contacts`, `announces`) feed
+Numbered listings (`chats`, `msgs`, `unfinished`, `contacts`, `announces`) feed
 the index arguments of `read` / `send` / `ping` / `cancel` / `msgs <#>`. One
 index space serves them all, which is why `cancel` re-reads the record it lands
-on rather than trusting that the last listing was `unsettled`. A `<peer>` substring is
+on rather than trusting that the last listing was `unfinished`. A `<peer>` substring is
 matched case-insensitively against this identity's contacts (display_name and
-nick) first, then the announce catalogue; multiple matches print a numbered
+nick) first, then the heard-peer list; multiple matches print a numbered
 disambiguation list instead of acting, so the retry can pick a line number. Run
 any of these on-device with `spangap cli "<command>"`.
 
@@ -812,7 +812,7 @@ any of these on-device with `spangap cli "<command>"`.
 **Settings** (Settings → Reticulum Mesh → LXMF Messages): described by the
 `settings:` block in `straddle.yaml` and lowered by the build to both surfaces.
 The four identity slots are rows gated on the slot being occupied; the
-propagation nodes are a collection over the `lxmf.pnode.*` sentinels; the create
+propagation nodes are a collection over the `lxmf.pnode.*` command keys; the create
 and import forms submit to `lxmf.identity.*`, where the 128-hex and 32-hex rules
 are stated once instead of as a regex per UI.
 

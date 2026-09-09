@@ -34,7 +34,7 @@ architecture and resolves several behaviours the storage model forces.
    `lxmMessageIdHex`.
 3. **Method auto-selection in firmware.** Upstream makes the caller pick the
    mode; we resolve per-message → per-identity default → `auto` and
-   auto-promote oversize (or a warm conversation Link) to DIRECT/Resource
+   auto-promote oversize (or an already-open conversation Link) to DIRECT/Resource
    (§6), because the storage API has no good place for a human to pick
    transport per send.
 4. **Opportunistic 16-byte strip lives in rnsd, not lxmf.** On the wire,
@@ -50,9 +50,9 @@ architecture and resolves several behaviours the storage model forces.
    and every link consumer opens the same number — rnsd reports the Resource
    lifecycle there by task handle, so it carries no consumer's name.
 6. **`OUT_RESULT status=0 ≡ sent`, never `delivered`.** An opportunistic
-   packet settles `delivered` only on rnsd's second result for the same
+   packet ends as `delivered` only on rnsd's second result for the same
    `send_id`, carrying the recipient's packet proof; a DIRECT/Resource
-   transfer settles on the Link proof. `applyOutResult` must not
+   transfer finishes on the Link proof. `applyOutResult` must not
    optimistically upgrade on the first result.
 7. **Unknown-sender inbound is buffered, then replayed.** When
    `rnsdRecallPubkey` misses (we've never heard the sender announce), the raw
@@ -191,7 +191,7 @@ The slot index is captured at compile time in four static stubs
 (`onIdCmd0…3`) so the callback stays `(key,val)` with no key parsing. **The
 firmware never subscribes to `s.lxmf.*` or `lxmf.id.<n>.*` (non-`cmd`).**
 Every firmware write to message records or ephemeral mirrors is silent
-relative to its own subscriptions — the cmd sentinels are the only wake
+relative to its own subscriptions — the cmd command keys are the only wake
 sources. Resist widening these prefixes "for symmetry."
 
 `onOpenContactUrl` does **not** consume its key: the value is
@@ -321,7 +321,7 @@ no local landing dest — so `onResourceAux` falls back to recovering the
 owning identity from the packed LXM's leading 16-byte destination hash
 (re-validated in `onInboundLxm`).
 
-**Link identification.** After the *first delivered* settle on a
+**Link identification.** After the *first delivered* result on a
 conversation Link, `directLinkSettle` sends `rnsdLinkIdentify(tag)` —
 rnsd signs a `LINKIDENTIFY` with the identity the link was opened with —
 so the peer can send its replies back over *our* Link (which we accept)
@@ -330,7 +330,7 @@ to the peer opening its own reply link.
 
 We do **not** send over a peer's inbound Link into us. Not every LXMF
 client accepts traffic on the Link it opened, so outgoing sends always
-ride a conversation Link *we* opened (reusing the warm one if present,
+ride a conversation Link *we* opened (reusing the already-open one if present,
 else opening a fresh one — `processReady` → `convGet`). Inbound Links are
 strictly receive-only: rnsd forwards the peer's LXMs on them into the
 shared `onInboundLxm`, and that is all they carry. Consequently the
@@ -343,8 +343,8 @@ Links — never a peer's inbound Link into us.
 client: write msgs.<peer>.<localkey>.{peer,title,content,thread,method,stage=draft}
 client: write lxmf.id.<n>.cmd.send = <peer>/<localkey>      ◄── commit (same txn ideal)
 
-handleIdCmd → split val on '/' → delete sentinel → processSend(id,peer,localkey):
-  peer arrives from the sentinel (it IS the record's path segment)
+handleIdCmd → split val on '/' → delete command key → processSend(id,peer,localkey):
+  peer arrives from the command key (it IS the record's path segment)
   validate 32-hex → 16 B dest
   pack [ts_ms, title, content, fields]  (title BEFORE content)
   optional stamp (lxmPackWire appends payload element [4] if peer advertises a cost)
@@ -359,7 +359,7 @@ processReady — method resolution (after the wire is packed, so oversize
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "link-always"           → use a Link
   "link-if-one-exists"    → use a Link if oversize OR our own conversation Link to peer is
-                            already warm (a peer's inbound Link into us never counts)
+                            already open (a peer's inbound Link into us never counts)
   "link-if-big"           → use a Link only if oversize, else OUT_PACKET
   "opportunistic-or-fail" → fail if oversize, else OUT_PACKET on the mailbox handle
   large + Link    → rnsdLinkSendResource (Resource over the Link)
@@ -406,14 +406,14 @@ holding nothing — no outbox slot, nothing rnsd-side. `queueSweep` runs from th
 non-empty, on this task: every piece of outbound state is task-local and
 lock-free, and a task of its own would need locking on all of it for no gain.
 Per entry: a status outside the in-progress set or `tries == 255` means it
-settled elsewhere and is dropped; an outbox slot holding it means an attempt is
+finished elsewhere and is dropped; an outbox slot holding it means an attempt is
 in flight and it is skipped; past the timeout it fails `DELIVERY_TIMEOUT`
 through `msgFail` — or `RADIO_BUSY`, when the summed LoRa contention-drop
 counter grew while the message sat there (`radioBusyOr` against the baseline
 `queueAdd` stamped): the own transmitter never got it out, which is a different
 fault from a silent recipient. Else `processReady` makes one more attempt.
 `msgSetStatus` (DELIVERED / CANCELLED) and `msgFail` remove the entry, so a
-message leaves the queue the moment it settles.
+message leaves the queue the moment it finishes.
 
 **A sweep's unit is the conversation, not the message.** `processReady`'s
 `retry` argument forces the Link (same exemption as oversize:
@@ -431,11 +431,11 @@ against it.
 per interval would be its own defect, so `msgSetStatus` calls
 `queueKickConversation` on every DELIVERED: if the queue still holds anything
 for that peer, `s_queueNextSweep_s` moves to now and the next message goes on
-the following 1 Hz pass — over the Link that is still warm and still open,
-which is the whole reason not to wait. It is the one choke point every settle
+the following 1 Hz pass — over the Link that is still open,
+which is the whole reason not to wait. It is the one choke point every final status
 path funnels through, so it is stated once rather than at each of them. The
 sweep clears `s_queueKicked` on entry and honours it on exit: a delivery that
-settles *inline* (a peer that is another identity on this box) must not have
+finishes *inline* (a peer that is another identity on this box) must not have
 its follow-up pushed back out to a whole interval by the tail that arms the
 next ordinary sweep.
 
@@ -473,7 +473,7 @@ to a peer opens a Link (`rnsdLinkOpen(peer, "lxmf.delivery", …,
 tag="lxmf.id<n>.<mid8>")`) that is kept and reused for the whole chat, in
 both directions, reaped by `convReap` past `s.lxmf.link.idle_s` (default
 600 s). Because `RNSD_PORT_LINK` has no `OUT_RESULT`, the 1 Hz
-`resolveDirectSends()` settles `sent`/`delivered` from
+`resolveDirectSends()` ends as `sent`/`delivered` from
 `rnsd.links.<tag>.{state, tx_packets, tx_proven, proof_timeouts, last_error}`
 (baselines captured at send time) and the Resource ACK
 (`RNSD_LINK_RESOURCE_OUTBOUND_DONE`) is proof-grade.
@@ -497,7 +497,7 @@ same counter as messages; `pingApplyOutResult` / `pingApplyOutStatus` claim that
 `SENT` is not an outcome (rnsd follows it with a second result when the proof
 lands or times out). Pressing again supersedes rather than queues — a
 measurement the user is watching should be the newest one, not the oldest
-queued. `pingTick` on the 1 Hz pass settles `timeout` at
+queued. `pingTick` on the 1 Hz pass ends as `timeout` at
 `LXMF_PING_TIMEOUT_S = 20`, which is what covers the one case rnsd emits no
 result for at all: a send parked on a path search that never resolves. A late
 result for an abandoned probe falls through to `applyOutResult` and logs an
@@ -528,7 +528,7 @@ unknown-send_id line at verb level.
    `s.lxmf.stamp_cost`; drop post-dedup if missing/under-cost.
 9. `lxmParsePayload`; persist under `…msgs.<peer>.<mid>.*` (`<peer> = src`)
    with `stage=received`, `dir=in`, `read=0`; stub `contacts.<src>`
-   (trust=0, copy `display_name` from the announce catalogue if heard);
+   (trust=0, copy `display_name` from the heard-peer list if heard);
    refresh `last_seen`; play the notification sound if enabled; `received++`.
 
 ## 8. Stamps
@@ -607,7 +607,7 @@ recipient pulls on its own sync. Proof timeout / link failure / TTL
 (`LXMF_PN_UP_TTL_S` = 90) → `PN_FAIL`; an error link-packet
 (`msgpack([errcode])`, e.g. 0xF5 invalid stamp) → `PN_REJECTED`. Two
 concurrent upload sessions (`LXMF_PN_UP_SESSIONS`); a third → `OUTBOX_FULL`.
-Pre-flight settles: no cached recipient pubkey (step 2 can't encrypt) →
+Pre-flight failures: no cached recipient pubkey (step 2 can't encrypt) →
 path request + `PN_FAIL`, over the node's per-transfer limit (step 4) →
 `TOO_LARGE`, link-open refusal → `LINK_OPEN_FAIL`. `pnUploadStart` owns
 every one of them, so no caller has to.
@@ -615,7 +615,7 @@ every one of them, so no caller has to.
 **Sync** (`pnSyncAdvance` + `pnRequestAux`): one session at a time walks
 a (node × identity) queue, fed by the periodic scheduler
 (`s.lxmf.pn.check_interval_s`, default 1800, first pass ~2 min after
-bring-up; 0 = manual) and the `lxmf.cmd.pn_sync` sentinel ("all" =
+bring-up; 0 = manual) and the `lxmf.cmd.pn_sync` command key ("all" =
 check-marked nodes — or *every* configured node when none is marked, since
 asking and getting nothing is the one useless answer — or one 32-hex node).
 "all" stands in for this interval's periodic pass, so it re-arms
@@ -753,10 +753,10 @@ remainder, and this end dedups on `message_id`. A record held with
 `body_absent` set is *not* a duplicate — it is a pending fetch, so the metadata
 is refreshed and the body still awaited.
 
-**`ON_PROXY` is terminal-marked but not settled.** The STATUS handler writes it
+**`ON_PROXY` is terminal-marked but not finished.** The STATUS handler writes it
 through `msgFail` (status + `tries = 255`: out of our hands) and deliberately
 does NOT send `SETTLED`, because the server is still working on it and will say
-`DELIVERED` — or why not — later. Only a real terminal status settles, and that
+`DELIVERED` — or why not — later. Only a real terminal status finishes, and that
 is what lets the server delete its record.
 
 **Frames over `LXMF_PROXY_MSG_MAX` (300 B) ride a Resource** on the Channel's
@@ -769,7 +769,7 @@ account-scoped values into one string on the 1 Hz tick and pushes when it moves.
 Widening lxmf's storage subscriptions to `s.lxmf.*` for this would reintroduce
 exactly the self-notify churn §3 exists to avoid.
 
-**The heard-server catalogue** is a second announce fan-out subscription, filtered
+**The heard-server list** is a second announce fan-out subscription, filtered
 to `lxmproxy.server`, bounded at `LXMF_PROXY_MAX_HEARD` (16, least-recently-heard
 evicted) and published as `lxmf.proxies.<dest>.{label,last}` plus the finished
 `lxmf.proxies_text`. Nobody types a hash.
@@ -810,7 +810,7 @@ Inbound: lxmf subscribes rnsd's `RNSD_PORT_ANNOUNCES` fan-out filtered to
 `hops(1)|dest(16)|identity(16)|pubkey(64)|ratchet(32)|app_data(N)`;
 `onAnnounceFromRnsd` parses (`parseLxmfAnnounce` handles the app_data shapes
 seen in the wild), skips own dests, and writes **one record per destination**
-into the announce catalogue store. The ratchet is a frame field of its own —
+into the heard-peer list store. The ratchet is a frame field of its own —
 all-zero when the peer advertises none — never something to pick out of
 app_data; rnsd owns that slicing (rns/INTERNALS §4.2), and lxmf only mirrors
 the value for the browser. What it is *for* — encrypting to it — needs no value
@@ -821,7 +821,7 @@ lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (schema 3)
 ```
 
 `last`/`hops` are fixed-width and mutate in place on a re-announce (no record
-rebuild); `cost` is a `SDB_FIXSTR` so its `-1` "unknown" sentinel round-trips;
+rebuild); `cost` is a `SDB_FIXSTR` so its `-1` "unknown" command key round-trips;
 `ratchet`/`name` are text. `ratchet` is written on every announce, empty
 included — a peer that stops advertising one must stop showing one — while
 `name`/`cost` are only written when present, so a nil-name announce
@@ -834,14 +834,14 @@ cap is fixed at registration). Reads go through `readAnnounce()` (one dest) and
 `forEachAnnounce()` (accumulates a store's per-field callbacks back into a
 record), so no code parses a packed string anymore.
 
-Because the catalogue is RAM-only, `onAnnounceFromRnsd` also writes the
+Because the list is RAM-only, `onAnnounceFromRnsd` also writes the
 announced name verbatim into `contacts.<dest>.display_name` of every slot that
 has that contact — the announce is authoritative for the name (a nameless
 announce leaves the last one standing rather than demoting the contact to a hex
 hash), and this write is what makes it reboot-durable. Unconditional (no read-compare —
 storage no-ops identical values); frontends therefore never need to promote
 announce names into contacts themselves, they only fall back to the live
-catalogue for non-contact peers.
+list for non-contact peers.
 
 **Capability bits.** app_data element `[2]` is a msgpack `uint16` bitfield
 (`LXMF_ANN_CAP_*`), always emitted, so a later element can be appended
@@ -858,7 +858,7 @@ Bit 0 is advertised; a peer's bits are persisted on its contact record
 
 **Concurrency:** `AnnounceFanout::received_announce` runs on the **rnsd**
 task (inside `Transport::inbound`) but only does `memcpy + itsSend(timeout=0)`
-per subscriber; all announce-catalogue storage writes happen on the **lxmf**
+per subscriber; all heard-peer-list storage writes happen on the **lxmf**
 task in `onAnnounceFromRnsd`. rnsd never touches storage in the announce
 path, so announce traffic cannot overflow rnsd's recv queue.
 
@@ -866,7 +866,7 @@ path, so announce traffic cannot overflow rnsd's recv queue.
 
 The schema is an array (`…id.<n>.*`, `n ∈ [0, LXMF_MAX_IDENTITIES = 4)`);
 single-identity runs at `n = 0`. Each slot is fully compartmentalised —
-contacts, messages, drafts siloed by path; `destroyIdentity(n)` wipes
+contacts, messages, drafts kept separate by path; `destroyIdentity(n)` wipes
 `secrets.lxmf.id.<n>.privkey`, `s.lxmf.id.<n>.*`, and `lxmf.id.<n>.*`, and
 nothing outside the slot.
 
@@ -908,7 +908,7 @@ the conversation subtree).
 ### Global (`s.lxmf.*`)
 
 ```
-max_announces        2048   announce-catalogue cap (0 = no eviction)
+max_announces        2048   heard-peer list cap (0 = no eviction)
 stamp_cost           8      advertised PoW cost (0–18; 0 = none)
 generate_stamps      1      pay a peer's advertised cost when sending
 enforce_stamps       0      drop inbound without a valid stamp for our cost
@@ -951,7 +951,7 @@ msgs.<id>.title / content
 msgs.<id>.reply_to       raw 32 B replied-to message hash (FIELD_REPLY_TO); all-zero = not a reply
 msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; legacy auto/direct/opportunistic still parse)
 msgs.<id>.ts             unix s (sender clock; can be wrong — recv_ts is the display anchor)
-msgs.<id>.delivered_ts   u32 unix s the delivery proof settled DELIVERED; 0 = not delivered
+msgs.<id>.delivered_ts   u32 unix s the delivery proof finished DELIVERED; 0 = not delivered
 msgs.<id>.read           inbound only, 0 | 1
 msgs.<id>.message_id     raw 32 B SHA-256 (firmware)
 ```
@@ -983,12 +983,12 @@ Callers keep using the same `s.lxmf.id.N.msgs.<peer>.<key>.<field>` key strings;
 storage routes them to the store transparently and synthesizes the same change
 notifications a cfgRoot write would. Message bodies are shipped to the browser on
 demand (`{"fetch":…}` when a conversation opens), not on the connect dump; the
-conversation *directory* (`contacts`) and the announce catalogue are separate
+conversation *directory* (`contacts`) and the heard-peer list are separate
 browser-mirrored stores (see §9 and storage-internals §0). Deleting a
 conversation (or the identity) via `storageDeleteTree` drops the instance + its
 file.
 
-Two alternatives to the per-contact layout are settled. Having firmware scan
+Two alternatives to the per-contact layout are finished. Having firmware scan
 every `msgs.*` subtree for a bare `<key>` (so `cmd.*` values could omit the
 peer) is rejected — it reintroduces exactly the O(all-messages) walk the
 layout exists to avoid, which is why `cmd.{send,cancel,delete}` values carry
@@ -1008,7 +1008,7 @@ lxmf.id.<n>.stats.{sent,received,pending,failed}
 lxmf.id.<n>.{proxy_state,proxy_link,proxy_text,proxy_label,proxy_quota}  (§8c)
 lxmf.id.<n>.{proxy_offer,proxy_held}   the pane's two row gates, truthiness only
 lxmf.id.<n>.accept                  0 gates this destination's inbound in rnsd (§8c)
-lxmf.id.<n>.setproxy                the "use a proxy" form's sentinel; answers on
+lxmf.id.<n>.setproxy                the "use a proxy" form's command key; answers on
                                     .setproxy.{error,done}
 
 lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,caps,name}   (RAM-only record store, §9 — not cfgRoot)
@@ -1040,15 +1040,15 @@ rows render — `lxmf.id.<n>.used` as the slot gate, `label_text`, `state_text`,
 `last_error` as its tooltip.
 
 The frontend write contract (`modules/lxmf.ts`, `CmdQueue`): a record write
-plus its `cmd` sentinel must go as **one** `sendJson` nested patch — the
-queue `deepAssign`s the record data and the sentinel into a single patch —
+plus its `cmd` command key must go as **one** `sendJson` nested patch — the
+queue `deepAssign`s the record data and the command key into a single patch —
 never two separate `set()` calls. Command serialization is **per `cmd` key**
-(one queue per full sentinel path, so per identity too), not global:
+(one queue per full command key path, so per identity too), not global:
 different cmd kinds never block each other; only same-kind writes queue.
-Completion is settled on the record's firmware-owned *effect* (e.g.
-`message_id` appearing, or a `failed` stage) — never on the sentinel
+Completion is decided on the record's firmware-owned *effect* (e.g.
+`message_id` appearing, or a `failed` stage) — never on the command key
 disappearing, because ephemeral `lxmf.*` deletions are not propagated back
-over the storage DataChannel, so "sentinel gone" is unobservable and using
+over the storage DataChannel, so "command key gone" is unobservable and using
 it produced false send failures.
 
 **What counts as a contact.** A contact is a peer with **at least one stored

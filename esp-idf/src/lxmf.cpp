@@ -2042,7 +2042,7 @@ static void sendAnnounce(lxmf_id_t& id)
  * this link, and those bytes feed the same onInboundLxm pipeline as the
  * inbound-Link path. Sends to one peer serialize: rnsd allows one
  * in-flight resource per link slot and the pre-active outbox holds one
- * packet, so a send while another is unsettled on the same link waits in
+ * packet, so a send while another is unfinished on the same link waits in
  * the delivery queue for the next sweep. Budget: ≤ LXMF_MAX_CONV_LINKS
  * of the device link budget (12 total; nomad's sessions hold 7);
  * LRU-evicted when full. */
@@ -2124,7 +2124,7 @@ static void onConvLinkDisc(int ref)
     c.identified = false;
 }
 
-/* True while any unsettled DIRECT outbound rides the conversation link
+/* True while any unfinished DIRECT outbound rides the conversation link
  * with this tag (sends serialize per link; rnsd holds one in-flight
  * resource + one receipt per slot). */
 static bool linkTagBusy(const std::string& tag)
@@ -6065,7 +6065,7 @@ static void processCancel(lxmf_id_t& id, const std::string& peer_hex,
  * is WAITING for another attempt — a message on its first attempt is settling
  * against an outbox slot and is not in it, and that is exactly a send somebody
  * would want to call back. The predicate is queueSweep's, so "all" cancels
- * precisely what `lxmf unsettled` listed. */
+ * precisely what `lxmf unfinished` listed. */
 static void processCancelAll(lxmf_id_t& id)
 {
     char prefix[64];
@@ -6083,7 +6083,7 @@ static void processCancelAll(lxmf_id_t& id)
             hits.emplace_back(peer, key);
         }
     for (const auto& h : hits) processCancel(id, h.first, h.second);
-    info("id %d: cancelled %zu unsettled outbound", id.index, hits.size());
+    info("id %d: cancelled %zu unfinished outbound", id.index, hits.size());
 }
 
 /* cmd.delete — wipe a message record (frees `wire` storage), or, when
@@ -7074,7 +7074,7 @@ static void cliMsgs(const char* rest)
     printMsgRows(sel, rows, /*show_peer=*/false);
 }
 
-/* ── `lxmf unsettled` / `lxmf cancel` ──
+/* ── `lxmf unfinished` / `lxmf cancel` ──
  *
  * Unsettled = outbound this identity has not finished with: the delivery queue
  * will attempt it again. The test is `statusInProgress() && tries != GAVEUP` —
@@ -7083,7 +7083,7 @@ static void cliMsgs(const char* rest)
  * with the queue about what is still in play would be worse than no listing.
  *
  * Two things that look terminal are not, and one that looks live is not:
- *   - `AWAITING_PROOF` is unsettled. The message is on the air and nothing has
+ *   - `AWAITING_PROOF` is unfinished. The message is on the air and nothing has
  *     answered; that is exactly the state worth seeing.
  *   - `CANCELLED` does NOT set tries = GAVEUP, so `tries == 255` alone is not an
  *     is-it-finished test. statusInProgress excludes it by status instead.
@@ -7149,7 +7149,7 @@ static void cliUnsettled(void)
 
     std::vector<UnsettledRow> rows = collectUnsettled(sel);
     s_msgs_list.clear();
-    if (rows.empty()) { cliPrintf("id %d  nothing unsettled\n", sel); return; }
+    if (rows.empty()) { cliPrintf("id %d  nothing unfinished\n", sel); return; }
 
     cliPrintf("%-3s %-16s %-17s %-5s %-5s %s\n",
               "#", "peer", "status", "tries", "age", "title");
@@ -7168,10 +7168,10 @@ static void cliUnsettled(void)
      * listing raises. Zero means the queue is idle and holds nothing. */
     const uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
     if (!s_queueNextSweep_s)
-        cliPrintf("%zu unsettled, oldest %s — none queued for a sweep\n",
+        cliPrintf("%zu unfinished, oldest %s — none queued for a sweep\n",
                   rows.size(), briefAge(rows.front().ts).c_str());
     else
-        cliPrintf("%zu unsettled, oldest %s — next sweep in %s\n",
+        cliPrintf("%zu unfinished, oldest %s — next sweep in %s\n",
                   rows.size(), briefAge(rows.front().ts).c_str(),
                   briefDur(s_queueNextSweep_s > now_s
                            ? (long)(s_queueNextSweep_s - now_s) : 0).c_str());
@@ -7186,7 +7186,7 @@ static void cliCancel(const char* rest)
     const int sel = selectedId();
     lxmf_id_t* id = idAt(sel);
     if (!id || !id->used) { cliPrintf("no identity at slot %d\n", sel); return; }
-    if (!*rest) { cliPrintf("usage: lxmf cancel <n>|all  (see `lxmf unsettled`)\n"); return; }
+    if (!*rest) { cliPrintf("usage: lxmf cancel <n>|all  (see `lxmf unfinished`)\n"); return; }
 
     auto cancelOne = [&](const std::string& peer, const std::string& key) {
         char k[64];
@@ -7202,15 +7202,15 @@ static void cliCancel(const char* rest)
          * predicted, since the set is re-derived there and a message may settle
          * on its own between the two. */
         const size_t before = collectUnsettled(sel).size();
-        if (!before) { cliPrintf("nothing unsettled\n"); return; }
+        if (!before) { cliPrintf("nothing unfinished\n"); return; }
         cancelOne("all", "");
-        cliPrintf("cancelling %zu unsettled — `lxmf unsettled` to confirm\n", before);
+        cliPrintf("cancelling %zu unfinished — `lxmf unfinished` to confirm\n", before);
         return;
     }
 
     const int n = std::atoi(rest);
     if (n < 1 || (size_t)n > s_msgs_list.size()) {
-        cliPrintf("cancel: index out of range (run `lxmf unsettled` first)\n");
+        cliPrintf("cancel: index out of range (run `lxmf unfinished` first)\n");
         return;
     }
     const MsgRef ref = s_msgs_list[(size_t)n - 1];
@@ -7512,7 +7512,7 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf chats              list conversations for selected id (numbered)\n");
         cliPrintf("lxmf msgs [<arg>]       no arg = chats; <peer> = thread; <status> = filter;\n");
         cliPrintf("                      `?` = the status names the filter takes\n");
-        cliPrintf("lxmf unsettled          outbound not yet settled — what the queue will retry\n");
+        cliPrintf("lxmf unfinished          outbound not yet finished — what the queue will retry\n");
         cliPrintf("lxmf cancel <n>|all     settle those CANCELLED (<n> from the last listing)\n");
         cliPrintf("lxmf read <n>           print msg n from last listing; marks read\n");
         cliPrintf("lxmf c[ontacts] [<arg>] list contacts for selected id (numbered);\n");
@@ -7591,7 +7591,7 @@ static void cliLxmf(const char* args)
                                else cliChats(s);
                                return; }
     if (verb == "msgs")      { cliMsgs(rest); return; }
-    if (verb == "unsettled") { cliUnsettled(); return; }
+    if (verb == "unfinished") { cliUnsettled(); return; }
     if (verb == "cancel")    { cliCancel(rest); return; }
     if (verb == "read")      { cliRead(rest); return; }
     if (cliVerbIs(verb.c_str(), "contacts", 1)) { cliContacts(rest); return; }
