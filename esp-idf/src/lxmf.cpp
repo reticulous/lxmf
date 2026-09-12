@@ -491,14 +491,16 @@ static const sdb_schema& lxmfMsgSchema()
  * registered legacy hint layouts and re-packs them in this one, dropping values
  * for fields this layout no longer carries.
  *
- * A contact's public key is deliberately NOT here. rnsd's directory is
- * authoritative for "what I currently know about that destination", holds the
- * key in the same record as the route, and persists it; lxmf claims each
- * contact (lxmfClaimContact) so that record outranks unclaimed announce traffic
- * under eviction. Storing a second copy here would be a second thing to keep
- * consistent for no gain — a key with no path saves no work, because acquiring
- * a path means a path request and the response is an announce carrying the
- * key. */
+ * A contact's public key is here because verifying a message from that contact
+ * needs the key and nothing else — no route, no path, no announce. rnsd's
+ * directory holds the same key beside the route and is the fast path every
+ * reader takes, but it is a cache: its arena is sized from free PSRAM at boot
+ * and its image is discarded whole on any mismatch, so a key that lived only
+ * there can be gone while the contact is still in the address book, and every
+ * message from that contact then waits on a path request it never needed. The
+ * address book is the durable, bounded list of destinations this node cares
+ * about, so the key rides with it and is handed back to the directory at boot
+ * (lxmfSyncContactKey). */
 static const sdb_schema& lxmfContactSchema()
 {
     static const sdb_schema s = [] {
@@ -508,6 +510,9 @@ static const sdb_schema& lxmfContactSchema()
         x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
          .u8("trust")
          .data("hash", 16)
+         .data("pubkey", 64)   /* X25519(32) ‖ Ed25519(32), as rnsd hands it
+                                * out; unset until an announce is heard or a
+                                * message from them verifies */
          .u8("caps")           /* announce caps bitfield (bit0 = accepts
                                 * double-encrypted payloads), persisted from
                                 * the last announce that carried one */
@@ -575,6 +580,44 @@ static void lxmfClaimContact(const std::string& peer_hex)
     uint8_t dh[16];
     if (!hexToBytes(peer_hex.c_str(), peer_hex.size(), dh, 16)) return;
     rnsdClaim(dh, RNSD_CLAIM_LXMF, RNSD_CLAIM_PERSIST, RNSD_CLAIM_LAYER_DIR, 0);
+}
+
+/* Keep a contact's public key with the contact (see lxmfContactSchema). Both
+ * sources are authenticated: an announce carries a signature over the key it
+ * advertises, and a message that verifies proves the key that verified it.
+ *
+ * Written only when it differs from what is stored: a peer re-announces on its
+ * own beat, and an unchanged 64-byte write would rewrite the record and notify
+ * every subscriber for news nobody had. */
+static void contactSetPubkey(int n, const std::string& peer_hex,
+                             const uint8_t pk[RNSD_PUBKEY_LEN])
+{
+    std::string key = contactPath(n, peer_hex, "pubkey");
+    std::string hex = bytesToHex(pk, RNSD_PUBKEY_LEN);
+    if (storageGetStr(key.c_str(), "") == hex) return;
+    storageSet(key.c_str(), hex.c_str());
+}
+
+/* The stored key for a contact, if one was ever heard. */
+static bool contactGetPubkey(int n, const std::string& peer_hex,
+                             uint8_t out[RNSD_PUBKEY_LEN])
+{
+    std::string hex = storageGetStr(contactPath(n, peer_hex, "pubkey").c_str(), "");
+    if (hex.size() != RNSD_PUBKEY_LEN * 2) return false;
+    return hexToBytes(hex.c_str(), hex.size(), out, RNSD_PUBKEY_LEN);
+}
+
+/* Reconcile one contact's key between the address book and rnsd's directory:
+ * whichever side holds it hands it to the other. Both directions matter at
+ * boot — a contact stored before its key was is filled in from a directory
+ * image that survived, and a contact whose key we hold gets it back into the
+ * directory the image lost, which is where every consumer looks it up. */
+static void lxmfSyncContactKey(int n, const std::string& peer_hex)
+{
+    uint8_t dh[LXMF_DEST_HASH_LEN], pk[RNSD_PUBKEY_LEN];
+    if (!hexToBytes(peer_hex.c_str(), peer_hex.size(), dh, LXMF_DEST_HASH_LEN)) return;
+    if (contactGetPubkey(n, peer_hex, pk)) { rnsdSeedPubkey(dh, pk); return; }
+    if (rnsdRecallPubkey(dh, pk)) contactSetPubkey(n, peer_hex, pk);
 }
 
 /* Per-conversation read watermark: the ts (seconds) up to and including which
@@ -1545,6 +1588,7 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
     const uint8_t* dh       = buf + 1;
     /* buf + 17 is the announce identity hash — unused but
      * available if a consumer ever wants it. */
+    const uint8_t* pubkey   = buf + LXMF_ANNOUNCE_PUBKEY_OFF;
     const uint8_t* ratchet  = buf + LXMF_ANNOUNCE_RATCHET_OFF;
     const uint8_t* app_data = buf + LXMF_ANNOUNCE_HDR;
     size_t         app_len  = n - LXMF_ANNOUNCE_HDR;
@@ -1613,6 +1657,9 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
              * element, so a legacy announce never wipes a known value. */
             if (info.caps >= 0)
                 setIntIfChanged(contactPath(id.index, dh_hex, "caps"), info.caps);
+            /* The key the announce is signed with, kept with the contact so it
+             * outlives rnsd's directory image. */
+            contactSetPubkey(id.index, dh_hex, pubkey);
             /* Restamp the claim while we are here: an announce is evidence
              * this contact is live, and claim recency is what orders eviction
              * among claimed records. */
@@ -2940,29 +2987,40 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     }
 
     /* Recall sender pubkey from rnsd's cache (populated by their
-     * announces). If absent, buffer the wire and request a path: the
+     * announces). A contact we have heard before answers this without the
+     * network: the key is stored with the contact, and verification wants
+     * nothing else. Seed it back so every other consumer finds it too.
+     *
+     * With no key from either, buffer the wire and request a path: the
      * path request makes the sender re-announce, and drainPendingVerify
      * replays this message once their announce lands. Opportunistic
      * LXMF has no retransmission, so dropping here loses the message. */
     uint8_t sender_pubkey[RNSD_PUBKEY_LEN];
     if (!rnsdRecallPubkey(sh, sender_pubkey)) {
-        warn("id %d: inbound LXM from unknown sender %s — buffering, issuing path request",
-             id.index, bytesToHex(sh, LXMF_DEST_HASH_LEN).c_str());
-        uint64_t now_ms = nowUnixMs();
-        auto& q = id.pending_verify;
-        q.erase(std::remove_if(q.begin(), q.end(),
-                    [&](const pending_verify_t& e) {
-                        return now_ms - e.enqueued_ms > LXMF_PENDING_VERIFY_TTL_MS;
-                    }),
-                q.end());
-        while (q.size() >= LXMF_MAX_PENDING_VERIFY) q.erase(q.begin());
-        pending_verify_t e;
-        std::memcpy(e.sender, sh, LXMF_DEST_HASH_LEN);
-        e.wire.assign(wire, wire + n);
-        e.enqueued_ms = now_ms;
-        q.push_back(std::move(e));
-        rnsdRequestPath(sh);
-        return;
+        std::string peer_hex = bytesToHex(sh, LXMF_DEST_HASH_LEN);
+        if (contactGetPubkey(id.index, peer_hex, sender_pubkey)) {
+            rnsdSeedPubkey(sh, sender_pubkey);
+            verb("id %d: inbound LXM from %s — key from the address book",
+                 id.index, peer_hex.c_str());
+        } else {
+            warn("id %d: inbound LXM from unknown sender %s — buffering, issuing path request",
+                 id.index, peer_hex.c_str());
+            uint64_t now_ms = nowUnixMs();
+            auto& q = id.pending_verify;
+            q.erase(std::remove_if(q.begin(), q.end(),
+                        [&](const pending_verify_t& e) {
+                            return now_ms - e.enqueued_ms > LXMF_PENDING_VERIFY_TTL_MS;
+                        }),
+                    q.end());
+            while (q.size() >= LXMF_MAX_PENDING_VERIFY) q.erase(q.begin());
+            pending_verify_t e;
+            std::memcpy(e.sender, sh, LXMF_DEST_HASH_LEN);
+            e.wire.assign(wire, wire + n);
+            e.enqueued_ms = now_ms;
+            q.push_back(std::move(e));
+            rnsdRequestPath(sh);
+            return;
+        }
     }
 
     /* A stamped message carries the PoW as payload element [4], appended
@@ -3089,8 +3147,11 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     storageEnd();
 
     /* bumpConvDirectory has materialised the contact, so claim it: from here on
-     * their directory record is protected like any other contact's. */
+     * their directory record is protected like any other contact's — and keep
+     * the key that just verified this message, which is the same key an
+     * announce would have brought and may be the only copy we get. */
     lxmfClaimContact(sh_hex);
+    contactSetPubkey(id.index, sh_hex, sender_pubkey);
 
     id.received++;
     info("id %d: recv mid=%s from=%s len=%zuB title=\"%s\"",
@@ -6615,17 +6676,23 @@ static int s_ann_count_tmp = 0;
 
 /* ─────────────── bootstrap ─────────────── */
 
-/* Boot-time re-assertion of the directory claim on every stored contact. rnsd
- * keeps claims compiled into its persisted image, so this is usually a restamp
- * rather than news — but a discarded image must cost only the head start, never
- * the intent, and the intent lives here. */
+/* Boot-time re-assertion of the directory claim on every stored contact, and of
+ * the key we hold for it. rnsd keeps claims compiled into its persisted image,
+ * so the claim is usually a restamp rather than news — but a discarded image
+ * costs the claim its record AND every key in it, and a claim alone only
+ * reserves an empty one. Seeding the stored keys back is what makes a discarded
+ * image cost the routes it should cost and nothing more: a message from a known
+ * contact still verifies on arrival, with no path request in the way. */
 static void lxmfPreloadContactClaims(void)
 {
     for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
         s_seedPeers.clear();
         std::string cpre = "s.lxmf.id." + std::to_string(n) + ".contacts";
         storageForEach(cpre.c_str(), seedCollectPeer);
-        for (auto& peer : s_seedPeers) lxmfClaimContact(peer);
+        for (auto& peer : s_seedPeers) {
+            lxmfClaimContact(peer);
+            lxmfSyncContactKey(n, peer);
+        }
     }
     s_seedPeers.clear();
 }
@@ -7844,8 +7911,9 @@ static void lxmfTaskMain(void*)
      * pre-connect window fails cleanly instead of touching an unconnected dest. */
     loadAllIdentities();
 
-    /* Re-assert the directory claim on every stored contact before we connect.
-     * Pure storage + rnsd's directory aux — no rns.ready needed. */
+    /* Re-assert the directory claim on every stored contact before we connect,
+     * and hand rnsd back the key we hold for each. Pure storage + rnsd's
+     * directory aux — no rns.ready needed. */
     lxmfPreloadContactClaims();
 
     /* Every outbound still in progress in storage goes back on the delivery
