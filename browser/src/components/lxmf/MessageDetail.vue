@@ -15,6 +15,15 @@
         <span class="status">{{ statusName }}</span>
       </div>
 
+      <!-- The failure our proxy stopped on. Said here and not in the
+           conversation, where one ✕ is the whole story a reader wants — and
+           said as the PROXY's verdict, because the one thing this must never
+           be read as is trouble reaching the proxy. -->
+      <template v-if="proxyGaveUpWith">
+        <div class="sect">Our proxy gave up</div>
+        <div class="sn text">It tried and stopped: {{ proxyGaveUpWith }}</div>
+      </template>
+
       <template v-if="m.title">
         <div class="sect">Title</div>
         <div class="sn text">{{ m.title }}</div>
@@ -43,6 +52,13 @@
       <template v-if="isReply">
         <div class="sect">In reply to</div>
         <div class="sn small">{{ grouped(m.replyTo!) }}</div>
+        <!-- The fragment as it arrived, whether or not it is one the
+             conversation will draw — that needs it to occur in the message
+             above, and this is where an unverifiable quote can still be read. -->
+        <template v-if="m.replyQuote">
+          <div class="sect">Quoting</div>
+          <div class="sn small">{{ m.replyQuote }}</div>
+        </template>
       </template>
 
       <div class="sect">Details</div>
@@ -57,7 +73,13 @@
         </template>
       </div>
 
-      <button v-if="m.dir === 'out'" class="resend" @click="openResend">Resend…</button>
+      <!-- "…" only where a press opens a dialog. With one thing it can mean,
+           the button says the thing. -->
+      <button v-if="m.dir === 'out'" class="resend" @click="openResend">
+        {{ resendOptions.length === 1 && resendOptions[0].via === RESEND_RETRY
+             ? 'Try again now' : 'Resend…' }}
+      </button>
+      <div v-if="resendDone" class="done">{{ resendDone }}</div>
     </div>
 
     <!-- Resend dialog: direct first, the contact's node second (when set),
@@ -81,26 +103,47 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
-import { type Message, type PnNode, lxmfStatusName,
-         hasDest, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+import { type Message, type PnNode, lxmfStatusName, LxmfStatus,
+         hasDest, LXMF_TRIES_GAVEUP, RESEND_RETRY } from '../../modules/lxmf'
 
 const props = defineProps<{
   m: Message
   peerName: string
   pnNodes: PnNode[]
   contactPn: string
+  /** This identity's mail belongs to a proxy server. */
+  proxied?: boolean
+  /** A conversation link to this peer is up, so this device can carry it. */
+  linkUp?: boolean
 }>()
 const emit = defineEmits<{
   close: []
-  /** via = '' → resend directly; else the 32-hex propagation node. */
+  /** via = '' → resend directly, RESEND_RETRY → ask our proxy to try again
+   *  without moving the body, else the 32-hex propagation node. */
   resend: [m: Message, via: string]
 }>()
 
-/* ── Resend dialog ── */
+/* ── Resend ──
+ *
+ * A dialog is for choosing, so it appears only when there is a choice. Proxied
+ * with no link open there is exactly one thing a press can mean, and asking
+ * which of one is a question with no information in it. */
 const resendOpen = ref(false)
 const resendVia = ref('')
+const resendDone = ref('')       /* the little "here is what I did" notice */
+let doneTimer: ReturnType<typeof setTimeout> | undefined
+
 const resendOptions = computed(() => {
-  const opts: { via: string; label: string }[] = [{ via: '', label: 'Directly' }]
+  const opts: { via: string; label: string }[] = []
+  /* Proxied, this device does not send: the server does. The direct option
+   * comes back only when a link to the recipient is open, which is the one
+   * case where this device can carry the message itself. */
+  if (props.proxied) {
+    if (props.linkUp) opts.push({ via: '', label: 'Directly, over the open link' })
+    opts.push({ via: RESEND_RETRY, label: 'Ask your proxy to try again now' })
+  } else {
+    opts.push({ via: '', label: 'Directly' })
+  }
   const cpn = hasDest(props.contactPn) ? props.contactPn.toLowerCase() : ''
   if (cpn) {
     const known = props.pnNodes.find(n => n.hash === cpn)
@@ -115,16 +158,39 @@ const resendOptions = computed(() => {
   }
   return opts
 })
+
+function fire(via: string) {
+  emit('resend', props.m, via)
+  /* The one action with nothing to watch afterwards says so itself: no message
+   * leaves this device, so the conversation shows nothing happening for as long
+   * as the proxy takes. */
+  if (via === RESEND_RETRY) {
+    resendDone.value = 'Asked your proxy to try again now.'
+    clearTimeout(doneTimer)
+    doneTimer = setTimeout(() => { resendDone.value = '' }, 2600)
+  }
+}
+
 function openResend() {
-  resendVia.value = ''
+  const opts = resendOptions.value
+  if (opts.length === 1) { fire(opts[0].via); return }
+  resendVia.value = opts[0].via
   resendOpen.value = true
 }
 function doResend() {
   resendOpen.value = false
-  emit('resend', props.m, resendVia.value)
+  fire(resendVia.value)
 }
 
 const statusName = computed(() => lxmfStatusName(props.m.status))
+
+/* The status the proxy itself stopped on, named — empty unless this message
+ * actually ended that way, so the section it fills does not appear on messages
+ * the proxy never gave up on. */
+const proxyGaveUpWith = computed(() =>
+  props.m.status === LxmfStatus.OurProxyGaveUp && props.m.proxyStatus
+    ? (lxmfStatusName(props.m.proxyStatus) || 'an unnamed failure')
+    : '')
 
 const grouped = (hex: string) => (hex.match(/.{1,4}/g) ?? []).join(' ')
 
@@ -205,6 +271,11 @@ async function copy(key: string, val: string) {
   font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
 }
 .resend:hover { background: #46704f; }
+/* The receipt for an action with nothing else to show for itself. */
+.done {
+  margin-top: 8px; color: #9ecf9e; text-align: center;
+  font-size: calc(12px * var(--rfs, 1));
+}
 .dlg-bg {
   position: absolute; inset: 0; background: rgba(0,0,0,0.5); z-index: 8;
   display: flex; align-items: center; justify-content: center;

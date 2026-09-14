@@ -4,6 +4,20 @@
      cmd.send. The DIRECT hint is informational, never blocking. -->
 <template>
   <div class="composer">
+    <!-- What the next message will reply to, sitting where the reply itself
+         will end up: same quote block, directly over the typing area, with an
+         (x) that abandons the reply and keeps the text. -->
+    <div v-if="quote" class="replybar">
+      <div class="rq">
+        <div class="rqwho">
+          <q-icon :name="matReply" size="13px" /> Replying to {{ quote.label }}
+        </div>
+        <div class="rqtext">{{ quote.text }}</div>
+      </div>
+      <button class="rqx" title="Cancel reply" @click="emit('cancel-quote')">
+        <q-icon :name="matClose" size="16px" />
+      </button>
+    </div>
     <div v-if="overBudget" class="hint">
       long message — will send DIRECT (not opportunistic)
     </div>
@@ -26,12 +40,18 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { matSend } from '@quasar/extras/material-icons'
+import { matSend, matReply, matClose } from '@quasar/extras/material-icons'
 
-const props = defineProps<{ modelValue: string }>()
+const props = defineProps<{
+  modelValue: string
+  /* The message the next send replies to — who wrote it and the line being
+   * quoted — or null when this is an ordinary message. */
+  quote?: { label: string; text: string } | null
+}>()
 const emit = defineEmits<{
   'update:modelValue': [v: string]
   send: [content: string]
+  'cancel-quote': []
 }>()
 
 const text = computed({
@@ -46,6 +66,19 @@ const overBudget = computed(() =>
 const canSend = computed(() => text.value.trim().length > 0)
 
 const ta = ref<HTMLTextAreaElement | null>(null)
+
+/* A reply that has just been picked leaves the cursor here: the quote appearing
+ * above the field IS the invitation to type, and reaching for the field
+ * afterwards is a step the user never needs to take. Only on the way in — a
+ * cancelled reply leaves focus where the reader put it. */
+watch(() => props.quote, (q, was) => {
+  if (!q) return
+  /* By value, not by identity: the quote is recomputed on unrelated changes
+   * (a peer's name arriving), and those must not pull the cursor back here. */
+  if (was && was.label === q.label && was.text === q.text) return
+  nextTick(() => ta.value?.focus())
+})
+
 function autoGrow() {
   const el = ta.value
   if (!el) return
@@ -63,6 +96,27 @@ function doSend() {
 
 <style scoped>
 .composer { border-top: 1px solid rgba(255,255,255,0.08); padding: 8px 10px; }
+.replybar {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 6px; padding: 4px 6px;
+  background: rgba(255,255,255,0.05);
+  border-left: 3px solid rgba(120,170,140,0.8); border-radius: 4px;
+}
+.rq { flex: 1; min-width: 0; }
+.rqwho {
+  display: flex; align-items: center; gap: 4px;
+  font-size: calc(11px * var(--rfs, 1)); font-weight: 600; color: #9fc3ae;
+}
+.rqtext {
+  font-size: calc(12px * var(--rfs, 1)); color: #bdbdbd;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rqx {
+  flex: none; display: flex; align-items: center; justify-content: center;
+  background: none; border: none; color: #9a9a9a;
+  cursor: pointer; padding: 3px; border-radius: 50%;
+}
+.rqx:hover { background: rgba(255,255,255,0.08); color: #e0e0e0; }
 .hint { font-size: calc(11px * var(--rfs, 1)); color: #8fa6c0; margin-bottom: 5px; }
 .row { display: flex; align-items: flex-end; gap: 8px; }
 .input {

@@ -1,5 +1,5 @@
 <!-- ContactSignal — amber link-quality bars for a peer, from the radio's own
-     record of it (SUPE's lora.<n>.meas.*: the strongest level heard from the
+     record of it (SUPE's lora.<n>.meas.*: the last level heard from the
      node that answers to the peer's destination hash). With `fallback-gw`,
      falls back to the gateway signal (rnsd.gw.*) when no radio has heard the
      peer — the conversation-header rule where a peer's own signal OVERRULES the

@@ -4,15 +4,16 @@
  *   S → C   HELLO    [label, limits, serving?]        as soon as the identify is read
  *   C → S   HANDOVER [privkey, display_name, ratchets]
  *   S → C   SERVING  [ok, reason]                     the account is on the air
- *   S → C   MSG      [msg_id, peer, name, ts, title, size, body?]   pushed live
+ *   S → C   MSG      [msg_id, peer, name, ts, title, size, body?, reply_to, quote]
  *   C → S   FETCH    [msg_id, peer]                   a withheld body
- *   S → C   BODY     [msg_id, peer, content, reply_to]  Resource when large
+ *   S → C   BODY     [msg_id, peer, content, reply_to, quote]  Resource when large
  *   C → S   HANDED   [msg_id, peer]                   after persist
- *   C → S   SEND     [local_key, peer, ts, title, content, reply_to, method, pn]
- *   S → C   STATUS   [key, peer, status, ts, message_id?]  live status
- *   C → S   SETTLED  [key, peer]                      terminal status seen
+ *   C → S   SEND     [local_key, peer, ts, title, content, reply_to, quote, method, pn]
+ *   S → C   STATUS   [key, peer, status, ts, message_id?]  once: how it went
  *   C ↔ S   CONFIG   [map]                            account settings
  *   S → C   STATE    [map]                            what only the server knows
+ *   C → S   DROP     [key, peer]                      deleted here; drop/cancel there
+ *   C → S   RETRY    [key, peer]                      try that one now, body stays put
  *   C → S   RELEASE  []                               deprovision
  *   S → C   RATCHETS [record]                         release hands the set back
  *
@@ -91,17 +92,21 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_SERVING  = 3,
 
     /* S→C  [4, msg_id b32, peer b16, peer_name str, ts u32, title str,
-     *          size u32, body str|nil]
+     *          size u32, body str|nil, reply_to b32|nil, quote str]
      * One inbound message the server holds and the client does not. `size` is
      * the body length whether or not the body rides along; a nil body is a
      * withheld one the client fetches on demand. `peer_name` is an
-     * opportunistic hint for a peer the client has never heard announce. */
+     * opportunistic hint for a peer the client has never heard announce.
+     * `reply_to` is the message this one replies to and `quote` the fragment of
+     * it the sender picked out (empty when the reply quotes the whole message):
+     * both ride here as well as on BODY, because a reply whose body fits inline
+     * is never fetched and would otherwise reach the client as a bare message. */
     LXMPROXY_FR_MSG      = 4,
 
     /* C→S  [5, msg_id b32, peer b16] — send me the body you withheld. */
     LXMPROXY_FR_FETCH    = 5,
 
-    /* S→C  [6, msg_id b32, peer b16, content str, reply_to b32|nil]
+    /* S→C  [6, msg_id b32, peer b16, content str, reply_to b32|nil, quote str]
      * The withheld body. Rides a Resource on the Channel's Link when it does
      * not fit one Channel message. */
     LXMPROXY_FR_BODY     = 6,
@@ -113,7 +118,7 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_HANDED   = 7,
 
     /* C→S  [8, local_key str, peer b16, ts u32, title str, content str,
-     *          reply_to b32|nil, method str, pn b16|nil]
+     *          reply_to b32|nil, quote str, method str, pn b16|nil]
      * Reproduce this draft on the server and send it. `local_key` is the
      * client's own `o_<unix_ms>_<rand4>`, and it is the idempotency key: a SEND
      * repeated after a reconnect meets the same record and gets the same
@@ -129,9 +134,12 @@ enum LxmproxyFrameType : uint8_t {
      * true error rather than a proxy-flavoured one. */
     LXMPROXY_FR_STATUS   = 9,
 
-    /* C→S  [10, key str, peer b16] — a terminal outbound status is persisted
-     * here. */
-    LXMPROXY_FR_SETTLED  = 10,
+    /* 10 is retired and stays retired. It was SETTLED — the client saying it
+     * had a STATUS — which the Channel's own delivery proof already says: an
+     * envelope is either proved by the far side or the link is torn down
+     * trying, so `rnsd.chan.<tag>.outstanding` reaching zero IS the
+     * acknowledgement, and the frame was 131 bytes plus a proof back per
+     * message restating it. */
 
     /* C↔S  [11, map str→str]
      * Account-scoped settings. Edited only on the client, because it is the
@@ -152,6 +160,22 @@ enum LxmproxyFrameType : uint8_t {
     /* S→C  [14, ratchets str] — the retained ratchet record, handed back.
      * The server has deregistered by the time this is sent. */
     LXMPROXY_FR_RATCHETS = 14,
+
+    /* C→S  [15, key str, peer b16]
+     * The client has deleted this outbound. Drop it here too — and CANCEL it
+     * if it has not left yet, which is the only reason this frame exists: a
+     * message deleted on the device it was written on should not go on being
+     * sent by a machine somewhere else. A record already delivered is simply
+     * removed. Silent: there is no answer, and nothing to settle. */
+    LXMPROXY_FR_DROP     = 15,
+
+    /* C→S  [16, key str, peer b16]
+     * Try this one NOW. Not a resend — the body is already here, and putting it
+     * back on the air to say "again" would cost the whole message to carry one
+     * bit. Whatever state the record is in, it goes to the front: one that gave
+     * up is queued afresh, and one merely waiting for the next sweep stops
+     * waiting. The answer is the ordinary STATUS that follows. */
+    LXMPROXY_FR_RETRY    = 16,
 };
 
 /** Every field any frame can carry, filled by lxmproxyParse. Unset fields keep
@@ -177,7 +201,7 @@ struct LxmproxyFrame {
     uint32_t    ok = 0;
     uint32_t    hold = 0;       /* a refusal to wait out, not to give up on */
 
-    /* MSG / FETCH / BODY / HANDED / STATUS / SETTLED */
+    /* MSG / FETCH / BODY / HANDED / STATUS */
     uint8_t     msg_id[LXMPROXY_MID_LEN] = {};
     bool        have_msg_id = false;
     uint8_t     peer[LXMPROXY_DEST_LEN] = {};
@@ -190,6 +214,10 @@ struct LxmproxyFrame {
     bool        have_body = false;      /* MSG carried its body inline */
     uint8_t     reply_to[LXMPROXY_MID_LEN] = {};
     bool        have_reply_to = false;
+    std::string reply_quote;            /* the fragment of the replied-to message
+                                         * this one quotes (FIELD_REPLY_QUOTE);
+                                         * empty on a reply that quotes the whole
+                                         * message */
 
     /* SEND */
     std::string key;                    /* the client's local key, or a message id */
@@ -220,13 +248,16 @@ std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                       const uint8_t peer[LXMPROXY_DEST_LEN],
                                       const char* peer_name, uint32_t ts,
                                       const std::string& title, uint32_t size,
-                                      const std::string* body);
+                                      const std::string* body,
+                                      const uint8_t* reply_to,
+                                      const std::string& reply_quote);
 std::vector<uint8_t> lxmproxyBuildFetch(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                         const uint8_t peer[LXMPROXY_DEST_LEN]);
 std::vector<uint8_t> lxmproxyBuildBody(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                        const uint8_t peer[LXMPROXY_DEST_LEN],
                                        const std::string& content,
-                                       const uint8_t* reply_to);
+                                       const uint8_t* reply_to,
+                                       const std::string& reply_quote);
 std::vector<uint8_t> lxmproxyBuildHanded(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                          const uint8_t peer[LXMPROXY_DEST_LEN]);
 std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
@@ -234,13 +265,16 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
                                        uint32_t ts, const std::string& title,
                                        const std::string& content,
                                        const uint8_t* reply_to,
+                                       const std::string& reply_quote,
                                        const char* method, const uint8_t* pn);
 std::vector<uint8_t> lxmproxyBuildStatus(const std::string& key,
                                          const uint8_t peer[LXMPROXY_DEST_LEN],
                                          uint32_t status,
                                          uint32_t ts, const uint8_t* message_id);
-std::vector<uint8_t> lxmproxyBuildSettled(const std::string& key,
-                                          const uint8_t peer[LXMPROXY_DEST_LEN]);
+std::vector<uint8_t> lxmproxyBuildDrop(const std::string& key,
+                                       const uint8_t peer[LXMPROXY_DEST_LEN]);
+std::vector<uint8_t> lxmproxyBuildRetry(const std::string& key,
+                                        const uint8_t peer[LXMPROXY_DEST_LEN]);
 std::vector<uint8_t> lxmproxyBuildConfig(
         const std::vector<std::pair<std::string, std::string>>& map);
 std::vector<uint8_t> lxmproxyBuildState(

@@ -73,20 +73,6 @@ constexpr size_t LXMF_OVERHEAD      = LXMF_DEST_HASH_LEN * 2 + LXMF_SIG_LEN;  /*
  * spurious "evicted"). Derived from MTU=500: ((464-48-32)/16)*16-1. */
 constexpr size_t LXMF_OPP_PAYLOAD_MAX = 383;
 
-/* Announce app_data element [2] capability bitfield — a 16-bit (two-byte)
- * field, emitted as a msgpack uint16 so there is headroom well past the first
- * byte for future flags. Parsers read it width-agnostically (any msgpack uint),
- * so widening the field is interop-safe with peers that emitted a narrower one.
- *
- * bit0 LXMF_ANN_CAP_DOUBLE_ENC: a link/resource payload to this destination may
- *   be a destination-encrypted envelope blob (mR Identity token) instead of
- *   plaintext LXMF wire — the receiver decrypts with its identity and re-enters
- *   the normal inbound pipeline.
- * Always advertised by this implementation. Bit 1 is reserved: it once carried
- * an extended-proof capability and must not be reused for anything else, since
- * nodes in the field may still assert it. */
-constexpr uint16_t LXMF_ANN_CAP_DOUBLE_ENC = 0x0001;
-
 /* Max concurrent LXMF identities. Schema is an array (id.<n>). */
 #define LXMF_MAX_IDENTITIES 4
 
@@ -200,6 +186,26 @@ struct ping_t {
     uint16_t    send_id = 0;
     std::string peer;               /* 32-hex destination being probed */
     uint32_t    deadline_s = 0;     /* unix s; settle "timeout" past it whatever rnsd says */
+    /* A probe that IS a link establishment. Used where this device has no
+     * destination registration of its own to send a packet from — a proxied
+     * account, whose registrant is the server's device — and where there is no
+     * conversation link to the peer already open. Dialling one and timing the
+     * answer measures the same round trip a probe packet would: the request
+     * goes out, the far end proves it by accepting, and the link comes up. It
+     * is then dropped again, because the question was the round trip and not
+     * the session. */
+    bool        by_link = false;
+    std::string link_tag;
+    int         link_handle = -1;   /* >= 0 only for a link this probe dialled,
+                                     * which is also what says the probe owns it
+                                     * and must take it down again */
+    uint32_t    link_started_ms = 0;
+    /* Probing over a link that was already open: the link's delivery-proof
+     * counters as they stood before the probe, so the first increment after it
+     * is this probe's answer. The link is serialized, so nothing else can move
+     * them in between. */
+    int         proof_base_proven = 0;
+    int         proof_base_timeouts = 0;
 };
 
 struct lxmf_id_t {
@@ -241,7 +247,12 @@ static void unsubscribePerIdCmds(int n);
 /* Inbound pipeline + the pending-verification drain. onAnnounceFromRnsd
  * (defined above onInboundLxm) calls the drain; both run on the lxmf
  * task only. */
-static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n);
+/* `via_link` marks an LXM that arrived on a conversation link of ours rather
+ * than through the destination registration — which, while proxied, is held by
+ * the server and not by this device. Defaulted, so only the link's own receive
+ * path has to say so. */
+static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n,
+                         bool via_link = false);
 static void drainPendingVerify(lxmf_id_t& id, const uint8_t* sender_hash);
 static void drainAllPendingVerify(lxmf_id_t& id);
 
@@ -250,6 +261,8 @@ static void drainAllPendingVerify(lxmf_id_t& id);
  * and the announce path both ask these before doing anything of their own. */
 static bool proxyIsClient(int n);   /* this account's mail belongs to a server */
 static bool proxyReady(int n);      /* …and the Channel to it is up and serving */
+static bool proxySendFrame(int n, const std::vector<uint8_t>& frame,
+                           uint32_t* opaque_out = nullptr);
 static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
                       const std::string& mid);
 
@@ -462,6 +475,44 @@ static const sdb_schema& lxmfMsgSchema()
                                * its own storage. What is left is what is owed,
                                * which is what makes deletion a policy and not a
                                * wire rule. Meaningless on a client. */
+         .u8("via_link")      /* 1 = this message went out, or came in, over a
+                               * conversation link to the peer rather than
+                               * through the proxy that holds our address. Only
+                               * interesting while proxied — unproxied it is the
+                               * ordinary case and the frontends do not draw it
+                               * — but recorded either way, because what carried
+                               * a message is a fact about the message and not
+                               * about how the account happens to be set up
+                               * today. */
+         .u8("proxy_status")  /* CLIENT side: the server's own LxmfStatus behind
+                               * an OUR_PROXY_GAVE_UP, verbatim — which failure
+                               * it stopped on. The five proxy states are what a
+                               * conversation shows; this is what its detail
+                               * page can say underneath, and the distinction
+                               * that matters is that it is the PROXY's verdict
+                               * on reaching the recipient and not this device's
+                               * trouble reaching the proxy. 0 = nothing said. */
+         .u8("offered")       /* SERVER side: 1 = this inbound has been offered
+                               * to the client (a MSG frame went out for it).
+                               * Said once: the Channel already resends what
+                               * goes unproved, so repeating the offer above it
+                               * was never what delivered anything — it only
+                               * meant a message the client held but could not
+                               * yet acknowledge, a withheld body waiting on a
+                               * download, was announced again on a timer for as
+                               * long as both ends stayed up. Meaningless on a
+                               * client. */
+         .u8("told")          /* SERVER side: the status last relayed to the
+                               * client, +1 so that 0 means "nothing told yet"
+                               * and DRAFT (0) is tellable. A status is relayed
+                               * when it differs from this, so the two being
+                               * equal IS "the client knows the latest" — no
+                               * separate flag to keep in step with the status
+                               * it describes. Persisted rather than held per
+                               * Channel: a reconnect used to re-announce every
+                               * record the box still held, one frame each, for
+                               * a client that already knew all of them.
+                               * Meaningless on a client. */
          .u32("body_size")    /* content length in bytes, whether or not the
                                * content is here — what a download affordance
                                * shows before it downloads anything */
@@ -472,7 +523,11 @@ static const sdb_schema& lxmfMsgSchema()
          .u32("delivered_ts") /* unix s the delivery proof settled DELIVERED;
                                * 0 = not delivered */
          .data("message_id", 32).data("reply_to", 32)
-         .text("title").text("content");
+         .text("title").text("content")
+         .text("reply_quote");  /* the fragment of the replied-to message this
+                                 * one quotes (FIELD_REPLY_QUOTE); empty when the
+                                 * reply quotes the message as a whole and each
+                                 * end draws the preview from its own copy */
         return x;
     }();
     return s;
@@ -509,13 +564,15 @@ static const sdb_schema& lxmfContactSchema()
         x.schema_ver = 2;
         x.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
          .u8("trust")
+         .u8("preview_mine")    /* Which way the ONE preview went: 1 = we sent
+                                * it, so the list prefixes "You: ". There is no
+                                * second preview — `preview` is the last message
+                                * whoever wrote it, and this byte is the only
+                                * thing needed to label it. */
          .data("hash", 16)
          .data("pubkey", 64)   /* X25519(32) ‖ Ed25519(32), as rnsd hands it
                                 * out; unset until an announce is heard or a
                                 * message from them verifies */
-         .u8("caps")           /* announce caps bitfield (bit0 = accepts
-                                * double-encrypted payloads), persisted from
-                                * the last announce that carried one */
          .data("pn", 16)       /* the contact's preferred classic
                                 * lxmf.propagation node, client-set from the
                                 * contact details page; all-zero = none */
@@ -538,10 +595,6 @@ static const sdb_schema& lxmfAnnounceSchema()
         x.schema_id = 3;
         x.schema_ver = 2;
         x.u32("last").u8("hops").fixstr("cost", 6).data("ratchet", 32)
-         /* announce app_data element [2]: capability bitfield (bit0 =
-          * accepts double-encrypted payloads); fixstr so the -1
-          * "unknown" sentinel round-trips like `cost` */
-         .fixstr("caps", 4)
          .text("name");
         return x;
     }();
@@ -659,13 +712,16 @@ static int bumpConvDirectory(int n, const std::string& peer, int ts_s,
     int recv = ts_s > prev ? ts_s : prev;               /* refuse to go back */
     storageSet(contactPath(n, peer, "last_ts").c_str(), recv);
     /* Bounded, single-line preview (control chars folded) — the list shows a
-     * snippet, never the whole body. */
+     * snippet, never the whole body. The preview is the LAST message either
+     * way; `preview_mine` says which way, so the list can put "You:" in front of
+     * ours and nothing in front of theirs. */
     std::string p;
     for (char c : preview) {
         if (p.size() >= 80) break;
         p += (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
     }
     storageSet(contactPath(n, peer, "preview").c_str(), p.c_str());
+    storageSet(contactPath(n, peer, "preview_mine").c_str(), inbound ? 0 : 1);
     if (inbound)
         storageSet(contactPath(n, peer, "unread").c_str(),
                    storageGetInt(contactPath(n, peer, "unread").c_str(), 0) + 1);
@@ -699,14 +755,16 @@ static void seedCollectPeer(const char* key, const char*) {
 static int         s_aggCount, s_aggUnread;
 static long        s_aggLastTs, s_aggReadTs;
 static std::string s_aggPreview;
+static bool        s_aggPreviewMine;
 static std::string s_aggMid, s_aggMidStage, s_aggMidContent;   /* message being accumulated */
 static long        s_aggMidTs;
 static bool        s_aggMidIn;
 static void seedFlushMsg() {
     if (!s_aggMid.empty() && atoi(s_aggMidStage.c_str()) != LXMF_ST_DRAFT) {
         s_aggCount++;
-        s_aggLastTs  = s_aggMidTs;
-        s_aggPreview = s_aggMidContent;
+        s_aggLastTs     = s_aggMidTs;
+        s_aggPreview    = s_aggMidContent;
+        s_aggPreviewMine = !s_aggMidIn;
         if (s_aggMidIn && s_aggMidTs > s_aggReadTs) s_aggUnread++;
     }
     s_aggMid.clear(); s_aggMidTs = 0; s_aggMidIn = false;
@@ -738,6 +796,7 @@ static void lxmfSeedDirectory() {
         for (auto& peer : s_seedPeers) {
             if (storageGetInt(contactPath(n, peer, "count").c_str(), 0) > 0) continue;
             s_aggCount = 0; s_aggUnread = 0; s_aggLastTs = 0; s_aggPreview.clear();
+            s_aggPreviewMine = false;
             s_aggReadTs = convReadTs(n, peer);
             seedFlushMsg();   /* reset per-message accumulators */
             std::string mp = "s.lxmf.id." + std::to_string(n) + ".msgs." + peer;
@@ -751,6 +810,7 @@ static void lxmfSeedDirectory() {
             storageSet(contactPath(n, peer, "count").c_str(),   s_aggCount);
             storageSet(contactPath(n, peer, "last_ts").c_str(), (int)s_aggLastTs);
             storageSet(contactPath(n, peer, "preview").c_str(), pv.c_str());
+            storageSet(contactPath(n, peer, "preview_mine").c_str(), s_aggPreviewMine ? 1 : 0);
             storageSet(contactPath(n, peer, "unread").c_str(),  s_aggUnread);
             storageEnd();
             seeded++;
@@ -887,15 +947,6 @@ static void mpPackInt(std::vector<uint8_t>& out, int v)
     }
 }
 
-/* Always emit a msgpack uint16 (0xCD hi lo), even for small values — used for
- * the two-byte announce caps field so the full 16-bit width is on the wire
- * regardless of which bits are set. */
-static void mpPackU16(std::vector<uint8_t>& out, uint16_t v)
-{
-    out.push_back(0xCD);
-    out.push_back((uint8_t)((v >> 8) & 0xFF));
-    out.push_back((uint8_t)( v       & 0xFF));
-}
 
 static void mpPackBinHeader(std::vector<uint8_t>& out, size_t len)
 {
@@ -1075,8 +1126,6 @@ struct LxmfAnnounceInfo {
     std::string ratchet_hex;   /* announce field, filled by the caller from the
                                 * fan-out frame; empty if the peer advertises
                                 * none */
-    int         caps;          /* element [2]: capability bitfield, -1 = unknown.
-                                * bit0 = accepts double-encrypted payloads */
 };
 
 /* LXMF announce app_data shapes seen in the wild (LXMF reference 0.9.8).
@@ -1087,19 +1136,15 @@ struct LxmfAnnounceInfo {
  *   [b] msgpack([display_name_bytes_or_nil])               (no cost yet)
  *   [c] raw_utf8_name                                      (very old)
  *
- * Reticulous peers extend [a] positionally (array-length-as-version):
- *
- *   [d] msgpack([name_bin_or_nil, stamp_cost, caps_uint])
- *
- * Element [2] is the caps bitfield (bit0 = accepts double-encrypted
- * payloads). Try strict-msgpack forms first; fall back to raw-bytes name —
- * and once a name has parsed from the array, later malformed elements never
- * demote to that fallback. */
+ * Try strict-msgpack forms first; fall back to raw-bytes name — and once a
+ * name has parsed from the array, later malformed elements never demote to
+ * that fallback. Elements past [1] are skipped rather than read: other
+ * implementations may extend the array positionally, and an extension nothing
+ * here acts on must not be able to cost us the name in front of it. */
 static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
 {
     LxmfAnnounceInfo info;
     info.stamp_cost = -1;
-    info.caps       = -1;
 
     if (!p || n == 0) return info;
 
@@ -1128,12 +1173,6 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
         /* From here on the name is banked — every path returns true, so a
          * malformed tail can never demote the announce to the raw-name
          * heuristic (which would lose the parsed name). */
-        if (cnt >= 3) {
-            /* [2]: capability bitfield (uint). */
-            uint64_t caps = 0;
-            if (mpReadUint(s, caps)) info.caps = (int)caps;
-            else if (!mpScanNext(s)) return true;
-        }
         return true;
     };
 
@@ -1160,6 +1199,13 @@ static LxmfAnnounceInfo parseLxmfAnnounce(const uint8_t* p, size_t n)
 
 struct LxmFields {
     std::string reply_to;      /* hex64 hash of the replied-to message, empty if not a reply */
+    /* The fragment of the replied-to message the sender quoted, UTF-8
+     * (FIELD_REPLY_QUOTE). Sent only when the user picked a fragment by
+     * selecting it — a plain reply carries reply_to alone and each end draws the
+     * quote from the message it already holds. A receiver shows this text only
+     * where it really occurs in the message reply_to names, so a quote cannot
+     * put words in anyone's mouth. */
+    std::string reply_quote;
     std::string ticket;        /* raw msgpack value of FIELD_TICKET, empty if none */
     /* Future: telemetry, attachments, etc. */
 };
@@ -1198,6 +1244,10 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
      * normal (non-reply) message carries no reply field at all. */
     size_t field_count = 0;
     if (!fields.reply_to.empty())      field_count++;
+    /* A quote without the hash it belongs to is not addressable, so the pair
+     * travels together or not at all. */
+    bool quote = !fields.reply_to.empty() && !fields.reply_quote.empty();
+    if (quote)                         field_count++;
     mpPackMapHeader(out, field_count);
     if (!fields.reply_to.empty()) {
         mpPackInt(out, LXMF_FIELD_REPLY_TO);
@@ -1212,6 +1262,14 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
             }
         }
         mpPackBin(out, raw, sizeof(raw));
+    }
+    if (quote) {
+        mpPackInt(out, LXMF_FIELD_REPLY_QUOTE);
+        /* UTF-8 bytes, packed BIN like title/content — the reference impl's
+         * fields are bytes, and a str lands as a Python str a client then tries
+         * to .decode(). */
+        mpPackBin(out, reinterpret_cast<const uint8_t*>(fields.reply_quote.data()),
+                  fields.reply_quote.size());
     }
     return out;
 }
@@ -1290,6 +1348,11 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
                     std::snprintf(hex + 2*j, 3, "%02x", (uint8_t)raw[j]);
                 fields_out->reply_to.assign(hex, 64);
             }
+        } else if (key == LXMF_FIELD_REPLY_QUOTE) {
+            std::string q;
+            if (!mpReadStrOrBin(s, q)) { if (!mpScanNext(s)) return false; continue; }
+            if (fields_out && q.size() <= LXMF_REPLY_QUOTE_MAX)
+                fields_out->reply_quote = std::move(q);
         } else if (key == LXMF_FIELD_TICKET) {
             /* Capture the raw msgpack value span regardless of its shape
              * (str/bin/array) so it can be logged. We don't yet cache or
@@ -1617,14 +1680,12 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
      * oldest-inserted record; a re-announce from an existing dest mutates
      * last/hops/cost in place — no new record, no eviction, no scan. `cost` is a
      * fixstr so the -1 "unknown" sentinel round-trips. */
-    char cbuf[8], capsbuf[8];
+    char cbuf[8];
     std::snprintf(cbuf, sizeof(cbuf), "%d", info.stamp_cost);
-    std::snprintf(capsbuf, sizeof(capsbuf), "%d", info.caps);
     storageBegin();
     storageSet((base + ".last").c_str(), (int)(nowUnixMs() / 1000));
     storageSet((base + ".hops").c_str(), hops);
     storageSet((base + ".cost").c_str(), cbuf);
-    storageSet((base + ".caps").c_str(), capsbuf);
     /* Written even when empty, unlike the fields below: a peer that stops
      * advertising a ratchet must stop showing one. */
     storageSet((base + ".ratchet").c_str(), info.ratchet_hex.c_str());
@@ -1652,11 +1713,6 @@ static void onAnnounceFromRnsd(int handle, size_t /*bytesAvail*/)
             if (!info.name.empty())
                 storageSet(contactPath(id.index, dh_hex, "display_name").c_str(),
                            info.name.c_str());
-            /* Persist advertised capabilities (announce catalogue is
-             * RAM-only). Written only when the announce carried a caps
-             * element, so a legacy announce never wipes a known value. */
-            if (info.caps >= 0)
-                setIntIfChanged(contactPath(id.index, dh_hex, "caps"), info.caps);
             /* The key the announce is signed with, kept with the contact so it
              * outlives rnsd's directory image. */
             contactSetPubkey(id.index, dh_hex, pubkey);
@@ -2007,13 +2063,12 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
      * toggle. */
     int cost = storageGetInt("s.lxmf.stamp_cost", 8);
 
-    /* Element [2]: the two-byte caps bitfield — bit0 (accepts
-     * double-encrypted payloads) is always set, so the element is always
-     * present. Appending array elements is interop-safe — the reference
-     * helpers and parseLxmfAnnounce read [0]/[1] and ignore extras
-     * (array-length-as-version, exactly how stamp_cost itself was added). */
+    /* Plain LXMF: `[display_name, stamp_cost]` and nothing else. We used to
+     * append a capability bitfield as element [2]; nothing ever read one back
+     * — not here and not in any other implementation — so it was a field
+     * announced to the whole mesh on every announce and consulted by nobody. */
     std::vector<uint8_t> out;
-    mpPackArrayHeader(out, 3);
+    mpPackArrayHeader(out, 2);
     /* Display name goes out as msgpack BIN, not str: LXMF's
      * display_name_from_app_data does dn.decode("utf-8") on the unpacked
      * value, which only works when it unpacks to Python bytes. A str
@@ -2022,8 +2077,6 @@ static std::vector<uint8_t> buildAnnounceAppData(int id_n)
     if (name.empty()) out.push_back(0xC0 /* nil */);
     else              mpPackBin(out, reinterpret_cast<const uint8_t*>(name.data()), name.size());
     mpPackInt(out, cost);
-    /* [2] caps, emitted as a two-byte uint16. */
-    mpPackU16(out, LXMF_ANN_CAP_DOUBLE_ENC);
     return out;
 }
 
@@ -2150,7 +2203,7 @@ static void onConvLinkRecv(int handle, size_t /*bytesAvail*/)
         if (!c.used || c.handle != handle) continue;
         if (s_ids[c.id_index].used) {
             c.last_used_s = (uint32_t)(nowUnixMs() / 1000);
-            onInboundLxm(s_ids[c.id_index], buf, n);
+            onInboundLxm(s_ids[c.id_index], buf, n, /*via_link=*/true);
         }
         return;
     }
@@ -2232,7 +2285,10 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
     slot->handle      = lh;
     slot->last_used_s = (uint32_t)(nowUnixMs() / 1000);
     slot->identified  = false;
-    info("id %d: conv link %s opened to %s", id.index, tag, peer_hex.c_str());
+    /* Dialled, not up: rnsd still has to find a path and complete the
+     * handshake, and either can fail. The link is established only when
+     * `rnsd.links.<tag>.state` reads "active". */
+    info("id %d: conv link %s dialling %s", id.index, tag, peer_hex.c_str());
     return slot;
 }
 
@@ -2326,7 +2382,14 @@ static bool statusInProgress(int st)
 {
     return st == LXMF_ST_QUEUED || st == LXMF_ST_REQUESTING_PATH ||
            st == LXMF_ST_SENDING || st == LXMF_ST_AWAITING_PROOF ||
-           st == LXMF_ST_RETRYING_DELIVERY || st == LXMF_ST_RETRYING_LINK;
+           st == LXMF_ST_RETRYING_DELIVERY || st == LXMF_ST_RETRYING_LINK ||
+           /* A SEND still crossing to the server as a Resource: the transfer
+            * can fail halfway, so it is ours and still moving until rnsd
+            * echoes it done — unlike ON_OUR_PROXY, which is the server's to
+            * move. A SEND small enough for one Channel message never sits
+            * here; the Channel's own proof carries it, and it goes straight
+            * to ON_OUR_PROXY. */
+           st == LXMF_ST_SENDING_TO_PROXY;
 }
 
 static void queueAdd(int n, const std::string& peer, const std::string& mid)
@@ -2558,7 +2621,8 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
     std::string reply_to = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_to").c_str(), "");
 
     LxmFields fields;
-    fields.reply_to = reply_to;
+    fields.reply_to    = reply_to;
+    fields.reply_quote = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_quote").c_str(), "");
 
     /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
      * but only when generation is enabled and they actually advertise a
@@ -2653,27 +2717,44 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         return;
     }
 
-    /* A proxied identity has no destination of its own and nothing to send
-     * from: the server does the sending. Hand the draft over and let its
-     * STATUS frames drive the record from here on. With no Channel the message
-     * sits QUEUED locally and shows no checkmark — a machine that is not mine
-     * does not have it yet. */
+    /* A proxied identity has no destination of its own, so ordinarily it has
+     * nothing to send FROM: the server does the sending, and the draft goes
+     * over the Channel. With no Channel the message sits QUEUED locally and
+     * shows no checkmark — a machine that is not mine does not have it yet.
+     *
+     * The exception is a conversation link that is already open to this peer.
+     * A Link is dialled with the account's identity and carries its own
+     * traffic; none of it goes through the registration the proxy holds. So
+     * when there is one, this device can hand the message straight to the
+     * recipient — fewer hops, no copy on somebody else's box, and a real
+     * delivery proof of our own. Return traffic the peer does not put on that
+     * same link still arrives by way of the proxy, which is the address the
+     * world knows. */
+    bool viaLink = false;
     if (proxyIsClient(id.index)) {
-        if (proxyReady(id.index)) {
-            proxySend(id, peer_hex, mid);
-        } else {
-            msgSetStatus(id.index, peer_hex, mid, LXMF_ST_QUEUED);
-            queueAdd(id.index, peer_hex, mid);
+        viaLink = convGet(id, peer_hex, dh, /*open_if_missing=*/false) != nullptr;
+        if (!viaLink) {
+            if (proxyReady(id.index)) {
+                proxySend(id, peer_hex, mid);
+            } else {
+                msgSetStatus(id.index, peer_hex, mid, LXMF_ST_QUEUED);
+                queueAdd(id.index, peer_hex, mid);
+            }
+            return;
         }
-        return;
     }
 
     /* The identity can be loaded (dest hash published, history visible) before
      * its delivery dest is connected — the post-reset window while rnsd comes
      * up. A send can't be transmitted without a live handle; fail it cleanly
      * rather than reach into rnsd with an unconnected dest. The UIs gate send
-     * on `ready`, so this is a backstop for the CLI / a race. */
-    if (id.handle < 0) {
+     * on `ready`, so this is a backstop for the CLI / a race.
+     *
+     * Not for a send riding a link: that route never touches `id.handle` —
+     * the packet goes out on the link's own ITS handle and settles on the
+     * link's delivery-proof counters — and a proxied identity has no handle to
+     * have, permanently and by design. */
+    if (id.handle < 0 && !viaLink) {
         warn("id %d: msg %s not sent (mailbox not up yet)", id.index, mid.c_str());
         msgFail(id.index, peer_hex, mid, LXMF_ST_MAILBOX_STARTING);
         return;
@@ -2747,7 +2828,13 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     method = canonMethod(method);
 
     bool use_direct;
-    if (method == "opportunistic-or-fail") {
+    if (viaLink) {
+        /* Proxied, and only here because a link is open. The link is the whole
+         * reason this send is not going to the server, and the opportunistic
+         * route is not available anyway — it goes through the registration the
+         * proxy holds. So the method has nothing left to choose. */
+        use_direct = true;
+    } else if (method == "opportunistic-or-fail") {
         if (oversize) {
             warn("id %d: msg %s exceeds opportunistic budget (wire %zu B)",
                  id.index, mid.c_str(), wire.size());
@@ -2862,6 +2949,9 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             }
         }
         cl->last_used_s = (uint32_t)(nowUnixMs() / 1000);
+        /* Carried by a link of our own rather than by whatever holds our
+         * address. Recorded on the message, so the bubble can say so. */
+        storageSet(msgPath(id.index, peer_hex, mid, "via_link").c_str(), 1);
         o->direct            = true;
         o->is_resource       = as_resource;
         o->link_handle       = lhandle;
@@ -2948,7 +3038,7 @@ static void dedupAdd(const std::string& mid_hex)
     s_dedup_head = (s_dedup_head + 1) % LXMF_DEDUP_RING;
 }
 
-static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
+static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_link)
 {
     if (!idEnabled(id.index)) {
         dbg("id %d: inbound LXM dropped (identity disabled)", id.index);
@@ -3126,8 +3216,16 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n)
     storageSet(msgPath(id.index, sh_hex, mid_hex, "body_size").c_str(), (int)content.size());
     if (!fields.reply_to.empty())
         storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_to").c_str(), fields.reply_to.c_str());
+    if (!fields.reply_to.empty() && !fields.reply_quote.empty())
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_quote").c_str(),
+                   fields.reply_quote.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "ts").c_str(),         (int)(ts / 1000));
     storageSet(msgPath(id.index, sh_hex, mid_hex, "message_id").c_str(), mid_hex.c_str());
+    /* Arrived on a conversation link rather than by way of whatever holds our
+     * address. Written only when true: an inbound that came the ordinary way
+     * leaves the field at its default, and the frontends draw nothing. */
+    if (via_link)
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "via_link").c_str(), 1);
     /* Stub contact if new — copy display_name across from the cross-
      * identity announce catalogue if we've heard them announce. */
     if (!storageExists(contactPath(id.index, sh_hex, "hash").c_str())) {
@@ -3240,7 +3338,21 @@ static void drainAllPendingVerify(lxmf_id_t& id)
  * `lxmf.` key sync). `state` is the only field a UI must read: `probing` while
  * in flight, then a settled word. The rest are present only when measured. */
 
-#define LXMF_PING_TIMEOUT_S 20
+/* How long a probe waits before calling it. A probe with no link to ride first
+ * needs a PATH, and that search runs on rnsd's budget — so a fixed deadline
+ * here can only be wrong: at 20 s against rnsd's default 30 it gave up while
+ * rnsd was still legitimately looking, and the first probe to any contact whose
+ * path was not cached answered with nothing. The second one, path now cached,
+ * measured fine. Derived instead, so the two cannot disagree and retuning the
+ * path budget carries this with it. The margin covers the link handshake that
+ * follows the path, which is the only other thing a probe waits on. */
+#define LXMF_PING_HANDSHAKE_MARGIN_S 10
+static uint32_t pingTimeoutS(void)
+{
+    int p = storageGetInt("s.rnsd.link.path_timeout_s", 30);
+    if (p < 5) p = 5;
+    return (uint32_t)p + LXMF_PING_HANDSHAKE_MARGIN_S;
+}
 
 static std::string pingPath(const std::string& peer_hex, const char* field)
 {
@@ -3251,8 +3363,15 @@ static std::string pingPath(const std::string& peer_hex, const char* field)
  * previous one's numbers next to its own `probing`. */
 static void pingClear(const std::string& peer_hex)
 {
-    static const char* kFields[] = { "state", "ts", "rtt_ms", "hops",
-                                     "loss_to", "loss_from" };
+    /* The probe's own findings, and nothing else. What the RADIO measured is not
+     * copied here — it is read live from `lora.<n>.meas.*` wherever it is shown
+     * (lxmfPingLink). A snapshot taken when the probe settled froze whatever
+     * iface-lora happened to have published by then, and that publication runs
+     * on a 15 s beat: a first probe settled a second after the link came up,
+     * found nothing, and stored nothing, so the reading stayed missing until
+     * somebody pinged again. Live, it appears the moment the beat publishes and
+     * stays current afterwards. */
+    static const char* kFields[] = { "state", "ts", "rtt_ms", "hops" };
     storageBegin();
     for (const char* f : kFields) storageUnset(pingPath(peer_hex, f).c_str());
     storageEnd();
@@ -3260,13 +3379,22 @@ static void pingClear(const std::string& peer_hex)
 
 /* The radio's own measurement of a peer, from iface-lora's per-peer publication
  * `lora.<n>.meas.<slot>.*`: the record whose `tags` holds the first six hex
- * characters of the peer's destination hash. Both path losses are in dB —
- * `loss_to` is us→them (the peer's report of how our frame landed), `loss_from`
- * is them→us — and each is present only when SUPE has measured it. rssi/snr
- * (dBm, dB×10) are the strongest level heard from the peer. */
+ * characters of the peer's destination hash.
+ *
+ * A direction is a path loss in dB with the reading it was measured from: the
+ * frame's signal-to-noise (dB×10) and the power that frame went out at (dBm) —
+ * ours for us→them, the peer's for them→us — and the unix second of the
+ * reading. `loss_to` is us→them (the peer's report of how our frame landed),
+ * `loss_from` is them→us, and each exists only where SUPE has measured it: a
+ * loss is a level against a power the OTHER end stated, and nobody outside the
+ * protocol states one. What there is for such a peer is what this radio itself
+ * knows — the last level it read (`rssi`/`snr`) and the power it last sent at
+ * (`txp`) — and those are always there. */
 struct PeerMeas {
-    bool have_to = false, have_from = false, have_sig = false;
-    int  loss_to = 0, loss_from = 0, rssi = 0, snr10 = 0;
+    bool have_to = false, have_from = false, have_sig = false, have_txp = false;
+    int  loss_to = 0, snr_to = 0, txp_to = 0, to_ts = 0;
+    int  loss_from = 0, snr_from = 0, peer_txp = 0, from_ts = 0;
+    int  rssi = 0, snr10 = 0, txp = 0, heard_ts = 0;
 };
 static std::vector<std::string> collectTokens(const std::string& prefix);   /* fwd */
 static bool lxmfPeerMeas(const std::string& peer_hex, PeerMeas& out)
@@ -3283,25 +3411,107 @@ static bool lxmfPeerMeas(const std::string& peer_hex, PeerMeas& out)
             out.have_from = storageExists((base + ".loss_from").c_str());
             out.have_sig  = storageExists((base + ".rssi").c_str());
             out.loss_to   = storageGetInt((base + ".loss_to").c_str(),   0);
+            out.snr_to    = storageGetInt((base + ".snr_to").c_str(),    0);
+            out.txp_to    = storageGetInt((base + ".txp_to").c_str(),    0);
+            out.to_ts     = storageGetInt((base + ".to_ts").c_str(),     0);
             out.loss_from = storageGetInt((base + ".loss_from").c_str(), 0);
+            out.snr_from  = storageGetInt((base + ".snr_from").c_str(),  0);
+            out.peer_txp  = storageGetInt((base + ".peer_txp").c_str(),  0);
+            out.from_ts   = storageGetInt((base + ".from_ts").c_str(),   0);
+            out.have_txp  = storageExists((base + ".txp").c_str());
             out.rssi      = storageGetInt((base + ".rssi").c_str(),      0);
             out.snr10     = storageGetInt((base + ".snr").c_str(),       0);
+            out.txp       = storageGetInt((base + ".txp").c_str(),       0);
+            out.heard_ts  = storageGetInt((base + ".heard_ts").c_str(),  0);
             return true;
         }
     }
     return false;
 }
 
-/* Settle a ping: write the outcome word and, for a proven probe, the round
- * trip, the hop count and the radio's path loss to and from the peer (from the
- * SUPE publication — the probe itself measures only the round trip), then free
- * the slot. A direction SUPE has not measured is simply an absent key. */
+/* The radio's reading of the link to a peer, as a person reads it: one line per
+ * direction the radio has measured, joined by `sep`. Empty when it has measured
+ * nothing — no radio has heard this peer, or the probe went out over something
+ * that is not a radio at all.
+ *
+ *     us->them 91 dB path loss, SNR 11 dB @ tx +10 dBm (10 mW)
+ *     them->us 88 dB path loss, SNR 9 dB @ tx +22 dBm (158 mW)
+ *
+ * The path loss leads because it is the link's own property whatever either end
+ * transmits at; the signal-to-noise says whether the link is weak or merely
+ * quiet, and the power is what the loss was measured against — in watts beside
+ * the dBm, since that is the half a reader can feel.
+ *
+ * **A loss needs SUPE, and without it there is no loss to print.** A path loss
+ * is a level measured against the power the FAR END transmitted at, and only a
+ * SUPE peer states that power. What this radio has on its own is what it read
+ * and what it sent at, and that is the whole line for such a peer:
+ *
+ *     heard @ -95 dBm / SNR 9.5 dB @ tx +22 dBm (158 mW)
+ *
+ * No ages. These are the readings, and they are read LIVE from
+ * `lora.<n>.meas.*` — the probe does not snapshot them. A copy taken when a
+ * probe settled was stale the next time the radio heard the peer, and on a
+ * first probe it was empty: iface-lora republishes on a 15 s beat, so a link
+ * that came up a second ago has not been published yet, and the line stayed
+ * missing until somebody pinged a second time.
+ *
+ * Built here rather than in each frontend so the contact page and the console
+ * cannot drift into describing the same measurement two different ways. */
+std::string lxmfPingLink(const std::string& peer_hex, const char* sep)
+{
+    PeerMeas m;
+    if (!lxmfPeerMeas(peer_hex, m)) return "";
+    auto dirLine = [&](const char* dir, int loss, int snr10, int txp) {
+        char pw[16], b[128];
+        snprintf(b, sizeof b, "%s %d dB path loss, SNR %.0f dB @ tx %+d dBm (%s)",
+                 dir, loss, snr10 / 10.0, txp, fmtPower(txp, pw, sizeof pw));
+        return std::string(b);
+    };
+
+    std::string out;
+    if (m.have_to)
+        out = dirLine("us->them", m.loss_to, m.snr_to, m.txp_to);
+    if (m.have_from) {
+        if (!out.empty()) out += sep;
+        out += dirLine("them->us", m.loss_from, m.snr_from, m.peer_txp);
+    }
+    if (out.empty() && m.have_sig) {
+        char b[112];
+        int  n = snprintf(b, sizeof b, "heard @ %d dBm / SNR %.1f dB",
+                          m.rssi, m.snr10 / 10.0);
+        if (m.have_txp && n > 0 && n < (int)sizeof b) {
+            char pw[16];
+            snprintf(b + n, sizeof b - n, " @ tx %+d dBm (%s)",
+                     m.txp, fmtPower(m.txp, pw, sizeof pw));
+        }
+        out = b;
+    }
+    return out;
+}
+
+/* Settle a ping: write the outcome word and the round trip and hop count where
+ * there was one, then free the slot.
+ *
+ * The RADIO's reading of the link is not written here. It is published
+ * continuously by iface-lora and owes the probe nothing, so every surface reads
+ * it live (lxmfPingLink) rather than taking a copy at this instant — a copy is
+ * wrong the moment the radio hears the peer again, and on a first probe it is
+ * wrong immediately, because iface-lora republishes on a 15 s beat and a link
+ * that came up a second ago has not been published yet. */
 static void pingSettle(lxmf_id_t& id, const char* state,
                        uint32_t rtt_ms, int hops)
 {
     if (!id.ping.used) return;
     std::string peer = id.ping.peer;
     id.ping.used = false;
+    /* Whatever carried this probe is done with. The link a dial opened is
+     * closed by the caller that knows the outcome; this only forgets it, so a
+     * later settle cannot act on a handle that has already gone. */
+    id.ping.by_link = false;
+    id.ping.link_tag.clear();
+    id.ping.link_handle = -1;
+    id.ping.link_started_ms = 0;
 
     storageBegin();
     storageSet(pingPath(peer, "state").c_str(), state);
@@ -3309,11 +3519,6 @@ static void pingSettle(lxmf_id_t& id, const char* state,
     if (hops >= 0) {
         storageSet(pingPath(peer, "rtt_ms").c_str(), (int)rtt_ms);
         storageSet(pingPath(peer, "hops").c_str(),   hops);
-        PeerMeas m;
-        if (lxmfPeerMeas(peer, m)) {
-            if (m.have_to)   storageSet(pingPath(peer, "loss_to").c_str(),   m.loss_to);
-            if (m.have_from) storageSet(pingPath(peer, "loss_from").c_str(), m.loss_from);
-        }
     }
     storageEnd();
     info("id %d: ping %s → %s (rtt=%u ms)", id.index, peer.c_str(), state,
@@ -3330,48 +3535,105 @@ static void pingStart(lxmf_id_t& id, const std::string& peer_hex)
         warn("id %d: ping bad peer \"%s\"", id.index, peer_hex.c_str());
         return;
     }
-    if (id.handle < 0) {
+    /* No registration with rnsd for this account — it has not come up yet, or
+     * this is a proxied identity whose registrant is the server's device. The
+     * 1 Hz tick retries anyway; a press is exactly when it is worth one more. */
+    if (id.handle < 0) connectOurDest(id);
+
+    /* **A ping is a link when there is no link.**
+     *
+     * The probe used to be a bare packet to the peer's delivery destination,
+     * answered by its delivery proof. That measures a round trip and nothing
+     * else — and the round trip is the half of the answer people look at least.
+     * What they read is the line under it: the path loss each way, which needs
+     * a power the far end STATED and a report of what it heard from us. A
+     * packet stating no power and asking for nothing produces neither, so a
+     * contact that has never been messaged answers a press with zeros, and the
+     * same press after one message answers properly — the message having done
+     * the exchange the probe did not.
+     *
+     * Establishing a link is that exchange. The request goes out carrying this
+     * radio's power, the far end proves it by accepting and reports what it
+     * heard, µR measures the round trip itself and rnsd publishes it as
+     * `rtt_ms`. One question, and the whole answer comes back. The link is
+     * dropped again once it has: what was wanted was the measurement, not a
+     * session.
+     *
+     * An existing conversation link is used as it stands instead (below): it
+     * has already been paid for, its establishment already produced the
+     * readings, and tearing down a link somebody is talking over to measure it
+     * would be a strange way to answer a button. */
+    {
+        convlink_t* have = convGet(id, peer_hex, dh, /*open_if_missing=*/false);
+        if (!have) {
+            pingClear(peer_hex);
+            id.ping.used  = true;
+            id.ping.peer  = peer_hex;
+            id.ping.by_link = true;
+            /* No outbox send belongs to this probe. 0 is never a real send_id
+             * (next_send_id skips it), so the OUT_RESULT/OUT_STATUS handlers
+             * cannot mistake somebody else's result for this ping's. */
+            id.ping.send_id = 0;
+            id.ping.deadline_s = (uint32_t)(nowUnixMs() / 1000) + pingTimeoutS();
+            id.ping.link_started_ms = (uint32_t)nowUnixMs();
+            char tag[32];
+            std::snprintf(tag, sizeof tag, "lxmf.ping%d.%.8s", id.index, peer_hex.c_str());
+            id.ping.link_tag = tag;
+            storageBegin();
+            storageSet(pingPath(peer_hex, "state").c_str(), "probing");
+            storageSet(pingPath(peer_hex, "ts").c_str(), (int)(nowUnixMs() / 1000));
+            storageEnd();
+            int lh = rnsdLinkOpen(dh, "lxmf.delivery", id.identity_key.c_str(),
+                                  tag, /*path_timeout_ms=*/0, /*link_timeout_ms=*/0,
+                                  /*ref=*/-1, nullptr, nullptr);
+            if (lh < 0) {
+                info("id %d: ping %s — link dial refused", id.index, peer_hex.c_str());
+                pingSettle(id, "failed", 0, -1);
+                return;
+            }
+            id.ping.link_handle = lh;
+            info("id %d: ping %s by link %s", id.index, peer_hex.c_str(), tag);
+            return;
+        }
+        /* A link is open: probe ON it. The wire is the same 32 bytes the
+         * packet probe sends, and the link's own delivery proof is the answer —
+         * the same counters a direct message settles on. */
         pingClear(peer_hex);
+        id.ping.used       = true;
+        id.ping.peer       = peer_hex;
+        id.ping.by_link    = true;
+        id.ping.send_id    = 0;              /* as above: no outbox send is ours */
+        id.ping.link_tag   = have->tag;
+        id.ping.link_started_ms = (uint32_t)nowUnixMs();
+        id.ping.deadline_s = (uint32_t)(nowUnixMs() / 1000) + pingTimeoutS();
         storageBegin();
-        storageSet(pingPath(peer_hex, "state").c_str(), "offline");
+        storageSet(pingPath(peer_hex, "state").c_str(), "probing");
         storageSet(pingPath(peer_hex, "ts").c_str(), (int)(nowUnixMs() / 1000));
         storageEnd();
+        uint8_t probe[2 * LXMF_DEST_HASH_LEN];
+        std::memcpy(probe,                      dh,           LXMF_DEST_HASH_LEN);
+        std::memcpy(probe + LXMF_DEST_HASH_LEN, id.dest_hash, LXMF_DEST_HASH_LEN);
+        std::string base = "rnsd.links." + have->tag;
+        id.ping.proof_base_proven   = storageGetInt((base + ".tx_proven").c_str(), 0);
+        id.ping.proof_base_timeouts = storageGetInt((base + ".proof_timeouts").c_str(), 0);
+        if (itsSend(have->handle, probe, sizeof probe, 0) == 0) {
+            pingSettle(id, "failed", 0, -1);
+            return;
+        }
+        info("id %d: ping %s on link %s", id.index, peer_hex.c_str(), have->tag.c_str());
         return;
     }
-
-    id.ping.used       = true;
-    id.ping.send_id    = id.next_send_id++;
-    if (id.next_send_id == 0) id.next_send_id = 1;
-    id.ping.peer       = peer_hex;
-    id.ping.deadline_s = (uint32_t)(nowUnixMs() / 1000) + LXMF_PING_TIMEOUT_S;
-
-    pingClear(peer_hex);
-    storageBegin();
-    storageSet(pingPath(peer_hex, "state").c_str(), "probing");
-    storageSet(pingPath(peer_hex, "ts").c_str(), (int)(nowUnixMs() / 1000));
-    storageEnd();
-
-    /* OUT_PACKET frame: op | send_id(2) | wire. rnsd strips the leading
-     * destination hash and sends the remainder as the packet payload — so the
-     * peer's plaintext is exactly our own destination hash. */
-    uint8_t frame[3 + 2 * LXMF_DEST_HASH_LEN];
-    frame[0] = RNSD_DEST_OUT_PACKET;
-    frame[1] = (uint8_t)(id.ping.send_id >> 8);
-    frame[2] = (uint8_t)(id.ping.send_id & 0xFF);
-    std::memcpy(frame + 3,                       dh,           LXMF_DEST_HASH_LEN);
-    std::memcpy(frame + 3 + LXMF_DEST_HASH_LEN,  id.dest_hash, LXMF_DEST_HASH_LEN);
-
-    if (!sendFrame(id, frame, sizeof(frame))) {
-        pingSettle(id, "failed", 0, -1);
-        return;
-    }
-    info("id %d: ping %s send_id=%u", id.index, peer_hex.c_str(),
-         (unsigned)id.ping.send_id);
 }
 
 /* True when this OUT_RESULT belongs to the in-flight ping — consumed here
  * instead of being looked up in the outbox table. rnsd emits SENT first and a
- * second result when the proof lands or times out, so SENT is not an outcome. */
+ * second result when the proof lands or times out, so SENT is not an outcome.
+ *
+ * A probe no longer takes this route — it is a link now, and settles on the
+ * link's own measurement — so `ping.send_id` is left at 0, which `next_send_id`
+ * never issues. These stay because the guard is what keeps a ping and an outbox
+ * send from being confused for one another, and that is worth keeping true by
+ * construction rather than by nobody currently sending one. */
 static bool pingApplyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
                                uint32_t rtt_ms, uint8_t hops)
 {
@@ -3406,7 +3668,59 @@ static bool pingApplyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type)
 static void pingTick(lxmf_id_t& id)
 {
     if (!id.ping.used) return;
+
+    /* A probe that is a link. Two shapes, one deadline:
+     *   - dialled for the probe: the link coming up IS the answer, and µR's own
+     *     measurement of that exchange is published as `rtt_ms`. Drop the link
+     *     the moment it has answered — it was a question, not a session.
+     *   - sent on a link already open: the answer is the link's delivery-proof
+     *     counter moving past where it stood when the probe went out. */
+    if (id.ping.by_link && !id.ping.link_tag.empty()) {
+        const std::string base = "rnsd.links." + id.ping.link_tag;
+        {
+            std::string st = storageGetStr((base + ".state").c_str(), "");
+            /* A link this probe dialled is one it owns, and the handle is what
+             * says so — a probe riding somebody else's conversation link holds
+             * none and must leave it standing. */
+            if (id.ping.link_handle >= 0) {
+                if (st == "active") {
+                    int rtt = storageGetInt((base + ".rtt_ms").c_str(), 0);
+                    if (rtt <= 0)   /* no measurement published: time it ourselves */
+                        rtt = (int)((uint32_t)nowUnixMs() - id.ping.link_started_ms);
+                    itsDisconnect(id.ping.link_handle);
+                    id.ping.link_handle = -1;
+                    pingSettle(id, "ok", (uint32_t)rtt, 0);
+                    return;
+                }
+                if (st == "failed" || st == "closed") {
+                    itsDisconnect(id.ping.link_handle);
+                    id.ping.link_handle = -1;
+                    pingSettle(id, "no-route", 0, -1);
+                    return;
+                }
+            } else {
+                int proven   = storageGetInt((base + ".tx_proven").c_str(), 0);
+                int timeouts = storageGetInt((base + ".proof_timeouts").c_str(), 0);
+                if (proven > id.ping.proof_base_proven) {
+                    pingSettle(id, "ok",
+                               (uint32_t)((uint32_t)nowUnixMs() - id.ping.link_started_ms), 0);
+                    return;
+                }
+                if (timeouts > id.ping.proof_base_timeouts) {
+                    pingSettle(id, "no-proof", 0, -1);
+                    return;
+                }
+            }
+        }
+    }
+
     if ((uint32_t)(nowUnixMs() / 1000) < id.ping.deadline_s) return;
+    /* A dial that never answered leaves a link half-open; the probe is over
+     * either way, so take it down with the answer. */
+    if (id.ping.link_handle >= 0) {
+        itsDisconnect(id.ping.link_handle);
+        id.ping.link_handle = -1;
+    }
     pingSettle(id, "timeout", 0, -1);
 }
 
@@ -3658,7 +3972,7 @@ static int onLinkInboxConnect(int handle, const void* data, size_t len)
     return (int)(slot - s_inlinks);
 }
 
-/* Double-encrypted delivery (announce caps bit0): a link/resource payload
+/* Double-encrypted delivery: a link/resource payload
  * whose leading 16 bytes name NO loaded delivery dest may be a
  * destination-encrypted envelope blob (mR Identity token) rather than
  * plaintext LXMF wire. Try every loaded
@@ -3740,7 +4054,7 @@ static void onLinkInboxDisconnect(int ref)
  *   C → S   HANDOVER [privkey, display_name, ratchets]      (first provisioning only)
  *   S → C   SERVING  [ok]                     → unregister our dest, role := client
  *   S → C   MSG / STATUS / STATE / BODY       live, while the Channel is up
- *   C → S   SEND / FETCH / HANDED / SETTLED / CONFIG
+ *   C → S   SEND / FETCH / HANDED / CONFIG
  *   C → S   RELEASE                           → S → C RATCHETS, role := off
  *
  * The other half of the LXMF proxy: this device holds an account's keys and
@@ -3780,11 +4094,14 @@ static void onLinkInboxDisconnect(int ref)
  * the conversation-link pool: `s.lxmf.link.idle_s` and the four-link LRU cap
  * exist precisely to kill long-held links.
  *
- * Acks are explicit and after persist. rnsd proves a packet the moment the
- * hand-off to the consumer task succeeds, before anything is stored, and a
- * Resource's conclusion is likewise pre-persist; neither is a handover ack.
- * HANDED goes out once the record — body included — is in storage, SETTLED once
- * a terminal outbound status is. The server deletes on nothing else. */
+ * A MESSAGE is acknowledged; a STATUS is not, and the difference is what each
+ * is worth. `HANDED` goes out once an inbound record — body included — is in
+ * storage, which is strictly more than "the frame arrived": rnsd proves a
+ * packet the moment the hand-off to the consumer task succeeds, before anything
+ * is stored. Mail is worth a frame to say it was kept. A status word is not:
+ * the Channel proves every envelope or tears the link down trying, so the
+ * server learns this device has a `STATUS` from its own delivery proof
+ * (`rnsd.chan.<tag>.outstanding` reaching zero) and nothing goes back. */
 
 /* A frame past this rides a Resource on the Channel's hidden Link instead of
  * one Channel message. Conservative against the channel MDU (link MDU less the
@@ -3834,6 +4151,14 @@ struct proxy_t {
     bool        was_ready = false;    /* proxyReady() last tick — the edge kicks the queue */
     std::string cfg_sig;              /* last CONFIG pushed, as one string */
     std::string label;                /* the operator's label for the server */
+    uint32_t    max_envelope_kb = 0;  /* HELLO's ceiling on one message, 0 = not
+                                       * said yet. Kept so an oversize draft
+                                       * fails HERE: the server would only
+                                       * answer TOO_LARGE after the body had
+                                       * crossed the air, and a refusal that
+                                       * costs the airtime of the thing being
+                                       * refused is the one error worth
+                                       * knowing before sending. */
 };
 static proxy_t s_proxy[LXMF_MAX_IDENTITIES];
 static uint16_t s_proxyTagSeq = 0;
@@ -3844,6 +4169,17 @@ static int      s_proxy_ann_handle = -1;
  * so a picker can list them by label; RAM only, like the announce catalogue. */
 struct proxy_heard_t { std::string label; uint32_t last_s; };
 static std::map<std::string, proxy_heard_t> s_proxyHeard;
+
+/* SENDs still crossing to the server as a Resource, waiting for rnsd's
+ * OUTBOUND_DONE echo. A Resource is proved part by part, so that echo is this
+ * device's own evidence that the server has the message — no frame has to come
+ * back to say so. Bounded by what one Channel carries at a time. */
+struct proxy_send_t {
+    uint32_t    opaque;
+    int         id_index;
+    std::string peer, mid;
+};
+static std::vector<proxy_send_t> s_proxySends;
 
 static bool connectOurDest(lxmf_id_t& id);        /* fwd */
 static void sendAnnounce(lxmf_id_t& id);          /* fwd */
@@ -3996,17 +4332,25 @@ static void onProxyChanDisc(int ref)
 /* Send one frame: a Channel message when it fits, else a Resource on the
  * Channel's hidden Link. The bytes are identical either way — the far end
  * parses the same thing whichever arrived. */
-static bool proxySendFrame(int n, const std::vector<uint8_t>& frame)
+/* `opaque_out`, when given, is set to the Resource id a frame too big for one
+ * Channel message went out under, and left at 0 for one that fitted. Only the
+ * Resource has an echo — that is the whole difference the caller cares about. */
+static bool proxySendFrame(int n, const std::vector<uint8_t>& frame,
+                           uint32_t* opaque_out)
 {
+    if (opaque_out) *opaque_out = 0;
     proxy_t& p = s_proxy[n];
     if (p.handle < 0 || !p.active) return false;
     if (frame.size() > LXMF_PROXY_MSG_MAX) {
         void* buf = gp_alloc(frame.size());
         if (!buf) { warn("id %d: proxy resource malloc %zuB failed", n, frame.size()); return false; }
         memcpy(buf, frame.data(), frame.size());
+        uint32_t opaque = s_proxyOpaque++;
         /* rnsd owns buf from here and frees it once the engine has copied it. */
-        return rnsdChannelSendResource(p.tag.c_str(), buf, frame.size(),
-                                       s_proxyOpaque++);
+        if (!rnsdChannelSendResource(p.tag.c_str(), buf, frame.size(), opaque))
+            return false;
+        if (opaque_out) *opaque_out = opaque;
+        return true;
     }
     std::vector<uint8_t> msg;
     msg.reserve(2 + frame.size());
@@ -4056,6 +4400,14 @@ static void proxyCloseChannel(int n)
     int h = p.handle;
     p.handle = -1; p.active = false; p.serving = false;
     p.cfg_sig.clear();
+    /* Resources in flight on this Channel will never echo now. Their records
+     * are SENDING_TO_PROXY and in the queue, which is where an interrupted
+     * transfer belongs: a Resource that did not complete was never handed to
+     * the server's consumer at all, so there is nothing there to collide with
+     * and the next sweep simply sends it again. */
+    for (size_t i = s_proxySends.size(); i-- > 0; )
+        if (s_proxySends[i].id_index == n)
+            s_proxySends.erase(s_proxySends.begin() + i);
     itsDisconnect(h);
 }
 
@@ -4161,6 +4513,16 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
         storageSet(msgPath(id.index, peer_hex, mid_hex, "ts").c_str(), (int)fr.ts);
         storageSet(msgPath(id.index, peer_hex, mid_hex, "read").c_str(), 0);
         storageSet(msgPath(id.index, peer_hex, mid_hex, "title").c_str(), fr.title.c_str());
+        /* What this message replies to travels with the offer and not only with
+         * the body, so a reply whose body fits inline — never fetched, so no
+         * BODY frame ever follows — still lands here as a reply. */
+        if (fr.have_reply_to) {
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_to").c_str(),
+                       bytesToHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+            if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
+                storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_quote").c_str(),
+                           fr.reply_quote.c_str());
+        }
     }
     storageSet(msgPath(id.index, peer_hex, mid_hex, "body_size").c_str(), (int)fr.size);
     storageSet(msgPath(id.index, peer_hex, mid_hex, "body_absent").c_str(), withheld ? 1 : 0);
@@ -4216,6 +4578,8 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
     std::string title    = storageGetStr(msgPath(id.index, peer_hex, mid, "title").c_str(), "");
     std::string content  = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
     std::string reply_to = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_to").c_str(), "");
+    std::string reply_quote =
+        storageGetStr(msgPath(id.index, peer_hex, mid, "reply_quote").c_str(), "");
     std::string method   = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
     std::string pn       = storageGetStr(contactPath(id.index, peer_hex, "pn").c_str(), "");
 
@@ -4240,18 +4604,61 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
         storageEnd();
     }
 
+    /* THE PREVIEW IS THE LAST MESSAGE, WHOEVER WROTE IT. The local send path
+     * bumps the conversation directory when it packs the message, and a proxied
+     * send never packs here — so without this the list only ever caught what
+     * the other side sent, and every conversation read as if the peer spoke
+     * last. `recv_ts` is the once-marker: bumpConvDirectory returns it and
+     * nothing else writes it, so a resend after a reconnect finds it set and
+     * does not count the same message twice. */
+    if (storageGetInt(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), 0) == 0) {
+        int recv = bumpConvDirectory(id.index, peer_hex, ts, content,
+                                     /*inbound=*/false);
+        storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
+    }
+
+    /* Too big for that server, decided here. HELLO says the ceiling, so there
+     * is no reason to spend the air on a body only to be told; and a failure
+     * the client resolves itself is one the proxy's verdicts never have to
+     * carry, which keeps those verdicts meaning "it tried and could not". */
+    const proxy_t& p = s_proxy[id.index];
+    if (p.max_envelope_kb && content.size() > (size_t)p.max_envelope_kb * 1024) {
+        warn("id %d: %zuB draft over the proxy's %u kB ceiling — not sending",
+             id.index, content.size(), (unsigned)p.max_envelope_kb);
+        msgFail(id.index, peer_hex, mid, LXMF_ST_TOO_LARGE);
+        return;
+    }
+
     std::vector<uint8_t> f = lxmproxyBuildSend(mid, dh, (uint32_t)ts, title, content,
-                                               have_rt ? rt : nullptr, method.c_str(),
+                                               have_rt ? rt : nullptr, reply_quote,
+                                               method.c_str(),
                                                have_pn ? pnh : nullptr);
-    if (!proxySendFrame(id.index, f)) {
+    uint32_t opaque = 0;
+    if (!proxySendFrame(id.index, f, &opaque)) {
         /* No Channel, or the send was refused: the message waits locally with
          * no checkmark until one comes back. */
         msgSetStatus(id.index, peer_hex, mid, LXMF_ST_QUEUED);
         queueAdd(id.index, peer_hex, mid);
         return;
     }
-    msgSetStatus(id.index, peer_hex, mid, LXMF_ST_SENDING);
-    queueAdd(id.index, peer_hex, mid);   /* re-SEND on the next sweep if nothing settles */
+    /* HANDING IT OVER IS THE HANDOVER. The Channel is proved end to end and
+     * retransmits until it is, so a SEND that has gone out is a SEND the server
+     * has — there is no frame to wait for, and asking the server to send one
+     * back would put a round trip on a 4 kbps radio to say what this device
+     * already knows. From here the server holds the message and this queue has
+     * nothing left to attempt; the next thing on the air about it is its
+     * outcome.
+     *
+     * A body too big for one Channel message crosses as a Resource, which is
+     * proved part by part and can still fail halfway. That one stays ours —
+     * SENDING_TO_PROXY, in the queue — until rnsd echoes the transfer done. */
+    if (opaque) {
+        s_proxySends.push_back({ opaque, id.index, peer_hex, mid });
+        msgSetStatus(id.index, peer_hex, mid, LXMF_ST_SENDING_TO_PROXY);
+        queueAdd(id.index, peer_hex, mid);
+    } else {
+        msgSetStatus(id.index, peer_hex, mid, LXMF_ST_ON_OUR_PROXY);
+    }
     dbg("id %d: proxy SEND %s → %s", id.index, mid.c_str(), peer_hex.c_str());
 }
 
@@ -4278,6 +4685,7 @@ static void proxyHandleFrame(int n, const LxmproxyFrame& fr)
     switch (fr.type) {
     case LXMPROXY_FR_HELLO: {
         p.label = fr.label;
+        p.max_envelope_kb = fr.max_envelope_kb;
         if (fr.serving) {
             /* Already provisioned there — a reconnect, or a client that lost
              * the SERVING confirmation last time. */
@@ -4388,9 +4796,13 @@ static void proxyHandleFrame(int n, const LxmproxyFrame& fr)
         storageSet(msgPath(n, peer_hex, mid_hex, "body_absent").c_str(), 0);
         storageSet(msgPath(n, peer_hex, mid_hex, "body_size").c_str(),
                    (int)fr.content.size());
-        if (fr.have_reply_to)
+        if (fr.have_reply_to) {
             storageSet(msgPath(n, peer_hex, mid_hex, "reply_to").c_str(),
                        bytesToHex(fr.reply_to, 32).c_str());
+            if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
+                storageSet(msgPath(n, peer_hex, mid_hex, "reply_quote").c_str(),
+                           fr.reply_quote.c_str());
+        }
         storageEnd();
         info("id %d: proxy body %s (%zuB)", n, mid_hex.c_str(), fr.content.size());
         proxySendFrame(n, lxmproxyBuildHanded(fr.msg_id, fr.peer));
@@ -4399,32 +4811,54 @@ static void proxyHandleFrame(int n, const LxmproxyFrame& fr)
     case LXMPROXY_FR_STATUS: {
         if (!fr.have_peer || fr.key.empty()) break;
         std::string peer_hex = bytesToHex(fr.peer, 16);
-        if (!storageExists(msgPath(n, peer_hex, fr.key, "status").c_str())) break;
+        /* A verdict for a message this device no longer has. Nothing is sent
+         * back — receiving it is what settles it, and the Channel's own proof
+         * has already told the server that. Logged, because the outcome itself
+         * is now lost and that is worth being able to find. */
+        if (!storageExists(msgPath(n, peer_hex, fr.key, "status").c_str())) {
+            warn("id %d: proxy status %s for %s/%s — no such record here",
+                 n, lxmfStatusName((uint8_t)fr.status), peer_hex.c_str(), fr.key.c_str());
+            break;
+        }
         uint8_t st = (uint8_t)fr.status;
         storageBegin();
-        /* The first STATUS carries the server-side message_id, which is what
-         * maps our local key onto its record. */
+        /* STATUS carries the server-side message_id, which is what maps our
+         * local key onto its record. */
         if (fr.have_msg_id)
             storageSet(msgPath(n, peer_hex, fr.key, "message_id").c_str(),
                        bytesToHex(fr.msg_id, LXMPROXY_MID_LEN).c_str());
         storageEnd();
-        /* Failures relay the server's real LxmfStatus verbatim, so this shows
-         * the true error rather than a proxy-flavoured one. ON_PROXY is the
-         * one status that is out of our hands and still moving: a machine that
-         * is not mine has it, and the server will say DELIVERED (or why not)
-         * when it knows — so it is NOT settled here and the server keeps the
-         * record. */
-        if (st == LXMF_ST_ON_PROXY) {
+        /* A STATUS is an OUTCOME — the server sends no other kind. A message
+         * sent through a proxy has five states, and every way the server's
+         * attempt can have ended collapses into one of them. What is lost by
+         * collapsing is kept: `proxy_status` holds the verdict verbatim, so the
+         * detail page can say which failure it was while the conversation shows
+         * one red ✕.
+         *
+         * Anything that is not an outcome is ignored — the server should not
+         * have sent it, this device has nothing to do about a message somebody
+         * else is still working on, and the outcome is coming. */
+        if (!lxmfStatusIsVerdict(st)) {
+            verb("id %d: proxy status %s for %s/%s is not an outcome — ignored",
+                 n, lxmfStatusName(st), peer_hex.c_str(), fr.key.c_str());
+        } else if (st == LXMF_ST_DELIVERED) {
+            msgSetStatus(n, peer_hex, fr.key, LXMF_ST_OUR_PROXY_DELIVERED);
+        } else if (st == LXMF_ST_CANCELLED) {
+            /* Our own doing — a DROP, or a cancel from either end. It is not a
+             * verdict on the recipient, so it keeps its own name. */
+            msgSetStatus(n, peer_hex, fr.key, st);
+        } else if (st == LXMF_ST_PROXY_REFUSED) {
+            /* Not one of the five: the server would not TAKE it. That is
+             * trouble reaching the proxy, which is ours to see as itself. */
             msgFail(n, peer_hex, fr.key, st);
-        } else if (statusInProgress(st)) {
-            msgSetStatus(n, peer_hex, fr.key, st);
-        } else if (st == LXMF_ST_DELIVERED || st == LXMF_ST_CANCELLED) {
-            msgSetStatus(n, peer_hex, fr.key, st);
-            proxySendFrame(n, lxmproxyBuildSettled(fr.key, fr.peer));
         } else {
-            msgFail(n, peer_hex, fr.key, st);
-            proxySendFrame(n, lxmproxyBuildSettled(fr.key, fr.peer));
+            storageSet(msgPath(n, peer_hex, fr.key, "proxy_status").c_str(), (int)st);
+            msgFail(n, peer_hex, fr.key, LXMF_ST_OUR_PROXY_GAVE_UP);
         }
+        /* Nothing goes back. The Channel proved this STATUS the moment it
+         * arrived, and an envelope is either proved or the link dies trying —
+         * so the server already knows this device has it, and a frame saying so
+         * would cost a further 131 bytes out and a proof back, per message. */
         break;
     }
     case LXMPROXY_FR_STATE: {
@@ -4607,9 +5041,25 @@ static bool proxyResourceAux(const rnsd_link_resource_done_t& d)
     if (d.opcode == RNSD_LINK_RESOURCE_OUTBOUND_DONE ||
         d.opcode == RNSD_LINK_RESOURCE_FAILED) {
         if (d.opaque_id < LXMF_PROXY_OPAQUE_BASE) return false;
-        /* Our frames are acknowledged by the protocol (HANDED / SETTLED /
-         * STATUS), never by the transfer, so there is nothing to settle here. */
-        if (d.opcode == RNSD_LINK_RESOURCE_FAILED)
+        bool ok = d.opcode == RNSD_LINK_RESOURCE_OUTBOUND_DONE;
+        /* A SEND that crossed as a Resource ends here, and only here. The
+         * transfer completing IS the server having the message; the transfer
+         * failing puts it back in this device's queue to try again. Every other
+         * frame is answered by the protocol (HANDED / STATUS) or by the
+         * Channel's own proof, and has nothing to settle on the transfer. */
+        for (size_t i = 0; i < s_proxySends.size(); ++i) {
+            if (s_proxySends[i].opaque != d.opaque_id) continue;
+            proxy_send_t ps = s_proxySends[i];
+            s_proxySends.erase(s_proxySends.begin() + i);
+            if (ok) {
+                msgSetStatus(ps.id_index, ps.peer, ps.mid, LXMF_ST_ON_OUR_PROXY);
+            } else {
+                msgSetStatus(ps.id_index, ps.peer, ps.mid, LXMF_ST_QUEUED);
+                queueAdd(ps.id_index, ps.peer, ps.mid);
+            }
+            return true;
+        }
+        if (!ok)
             warn("proxy: outbound resource failed (opaque=%u)", (unsigned)d.opaque_id);
         return true;
     }
@@ -5819,7 +6269,7 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
         }
         if (idx < 0 && d.buf && d.len > 0) {
             /* No identity claims the leading 16 bytes — the resource may
-             * be a double-encrypted envelope (announce caps bit0). */
+             * be a double-encrypted envelope. */
             if (tryDoubleEncrypted((const uint8_t*)d.buf, d.len)) {
                 rnsdResourceRelease(d.buf);
                 return;
@@ -6166,6 +6616,18 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
         return;
     }
 
+    /* An outbound the proxy is holding for us goes with it. Deleting a message
+     * here and leaving a machine elsewhere still trying to send it is the one
+     * outcome nobody would expect from a delete — and if it has already gone
+     * out, the server simply stops owing us its status. Before the local wipe,
+     * while the key is still ours to name. */
+    if (!mid.empty() && proxyIsClient(id.index) && proxyReady(id.index) &&
+        storageGetStr(msgPath(id.index, peer_hex, mid, "dir").c_str(), "") == "out") {
+        uint8_t dh[16];
+        if (hexToDestHash(peer_hex, dh))
+            proxySendFrame(id.index, lxmproxyBuildDrop(mid, dh));
+    }
+
     /* storageDeleteTree → deleteFromTree splits on the LAST dot, so the
      * argument must be the node path WITHOUT a trailing dot (cf.
      * destroyIdentity's idPath(n,"")). msgPrefix's trailing dot is for
@@ -6428,6 +6890,26 @@ static void handleIdCmd(int n, const char* key, const char* val)
                     pnUploadStart(id, peer_hex, mid, node);
             } else if (!via.empty()) {
                 warn("id %d: cmd.send unknown via \"%s\"", n, via.c_str());
+            } else {
+                processSend(id, peer_hex, mid);
+            }
+        }
+        else if (std::strcmp(verb, "retry") == 0) {
+            /* Try this one again NOW. Proxied, that is a frame naming the
+             * record — the body is already on the server and putting it back on
+             * the air to say "again" would cost the whole message to carry one
+             * bit. Unproxied there is nothing to ask: this device owns the
+             * queue, so it is an ordinary send. */
+            if (mid.empty()) {
+                warn("id %d: cmd.retry needs <peer>/<key> (got \"%s\")", n, val);
+            } else if (proxyIsClient(n)) {
+                uint8_t dh[16];
+                if (!proxyReady(n))
+                    warn("id %d: cmd.retry with no Channel to the proxy", n);
+                else if (!hexToDestHash(peer_hex, dh))
+                    warn("id %d: cmd.retry bad peer \"%s\"", n, peer_hex.c_str());
+                else
+                    proxySendFrame(n, lxmproxyBuildRetry(mid, dh));
             } else {
                 processSend(id, peer_hex, mid);
             }
@@ -7080,8 +7562,9 @@ static void cliMsgs(const char* rest)
          * whatever is added between its ends. Anything not named below still
          * matches as a filter — it falls into "gave up" and is listed there. */
         static const uint8_t kSettled[] = { LXMF_ST_DELIVERED, LXMF_ST_CANCELLED,
-                                            LXMF_ST_RECEIVED };
-        static const uint8_t kElsewhere[] = { LXMF_ST_ON_PROXY, LXMF_ST_ON_PN };
+                                            LXMF_ST_RECEIVED,
+                                            LXMF_ST_OUR_PROXY_DELIVERED };
+        static const uint8_t kElsewhere[] = { LXMF_ST_ON_OUR_PROXY, LXMF_ST_ON_PN };
         auto line = [](const char* label, const uint8_t* v, size_t n) {
             cliPrintf("%s:\n ", label);
             for (size_t i = 0; i < n; i++) cliPrintf(" %s", lxmfStatusName(v[i]));
@@ -7154,10 +7637,12 @@ static void cliMsgs(const char* rest)
  *     answered; that is exactly the state worth seeing.
  *   - `CANCELLED` does NOT set tries = GAVEUP, so `tries == 255` alone is not an
  *     is-it-finished test. statusInProgress excludes it by status instead.
- *   - `ON_PROXY` / `ON_PN` are excluded: another node holds the message and is
- *     sending it, and OUR queue will not retry it. Cancelling here would settle
- *     a local record while the holder went on delivering, so the two would
- *     disagree about what happened — and there is no frame to tell it to stop.
+ *   - `ON_OUR_PROXY` / `ON_PN` are excluded: another node holds the message and
+ *     is sending it, and OUR queue will not retry it. Cancelling here would
+ *     settle a local record while the holder went on delivering, so the two
+ *     would disagree about what happened. For the proxy there is now a frame
+ *     that says stop — `DROP`, which a delete sends — but an `unfinished`
+ *     listing is about what this queue will attempt, and this queue will not.
  */
 struct UnsettledRow {
     std::string peer, key, status, title;
@@ -7320,6 +7805,7 @@ static void cliRead(const char* rest)
     std::string title   = storageGetStr(msgPath(sel, peer, mid, "title").c_str(),   "");
     std::string content = storageGetStr(msgPath(sel, peer, mid, "content").c_str(), "");
     std::string reply_to = storageGetStr(msgPath(sel, peer, mid, "reply_to").c_str(), "");
+    std::string quote    = storageGetStr(msgPath(sel, peer, mid, "reply_quote").c_str(), "");
     int ts              = storageGetInt(msgPath(sel, peer, mid, "ts").c_str(),       0);
 
     cliPrintf("─── id %d  msg #%d  %s ───\n", sel, n, mid.c_str());
@@ -7329,6 +7815,7 @@ static void cliRead(const char* rest)
     cliPrintf("peer:   %s\n", peer.c_str());
     cliPrintf("ts:     %d\n", ts);
     if (!reply_to.empty()) cliPrintf("reply_to: %s\n", reply_to.c_str());
+    if (!quote.empty())    cliPrintf("quoting: %s\n", quote.c_str());
     if (!title.empty())  cliPrintf("title:  %s\n", title.c_str());
     cliPrintf("\n%s\n", content.c_str());
 
@@ -7739,7 +8226,7 @@ static void cliLxmf(const char* args)
         char kc;
         const bool interactive = (cliReadRaw(&kc, 1, 0) >= 0);
         TickType_t t0       = xTaskGetTickCount();
-        TickType_t deadline = t0 + pdMS_TO_TICKS((LXMF_PING_TIMEOUT_S + 2) * 1000);
+        TickType_t deadline = t0 + pdMS_TO_TICKS((pingTimeoutS() + 2) * 1000);
         std::string st;
         bool aborted = false;
         for (;;) {
@@ -7773,18 +8260,24 @@ static void cliLxmf(const char* args)
         }
         cliPrintf("%s after %u ms", st.c_str(), waited);
 
-        /* The round trip is the probe's own measurement; the two path losses
-         * are the radio's (SUPE, via lora.<n>.meas.*), one per direction, and a
-         * direction it has not measured says so rather than printing zero. */
+        /* The round trip is the probe's own measurement; what follows is the
+         * radio's (SUPE, via lora.<n>.meas.*) — one line per direction it has
+         * measured, or the last level heard where it can have no loss. It is
+         * printed whatever became of the probe, because it is a measurement of
+         * the link rather than of the probe, and an outcome with nothing behind
+         * it is what a silent peer and an unheard one look like alike. A radio
+         * that has measured nothing prints nothing rather than a row of zeros. */
         std::string rtt  = fld("rtt_ms"), hops = fld("hops");
-        std::string to   = fld("loss_to"), from = fld("loss_from");
-        if (!rtt.empty())
-            cliPrintf(" | rtt=%s ms hops=%s", rtt.c_str(), hops.c_str());
-        if (st == "ok")
-            cliPrintf(" | path loss us->them %s  them->us %s",
-                      to.empty()   ? "not measured" : (to + " dB").c_str(),
-                      from.empty() ? "not measured" : (from + " dB").c_str());
+        if (!rtt.empty()) {
+            cliPrintf(" | rtt=%s ms", rtt.c_str());
+            /* A link measures the round trip, not the path. `rnpath <hash>` is
+             * what says how many hops it took; printing 0 here would answer a
+             * question this probe never asked. */
+            if (!hops.empty() && hops != "0") cliPrintf(" hops=%s", hops.c_str());
+        }
         cliPrintf("\n");
+        std::string link = lxmfPingLink(peer, "\n");
+        if (!link.empty()) cliPrintf("%s\n", link.c_str());
         return;
     }
     if (verb == "proxy") {

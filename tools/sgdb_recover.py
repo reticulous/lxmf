@@ -71,6 +71,7 @@ class Schema:
 def msg_current():
     s = Schema(1, 4)
     (s.u8("tries").u8("status").u8("body_absent").u8("handed")
+      .u8("via_link").u8("proxy_status").u8("offered").u8("told")
       .u32("body_size").u32("recv_ts").fixstr("dir", 4).fixstr("method", 16)
       .u32("ts").u32("delivered_ts").data("message_id", 32).data("reply_to", 32)
       .text("title").text("content"))
@@ -80,14 +81,26 @@ def msg_current():
 def contact_current():
     s = Schema(2, 2)
     (s.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
-      .u8("trust").data("hash", 16).u8("caps").data("pn", 16)
+      .u8("trust").u8("preview_mine").data("hash", 16).data("pn", 16)
       .text("display_name").text("nick").text("preview"))
     return s
 
 
-# Every id=2 layout from v2a (hdr 109) onward shares this exact fixed prefix, so
-# these offsets decode any contacts file hdr>=109.
-CONTACT_PREFIX = contact_current()
+def contact_predescriptor():
+    """The fixed prefix every id=2 layout from v2a (hdr 109) up to the last
+    format_ver-1 write shares. Kept separate from contact_current() because
+    those files predate `preview_mine`, and inserting it would shift `hash` and
+    `pn` off the offsets they actually sit at in an old image."""
+    s = Schema(2, 2)
+    (s.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
+      .u8("trust").data("hash", 16).data("pn", 16)
+      .text("display_name").text("nick").text("preview"))
+    return s
+
+
+# format_ver-1 contacts files carry no descriptor; these offsets decode any of
+# them with hdr>=109. A format_ver-2 file describes itself and never comes here.
+CONTACT_PREFIX = contact_predescriptor()
 # id=1: only a file written by the current layout matches these fixed offsets
 # exactly; an older msg file (hdr 104) shares the prefix up to `tries`/`status`
 # and nothing after it.

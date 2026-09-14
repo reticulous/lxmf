@@ -226,7 +226,7 @@ destination_hash(16) | source_hash(16) | Ed25519 sig(64) | msgpack(payload)
 
 Constants: `LXMF_DEST_HASH_LEN = 16`, `LXMF_SIG_LEN = 64`,
 `LXMF_OVERHEAD = 112`, `LXMF_OPP_PAYLOAD_MAX = 383` (RNS ENCRYPTED_MDU —
-single-packet plaintext ceiling). `FIELD_THREAD` is stored hex64 but packed
+single-packet plaintext ceiling). `FIELD_REPLY_TO` is stored hex64 but packed
 as raw 32 B on the wire (`lxmPackPayload` converts both ways).
 
 ### Delivery modes (`LXMessage` mode codes)
@@ -243,8 +243,22 @@ as raw 32 B on the wire (`lxmPackPayload` converts both ways).
 `0x01 EMBEDDED_LXMS, 0x02/0x03 TELEMETRY[_STREAM], 0x04 ICON_APPEARANCE,
 0x05 FILE_ATTACHMENTS, 0x06 IMAGE, 0x07 AUDIO, 0x08 THREAD, 0x09/0x0A
 COMMANDS/RESULTS, 0x0B GROUP, 0x0C TICKET, 0x0D EVENT, 0x0E RNR_REFS, 0x0F
-RENDERER, 0xFB-0xFD CUSTOM_*, 0xFE NON_SPECIFIC, 0xFF DEBUG`.
+RENDERER, 0x30 REPLY_TO, 0x31 REPLY_QUOTE, 0x40 REACTION, 0x41 COMMENT,
+0x42 CONTINUATION, 0xFB-0xFD CUSTOM_*, 0xFE NON_SPECIFIC, 0xFF DEBUG`.
 `RENDERER ∈ {PLAIN, MICRON, MARKDOWN, BBCODE}`.
+
+Of those, this implementation packs and parses `REPLY_TO` (raw 32 B message
+hash) and `REPLY_QUOTE` (UTF-8 fragment of the quoted message), parses and logs
+`TICKET`, and skips the rest without failing the parse. The quote is optional
+and travels only when the user picked a fragment out of the message they are
+replying to; a plain reply carries `REPLY_TO` alone and each end draws the
+preview from its own copy of the quoted message. **A received quote is drawn
+only where it really occurs in the message `REPLY_TO` names** — a fragment that
+is not a substring of that message is dropped at display, so a sender cannot put
+words in the other party's bubble, and a quote of a message this device does not
+hold is not shown at all. Upstream's reference clients (Sideband, NomadNet,
+MeshChat) implement none of the reply fields yet, so a reply reaches them as an
+ordinary message and loses only the quote.
 
 ### Identity & destinations
 
@@ -468,6 +482,15 @@ than leaving the message QUEUED on screen forever; `resolveOutboundWire` bumps
 the conversation directory only for a record with no `message_id` yet, so the
 re-pack such a message needs (the RAM outbox is empty) is not counted twice.
 
+**The conversation directory is bumped on all four paths**, because the preview
+is the last message whoever wrote it and `count` is every message either way:
+`resolveOutboundWire` at pack time, `onInboundLxm` on receipt, the proxy `MSG`
+handler for proxied inbound, and `proxySend` for proxied outbound. That last one
+is not optional — a proxied send never packs here, so without it a proxied
+conversation only ever caught what the peer sent and every row read as if the
+peer spoke last. Each path bumps once, guarded by the field the bump itself
+writes: `message_id` for the local send, `recv_ts` for the proxied one.
+
 DIRECT uses **persistent per-peer conversation Links**: the first DIRECT send
 to a peer opens a Link (`rnsdLinkOpen(peer, "lxmf.delivery", …,
 tag="lxmf.id<n>.<mid8>")`) that is kept and reused for the whole chat, in
@@ -484,12 +507,31 @@ both directions, reaped by `convReap` past `s.lxmf.link.idle_s` (default
 our_dest`), so rnsd strips the leading destination and the peer's plaintext is
 exactly our `lxmf.delivery` hash: the peer's lxmf names it as a probe and drops
 it after its rnsd has proved it. The probe measures the round trip and hop
-count; `pingSettle` writes beside them the radio's path loss to and from the
-peer, read by `lxmfPeerMeas` from iface-lora's per-peer publication
-(`lora.<n>.meas.<slot>.*`: the slot whose `tags` holds the first six hex
-characters of the peer's destination hash — `loss_to`, `loss_from`, each only
-when SUPE has measured that direction). The record is
-`lxmf.ping.<peer>.{state,ts,rtt_ms,hops,loss_to,loss_from}`.
+count, and the record is that and nothing more:
+`lxmf.ping.<peer>.{state,ts,rtt_ms,hops}`.
+
+The radio's own reading of the link sits beside it but is never copied into it.
+`lxmfPingLink` (lxmf.h) reads it at render time through `lxmfPeerMeas`, from
+iface-lora's per-peer publication (`lora.<n>.meas.<slot>.*`: the slot whose
+`tags` holds the first six hex characters of the peer's destination hash), and
+turns it into the lines the contact page, the screen and the console print, so
+none of them describes the measurement in its own words. Each direction is a
+path loss with the reading it was measured from — its signal-to-noise and the
+power that frame went out at — and each exists only where SUPE has measured that
+direction; a peer outside the protocol states no power and so has neither, and
+what it gets is `rssi`/`snr`/`txp`, what this radio read and sent at. The
+reading shows under **every** outcome, not only `ok`: it
+measures the link rather than the probe, and a timeout over a peer being heard
+at −95 dBm is a different fault from a timeout over a peer never heard at all.
+
+**A press always answers, and the button is never disabled.** The probe does
+not depend on `id.handle` at all — it is a link, and a link is dialled with the
+identity rather than through the registration — so a proxied account, or one
+whose rnsd registration has not come up yet, probes exactly like any other. The
+press still retries `connectOurDest` on the way past, since a ping during
+rnsd's startup window is a good moment to bring the mailbox up. What it must
+not do is report the identity as not connected: a proxied account is reachable,
+its messages flow, and the contact is not implicated either way.
 
 The in-flight probe is one `ping_t` per identity, drawing its `send_id` from the
 same counter as messages; `pingApplyOutResult` / `pingApplyOutStatus` claim that
@@ -497,11 +539,25 @@ same counter as messages; `pingApplyOutResult` / `pingApplyOutStatus` claim that
 `SENT` is not an outcome (rnsd follows it with a second result when the proof
 lands or times out). Pressing again supersedes rather than queues — a
 measurement the user is watching should be the newest one, not the oldest
-queued. `pingTick` on the 1 Hz pass ends as `timeout` at
-`LXMF_PING_TIMEOUT_S = 20`, which is what covers the one case rnsd emits no
-result for at all: a send parked on a path search that never resolves. A late
-result for an abandoned probe falls through to `applyOutResult` and logs an
-unknown-send_id line at verb level.
+queued. `pingTick` on the 1 Hz pass ends as `timeout` at `pingTimeoutS()`, which
+covers the one case rnsd emits no result for at all: a send parked on a path
+search that never resolves. That deadline is **derived from the thing it is
+waiting on** — `s.rnsd.link.path_timeout_s` plus
+`LXMF_PING_HANDSHAKE_MARGIN_S` — because a probe with no link to ride waits on
+rnsd's path search first, and a deadline shorter than that search declares a
+probe dead while rnsd is still legitimately looking. It also has to stay inside
+`s.rnsd.proof_timeout_s`, or the probe reports `no-proof` for a proof still in
+flight. A late result for an abandoned probe falls through to `applyOutResult`
+and logs an unknown-send_id line at verb level.
+
+**The radio's reading is not part of the probe.** `pingSettle` writes only
+`state`, `ts`, `rtt_ms` and `hops`; the path losses and levels are read live
+from `lora.<n>.meas.*` by `lxmfPingLink` at render time. iface-lora republishes
+those on its own 15 s beat, so a snapshot taken at settle was stale as soon as
+the radio heard the peer again — and on a first probe it was empty, the link
+having come up seconds earlier. The LCD's contact-info label therefore watches
+`lora.` as well as `lxmf.ping`, guarded on the page being open, so the line
+appears when the beat publishes rather than only on the next probe.
 
 ## 7. Inbound lifecycle
 
@@ -661,7 +717,8 @@ S→C HELLO [label, limits, serving?]
  ↓ serving == 0 and provisioning      → C→S HANDOVER [privkey, name, ratchets]
 S→C SERVING ok                        → deregister our dest, role := client,
  ↓                                       forget secrets.rnsd.ratchets.<dest>
-S→C MSG / BODY / STATUS / STATE  ·  C→S SEND / FETCH / HANDED / SETTLED / CONFIG
+S→C MSG / BODY / STATUS / STATE
+                    C→S SEND / FETCH / HANDED / CONFIG / DROP / RETRY
  ↓ cmd.proxy_off
 C→S RELEASE → S→C RATCHETS            → write the record back, role := off,
                                          re-open the dest, announce
@@ -739,8 +796,14 @@ Resource's conclusion is likewise pre-persist; neither is a handover ack.
 `HANDED` goes out only once the record is in storage **with its body**, which is
 what stops a withheld body being deleted before anyone fetches it —
 `proxyStoreInbound` returns false for a metadata-only write and the `BODY`
-handler sends the `HANDED` instead. `SETTLED` is the same rule for a terminal
-outbound status.
+handler sends the `HANDED` instead.
+
+A `STATUS` gets no such frame back, and the asymmetry is the point: `HANDED`
+says strictly more than the Channel's proof does, and mail is worth a frame to
+say it was kept. A status word is not — losing one costs a checkmark. The
+Channel proves every envelope or tears the link down trying, so the server
+learns this device has a `STATUS` from `rnsd.chan.<tag>.outstanding` reaching
+zero. Frame type 10 (`SETTLED`) is retired.
 
 **A reconnect sweeps the delivery queue at once.** The queue's own cadence
 (`s.lxmf.delivery_interval`, ten minutes) is sized for a peer that may be
@@ -748,16 +811,75 @@ unreachable for hours; a server whose Channel has just come back is
 demonstrably there, so the `proxyReady` rising edge arms the sweep for the same
 1 Hz pass rather than leaving outbound waiting out the interval.
 
-**No cursor.** What is left is what is owed: a reconnect re-pushes the
-remainder, and this end dedups on `message_id`. A record held with
-`body_absent` set is *not* a duplicate — it is a pending fetch, so the metadata
-is refreshed and the body still awaited.
+**No cursor.** What is left is what is owed. The server offers each inbound
+once (`offered` on its own record) and this end dedups on `message_id` anyway. A
+record held with `body_absent` set is *not* a duplicate — it is a pending fetch,
+so the metadata is refreshed and the body still awaited, and no `HANDED` goes
+back until the body is actually here. That last part is why the offer must be
+said once and not on a timer: a withheld body cannot be acknowledged until
+somebody downloads it, so anything keyed on the acknowledgement alone
+re-announces it forever.
 
-**`ON_PROXY` is terminal-marked but not finished.** The STATUS handler writes it
-through `msgFail` (status + `tries = 255`: out of our hands) and deliberately
-does NOT send `SETTLED`, because the server is still working on it and will say
-`DELIVERED` — or why not — later. Only a real terminal status finishes, and that
-is what lets the server delete its record.
+**One STATUS per outgoing message, and it is the outcome.** The server relays a
+status only once the record has stopped moving — `lxmfStatusIsVerdict()`, shared
+by both ends, is the test. Its own progress through `REQUESTING_PATH`,
+`SENDING`, `AWAITING_PROOF`, `RETRYING_LINK` is commentary on work this device
+cannot join in with and cannot act on, and relaying each move of it spent four
+frames of a 4 kbps radio saying so. A non-verdict that arrives anyway is logged
+and ignored.
+
+**`ON_OUR_PROXY` is reached without a frame.** The Channel is proved end to end
+and retransmits until it is, so a `SEND` that has gone out is a `SEND` the
+server has: the client writes `ON_OUR_PROXY` itself the moment the frame is
+away, through `msgFail` (status + `tries = 255`: out of our hands). Nothing goes
+back in either direction: not when the `SEND` leaves, and not when the verdict
+lands. The server deletes its record off its own Channel's delivery proof.
+
+**`SENDING_TO_PROXY` is the Resource case alone.** A frame over
+`LXMF_PROXY_MSG_MAX` crosses as a Resource, which is proved part by part and can
+fail halfway, so it stays in progress (`statusInProgress`) and in the queue
+until rnsd echoes `RNSD_LINK_RESOURCE_OUTBOUND_DONE` against the `opaque_id`
+it went out under — `s_proxySends` is what holds the correlation. A failed
+transfer goes back to `QUEUED` for the next sweep; a Channel that closes with
+one in flight drops the correlation and leaves the record in the queue, where an
+interrupted transfer belongs. A Resource that did not complete was never handed
+to the server's consumer, so the re-send collides with nothing.
+
+**The verdict collapses too**: `DELIVERED` → `OUR_PROXY_DELIVERED`, anything
+terminal and unhappy → `OUR_PROXY_GAVE_UP`, with the server's own `LxmfStatus`
+written verbatim to the record's `proxy_status`. That field is the whole reason
+the collapse costs nothing: the conversation shows one ✕, and the detail page
+says which failure it was. Two statuses stay outside the five because they are
+not verdicts on reaching the recipient — `CANCELLED` (our own doing, from either
+end) and `PROXY_REFUSED` (the server would not take it), which is trouble
+reaching the proxy and has to read as itself.
+
+**An open conversation link outranks the proxy, and is the one thing that gets
+past `id.handle < 0`.** A proxied identity has no destination registration, and
+`processReady` refuses to send without one — except along the link route, which
+never touches `id.handle`: the packet goes out on the link's own ITS handle and
+settles on the link's delivery-proof counters. So the diversion to `proxySend`
+is conditional on there being no live link (`convGet(..., open_if_missing =
+false)`), and where there is one the send falls through with `use_direct` forced.
+Forced rather than chosen, because the method spectrum has nothing left to
+choose between: the opportunistic half of it goes through the registration the
+proxy holds.
+
+Both directions record `via_link` on the message. Outbound at the point the
+link branch commits; inbound through `onInboundLxm`'s defaulted `via_link`,
+which only the conversation link's own receive path passes as true.
+
+**Ping is a link when there is no destination to probe from.** Proxied,
+`pingStart` dials `lxmf.delivery` on the account's identity with a
+`lxmf.ping<n>.<peer8>` tag and settles on `rnsd.links.<tag>.rtt_ms` when the
+state reaches `active` — µR's own measurement of the establishment exchange —
+then drops the link. Where a conversation link is already open the probe rides
+it as a 32-byte packet and settles on the same `tx_proven` / `proof_timeouts`
+counters a direct message does, baselined before the send. `link_handle >= 0`
+is what distinguishes the two: a probe that dialled owns its link and must take
+it down, one riding somebody else's must leave it standing. The unproxied path
+is unchanged — a registration is there, and one packet is cheaper than a
+handshake.
 
 **Frames over `LXMF_PROXY_MSG_MAX` (300 B) ride a Resource** on the Channel's
 hidden Link (`rnsdChannelSendResource`, rns §12). Inbound ones arrive on the
@@ -843,18 +965,18 @@ storage no-ops identical values); frontends therefore never need to promote
 announce names into contacts themselves, they only fall back to the live
 list for non-contact peers.
 
-**Capability bits.** app_data element `[2]` is a msgpack `uint16` bitfield
-(`LXMF_ANN_CAP_*`), always emitted, so a later element can be appended
-positionally. Parsers read it width-agnostically, so widening it later is
-interop-safe.
+**The app_data is plain LXMF** — `[display_name, stamp_cost]` and nothing
+else. It once carried a capability bitfield as element `[2]`, advertised on
+every announce by every node; nothing ever read one back, here or anywhere
+else, so the whole field is gone rather than left on the air unconsulted.
+Elements past `[1]` are skipped rather than parsed: another implementation may
+extend the array positionally, and an extension nothing here acts on must not
+be able to cost us the name in front of it.
 
-| bit | meaning |
-|---|---|
-| 0 `DOUBLE_ENC` | a link/resource payload to us may be a destination-encrypted envelope blob rather than plaintext LXMF wire |
-| 1 | reserved — never to be reused, since nodes in the field may still assert it |
-
-Bit 0 is advertised; a peer's bits are persisted on its contact record
-(`contacts.<peer>.caps`) from each announce that carries the element.
+The double-encrypted inbound path stays and needs no announcement: a payload
+that decrypts to an LXM for one of our destinations re-enters the normal
+pipeline (`tryDoubleEncrypted`), whether or not anything advertised that it
+would be accepted.
 
 **Concurrency:** `AnnounceFanout::received_announce` runs on the **rnsd**
 task (inside `Transport::inbound`) but only does `memcpy + itsSend(timeout=0)`
@@ -937,18 +1059,23 @@ size gate), documented in [rns](../rns), not here.
 label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-if-one-exists)
 proxy_role               off (default) | server | client — which device registers and announces this account (§8c)
 proxy_dest               32-hex lxmproxy.server destination, while proxied
-contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,unread,read_ts,caps,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pn = the client-set per-contact propagation node, all-zero = none)
+contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pn = the client-set per-contact propagation node, all-zero = none)
 
 msgs.<id>.dir            in | out
 msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)
 msgs.<id>.tries          u8 attempt count; 255 is the ONLY terminal marker ("gave up")
 msgs.<id>.body_absent    u8 1 = a proxy server withheld the body; the UI offers a download (§8c)
 msgs.<id>.handed         u8 SERVER side: the client holds this record. Meaningless on a client
+msgs.<id>.offered        u8 SERVER side: 1 = this inbound has been offered to the client. Said once; only the Channel dying with the frame in it un-says it
+msgs.<id>.told           u8 SERVER side: the status last relayed to the client, +1 (0 = nothing told). Equal to `status + 1` means the client knows the latest — which is why a reconnect re-announces nothing
+msgs.<id>.via_link       u8 1 = carried by a conversation link rather than through the address our proxy holds; drawn only while proxied
+msgs.<id>.proxy_status   u8 CLIENT side: the server's own LxmfStatus behind an OUR_PROXY_GAVE_UP — which failure it stopped on. 0 = nothing said
 msgs.<id>.body_size      u32 content length, whether or not the content is here
 msgs.<id>.recv_ts        u32 monotonic received-time (never decreases); anchors date separators
 msgs.<id>.peer           hex16 (redundant with the path segment, kept for indexed query)
 msgs.<id>.title / content
 msgs.<id>.reply_to       raw 32 B replied-to message hash (FIELD_REPLY_TO); all-zero = not a reply
+msgs.<id>.reply_quote    the fragment of that message this one quotes (FIELD_REPLY_QUOTE), UTF-8; empty = quotes the whole message, and each end draws the preview from its own copy. Dropped on receipt above LXMF_REPLY_QUOTE_MAX (512 B), and shown only where it really occurs in the message `reply_to` names
 msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; legacy auto/direct/opportunistic still parse)
 msgs.<id>.ts             unix s (sender clock; can be wrong — recv_ts is the display anchor)
 msgs.<id>.delivered_ts   u32 unix s the delivery proof finished DELIVERED; 0 = not delivered
@@ -982,7 +1109,10 @@ cfgRoot subtree ([storage-internals §0](../spangap-core/docs/storage-internals.
 Callers keep using the same `s.lxmf.id.N.msgs.<peer>.<key>.<field>` key strings;
 storage routes them to the store transparently and synthesizes the same change
 notifications a cfgRoot write would. Message bodies are shipped to the browser on
-demand (`{"fetch":…}` when a conversation opens), not on the connect dump; the
+demand (`{"fetch":…}` the first time a conversation opens on a stream), not on the
+connect dump, and the device then keeps the last few conversations mirrored live
+so switching back to one renders from the mirror with nothing re-shipped
+(storage-internals §0, the open set); the
 conversation *directory* (`contacts`) and the heard-peer list are separate
 browser-mirrored stores (see §9 and storage-internals §0). Deleting a
 conversation (or the identity) via `storageDeleteTree` drops the instance + its
@@ -1011,14 +1141,17 @@ lxmf.id.<n>.accept                  0 gates this destination's inbound in rnsd (
 lxmf.id.<n>.setproxy                the "use a proxy" form's command key; answers on
                                     .setproxy.{error,done}
 
-lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,caps,name}   (RAM-only record store, §9 — not cfgRoot)
+lxmf.announces.<dest_hex>.{last,hops,cost,ratchet,name}   (RAM-only record store, §9 — not cfgRoot)
 lxmf.proxies.<dest_hex>.{label,last}   heard lxmproxy.server announces (§8c)
 lxmf.proxies_text                   the same, one finished line each
 
 lxmf.pn.sync                        node hash currently being synced, "" idle (§8b)
 lxmf.pn.<hash>.{last_check_s,last_err,last_got}   per-node sync results (RAM)
 
-lxmf.ping.<peer>.{state,ts,rtt_ms,hops,loss_to,loss_from}   latest probe (RAM, §6 Ping)
+lxmf.ping.<peer>.{state,ts,rtt_ms,hops}
+                                    latest probe (RAM, §6 Ping). The probe's own
+                                    findings only — the radio's reading is read
+                                    live from lora.<n>.meas.*, never copied here
 ```
 
 Record store schema id 4 is reserved and must not be assigned to a new store.

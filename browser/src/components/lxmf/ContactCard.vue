@@ -23,12 +23,21 @@
           <div v-if="showPing" class="pingpop" @click="showPing = false">
             <template v-if="!ping || ping.state === 'probing'">Probing…</template>
             <template v-else-if="ping.state === 'path'">Finding a path…</template>
-            <template v-else-if="ping.state === 'ok'">
-              <div class="pingrtt">{{ ping.rttMs }} ms · {{ ping.hops }} hop{{ ping.hops === 1 ? '' : 's' }}</div>
-              <div class="pingrow"><span>us→them</span>{{ lossText(ping.lossTo) }}</div>
-              <div class="pingrow"><span>them→us</span>{{ lossText(ping.lossFrom) }}</div>
+            <template v-else>
+              <!-- The probe's own outcome, then what the radio measured. The
+                   reading rides every outcome: it is a measurement of the link,
+                   not of the probe, and it is worth most where the probe came
+                   back empty. -->
+              <div v-if="ping.state === 'ok'" class="pingrtt">
+                <!-- A link measures the round trip, not the path, so it has no
+                     hop count to state. Saying "0 hops" would be a made-up
+                     number where there is simply no answer. -->
+                {{ ping.rttMs }} ms<template v-if="ping.hops > 0">
+                  · {{ ping.hops }} hop{{ ping.hops === 1 ? '' : 's' }}</template>
+              </div>
+              <div v-else class="pingrtt">{{ pingFailText }}</div>
+              <div v-for="l in linkLines" :key="l" class="pingrow">{{ l }}</div>
             </template>
-            <template v-else>{{ pingFailText }}</template>
           </div>
         </div>
       </div>
@@ -54,10 +63,6 @@
           <q-icon :name="copied ? matCheck : matContentCopy" size="15px" />
         </button>
       </div>
-
-      <!-- What the peer's announces told us about what it can take. -->
-      <div class="sect">Accepts long messages (double-encrypted)</div>
-      <div class="capval">{{ capsText }}</div>
 
       <!-- Per-contact propagation node: offered as the second option of the
            resend dialog for this contact's messages. -->
@@ -91,7 +96,7 @@ import { computed, ref } from 'vue'
 import { matArrowBack, matVerifiedUser, matContentCopy, matCheck }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
-import { hasDest,
+import { hasDest, pingLinkLines, peerMeasOf,
          type Contact, type PingResult, type PnNode, type Reachability }
   from '../../modules/lxmf'
 
@@ -121,20 +126,23 @@ function onPing() {
   emit('ping', props.peer)
 }
 
-/* One direction's path loss — the radio's own measurement of this peer (SUPE),
- * published beside the probe's round trip — or that it has not been measured,
- * which stays honest rather than reading as a zero. */
-function lossText(loss: string): string {
-  return loss ? `${loss} dB path loss` : 'not measured'
-}
+/* The radio's own reading of the link, published beside the probe's round trip:
+ * one line per direction SUPE has measured, or — for a peer outside the
+ * protocol, which states no power and so can have no path loss — the level this
+ * radio read and the power it sent at. Rendered by the module so
+ * this popover, the device's screen and its console cannot drift into
+ * describing the same measurement three different ways. */
+const linkLines = computed(() => pingLinkLines(peerMeasOf(props.peer)))
 
+/* What became of the probe, never a verdict on the contact. The probe is a link
+ * establishment, so these are that link's outcomes: `no-route` is the dial
+ * failing, `no-proof` a probe on a link already open going unanswered. */
 const pingFailText = computed(() => {
   switch (props.ping?.state) {
     case 'no-proof':  return 'Delivered, but no proof came back.'
     case 'no-route':  return 'No route to this contact.'
     case 'timeout':   return 'No answer.'
     case 'cancelled': return 'Probe cancelled.'
-    case 'offline':   return 'This identity is not connected.'
     default:          return 'Probe failed.'
   }
 })
@@ -164,12 +172,6 @@ function applyCustomPn() {
 
 const verified = computed(() => (props.contact?.trust ?? 0) >= 1)
 
-/* caps bit0 = the peer accepts double-encrypted payloads; -1 (no caps leaf on
- * the contact record — pre-caps peer or no announce yet) = unknown. */
-const capsText = computed(() => {
-  const caps = props.contact?.caps ?? -1
-  return caps < 0 ? 'unknown' : (caps & 1) ? 'yes' : 'no'
-})
 
 const copied = ref(false)
 let copiedTimer: ReturnType<typeof setTimeout> | undefined
@@ -215,7 +217,6 @@ const reachLine = computed(() => {
   color: #6fb98f; font-size: calc(12px * var(--rfs, 1));
 }
 .unverified { color: #888; font-size: calc(12px * var(--rfs, 1)); }
-.capval { color: #b8c0b8; font-size: calc(13px * var(--rfs, 1)); }
 .reach { text-align: center; color: #8a8a8a; font-size: calc(12px * var(--rfs, 1)); margin-bottom: 12px; }
 .sect {
   color: #aaa; font-size: calc(12px * var(--rfs, 1)); text-transform: uppercase;
@@ -266,10 +267,11 @@ const reachLine = computed(() => {
   color: #d8d8d8; font-size: calc(12px * var(--rfs, 1)); line-height: 1.5;
 }
 .pingrtt { color: #e8e8e8; font-weight: 600; margin-bottom: 4px; }
-.pingrow { white-space: nowrap; }
-.pingrow span {
-  display: inline-block; min-width: 62px; color: #8a8a8a;
-}
+/* A measurement line wraps rather than running off the popover: it carries a
+   loss, a signal-to-noise, a power in two units and an age, and truncating any
+   of those would drop the half a reader came for. */
+.pingrow { white-space: normal; }
+.pingrow + .pingrow { margin-top: 3px; }
 .pnsel {
   width: 100%; background: #2a2a2a; color: #e8e8e8;
   border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;

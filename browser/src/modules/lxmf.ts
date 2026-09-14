@@ -68,6 +68,13 @@ watch(_activeIdentity, (n) => { localStorage.setItem(LS_IDENT, String(n)) })
 const _activePeerById = reactive<Record<number, string>>({})
 const _draftsById = reactive<Record<number, Record<string, string>>>({})
 
+/* Conversations the device has shipped into the mirror on this stream and is
+ * still mirroring live (its open set). Module-level because the mirror is: one
+ * fetch serves every window. Reset on each (re)sync — the device's open set
+ * went with the stream that carried it. */
+const _shippedThreads = new Set<string>()
+let _shippedEpoch = -1
+
 /* ── Types ──────────────────────────────────────────────────────────── */
 
 /* Unified message status. The numeric VALUES are persisted in the record's u8
@@ -83,12 +90,29 @@ export enum LxmfStatus {
   LinkOpenFail = 19, ResMalloc = 20, ResSend = 21, LinkSendDrop = 22,
   PacketSendDrop = 23, ResTransfer = 24, LinkFail = 25, LinkClosed = 26,
   Unknown = 27, NoResponse = 28,
-  /* Proxy states, on a client whose account is served by an lxmproxy server
-   * (tries 255 yet still movable, since the server relays the account's real
-   * status back over the Channel: OnProxy → Delivered, or OnProxy → whatever
-   * the server's own send settled). */
-  OnProxy = 29, ProxyRefused = 30,
-  /* 31, 32 free; 33 retired */
+  /* Proxy states. An outbound that goes through a proxy has FIVE and no
+   * others, however many the server itself passes through:
+   *
+   *   Queued            nothing has left this device yet
+   *   SendingToProxy    a long message still crossing to the proxy    …
+   *   OnOurProxy        our proxy has it and is trying                ✓
+   *   OurProxyDelivered it reached the recipient                      ✓✓
+   *   OurProxyGaveUp    our proxy tried and stopped                   ✕
+   *
+   * The proxy says ONE thing per message: how it went. That it took the
+   * message is not news worth a frame — the Channel is proved end to end, so
+   * the ✓ appears when the SEND goes out, with nothing coming back. Only a
+   * message too long for one Channel message sits at `…` for a while, because
+   * that one crosses as a transfer that can fail halfway.
+   *
+   * The server's own machinery never crosses at all; the failure it stopped
+   * on is kept verbatim in the record's `proxyStatus`, for the detail page.
+   * ProxyRefused is NOT one of the five — it is the server declining to take
+   * the message at all, which is trouble reaching the proxy rather than the
+   * proxy's verdict on reaching the recipient. */
+  OnOurProxy = 29, ProxyRefused = 30,
+  SendingToProxy = 31, OurProxyDelivered = 32,
+  /* 33 retired */
   /* Send failed while the local LoRa radio was shedding frames to channel
    * contention — the own channel is jammed, not the peer silent. */
   RadioBusy = 34,
@@ -98,9 +122,16 @@ export enum LxmfStatus {
   /* Not delivered within s.lxmf.delivery_timeout minutes of attempts from the
    * delivery queue. */
   DeliveryTimeout = 38,
+  /* Our proxy stopped trying. WHY is the record's `proxyStatus`. */
+  OurProxyGaveUp = 39,
 }
 /* tries === 255 is the one definitive terminal marker (gave up). */
 export const LXMF_TRIES_GAVEUP = 255
+
+/* The resend `via` that means "ask our proxy to try again now" rather than
+ * naming a route. Not a destination hash and never mistaken for one: every
+ * other value is either '' (this device carries it) or 32 hex characters. */
+export const RESEND_RETRY = '~retry'
 
 export interface Message {
   key: string
@@ -110,11 +141,16 @@ export interface Message {
   tries: number
   title: string
   content: string
-  thread: string
   ts: number           // sender's clock (display)
   recvTs: number       // monotonic receive time (date-separator anchor)
   messageId: string
   replyTo?: string     // FIELD_REPLY_TO hex64, '' / all-zero if not a reply
+  // FIELD_REPLY_QUOTE: the fragment of the replied-to message this one quotes,
+  // sent only when the user picked one by selecting it. Empty means the reply
+  // quotes the whole message and the preview comes from our own copy of it.
+  // Never rendered unless it really occurs in the message `replyTo` names — see
+  // quoteOf() — so a sender cannot put words in the other party's bubble.
+  replyQuote?: string
   method?: string      // delivery method override
   read?: number        // inbound read flag
   // A proxy server withheld this body: the bubble offers the download rather
@@ -123,30 +159,102 @@ export interface Message {
   // inferred from an empty string.
   bodyAbsent: boolean
   bodySize: number
+  // The failure our proxy stopped on, behind an OurProxyGaveUp — its real
+  // LxmfStatus, verbatim. 0 = nothing said. The conversation shows one ✕; this
+  // is what the detail page says underneath it, and it is the PROXY's verdict
+  // on reaching the recipient, never this device's trouble reaching the proxy.
+  proxyStatus: number
+  // Carried by a conversation link to the peer rather than through the address
+  // our proxy holds. Drawn only while proxied, where it is the difference
+  // between "this went straight there" and "somebody else sent it for me";
+  // unproxied every message is direct and the mark would say nothing.
+  viaLink: boolean
 }
 
 /* One probe outcome from lxmf.ping.<peer>.*, RAM-only and overwritten by the
- * next probe. `state` is the only field always present: 'probing' / 'path' while
- * in flight, then 'ok' or a reason it stopped. The path losses are the radio's
- * own measurement of the peer (SUPE, lora.<n>.meas.*), in dB as the firmware
- * wrote them, '' when that direction has not been measured. */
+ * next probe. `state` is the only field always present: 'probing' / 'path'
+ * while in flight, then 'ok' or a reason it stopped.
+ *
+ * This is the probe's own findings and nothing else. What the RADIO measured is
+ * not here — read it live with `peerMeasOf` and render it with
+ * `pingLinkLines`. It is published on iface-lora's own beat, so a copy taken
+ * when a probe settled was stale as soon as the radio heard the peer again, and
+ * on a first probe it was simply empty. */
 export interface PingResult {
-  state: string        // probing | path | ok | no-proof | no-route | timeout | cancelled | failed | offline
+  state: string        // probing | path | ok | no-proof | no-route | timeout | cancelled | failed
   ts: number           // unix seconds of the last state change
   rttMs: number        // round trip, 0 unless state is 'ok'
   hops: number
-  lossTo: string       // path loss us→them, dB
-  lossFrom: string     // path loss them→us, dB
 }
 
-/* The radio's own record of a peer, from SUPE's per-peer publication
- * lora.<n>.meas.<slot>.* (iface-lora README). rssi dBm, snr dB; each undefined
- * when the radio holds no level; the losses '' when that direction is unmeasured. */
+/** A transmit power in dBm as a person reads power: "10 mW", "158 mW",
+ *  "126 µW", "1 W". Whole units — the input is a whole dBm, so a decimal would
+ *  claim a precision it never had. Mirrors `fmtPower` in spangap-core's
+ *  compat.h, which is what the device's own console and screen print. */
+export function powerText(dbm: number): string {
+  const mw = Math.pow(10, dbm / 10)
+  if (mw >= 999.5)  return `${Math.round(mw / 1000)} W`
+  if (mw >= 0.9995) return `${Math.round(mw)} mW`
+  if (mw >= 0.0005) return `${Math.round(mw * 1000)} µW`
+  return '<1 µW'
+}
+
+/** The radio's reading of the link, one line per direction it has measured:
+ *
+ *      us→them 91 dB path loss, SNR 11 dB @ tx +10 dBm (10 mW)
+ *      them→us 88 dB path loss, SNR 9 dB @ tx +22 dBm (158 mW)
+ *
+ *  The loss leads because it is the link's own property whatever either end
+ *  transmits at; the signal-to-noise says whether the link is weak or merely
+ *  quiet; the power is what the loss was measured against.
+ *
+ *  A loss needs SUPE: it is a level against the power the FAR END transmitted
+ *  at, and only a SUPE peer states one. What this radio has on its own is what
+ *  it read and what it sent at, and that is the whole line for such a peer:
+ *
+ *      heard @ -95 dBm / SNR 9.5 dB @ tx +22 dBm (158 mW)
+ *
+ *  No ages: these are the readings as they stand. Taken LIVE from the radio's
+ *  publication rather than from the probe — the probe settles seconds after a
+ *  link comes up and iface-lora republishes on its own 15 s beat, so a copy
+ *  made at that instant was empty and stayed empty until somebody probed again.
+ *  Empty when no radio has measured the peer at all — the round trip shown
+ *  above these lines is the probe's own measurement and true of any route. The
+ *  same lines the device's console and screen print (`lxmfPingLink`, lxmf.h). */
+export function pingLinkLines(m: PeerMeas | null): string[] {
+  if (!m) return []
+  const at = (txp: string) => {
+    const t = num(txp)
+    return ` @ tx ${t >= 0 ? '+' : ''}${t} dBm (${powerText(t)})`
+  }
+  const dir = (label: string, loss: string, snr: string, txp: string) =>
+    `${label} ${loss} dB path loss, SNR ${Math.round(num(snr) / 10)} dB` + at(txp)
+  const lines: string[] = []
+  if (m.lossTo)   lines.push(dir('us→them', m.lossTo, m.snrTo, m.txpTo))
+  if (m.lossFrom) lines.push(dir('them→us', m.lossFrom, m.snrFrom, m.peerTxp))
+  if (!lines.length && m.rssi !== undefined)
+    lines.push(`heard @ ${m.rssi} dBm / SNR ${(m.snr ?? 0).toFixed(1)} dB`
+               + (m.txp ? at(m.txp) : ''))
+  return lines
+}
+
+/* The radio's own record of a peer, from iface-lora's per-peer publication
+ * lora.<n>.meas.<slot>.* (iface-lora README). rssi dBm, snr dB×10; each
+ * undefined when the radio holds no level; the losses '' when that direction is
+ * unmeasured — only a SUPE peer states the power a loss is measured against.
+ * Read live wherever it is shown: it is republished on iface-lora's own beat,
+ * so anything that copied it at some other moment was either stale or, on a
+ * link that had just come up, empty. */
 export interface PeerMeas {
-  rssi: number | undefined
-  snr: number | undefined
+  rssi: number | undefined     // dBm
+  snr: number | undefined      // dB — already divided, unlike the raw publication
+  txp: string                  // the power this radio last sent at, dBm
   lossTo: string
+  snrTo: string                // dB×10, as published
+  txpTo: string
   lossFrom: string
+  snrFrom: string              // dB×10, as published
+  peerTxp: string
 }
 
 export interface Conversation {
@@ -178,7 +286,6 @@ export interface Contact {
   nick: string
   trust: number
   lastSeen: number
-  caps: number         // announce capability bits (bit0 = accepts double-encrypted payloads); -1 = leaf absent (unknown)
   pn: string           // per-contact propagation node (32-hex); '' / all-zero = none set
 }
 
@@ -254,11 +361,14 @@ const STATUS_NAME: Record<number, string> = {
   [LxmfStatus.ResTransfer]: 'RES_TRANSFER', [LxmfStatus.LinkFail]: 'LINK_FAIL',
   [LxmfStatus.LinkClosed]: 'LINK_CLOSED', [LxmfStatus.Unknown]: 'UNKNOWN',
   [LxmfStatus.NoResponse]: 'NO_RESPONSE',
-  [LxmfStatus.OnProxy]: 'ON_PROXY', [LxmfStatus.ProxyRefused]: 'PROXY_REFUSED',
+  [LxmfStatus.OnOurProxy]: 'ON_OUR_PROXY', [LxmfStatus.ProxyRefused]: 'PROXY_REFUSED',
+  [LxmfStatus.SendingToProxy]: 'SENDING_TO_PROXY',
+  [LxmfStatus.OurProxyDelivered]: 'OUR_PROXY_DELIVERED',
   [LxmfStatus.RadioBusy]: 'RADIO_BUSY',
   [LxmfStatus.OnPn]: 'ON_PN', [LxmfStatus.PnFail]: 'PN_FAIL',
   [LxmfStatus.PnRejected]: 'PN_REJECTED',
   [LxmfStatus.DeliveryTimeout]: 'DELIVERY_TIMEOUT',
+  [LxmfStatus.OurProxyGaveUp]: 'OUR_PROXY_GAVE_UP',
 }
 export function lxmfStatusName(status: number): string {
   return STATUS_NAME[status] ?? ''
@@ -282,7 +392,12 @@ export function peerMeasOf(peer: string): PeerMeas | null {
       if (!str(r.tags).includes(tag)) continue
       const rssi = r.rssi === undefined || r.rssi === '' ? undefined : num(r.rssi)
       const snr  = r.snr  === undefined || r.snr  === '' ? undefined : num(r.snr) / 10
-      return { rssi, snr, lossTo: str(r.loss_to), lossFrom: str(r.loss_from) }
+      return {
+        rssi, snr,
+        txp:      str(r.txp),
+        lossTo:   str(r.loss_to),   snrTo:   str(r.snr_to),   txpTo:   str(r.txp_to),
+        lossFrom: str(r.loss_from), snrFrom: str(r.snr_from), peerTxp: str(r.peer_txp),
+      }
     }
   }
   return null
@@ -487,6 +602,50 @@ export function segmentMessage(content: string): MsgSegment[] {
   return out
 }
 
+/* ── Reply quotes ────────────────────────────────────────────────────────────
+ * A reply names the message it answers (FIELD_REPLY_TO) and may carry the
+ * fragment of it the sender picked out (FIELD_REPLY_QUOTE). What a quote block
+ * SHOWS, though, is always taken from this device's own copy of the quoted
+ * message: a carried fragment is drawn only where it really occurs there, so a
+ * quote can never say something the quoted message does not. With no copy of
+ * the quoted message there is nothing to check against, and the block says only
+ * that this is a reply. */
+
+/** Longest quote a bubble or the composer strip draws. */
+export const QUOTE_PREVIEW_MAX = 120
+
+/** One line of quotable text: newlines collapsed, clipped with an ellipsis. */
+export function quoteLine(text: string, max = QUOTE_PREVIEW_MAX): string {
+  const one = text.replace(/\s+/g, ' ').trim()
+  return one.length > max ? one.slice(0, max) + '…' : one
+}
+
+export interface QuoteView {
+  /** Record key of the quoted message, '' when this device does not hold it. */
+  key: string
+  /** Who wrote the quoted message: 'You' or the peer's display name. */
+  label: string
+  /** The line to draw; '' when only "this is a reply" can be said. */
+  text: string
+}
+
+/** The quote block for `m`, or null when `m` is not a reply. `byId` maps
+ *  message_id → the message, over the conversation this bubble lives in. */
+export function quoteView(m: Message, byId: Map<string, Message>,
+                          nameOf: (peer: string) => string): QuoteView | null {
+  const id = m.replyTo ?? ''
+  if (!id || /^0+$/.test(id)) return null
+  const t = byId.get(id)
+  if (!t) return { key: '', label: '', text: '' }
+  const frag = m.replyQuote ?? ''
+  const text = frag && t.content.includes(frag) ? frag : t.content
+  return {
+    key: t.key,
+    label: t.dir === 'out' ? 'You' : nameOf(t.peer),
+    text: quoteLine(text),
+  }
+}
+
 /** Open a Nomad page URL tapped in a message (writes the shared sentinel). */
 export function openNomad(hash: string, path: string) {
   const h = hash.trim().toLowerCase()
@@ -516,10 +675,15 @@ export interface UseLxmf {
   draftFor: (peer: string) => string
   setDraft: (peer: string, text: string) => void
   openPeer: (peer: string) => void
-  send: (peer: string, content: string, opts?: { method?: string; thread?: string }) => Promise<void>
+  send: (peer: string, content: string,
+         opts?: { method?: string; replyTo?: string; replyQuote?: string }) => Promise<void>
   resend: (peer: string, key: string) => Promise<void>
   /** Resend through a propagation node (via = 32-hex node); '' = direct. */
   resendVia: (peer: string, key: string, via: string) => Promise<void>
+  /** Ask our proxy to attempt this one again now; the body does not move. */
+  retryNow: (peer: string, key: string) => Promise<void>
+  /** Whether this identity's mail belongs to a proxy server. */
+  proxied: ComputedRef<boolean>
   /** Global propagation-node list (s.lxmf.pn.<i>), in index order. */
   pnNodes: ComputedRef<PnNode[]>
   pnAdd: (hash: string, name?: string) => void
@@ -644,6 +808,33 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   watch(() => device.synced, (ok) => {
     if (ok) device.sendCommand({ fetch: 'lxmf.announces' })
   }, { immediate: true })
+
+  /* Message bodies live in the device's record store, not cfgRoot, so they ride
+   * no dump: the device ships a conversation on request into the mirror at
+   * s.lxmf.id.<n>.msgs.<peer> — where activeConversation reads — and mirrors its
+   * live changes from then on.
+   *
+   * Ask ONCE per conversation per stream. A fetch is a resync: it empties the
+   * subtree in the mirror and refills it a chunk at a time, which is a thread
+   * visibly rebuilding itself under the reader. A conversation already shipped
+   * is complete and kept live, so switching back to it must re-ask for nothing —
+   * the pane simply re-renders from what is already there. The device keeps a
+   * bounded set of conversations open and clears any it drops from the mirror,
+   * so a subtree that has gone missing is the signal to ask again. */
+  function shipThread(peer: string) {
+    const path = `s.lxmf.id.${activeId.value}.msgs.${peer}`
+    if (_shippedThreads.has(path) && device.get(path) !== undefined) return
+    device.sendCommand({ fetch: path })
+    _shippedThreads.add(path)
+  }
+
+  /* A (re)dump is a new stream, and the device's open set went with the old one:
+   * forget what we were shipped and re-ask for the conversation on screen, or it
+   * sits there quietly not updating. */
+  watch(() => device.syncEpoch, (epoch) => {
+    if (_shippedEpoch !== epoch) { _shippedEpoch = epoch; _shippedThreads.clear() }
+    if (activePeer.value) shipThread(activePeer.value)
+  })
   const contacts = computed<Record<string, Contact>>(() => {
     const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
     const out: Record<string, Contact> = {}
@@ -655,7 +846,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         nick: str(c.nick),
         trust: num(c.trust),
         lastSeen: num(c.last_seen),
-        caps: num(c.caps, -1),   // mirrored as a decimal string like trust; an absent leaf stays -1 (unknown)
         pn: str(c.pn),
       }
     }
@@ -718,15 +908,17 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       tries: num(r.tries),
       title: str(r.title),
       content: str(r.content),
-      thread: str(r.thread),
       ts: num(r.ts),
       recvTs: num(r.recv_ts),
       messageId: str(r.message_id),
       replyTo: str(r.reply_to),
+      replyQuote: str(r.reply_quote),
       method: str(r.method),
       read: num(r.read),
       bodyAbsent: num(r.body_absent) !== 0,
       bodySize: num(r.body_size),
+      proxyStatus: num(r.proxy_status),
+      viaLink: num(r.via_link) !== 0,
     }
   }
 
@@ -742,10 +934,16 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       const count = num(c.count)
       if (count <= 0) continue // announce-only contact, no messages exchanged
       const lastTs = num(c.last_ts)
+      // The preview is the last message whichever way it went; preview_mine is
+      // which way, so the list labels ours "You:" and theirs with nothing.
       const last: Message = {
-        key: '', peer, dir: 'out', status: LxmfStatus.AwaitingProof, tries: 0,
-        title: '', content: str(c.preview), thread: '', ts: lastTs, recvTs: lastTs,
+        key: '', peer, dir: num(c.preview_mine) ? 'out' : 'in',
+        status: LxmfStatus.AwaitingProof, tries: 0,
+        title: '', content: str(c.preview), ts: lastTs, recvTs: lastTs,
         messageId: '',
+        // A one-line preview, not a record: the fields a bubble would read off
+        // a real message have no meaning here and stand at their neutral values.
+        bodyAbsent: false, bodySize: 0, proxyStatus: 0, viaLink: false,
       }
       out.push({ peer, name: displayName(peer), last, ts: lastTs, unread: num(c.unread), count })
     }
@@ -810,7 +1008,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   }
 
   async function send(peer: string, content: string,
-                      opts?: { method?: string; thread?: string }) {
+                      opts?: { method?: string; replyTo?: string; replyQuote?: string }) {
     const n = activeId.value
     // Fail fast on a down/keyless identity rather than writing a
     // sentinel nothing will ever process (6 s CmdQueue timeout).
@@ -819,10 +1017,17 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     const key = `o_${Date.now()}_${rand4()}`
     const rec: Patch = {
       dir: 'out', peer, title: '', content,
-      thread: opts?.thread ?? '', status: LxmfStatus.Queued,
+      status: LxmfStatus.Queued,
       ts: Math.floor(Date.now() / 1000),
     }
     if (opts?.method) rec.method = opts.method
+    /* A reply names the message it answers by that message's id; the quote is
+     * the fragment of it the user picked out, and rides only with the hash it
+     * belongs to. */
+    if (opts?.replyTo) {
+      rec.reply_to = opts.replyTo
+      if (opts.replyQuote) rec.reply_quote = opts.replyQuote
+    }
     const data = nest(`s.lxmf.id.${n}.msgs.${peer}.${key}`, rec)
     if (_draftsById[n]) delete _draftsById[n]![peer]
     // The record is written optimistically as `queued` so the bubble
@@ -846,6 +1051,18 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       num(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.tries`))
     // Re-post the send; the core resets tries (< 255) as it re-attempts.
     return sendQ('send').enqueue(`${peer}/${key}`,
+      { settle: () => triesOf() !== LXMF_TRIES_GAVEUP })
+  }
+
+  /** Ask our proxy to attempt this one again, now. The body never moves — it is
+   *  already on the server, and putting it back on the air to say "again" would
+   *  cost the whole message to carry one bit. The answer is the ordinary status
+   *  that follows, so this settles on the record leaving its gave-up state. */
+  const retryNow = (peer: string, key: string) => {
+    const n = activeId.value
+    const triesOf = () =>
+      num(device.get(`s.lxmf.id.${n}.msgs.${peer}.${key}.tries`))
+    return queue(`lxmf.id.${n}.cmd.retry`).enqueue(`${peer}/${key}`,
       { settle: () => triesOf() !== LXMF_TRIES_GAVEUP })
   }
   const cancel = (peer: string, key: string) => {
@@ -873,6 +1090,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     })
   }
   const announceNow = () => sendQ('announce').enqueue('1')
+
+  /* Whether this identity's mail belongs to a proxy server — the firmware's
+   * own `proxy_role`, which is what decides where a send goes. Read rather
+   * than inferred from `up`: a slot can be down for reasons that have nothing
+   * to do with a proxy. */
+  const proxied = computed(() =>
+    str(idTree.value[activeId.value]?.proxy_role) === 'client')
 
   /* Per-peer conversation-link state, published ephemerally by the firmware
    * at lxmf.id.<n>.link.<peer> and re-derived every second, so it follows a
@@ -917,8 +1141,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       ts: num(r.ts),
       rttMs: num(r.rtt_ms),
       hops: num(r.hops),
-      lossTo: str(r.loss_to),
-      lossFrom: str(r.loss_from),
     }
   }
 
@@ -1056,10 +1278,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
 
   function openPeer(peer: string) {
     activePeer.value = peer
-    // Message bodies live in the device record store, not the mirror. Ask the
-    // device to ship this conversation's records (and stream its live changes)
-    // into the mirror at s.lxmf.id.<n>.msgs.<peer>, where activeConversation reads.
-    if (peer) device.sendCommand({ fetch: `s.lxmf.id.${activeId.value}.msgs.${peer}` })
+    if (peer) shipThread(peer)
   }
   const draftFor = (peer: string) => _draftsById[activeId.value]?.[peer] ?? ''
   const setDraft = (peer: string, text: string) => {
@@ -1077,10 +1296,10 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     conversations, activeConversation, contacts, announces,
     peerDirectory, unreadTotal,
     displayName, reachability, contactOf, draftFor, setDraft, openPeer,
-    send, resend, resendVia, cancel, deleteMessage, deleteConversation,
+    send, resend, resendVia, retryNow, cancel, deleteMessage, deleteConversation,
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
     pnStatus, setContactPn,
-    markConversationRead, announceNow, linkState, toggleLink,
+    markConversationRead, announceNow, linkState, toggleLink, proxied,
     ping, pingResult, fetchBody, peerMeas,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }

@@ -122,9 +122,10 @@ key. Presence = request in flight; absence = done.
 |---|---|---|
 | `lxmf.id.<n>.cmd.send` | `<peer>/<key>[/pn:<hash>]` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>`; the optional `pn:` segment uploads to that propagation node instead |
 | `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` finishes every outbound of this identity that has not finished. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
-| `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation |
+| `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation. A proxied outbound is dropped on the proxy too (`DROP`), so a message deleted here is not still being sent by a machine elsewhere |
+| `lxmf.id.<n>.cmd.retry` | `<peer>/<key>` | try this one again NOW. Proxied, that is a `RETRY` frame naming the record — the body is already on the server, and putting it back on the air to say "again" would cost the whole message to carry one bit. Unproxied it is an ordinary send, since this device owns the queue |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
-| `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — one packet out, its delivery proof back (see **Ping**) |
+| `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — a link establishment where there is no link, else one packet on the open one (see **Ping**) |
 | `lxmf.id.<n>.cmd.fetch` | `<peer>/<message_id>` | ask the proxy server for a body it withheld (see **Being proxied**) |
 | `lxmf.id.<n>.cmd.proxy_on` | `<32-hex>` | ask that `lxmproxy.server` to take this account; this device stays registered until the server confirms |
 | `lxmf.id.<n>.cmd.proxy_off` | any | hand the account back; this device stays proxied and working until the server answers |
@@ -207,7 +208,8 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
    s.lxmf.id.<n>.msgs.<peer>.<key>.peer     = <32-hex destination>
    s.lxmf.id.<n>.msgs.<peer>.<key>.title    = <utf-8>
    s.lxmf.id.<n>.msgs.<peer>.<key>.content  = <utf-8>
-   s.lxmf.id.<n>.msgs.<peer>.<key>.thread   = <hex64 root message_id, or "">
+   s.lxmf.id.<n>.msgs.<peer>.<key>.reply_to = <hex64 message_id, or absent>
+   s.lxmf.id.<n>.msgs.<peer>.<key>.reply_quote = <utf-8 fragment, or absent>
    s.lxmf.id.<n>.msgs.<peer>.<key>.status   = 0            # DRAFT
    ```
 
@@ -290,6 +292,51 @@ A message that gave up (`tries == 255`) is not retried on its own — write
 `cmd.send` again to re-send it, which restarts its try count and its
 delivery timeout.
 
+## Replying to a message
+
+```
+A → B   LXM { content: "on my way",
+              fields: { 0x30: <32 B message hash of B's message>,
+                        0x31: "where are you?"   (only when a fragment was picked) } }
+```
+
+`FIELD_REPLY_TO` (`0x30`) names the message being answered by its
+`message_id`; `FIELD_REPLY_QUOTE` (`0x31`) carries the fragment of it the
+sender selected. **A plain reply sends `0x30` alone** — both ends hold the
+quoted message and draw the preview line from their own copy, so the air
+carries a hash and not a second copy of the text. Selecting part of the message
+first is what puts `0x31` on the wire.
+
+**A quote is drawn only where it is true.** A received fragment is shown only
+if it really occurs in the message `reply_to` names; otherwise the block falls
+back to that message's own opening line, and a reply to a message this device
+does not hold says just "replying to a message". So a quote block can never put
+words in the other party's bubble. The fragment as it arrived is still on the
+message's detail page, verified or not.
+
+Both frontends work the same way:
+
+- **The quote sits where the reply will.** Picking *reply* puts the quoted line
+  directly above the typing area with an (x) that abandons the reply and keeps
+  the text; once sent, the same block sits at the head of the balloon, at both
+  ends. Tapping a quote scrolls the conversation to the message it came from
+  and marks it briefly — on the LCD, opening the history page it is on if it is
+  older than the page being read.
+- **Three actions per message**, in Signal's order: reply, details, delete. On
+  the web they replace the bubble's three-dot menu, appearing on hover, on a
+  click, or when text in the bubble is selected — a click no longer walks off to
+  the detail page, which is what the (i) is for. On the LCD a long press puts
+  the same three icons over the bubble, selecting the word under the finger on
+  the way if the press landed on text; dragging from there grows the selection
+  (the thread stops scrolling while a selection is up).
+- **Reply is available once a message has an id.** An outbound message has no
+  `message_id` until the firmware has packed it, and there is nothing to name
+  until then, so the action is disabled for exactly that window.
+
+Upstream's clients (Sideband, NomadNet, MeshChat) implement none of the reply
+fields, so a reply reaches them as an ordinary message: nothing breaks, the
+quote is simply not drawn.
+
 ## Propagation nodes
 
 Classic LXMF **propagation nodes** (reference `lxmf.propagation`
@@ -348,8 +395,10 @@ this device                            the server
                              ◄─ SERVING      it is registered and announcing
   deregister our own destination, role := client
                              ◄─ MSG …        mail, live, while we are online
-  SEND … ────────────────────────────►
-                             ◄─ STATUS       the account's real status, verbatim
+  SEND … ────────────────────────────►       (the Channel proves it: ✓)
+                             ◄─ STATUS       once, at the end: how it went
+                                             (the Channel proves that too, and
+                                              the server deletes on the proof)
 ```
 
 An account normally lives on the device in front of you: it registers its
@@ -447,11 +496,57 @@ the settings form. What is stored per identity is the one you chose:
 s.lxmf.id.<n>.proxy_dest    32-hex lxmproxy.server destination
 ```
 
-**While proxied.** Outbound goes over the Channel and the server's real
-`LxmfStatus` comes back verbatim, so a failure shows the true error rather than
-a proxy-flavoured one. One check (`ON_PROXY`) means the server has it; two
-(`DELIVERED`) still means a real LXMF delivery proof. With no Channel, outbound
-sits `QUEUED` locally with **no checkmark** — nothing has it but this device.
+**While proxied, an outbound has five states and no others** — however many the
+server itself passes through:
+
+| state | glyph | means |
+|---|---|---|
+| `QUEUED` | none | nothing has left this device yet |
+| `SENDING_TO_PROXY` | `…` | a long message still crossing to the proxy |
+| `ON_OUR_PROXY` | ✓ | our proxy has it and is trying |
+| `OUR_PROXY_DELIVERED` | ✓✓ | it reached the recipient — a real LXMF proof, relayed |
+| `OUR_PROXY_GAVE_UP` | ✕ | our proxy tried and stopped |
+
+**The proxy says one thing per message: how it went.** That it took the message
+is not news worth a frame — the Channel is proved end to end, so a SEND that has
+gone out is a SEND the proxy has, and the ✓ appears without anything coming
+back. Only a message too long for one Channel message sits at `…` for a while,
+because that one crosses as a transfer that can fail halfway.
+
+The server's own machinery — path requests, link retries, proof waits — is its
+business and not a state of ours, so none of it crosses at all.
+Nothing is lost: the failure it stopped on is kept verbatim on the record as
+`proxy_status` and named on the message's detail page ("Our proxy gave up: it
+tried and stopped: `NO_ROUTE`"). Saying it there rather than in the conversation
+keeps the distinction that matters — that it is the **proxy's verdict on
+reaching the recipient**, not this device's trouble reaching the proxy. Trouble
+of that kind has its own answers: `PROXY_REFUSED` when the server will not take
+the message at all, and a plain `QUEUED` when there is no Channel to offer it
+to.
+
+A body over the server's `max_envelope_kb` never leaves: `HELLO` states the
+ceiling and the client fails the draft `TOO_LARGE` itself rather than spending
+the air on a body only to be refused.
+
+**An open link outranks the proxy.** A conversation link is dialled with the
+account's identity and carries its own traffic; none of it goes through the
+registration the server holds. So when one is open to the peer, a send goes
+straight there — fewer hops, no copy on somebody else's box, and a delivery
+proof of our own rather than a relayed one. The proxy takes over again the
+moment the link is not there. Return traffic the peer does not put on that same
+link still arrives by way of the proxy, which is the address the world knows.
+
+Messages that travelled that way carry `via_link` on the record, and both
+frontends draw a small link mark for them — on an outgoing message before the
+checkmarks, since how it travelled comes before how it landed. Only while
+proxied: unproxied, every message goes direct and the mark would say nothing.
+
+**Deleting an outbound tells the proxy** (`DROP`), so a message deleted here is
+not still being sent by a machine elsewhere; if it has already gone, the server
+simply stops owing us its status. **Resend, while proxied and with no link
+open, is `RETRY`** — one frame naming the record. The body is already on the
+server, and putting it back on the air to say "again" would cost the whole
+message to carry one bit.
 
 Inbound arrives as ordinary message records. A body over the link's own
 threshold is **withheld**: the bubble offers a download instead of the text, and
@@ -525,10 +620,10 @@ both frontends print; the numbers are persisted, so the list is append-only
 
 | group | statuses | meaning |
 |---|---|---|
-| progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` | still in play; the delivery queue will try again |
-| finished | `DELIVERED` `CANCELLED` `RECEIVED` | proof received / user cancelled / inbound |
-| gave up | `DELIVERY_TIMEOUT` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` … | why it stopped: out of time, or a local error another attempt cannot fix |
-| held by another node | `ON_PROXY` `ON_PN` `PROXY_REFUSED` `PN_FAIL` `PN_REJECTED` | proxy-server / propagation-node states |
+| progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` `SENDING_TO_PROXY` | still in play; the delivery queue will try again |
+| finished | `DELIVERED` `OUR_PROXY_DELIVERED` `CANCELLED` `RECEIVED` | proof received (ours, or relayed by our proxy) / user cancelled / inbound |
+| gave up | `DELIVERY_TIMEOUT` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` `OUR_PROXY_GAVE_UP` … | why it stopped: out of time, a local error another attempt cannot fix, or our proxy's own verdict (which failure is on the record as `proxy_status`) |
+| held by another node | `ON_OUR_PROXY` `ON_PN` `PROXY_REFUSED` `PN_FAIL` `PN_REJECTED` | proxy-server / propagation-node states |
 
 The companion `tries` byte, not the status, is the definitive terminal marker:
 `tries == 255` means gave up, and below that the message is still live whatever
@@ -547,53 +642,116 @@ proof (or the proof-grade Resource transfer acknowledgement) produces
 Both frontends render this on outbound bubbles as the ALL-CAPS status name
 plus a glyph: grey `…` while in play, two green checks for `DELIVERED` (which
 needs no name), a grey ✕ for `CANCELLED`, a red ✕ once `tries` hits 255. A
-message held by another node — handed to a proxy server
-(`ON_PROXY`) or uploaded to a propagation node (`ON_PN`) — gets a single
+message held by another node — handed to our proxy
+(`ON_OUR_PROXY`) or uploaded to a propagation node (`ON_PN`) — gets a single
 open-circle tick: a machine that is not mine has it, no proof of arrival.
+`OUR_PROXY_DELIVERED` shows the same two checks as `DELIVERED`: they are one
+fact about the message and differ only in which machine holds the proof.
 
 ## Ping
 
 ```
-us ──probe packet (peer_dest | our_dest)──►  peer
-us ◄──────────── delivery proof ─────────── peer
+no link yet:  us ──LINKREQUEST──► peer ;  us ◄──LRPROOF── peer   (then dropped)
+link open:    us ──probe (peer_dest | our_dest) on the link──► peer
+              us ◄────────────── the link's own proof ───────── peer
 ```
 
 The contact detail page's **Ping** button (web and LCD, plus `lxmf ping <peer>`)
-measures a contact: round-trip time and hop count from the probe itself, and —
-when a radio has heard the peer — the path loss in both directions from the
-radio's own measurements (SUPE, published as `lora.<n>.meas.*`; see
-[iface-lora](../iface-lora)).
+measures a contact: the round trip, and — when a radio has heard the peer — the
+path loss in both directions from the radio's own measurements (SUPE, published
+as `lora.<n>.meas.*`; see [iface-lora](../iface-lora)).
 
-It is `rnprobe lxmf.delivery <hash>` sent from the identity's own destination,
-with our `lxmf.delivery` hash as the plaintext so the far end sees which contact
-is asking. The payload is that source hash and nothing else: it is not a valid
-LXM wire, and the peer's lxmf names it as a probe and drops it *after* its rnsd
-has already proved it, since proving happens on hand-off and before any parsing.
+**A ping is a link when there is no link.** The probe used to be a bare packet
+to the peer's delivery destination, answered by its delivery proof. That
+measures a round trip and nothing else — and the round trip is the half of the
+answer people look at least. What they read is the line under it: the path loss
+each way, which needs a power the far end *stated* and a report of what it heard
+from us. A packet stating no power and asking for nothing produces neither, so a
+contact that had never been messaged answered a press with zeros, and the same
+press after one message answered properly — the message having done the exchange
+the probe did not.
+
+Establishing a link *is* that exchange. The request goes out carrying this
+radio's power, the far end proves it by accepting and reports what it heard, µR
+measures the round trip itself and rnsd publishes it as
+`rnsd.links.<tag>.rtt_ms`. One question, and the whole answer comes back. The
+link is dropped again once it has: what was wanted was the measurement, not a
+session.
+
+Where a conversation link is already open the probe rides that instead, as the
+32-byte payload above, settling on the link's own delivery proof. That link has
+been paid for already, its establishment produced the readings, and tearing down
+a link somebody is talking over to measure it would be a strange way to answer a
+button. The payload is our own `lxmf.delivery` hash and nothing else: it is not
+a valid LXM wire, and the peer's lxmf names it as a probe and drops it *after*
+proving it, since proving happens on hand-off and before any parsing.
 
 Results are published per peer, RAM-only, overwritten by the next probe:
 
 ```
 lxmf.ping.<peer>.state       probing | path | ok | no-proof | no-route |
-                             timeout | cancelled | failed | offline
+                             timeout | cancelled | failed
 lxmf.ping.<peer>.ts          unix seconds of the last state change
 lxmf.ping.<peer>.rtt_ms      round trip; present on `ok`
-lxmf.ping.<peer>.hops
-lxmf.ping.<peer>.loss_to     path loss us→them, dB — the peer's report of how our frame landed
-lxmf.ping.<peer>.loss_from   path loss them→us, dB — a frame heard here against the power the peer stated
+lxmf.ping.<peer>.hops        0 — a link measures the round trip, not the path;
+                             `rnpath <hash>` is what says how many hops it took
 ```
 
-Only `state` is always present. A direction the radio has not measured — a
-peer that does not speak SUPE states no power, so no level of it is a loss —
-is an absent key, and every surface prints "not measured" for it rather than
-a zero. In the CLI the reading follows the command's own outcome and wait:
+That is the whole record: **the probe's own findings, and nothing else.** What
+the radio measured is read live from `lora.<n>.meas.*` and never copied here.
+iface-lora republishes those on its own 15 s beat, so a copy taken when a probe
+settled was stale as soon as the radio next heard the peer — and on a *first*
+probe it was empty, because the link had come up seconds earlier and had not
+been published yet. That is what made a first ping answer with nothing and the
+second one answer properly.
+
+The reading is shown under **every** outcome, not just a good one: it measures
+the link rather than the probe, and it is worth most where the probe came back
+empty, since nothing answering while the peer is heard at −95 dBm is a different
+fault from nothing answering from a peer never heard at all. A direction the
+radio has not measured gets no line — a peer that does not speak SUPE states no
+power, so no level of it is a loss, and what it gets instead is what this radio
+knows on its own. Every surface renders it through one function
+(`lxmfPingLink`, and its browser mirror `peerMeasOf` + `pingLinkLines`), so the
+contact page, the screen and the console cannot drift into describing the same
+measurement three different ways:
 
 ```
-ok after 1204 ms | rtt=1102 ms hops=1 | path loss us->them 97 dB  them->us 95 dB
+ok after 1204 ms | rtt=1102 ms hops=1
+us->them 97 dB path loss, SNR 7 dB @ tx +10 dBm (10 mW)
+them->us 95 dB path loss, SNR 9 dB @ tx +22 dBm (158 mW)
 ```
+
+A path loss is a level measured against the power the **far end** transmitted
+at, and only a SUPE peer states that power. So a peer outside the protocol has
+no loss in either direction, and the line is what this radio knows on its own —
+the level it read and the power it sent at:
+
+```
+heard @ -95 dBm / SNR 9.5 dB @ tx +22 dBm (158 mW)
+```
+
+No ages on any of it: these are the readings, and the probe that printed them
+just ran.
 
 One ping per identity is in flight at a time; pressing again supersedes rather
-than queues, and a probe that draws no result at all ends as `timeout` after
-20 s so the display never sticks on `probing`.
+than queues, and a probe that draws no result at all ends as `timeout` so the
+display never sticks on `probing`.
+
+**The probe's deadline is derived from what it waits on.** A probe with no link
+to ride first needs a path, and that search runs on rnsd's budget — so the
+deadline is `s.rnsd.link.path_timeout_s` (default 30) plus 10 s for the
+handshake that follows, and the two cannot disagree. A deadline shorter than the
+path search would declare a probe dead while rnsd is still legitimately looking,
+which shows up as a first ping that answers with nothing and a second one, path
+now cached, that measures fine.
+
+**The button is never disabled and a press always answers.** The probe is a
+link, dialled with the identity, so it owes nothing to this device's rnsd
+registration — an account that is proxied, or one whose registration has not
+come up yet, probes like any other. A press retries the registration on the way
+past anyway, since a ping during rnsd's startup window is a good moment to bring
+the mailbox up.
 
 The buttons fire and forget — the keys above are what they render. `lxmf ping`
 instead holds the prompt until `state` finishes, then prints the outcome with
@@ -605,9 +763,11 @@ duration, and ends the wait when the session closes. Cancelling ends the
 `lxmf.ping.<peer>`. Without an interactive session (cron, `spangap cli`) there
 is nothing to read, and a plain delay paces the loop instead.
 
-The 20 s timeout must stay inside rnsd's proof window (`s.rnsd.proof_timeout_s`):
-a probe that gives up before the transport does reports `no-proof` for a proof
-still in flight.
+The probe's deadline must stay inside rnsd's proof window
+(`s.rnsd.proof_timeout_s`): a probe that gives up before the transport does
+reports `no-proof` for a proof still in flight. Raising
+`s.rnsd.link.path_timeout_s` raises the probe's deadline with it, so the two
+have to be read together.
 
 ## Announces
 
@@ -700,10 +860,14 @@ default_method   link-always | link-if-one-exists | link-if-big | opportunistic-
 proxy_role       off (default) | server | client — which device registers and
                  announces this account (see Being proxied)
 proxy_dest       32-hex lxmproxy.server destination, while proxied
-contacts.<peer>.{hash,nick,display_name,trust,last_seen,caps,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
-msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,method,ts,recv_ts,
-                   read,message_id,body_absent,body_size,handed}
+contacts.<peer>.{hash,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
+msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,reply_quote,method,ts,recv_ts,
+                   read,message_id,body_absent,body_size,handed,told,offered,
+                   via_link,proxy_status}
                                  per-conversation message records
+                                 (handed/told are the proxy SERVER's;
+                                  proxy_status is the CLIENT's record of
+                                  which failure its proxy stopped on)
 ```
 
 ### Runtime (`lxmf.*`, RAM)
@@ -725,7 +889,7 @@ lxmf.id.<n>.proxy_quota          what the server reports it is holding for us
 lxmf.id.<n>.accept               0 gates this destination's inbound in rnsd —
                                  dropped WITHOUT a proof, so the sender retries.
                                  Set by whatever ran out of room; a boot accepts.
-lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,caps,name}
+lxmf.announces.<dest_hex>.{last,cost,hops,ratchet,name}
                                  heard-peer list (RAM, browser-mirrored)
 lxmf.proxies.<dest_hex>.{label,last}   heard lxmproxy.server list
 lxmf.proxies_text                the same, as one finished line each
@@ -769,7 +933,7 @@ lxmf unfinished              outbound from this identity that has not finished,
                             one queueResume uses — `statusInProgress()` and
                             `tries != 255` — so the listing is exactly what the
                             queue will attempt again, never a second opinion
-                            about it. ON_PROXY and ON_PN are absent by that
+                            about it. ON_OUR_PROXY and ON_PN are absent by that
                             definition: another node holds those and ours will
                             not retry them.
 lxmf cancel <n>|all         end those as CANCELLED, through the same
@@ -790,7 +954,7 @@ lxmf send <peer> <msg>      send; <peer> = 32-hex, a number from the last number
                             listing, or a name/nick substring
 lxmf a[nnounce]             announce the selected identity now
 lxmf p[ing] <peer>          probe <peer> (same forms as `send`); holds the prompt
-                            until the probe finishes, its 20 s timeout expires, or
+                            until the probe finishes, its deadline expires, or
                             Ctrl-C, then prints the outcome, the wait, and both
                             ends' signal
 lxmf proxy [<cmd>]          no arg = this identity's proxy state; `servers` =
@@ -845,6 +1009,14 @@ switcher on either.
   work in progress, and a tapped `lxmf@` link (`lcdShowProgram`) means a
   specific conversation under the identity already chosen. One app, one
   identity at a time.
+
+**A conversation reopens where you left it.** Switching away and coming back
+lands on the message that was at the top of the screen — on the LCD, on the
+history page it was on — rather than at the newest, for as long as the session
+lasts. A browser reload, an app close or a reboot forgets it, deliberately:
+where somebody had a thread scrolled to is not worth a write, and every
+conversation starting at its newest message is the right answer to a fresh
+start. One left AT its newest opens on whatever arrived meanwhile.
 
 Both frontends share the contact-info pattern: clicking anywhere on a
 conversation's header (or, on the LCD, a contact row's circled-i — the info

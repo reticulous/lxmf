@@ -41,17 +41,31 @@
       <template v-for="b in buckets" :key="b.day">
         <div class="daysep"><span>{{ b.day }}</span></div>
         <MessageBubble
-          v-for="m in b.messages" :key="m.key" :m="m"
+          v-for="m in b.messages" :key="m.key" :m="m" :proxied="proxied"
+          :quote="quoteFor(m)"
           @resend="m2 => emit('resend', m2)"
           @menu="m2 => emit('msg-menu', m2)"
           @delete="m2 => emit('msg-delete', m2)"
           @open="m2 => emit('msg-open', m2)"
           @fetch="m2 => emit('msg-fetch', m2)"
+          @reply="(m2, frag) => emit('msg-reply', m2, frag)"
+          @quote-open="jumpTo"
         />
       </template>
     </div>
   </div>
 </template>
+
+<script lang="ts">
+/* Where each conversation was left, keyed "<identity>/<peer>": the scroll offset
+ * to come back to, or null for "was at the newest" — which follows whatever
+ * arrived while away instead of freezing at an offset that is no longer the
+ * bottom. Module scope, not component state, because the compact layout unmounts
+ * this pane on Back and reopening is precisely when it has to hold. Not
+ * persisted and deliberately so: a reload or a reboot starts every conversation
+ * at its newest message. */
+const leftAt = new Map<string, number | null>()
+</script>
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
@@ -59,15 +73,21 @@ import { matArrowBack, matInfo, matLink, matLinkOff } from '@quasar/extras/mater
 import PeerAvatar from './PeerAvatar.vue'
 import MessageBubble from './MessageBubble.vue'
 import ContactSignal from './ContactSignal.vue'
-import type { Message, Reachability } from '../../modules/lxmf'
+import { quoteView, type Message, type Reachability } from '../../modules/lxmf'
 
 const props = defineProps<{
+  /* Identity slot this pane views. Only to scope the per-conversation scroll
+   * memory: the same peer under two identities is two conversations. */
+  identity: number
   peer: string
   name: string
   buckets: { day: string; messages: Message[] }[]
   reach: Reachability | null
   /* Conversation-link state to this peer: '' (down), 'establishing', 'active'. */
   linkState?: '' | 'establishing' | 'active'
+  /* This identity's mail belongs to a proxy server, which is what makes "this
+   * one went direct" worth marking on a bubble at all. */
+  proxied?: boolean
   /* Reveal the Back button (single-column / compact layouts). Hidden by
    * default — desktop master/detail keeps the rail permanently visible. */
   showBack?: boolean
@@ -77,6 +97,8 @@ const emit = defineEmits<{
   'msg-menu': [m: Message]
   'msg-delete': [m: Message]
   'msg-open': [m: Message]
+  /* Reply to this message, quoting `fragment` when the user selected one. */
+  'msg-reply': [m: Message, fragment: string]
   /* Ask the proxy server for a body it withheld. */
   'msg-fetch': [m: Message]
   'open-contact': [peer: string]
@@ -98,7 +120,31 @@ const reachLine = computed(() => {
   return `heard ${age}${hops}`
 })
 
+/* message_id → the message it names, over this conversation. What a reply's
+ * quote block is resolved against: the reply carries an id, and the line it
+ * shows comes from our own copy of the message that id names. */
+const byId = computed(() => {
+  const m = new Map<string, Message>()
+  for (const b of props.buckets)
+    for (const msg of b.messages) if (msg.messageId) m.set(msg.messageId, msg)
+  return m
+})
+const quoteFor = (m: Message) => quoteView(m, byId.value, () => props.name)
+
 const scroller = ref<HTMLElement | null>(null)
+
+/* Follow a quote back to the message it came from: scroll it into view and
+ * mark it briefly, so the eye finds it without the pane having to explain
+ * itself. A message the conversation no longer holds simply does not move. */
+function jumpTo(key: string) {
+  const el = scroller.value?.querySelector<HTMLElement>(`#msg-${CSS.escape(key)}`)
+  if (!el) return
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  el.classList.remove('flash')
+  void el.offsetWidth              /* restart the animation on a repeat tap */
+  el.classList.add('flash')
+  setTimeout(() => el.classList.remove('flash'), 1600)
+}
 
 function toBottom() {
   nextTick(() => {
@@ -106,6 +152,11 @@ function toBottom() {
     if (el) el.scrollTop = el.scrollHeight
   })
 }
+/* Starting a reply is the start of writing one, so the pane it will be written
+ * in comes back to the newest message — the composition layer asks for this
+ * when a reply begins. */
+defineExpose({ toBottom })
+
 /* Within 48px of the bottom counts as "looking at the newest". */
 function atBottom(): boolean {
   const el = scroller.value
@@ -119,9 +170,29 @@ function maybeRead() {
   if (props.peer && reading()) emit('read', props.peer)
 }
 
-/* Opening / switching a conversation always jumps to the bottom (newest), then
- * marks read if we're actually looking at it. */
-watch(() => props.peer, () => { toBottom(); nextTick(maybeRead) }, { immediate: true })
+/* Remember where this conversation is being read, so coming back to it lands
+ * there rather than at the newest. `null` records "at the newest" — the offset
+ * itself would be stale the moment anything arrives. */
+function remember(peer: string) {
+  const el = scroller.value
+  if (el && peer) leftAt.set(`${props.identity}/${peer}`, atBottom() ? null : el.scrollTop)
+}
+
+/* Switching conversations: hold the one being left where the reader had it, and
+ * put the one being opened back where they left it — at the newest if they were
+ * at the newest, or have never opened it. A conversation whose messages are
+ * still arriving has nothing to come back to yet, so the clamp lands it at the
+ * newest and the buckets watcher below keeps it there. */
+watch(() => props.peer, (peer, prev) => {
+  if (prev) remember(prev)
+  const y = peer ? leftAt.get(`${props.identity}/${peer}`) : null
+  if (y == null) toBottom()
+  else nextTick(() => {
+    const el = scroller.value
+    if (el) el.scrollTop = Math.min(y, el.scrollHeight - el.clientHeight)
+  })
+  nextTick(maybeRead)
+}, { immediate: true })
 
 /* A new/changed message follows to the bottom ONLY if we were already there —
  * never yank a reader who scrolled up into history (the watcher runs pre-DOM
@@ -154,13 +225,16 @@ function updateSticky() {
   stickyTimer = setTimeout(() => { stickyShow.value = false }, 2000)
 }
 
-function onScroll() { maybeRead(); updateSticky() }   /* + floating date */
+function onScroll() { remember(props.peer); maybeRead(); updateSticky() }
 
 onMounted(() => {
   document.addEventListener('visibilitychange', maybeRead)
   window.addEventListener('focus', maybeRead)
 })
 onBeforeUnmount(() => {
+  /* Compact layouts unmount this pane on Back — that is a conversation being
+   * left like any other, so record it on the way out. */
+  remember(props.peer)
   if (stickyTimer) clearTimeout(stickyTimer)
   document.removeEventListener('visibilitychange', maybeRead)
   window.removeEventListener('focus', maybeRead)

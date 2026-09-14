@@ -74,16 +74,20 @@
             </div>
             <template v-else>
               <ConversationThread
+                ref="thread"
+                :identity="identity"
                 :peer="lxmf.activePeer.value"
                 :name="lxmf.displayName(lxmf.activePeer.value)"
                 :buckets="lxmf.activeConversation.value"
                 :reach="lxmf.reachability(lxmf.activePeer.value)"
                 :link-state="lxmf.linkState(lxmf.activePeer.value)"
+                :proxied="lxmf.proxied.value"
                 :show-back="compact"
                 @resend="m => lxmf.resend(m.peer, m.key)"
                 @msg-menu="m => (menuMsg = m)"
                 @msg-delete="askDeleteMsg"
                 @msg-open="m => (detailMsg = m)"
+                @msg-reply="startReply"
                 @msg-fetch="m => lxmf.fetchBody(m.peer, m.key)"
                 @open-contact="showContact = true"
                 @toggle-link="p => lxmf.toggleLink(p)"
@@ -92,8 +96,10 @@
               />
               <Composer
                 :model-value="draft"
+                :quote="composerQuote"
                 @update:model-value="setDraft"
                 @send="onSend"
+                @cancel-quote="replyTo = null"
               />
             </template>
           </div>
@@ -120,6 +126,8 @@
           :peer-name="lxmf.displayName(detailMsg.peer)"
           :pn-nodes="lxmf.pnNodes.value"
           :contact-pn="lxmf.contactOf(detailMsg.peer)?.pn ?? ''"
+          :proxied="lxmf.proxied.value"
+          :link-up="lxmf.linkState(detailMsg.peer) === 'active'"
           @close="detailMsg = null"
           @resend="onResendVia"
         />
@@ -155,7 +163,7 @@ import ConversationThread from '../components/lxmf/ConversationThread.vue'
 import Composer from '../components/lxmf/Composer.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import MessageDetail from '../components/lxmf/MessageDetail.vue'
-import { useLxmf, type Message, LxmfStatus } from '../modules/lxmf'
+import { useLxmf, quoteLine, type Message, LxmfStatus, RESEND_RETRY } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
 import { useCompact } from 'spangap-browser/lib/viewport'
 
@@ -195,21 +203,59 @@ function startResize(e: MouseEvent) {
 const showContact = ref(false)
 const menuMsg = ref<Message | null>(null)
 const detailMsg = ref<Message | null>(null)
+const thread = ref<InstanceType<typeof ConversationThread> | null>(null)
 
 const draft = computed(() => lxmf.draftFor(lxmf.activePeer.value))
 function setDraft(v: string) { lxmf.setDraft(lxmf.activePeer.value, v) }
 
+/* The message the next send replies to, and the fragment of it the user
+ * selected ('' = the message as a whole). Lives here, beside the composer it
+ * belongs to, and only until that send: a reply is a thing you are in the
+ * middle of, not a property of the conversation. */
+const replyTo = ref<{ m: Message; fragment: string } | null>(null)
+
+const composerQuote = computed(() => {
+  const r = replyTo.value
+  if (!r) return null
+  return {
+    label: r.m.dir === 'out' ? 'You' : lxmf.displayName(r.m.peer),
+    text: quoteLine(r.fragment || r.m.content),
+  }
+})
+
+function startReply(m: Message, fragment: string) {
+  if (!m.messageId) return
+  /* Only quote a fragment that is still found in the message itself: that is
+   * what the far end will look for before it draws the quote, and a selection
+   * that spans a bubble's separate text runs need not be one. */
+  const frag = fragment && m.content.includes(fragment) ? fragment : ''
+  replyTo.value = { m, fragment: frag }
+  /* Answering a message is the start of writing one: the conversation comes
+   * back to its newest message, where the composer and its quote strip are.
+   * The composer takes the cursor itself, off the same quote. */
+  thread.value?.toBottom()
+}
+
 function openPeer(peer: string) {
   lxmf.openPeer(peer)
   showContact.value = false
+  replyTo.value = null
   lxmf.markConversationRead(peer)
 }
 
 async function onSend(content: string) {
   const peer = lxmf.activePeer.value
   if (!peer) return
+  const r = replyTo.value
+  replyTo.value = null
   try {
-    await lxmf.send(peer, content)
+    await lxmf.send(peer, content, r ? {
+      replyTo: r.m.messageId,
+      /* Only a fragment the user picked out travels; a reply to the whole
+       * message needs no quote on the wire, because the other end has that
+       * message and draws the line from its own copy. */
+      replyQuote: r.fragment,
+    } : undefined)
   } catch (e) {
     // Down identity / unprocessed sentinel: don't leave an unhandled
     // rejection. The guard above normally prevents reaching here.
@@ -247,6 +293,9 @@ function checkPropagation() {
 onBeforeUnmount(closePnToast)
 
 function onResendVia(m: Message, via: string) {
+  /* The proxy retry keeps the panel open: its whole answer is the notice the
+   * panel shows, and closing it would take that away as it appeared. */
+  if (via === RESEND_RETRY) { lxmf.retryNow(m.peer, m.key); return }
   detailMsg.value = null
   lxmf.resendVia(m.peer, m.key, via)
 }

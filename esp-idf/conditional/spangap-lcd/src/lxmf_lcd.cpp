@@ -178,6 +178,11 @@ lv_obj_t* mkLabel(lv_obj_t* parent, const std::string& txt, lv_color_t color) {
 struct Msg {
     std::string peer, key, content;
     std::string message_id;   /* SHA-256 hex64 */
+    std::string reply_to;     /* message_id this one replies to, empty = not a reply */
+    /* The fragment of that message the sender picked out (FIELD_REPLY_QUOTE).
+     * Empty on a reply to the message as a whole, where the quote line is taken
+     * from our own copy of it. Drawn only where it really occurs there. */
+    std::string reply_quote;
     uint8_t status = 0;    /* LxmfStatus code */
     uint8_t tries  = 0;    /* try count; 255 = gave up (terminal) */
     long ts = 0;           /* sender's clock (display) */
@@ -310,6 +315,18 @@ lv_timer_t* g_threadLoadTimer = nullptr;   /* defers the heavy load/render so th
 bool      g_needMsgLoad = false;           /* the pending render must refreshMsgs() first (a fresh open) */
 int       g_scrollAfter = 0;               /* 0 = to bottom, 1 = keep g_anchorMid in view */
 std::string g_anchorMid;                   /* bubble to hold steady across a paging rebuild */
+/* Where each conversation was left: the record key of the message at the top of
+ * the viewport, absent for "at the newest". Reopening a conversation lands there
+ * instead of at its newest message.
+ *
+ * A key, not a scroll offset: the thread is rebuilt from the store on every open
+ * and anything that arrived meanwhile moves every offset, while the message the
+ * reader had at the top is still that message. Keyed by peer alone — an identity
+ * switch clears it, and a fresh app layer starts empty, so it never outlives the
+ * session or reaches storage. */
+std::unordered_map<std::string, std::string> g_leftAt;
+std::vector<BubbleRef> g_histRefs;         /* the overlay's rendered bubbles, in render order */
+std::string g_histAnchor;                  /* record key the next overlay render lands on ("" = its bottom) */
 /* Inline day separators (recv_ts-anchored) + the floating sticky date that shows
  * the current day while scrolling and fades after a pause. */
 std::vector<std::pair<lv_obj_t*, long>> g_dateSeps;   /* separator widget + its recv_ts */
@@ -336,6 +353,15 @@ lv_obj_t* s_sendIcon = nullptr;         /* the Send button's paper-plane image (
 lv_obj_t* s_composePill  = nullptr;     /* expand pill (↑), left of the entry — shown collapsed */
 lv_obj_t* s_collapsePill = nullptr;     /* collapse pill (↓), right by Send — shown expanded */
 bool      g_composeExpanded  = false;   /* fixed 8-line composer (vs the 1–4 line quick field) */
+/* The reply the composer is holding: the record key of the message being
+ * answered, its message_id (which is what goes on the wire), and the fragment of
+ * it the user selected ("" = the message as a whole, quoted from each end's own
+ * copy). Cleared by the send it rides on, by the strip's (x), and by leaving the
+ * conversation. */
+std::string g_replyKey, g_replyMid, g_replyQuote;
+lv_obj_t* s_replyBar = nullptr;         /* that reply's quote strip, above the entry */
+lv_obj_t* s_replyWho = nullptr;         /* "Replying to <name>" */
+lv_obj_t* s_replyLbl = nullptr;         /* the quoted line */
 
 void refreshMsgs();
 void refreshAnnounces();
@@ -347,6 +373,8 @@ void threadSnapNewest();
 void applyComposeMode();
 void scrollThreadBottom(bool anim);
 void openHistory();
+void openHistoryAt(size_t ix, const std::string& mid);
+void rememberThreadPos();
 void closeHistory();
 void renderHistory();
 void updateHistButtons(size_t total);
@@ -375,6 +403,11 @@ void showInfo(const std::string& peer);
 void closeInfo();
 void updateThreadDownVis();
 void updateThreadLink();
+lv_obj_t* confirmButton(lv_obj_t* parent, const char* text, lv_color_t bg);
+void applyReplyBar();
+void cancelReply();
+void dismissMsgActions();
+void clearSelection();
 
 /* ---- deferred focus ----
  * The launcher tile (or a tapped row) is focused into the input group on
@@ -503,6 +536,7 @@ std::string idLabel(int n) {
 }
 
 void selectId(int n) {
+    if (n != g_id) g_leftAt.clear();   /* another identity's conversations, keyed by the same peers */
     g_id = n;
     g_msgsPrefix = (n >= 0) ? ("s.lxmf.id." + std::to_string(n) + ".msgs") : "";
     refreshMsgs();
@@ -551,6 +585,8 @@ void msgCb(const char* key, const char* val) {
     else if (!strcmp(field, "status"))  m->status = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "tries"))   m->tries  = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "message_id")) m->message_id = val ? val : "";
+    else if (!strcmp(field, "reply_to"))    m->reply_to    = val ? val : "";
+    else if (!strcmp(field, "reply_quote")) m->reply_quote = val ? val : "";
     else if (!strcmp(field, "body_absent")) m->body_absent = val && atoi(val) != 0;
     else if (!strcmp(field, "body_size"))   m->body_size   = val ? atol(val) : 0;
 }
@@ -600,7 +636,11 @@ void refreshAnnounces() {
 
 /* ---- compose / send ---- */
 
-void sendMessage(const std::string& peer, const std::string& text) {
+/* `reply_to` is the message_id this message answers ("" = not a reply) and
+ * `quote` the fragment of that message the user selected ("" = the message as a
+ * whole, where each end draws the quote line from its own copy). */
+void sendMessage(const std::string& peer, const std::string& text,
+                 const std::string& reply_to = "", const std::string& quote = "") {
     if (g_id < 0 || !idReady(g_id) || peer.empty() || text.empty()) return;
     static unsigned seq = 0;
     char key[40];
@@ -621,7 +661,10 @@ void sendMessage(const std::string& peer, const std::string& text) {
     setf("peer", peer.c_str());
     setf("title", "");
     setf("content", text.c_str());
-    setf("thread", "");
+    if (!reply_to.empty()) {
+        setf("reply_to", reply_to.c_str());
+        if (!quote.empty()) setf("reply_quote", quote.c_str());
+    }
     /* Optimistic status: QUEUED (not draft) so the bubble appears the instant we
        send (renders as the "..." in-flight chip). The lxmf task drives it on. */
     snprintf(k, sizeof k, "%s.status", base);
@@ -644,6 +687,7 @@ void sendMessage(const std::string& peer, const std::string& text) {
     Msg m;
     m.peer = peer; m.key = key; m.content = text; m.status = LXMF_ST_QUEUED;
     m.ts = ts; m.in = false;
+    m.reply_to = reply_to; m.reply_quote = quote;
     g_msgs.push_back(std::move(m));
 }
 
@@ -674,7 +718,10 @@ void onSend(lv_event_t*) {
     if (g_id < 0 || !idReady(g_id)) return;   /* slot can't take it yet — sending is held */
     const char* t = lcdInputBoxText(s_compose);   /* trailing whitespace stripped */
     if (t && *t) {
-        sendMessage(g_curPeer, t);
+        /* The reply the strip above the entry has been holding goes with this
+         * message and no further. */
+        sendMessage(g_curPeer, t, g_replyMid, g_replyQuote);
+        cancelReply();
         lv_textarea_set_text(s_compose, "");
         storageUnset(draftKey(g_id, g_curPeer).c_str());   /* draft consumed by the send */
         rebuildThread();     /* draw the optimistic bubble now, not on the storage round-trip */
@@ -744,6 +791,8 @@ std::string linkStateOf(const std::string& peer) {
  * the send plane fills its 2-line button. */
 int linkIconPx() { return lcdPx(18); }
 int sendIconPx() { return lcdPx(22); }
+/* reply / details / delete, in the popup a long press puts over a bubble. */
+int actionIconPx() { return lcdPx(20); }
 
 /* Point an lv_image at a runtime-rasterized icon, tinted to `col` (the rasters
  * are monochrome, so image-recolor at COVER paints the glyph shape any colour).
@@ -821,11 +870,19 @@ bool applyThreadIcons() {
     lcdIconRequest("link-off", linkIconPx());
     lcdIconRequest("tick-sent", tickIconPx());
     lcdIconRequest("tick-delivered", tickIconPx());
+    /* The long-press actions are built on the press and never re-sourced, so
+     * their three icons are warmed here with the rest of the screen's. */
+    lcdIconRequest("reply", actionIconPx());
+    lcdIconRequest("info", actionIconPx());
+    lcdIconRequest("trash", actionIconPx());
     return lcdIconReady("send", sendIconPx())
         && lcdIconReady("link", linkIconPx())
         && lcdIconReady("link-off", linkIconPx())
         && lcdIconReady("tick-sent", tickIconPx())
-        && lcdIconReady("tick-delivered", tickIconPx());
+        && lcdIconReady("tick-delivered", tickIconPx())
+        && lcdIconReady("reply", actionIconPx())
+        && lcdIconReady("info", actionIconPx())
+        && lcdIconReady("trash", actionIconPx());
 }
 
 /* Icons rasterize off-task, so they may not be ready the instant a thread opens.
@@ -894,6 +951,7 @@ void threadSnapNewest() {
 
 void showContacts() {
     closeInfo();                            /* a leftover info page would sit on top */
+    rememberThreadPos();                    /* before the overlay goes — it may be what's on screen */
     closeHistory();                         /* don't leave the overlay up for the next open */
     lcdProgramFullscreen(false);            /* status bar back for the list screen */
     if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
@@ -935,6 +993,7 @@ void showLoading(bool on) {
 void updatePageButtons(size_t total) {
     if (s_comp) { if (g_atNewest) lv_obj_remove_flag(s_comp, LV_OBJ_FLAG_HIDDEN);
                   else            lv_obj_add_flag(s_comp, LV_OBJ_FLAG_HIDDEN); }
+    applyReplyBar();   /* rides with the composer: a history page has neither */
     if (s_earlierBtn) { if (g_winLo > 0) lv_obj_remove_flag(s_earlierBtn, LV_OBJ_FLAG_HIDDEN);
                         else              lv_obj_add_flag(s_earlierBtn, LV_OBJ_FLAG_HIDDEN); }
     if (s_newerBtn && s_newerLbl) {
@@ -947,36 +1006,87 @@ void updatePageButtons(size_t total) {
     }
 }
 
+/* The row widget of a rendered bubble, by record key. Null if that message isn't
+ * in the rendered window (a different page, deleted, evicted). */
+lv_obj_t* bubbleRow(const std::vector<BubbleRef>& refs, const std::string& key) {
+    if (key.empty()) return nullptr;
+    for (auto& r : refs) {
+        if (r.mid != key || !r.meta || !lv_obj_is_valid(r.meta)) continue;
+        return lv_obj_get_parent(lv_obj_get_parent(r.meta));   /* meta → bubble → row */
+    }
+    return nullptr;
+}
+
 /* Hold g_anchorMid at the top of the viewport across a paging rebuild (so
  * "load earlier" doesn't jump you). Falls back to the bottom if it's gone. */
 void scrollToAnchor() {
     if (!s_msgList) return;
-    for (auto& r : g_bubbles) {
-        if (r.mid != g_anchorMid || !r.meta) continue;
-        lv_obj_update_layout(s_msgList);
-        lv_obj_t* row = lv_obj_get_parent(lv_obj_get_parent(r.meta));   /* meta → bubble → row */
-        if (row) { lv_obj_scroll_to_y(s_msgList, lv_obj_get_y(s_bubbles) + lv_obj_get_y(row), LV_ANIM_OFF);
-                   updateThreadDownVis(); return; }
+    lv_obj_update_layout(s_msgList);
+    lv_obj_t* row = bubbleRow(g_bubbles, g_anchorMid);
+    if (!row) { scrollThreadBottom(false); return; }
+    lv_obj_scroll_to_y(s_msgList, lv_obj_get_y(s_bubbles) + lv_obj_get_y(row), LV_ANIM_OFF);
+    updateThreadDownVis();
+}
+
+/* Record where the open conversation is being read, so reopening it lands there:
+ * the message at the top of the viewport — of the history overlay when that is
+ * what's on screen, since that is what the reader is looking at.
+ *
+ * At the newest with nothing below, nothing is recorded: the conversation should
+ * then open on whatever has arrived since, which is what "no entry" means. */
+void rememberThreadPos() {
+    if (g_curPeer.empty()) return;
+    bool hist = s_histWrap && !lv_obj_has_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t* list = hist ? s_histList : s_msgList;
+    lv_obj_t* bubs = hist ? s_histBubbles : s_bubbles;
+    const std::vector<BubbleRef>& refs = hist ? g_histRefs : g_bubbles;
+    if (!list || !bubs) return;
+    if (!hist && g_atNewest && lv_obj_get_scroll_bottom(list) <= 2) {
+        g_leftAt.erase(g_curPeer);
+        return;
     }
-    scrollThreadBottom(false);
+    int32_t top = lv_obj_get_scroll_y(list), bubOff = lv_obj_get_y(bubs);
+    std::string mid;
+    for (auto& r : refs) {
+        if (!r.meta || !lv_obj_is_valid(r.meta)) continue;
+        lv_obj_t* row = lv_obj_get_parent(lv_obj_get_parent(r.meta));
+        if (!row) continue;
+        if (bubOff + lv_obj_get_y(row) > top + 1) break;   /* render order: first row below the top */
+        mid = r.mid;
+    }
+    if (mid.empty() && !refs.empty()) mid = refs.front().mid;   /* scrolled above the first bubble */
+    if (mid.empty()) g_leftAt.erase(g_curPeer);
+    else             g_leftAt[g_curPeer] = mid;
 }
 
 void threadRenderCb(lv_timer_t*) {
     g_threadLoadTimer = nullptr;
     if (g_curPeer.empty()) return;
+    size_t anchorIx = SIZE_MAX;        /* where the remembered message sits in the conversation */
     if (g_needMsgLoad) {
         refreshMsgs();                 /* the heavy per-conversation record load */
         markRead(g_curPeer);
         g_needMsgLoad = false;
-        size_t total = 0; for (auto& m : g_msgs) if (m.peer == g_curPeer) total++;
+        size_t total = 0;
+        for (auto& m : g_msgs) {
+            if (m.peer != g_curPeer) continue;
+            if (!g_anchorMid.empty() && m.key == g_anchorMid) anchorIx = total;
+            total++;
+        }
         g_atNewest = true;
         g_winHi = total;
         g_winLo = total > PAGE_SIZE ? total - PAGE_SIZE : 0;   /* newest page */
     }
     showLoading(false);
     rebuildThread();                   /* renders the window + sets the page buttons */
-    if (g_scrollAfter == 1) scrollToAnchor();
-    else                    scrollThreadBottom(false);
+    /* Land where the conversation was left. Within the newest page the paging
+     * anchor does it; older than that means it was being read in the history
+     * overlay, so bring the overlay back up on the page holding it. A message
+     * that is no longer there (deleted, evicted) leaves anchorIx unset and falls
+     * through to the newest, as does a conversation left at the newest. */
+    if (g_scrollAfter != 1)              scrollThreadBottom(false);
+    else if (anchorIx != SIZE_MAX && anchorIx < g_winLo) openHistoryAt(anchorIx, g_anchorMid);
+    else                                 scrollToAnchor();
     g_anchorMid.clear();
 }
 
@@ -1126,8 +1236,11 @@ void buildThreadShell() {
     lv_obj_set_style_pad_hor(s_msgList, 4, 0);
     lv_obj_set_style_pad_ver(s_msgList, 1, 0);
     lv_obj_set_style_pad_row(s_msgList, 1, 0);
-    lv_obj_add_event_cb(s_msgList, [](lv_event_t*) { updateThreadDownVis(); updateStickyDate(); },
-                        LV_EVENT_SCROLL, nullptr);
+    /* A scroll takes the message actions away with it: they are anchored to a
+     * bubble, and scrolling is how you leave that bubble. */
+    lv_obj_add_event_cb(s_msgList, [](lv_event_t*) {
+        updateThreadDownVis(); updateStickyDate(); dismissMsgActions();
+    }, LV_EVENT_SCROLL, nullptr);
 
     /* Floating sticky date pill, pinned just under the header (a child of the
      * thread, not the scroll list, so it stays put while messages scroll). Shown
@@ -1196,6 +1309,51 @@ void buildThreadShell() {
     lv_obj_add_flag(s_loading, LV_OBJ_FLAG_FLOATING);
     lv_obj_center(s_loading);
     lv_obj_add_flag(s_loading, LV_OBJ_FLAG_HIDDEN);
+
+    /* Reply strip — directly above the entry, in the same scroll stream, so what
+     * the next message answers sits where that message itself will end up.
+     * Hidden until there is a reply to show (applyReplyBar). */
+    s_replyBar = lv_obj_create(s_msgList);
+    lv_obj_remove_style_all(s_replyBar);
+    lv_obj_set_width(s_replyBar, lv_pct(100));
+    lv_obj_set_height(s_replyBar, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_replyBar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_replyBar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_color(s_replyBar, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_replyBar, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_replyBar, 4, 0);
+    lv_obj_set_style_border_color(s_replyBar, lv_color_hex(0x78aa8c), 0);
+    lv_obj_set_style_border_width(s_replyBar, lcdPx(2), 0);
+    lv_obj_set_style_border_side(s_replyBar, LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_pad_all(s_replyBar, lcdPx(3), 0);
+    lv_obj_set_style_margin_hor(s_replyBar, 4, 0);
+    lv_obj_set_style_pad_column(s_replyBar, 4, 0);
+    lv_obj_remove_flag(s_replyBar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_replyBar, LV_OBJ_FLAG_HIDDEN);
+    {
+        lv_obj_t* col = lv_obj_create(s_replyBar);
+        lv_obj_remove_style_all(col);
+        lv_obj_set_flex_grow(col, 1);
+        lv_obj_set_height(col, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+        s_replyWho = lv_label_create(col);
+        lv_obj_set_style_text_font(s_replyWho, kFontSmall, 0);
+        lv_obj_set_style_text_color(s_replyWho, lv_color_hex(0x9fc3ae), 0);
+        lv_label_set_text(s_replyWho, "");
+        s_replyLbl = lv_label_create(col);
+        lv_obj_set_style_text_font(s_replyLbl, kFontSmall, 0);
+        lv_obj_set_style_text_color(s_replyLbl, lv_color_hex(0xbdbdbd), 0);
+        lv_label_set_long_mode(s_replyLbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(s_replyLbl, lv_pct(100));
+        lv_label_set_text(s_replyLbl, "");
+        /* (x) — abandons the reply and keeps whatever is typed. */
+        lv_obj_t* x = mkLabel(s_replyBar, LV_SYMBOL_CLOSE, lv_color_hex(0x9a9a9a));
+        lv_obj_add_flag(x, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_ext_click_area(x, 10);
+        lv_obj_add_event_cb(x, [](lv_event_t*) { cancelReply(); }, LV_EVENT_CLICKED, nullptr);
+    }
 
     /* Compose row — the LAST item in the scroll stream (part of the messages, not a
      * pinned bar), so it scrolls with them and is simply hidden on a history page
@@ -1423,10 +1581,12 @@ void composeReflectUp() {
 
 void openThread(const std::string& peer) {
     closeInfo();                            /* e.g. a nomad-link open while the info page is up */
+    rememberThreadPos();                    /* where the conv we're leaving was being read */
     if (!g_curPeer.empty() && g_curPeer != peer) saveDraft();   /* preserve the conv we're leaving */
+    if (g_curPeer != peer) { dismissMsgActions(); cancelReply(); }   /* both belong to the conv being left */
     g_curPeer = peer;
     if (!s_thread) buildThreadShell();
-    closeHistory();                         /* a fresh conversation opens on its newest page */
+    closeHistory();                         /* the overlay belongs to the conversation being left */
     lv_label_set_text(s_threadName, peerName(peer).c_str());
     updateThreadLink();
     updateThreadSignal();                   /* peer's direct signal, else the gateway signal */
@@ -1440,9 +1600,13 @@ void openThread(const std::string& peer) {
     deferFocus(s_compose);                  /* focus always rests on the entry box */
     /* Paint the shell + "<loading conversation>" placeholder NOW; the heavy
      * record load + bubble build (seconds for a long thread) is deferred so the
-     * screen never looks frozen. The window resets to the newest page. */
+     * screen never looks frozen. The window is built newest-first and the render
+     * then lands on where this conversation was left this session — at its newest
+     * if it was left there, or has not been opened. */
     g_needMsgLoad = true;
-    g_scrollAfter = 0;                      /* land at newest once loaded */
+    auto left = g_leftAt.find(peer);
+    g_anchorMid   = (left != g_leftAt.end()) ? left->second : "";
+    g_scrollAfter = g_anchorMid.empty() ? 0 : 1;
     beginThreadLoad();
 }
 
@@ -1902,9 +2066,10 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
          * that is not mine has it (a proxy server, or a propagation node
          * awaiting pickup). A real failure or refusal is ✕; cancelled a grey ✕;
          * else in flight. */
-        if (m.status == LXMF_ST_DELIVERED) {
+        if (m.status == LXMF_ST_DELIVERED ||
+            m.status == LXMF_ST_OUR_PROXY_DELIVERED) {
             makeDeliveryTicks(meta, "tick-delivered");
-        } else if (m.status == LXMF_ST_ON_PROXY || m.status == LXMF_ST_ON_PN) {
+        } else if (m.status == LXMF_ST_ON_OUR_PROXY || m.status == LXMF_ST_ON_PN) {
             makeDeliveryTicks(meta, "tick-sent");
         } else {
             const char* sym = "...";                 /* in flight */
@@ -2007,6 +2172,490 @@ void layoutMeta(lv_obj_t* bub, lv_obj_t* meta, uint8_t /*status*/) {
     fitBubbleMeta(meta);
 }
 
+/* ---- replies: quote blocks, the message-actions popup, text selection ----
+ *
+ * A long press on a bubble opens three icons over it — reply, details, delete —
+ * and a press that lands on the message's text selects the word under it first,
+ * which a drag then grows. Reply takes whatever is selected: nothing selected
+ * quotes the message as a whole (`reply_to` alone on the wire), a fragment
+ * quotes that fragment (`reply_quote` beside it). The quote then sits above the
+ * typing area until the message goes, and in the balloon afterwards, at both
+ * ends.
+ *
+ * What a quote block SHOWS is always read out of this device's own copy of the
+ * quoted message: a fragment that arrived on the wire is drawn only where it
+ * really occurs there. So a quote cannot say something its message does not,
+ * and a reply to a message this device never saw says only that it is one. */
+
+lv_obj_t*   s_msgActs  = nullptr;       /* the three-icon popup, floating over the thread */
+std::string g_actsKey;                  /* the message it acts on */
+lv_obj_t*   s_msgConfirm = nullptr;     /* delete-this-message confirmation */
+std::string g_delKey;
+
+/* A live selection: the label carrying it, the letter the drag started from, and
+ * the text it currently covers. The thread's scrolling is off while one is up,
+ * so dragging grows the selection instead of scrolling away from it. */
+lv_obj_t*   g_selLabel  = nullptr;
+uint32_t    g_selAnchor = 0;
+std::string g_selText;
+
+/* The bubble briefly marked after following a quote back to it, and the timer
+ * that takes the mark off again. */
+lv_obj_t*   g_flashObj   = nullptr;
+lv_timer_t* g_flashTimer = nullptr;
+
+/* Byte offset of letter `n` (the string's end past the last letter). The label's
+ * selection counts letters; a fragment is bytes. */
+size_t utf8ByteOf(const std::string& s, uint32_t n) {
+    size_t i = 0;
+    for (uint32_t seen = 0; seen < n && i < s.size(); seen++) {
+        i++;
+        while (i < s.size() && (((uint8_t)s[i]) & 0xC0) == 0x80) i++;
+    }
+    return i;
+}
+
+/* Letters before byte offset `b` — the inverse of utf8ByteOf. */
+uint32_t utf8LettersTo(const std::string& s, size_t b) {
+    uint32_t n = 0;
+    for (size_t i = 0; i < b && i < s.size(); i++)
+        if ((((uint8_t)s[i]) & 0xC0) != 0x80) n++;
+    return n;
+}
+
+/* One line of quotable text: unrenderables dropped, whitespace collapsed,
+ * clipped with an ellipsis. */
+std::string quoteLine(const std::string& text, size_t max = 60) {
+    std::string one;
+    bool sp = false;
+    for (char c : printable(text, true)) {
+        bool ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        if (ws) { sp = !one.empty(); continue; }
+        if (sp) { one += ' '; sp = false; }
+        one += c;
+    }
+    if (one.size() <= max) return one;
+    size_t cut = max;                      /* never cut a UTF-8 sequence in half */
+    while (cut > 0 && (((uint8_t)one[cut]) & 0xC0) == 0x80) cut--;
+    return one.substr(0, cut) + "...";
+}
+
+const Msg* msgByKey(const std::string& key) {
+    for (auto& m : g_msgs) if (m.peer == g_curPeer && m.key == key) return &m;
+    return nullptr;
+}
+const Msg* msgByMid(const std::string& mid) {
+    if (mid.empty()) return nullptr;
+    for (auto& m : g_msgs) if (m.peer == g_curPeer && m.message_id == mid) return &m;
+    return nullptr;
+}
+
+/* What a bubble's quote block says. `have` is "this message is a reply"; a `key`
+ * means the quoted message is here, and `text` the line to draw. */
+struct QuoteView { std::string key, who, text; bool have = false; };
+
+QuoteView quoteFor(const Msg& m) {
+    QuoteView q;
+    if (m.reply_to.empty() || m.reply_to.find_first_not_of('0') == std::string::npos)
+        return q;
+    q.have = true;
+    const Msg* t = msgByMid(m.reply_to);
+    if (!t) return q;
+    q.key  = t->key;
+    q.who  = t->in ? peerName(t->peer) : std::string("You");
+    q.text = quoteLine(!m.reply_quote.empty() &&
+                       t->content.find(m.reply_quote) != std::string::npos
+                           ? m.reply_quote : t->content);
+    return q;
+}
+
+void flashTimerCb(lv_timer_t*) {
+    if (g_flashObj && lv_obj_is_valid(g_flashObj))
+        lv_obj_set_style_outline_width(g_flashObj, 0, 0);
+    g_flashObj = nullptr;
+    g_flashTimer = nullptr;
+}
+
+/* Mark a bubble just scrolled to, briefly — long enough to find it by eye. */
+void flashBubble(lv_obj_t* row) {
+    if (!row) return;
+    lv_obj_t* bub = lv_obj_get_child(row, 0);
+    if (!bub) return;
+    if (g_flashTimer) { lv_timer_delete(g_flashTimer); flashTimerCb(nullptr); }
+    g_flashObj = bub;
+    lv_obj_set_style_outline_color(bub, lv_color_hex(0x78aa8c), 0);
+    lv_obj_set_style_outline_width(bub, lcdPx(2), 0);
+    lv_obj_set_style_outline_opa(bub, LV_OPA_COVER, 0);
+    g_flashTimer = lv_timer_create(flashTimerCb, 1600, nullptr);
+    lv_timer_set_repeat_count(g_flashTimer, 1);
+}
+
+/* Follow a quote back to the message it came from. On this page that is a
+ * scroll; older than this page it is the history overlay, opened on it. */
+void jumpToMid(const std::string& mid) {
+    const Msg* t = msgByMid(mid);
+    if (!t) return;
+    size_t ix = 0; bool found = false;
+    for (auto& m : g_msgs) {
+        if (m.peer != g_curPeer) continue;
+        if (&m == t) { found = true; break; }
+        ix++;
+    }
+    if (!found) return;
+    /* On the page being read: close the history overlay if it is what is up, and
+     * scroll to it. Older than that page: the overlay, opened on it. */
+    lv_obj_t* row = (ix >= g_winLo && ix < g_winHi) ? bubbleRow(g_bubbles, t->key) : nullptr;
+    if (row) {
+        closeHistory();
+        lv_obj_update_layout(s_msgList);
+        lv_obj_scroll_to_y(s_msgList, lv_obj_get_y(s_bubbles) + lv_obj_get_y(row), LV_ANIM_ON);
+        flashBubble(row);
+        updateThreadDownVis();
+        return;
+    }
+    openHistoryAt(ix, t->key);
+    flashBubble(bubbleRow(g_histRefs, t->key));
+}
+
+/* ---- text selection inside a bubble ---- */
+
+/* Give a label the selection colours (once — they are style-only): white on a
+ * blue brighter than the outbound balloon's own, so a selection reads the same
+ * way in either direction's bubble. */
+void selStyle(lv_obj_t* l) {
+    lv_obj_set_style_bg_color(l, lv_color_hex(0x2f7fdd), LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(l, LV_OPA_COVER, LV_PART_SELECTED);
+    lv_obj_set_style_text_color(l, lv_color_white(), LV_PART_SELECTED);
+}
+
+void clearSelection() {
+    if (g_selLabel && lv_obj_is_valid(g_selLabel)) {
+        lv_label_set_text_selection_start(g_selLabel, LV_DRAW_LABEL_NO_TXT_SEL);
+        lv_label_set_text_selection_end(g_selLabel, LV_DRAW_LABEL_NO_TXT_SEL);
+    }
+    g_selLabel = nullptr;
+    g_selText.clear();
+    if (s_msgList) lv_obj_add_flag(s_msgList, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+/* The text label of `bub` under a screen point — the message's own lines only,
+ * so the meta row and a withheld body's download offer are not selectable. */
+lv_obj_t* labelAt(lv_obj_t* bub, const lv_point_t& p) {
+    uint32_t n = lv_obj_get_child_count(bub);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t* c = lv_obj_get_child(bub, (int32_t)i);
+        if (!lv_obj_check_type(c, &lv_label_class)) continue;
+        if (lv_obj_has_flag(c, LV_OBJ_FLAG_CLICKABLE)) continue;   /* a link, or the download offer */
+        lv_area_t a; lv_obj_get_coords(c, &a);
+        if (p.x >= a.x1 && p.x <= a.x2 && p.y >= a.y1 && p.y <= a.y2) return c;
+    }
+    return nullptr;
+}
+
+/* Set the selection between the anchor and letter `to`, and remember the text. */
+void selApply(uint32_t to) {
+    if (!g_selLabel || !lv_obj_is_valid(g_selLabel)) return;
+    uint32_t a = g_selAnchor < to ? g_selAnchor : to;
+    uint32_t b = g_selAnchor < to ? to : g_selAnchor;
+    lv_label_set_text_selection_start(g_selLabel, a);
+    lv_label_set_text_selection_end(g_selLabel, b);
+    const char* txt = lv_label_get_text(g_selLabel);
+    std::string s = txt ? txt : "";
+    size_t from = utf8ByteOf(s, a), to_b = utf8ByteOf(s, b);
+    g_selText = s.substr(from, to_b - from);
+}
+
+/* The letter of `l` under a screen point. */
+uint32_t letterAt(lv_obj_t* l, const lv_point_t& p) {
+    lv_area_t a; lv_obj_get_coords(l, &a);
+    lv_point_t rel = { p.x - a.x1, p.y - a.y1 };
+    return lv_label_get_letter_on(l, &rel, false);
+}
+
+/* Start a selection under the finger: the word it landed on. Returns false when
+ * the press was not on selectable text, which leaves the popup quoting the
+ * whole message. */
+bool selBegin(lv_obj_t* bub) {
+    lv_indev_t* ind = lv_indev_active();
+    if (!ind) return false;
+    lv_point_t p; lv_indev_get_point(ind, &p);
+    lv_obj_t* l = labelAt(bub, p);
+    if (!l) return false;
+
+    const char* txt = lv_label_get_text(l);
+    std::string s = txt ? txt : "";
+    if (s.empty()) return false;
+    size_t b = utf8ByteOf(s, letterAt(l, p));
+    if (b >= s.size()) b = s.size() ? s.size() - 1 : 0;
+    auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    if (ws(s[b])) return false;
+    size_t from = b, to = b;
+    while (from > 0 && !ws(s[from - 1])) from--;
+    while (to < s.size() && !ws(s[to])) to++;
+
+    clearSelection();
+    g_selLabel  = l;
+    g_selAnchor = utf8LettersTo(s, from);
+    selStyle(l);
+    selApply(utf8LettersTo(s, to));
+    /* The drag that grows the selection is the same gesture that would scroll
+     * the thread, so the thread stops scrolling until the selection is let go. */
+    if (s_msgList) lv_obj_remove_flag(s_msgList, LV_OBJ_FLAG_SCROLLABLE);
+    return true;
+}
+
+/* Grow the selection to the letter under the finger (a drag after the press
+ * that started it). */
+void selExtend() {
+    if (!g_selLabel || !lv_obj_is_valid(g_selLabel)) return;
+    lv_indev_t* ind = lv_indev_active();
+    if (!ind) return;
+    lv_point_t p; lv_indev_get_point(ind, &p);
+    selApply(letterAt(g_selLabel, p));
+}
+
+/* ---- the reply the composer is holding ---- */
+
+void applyReplyBar() {
+    if (!s_replyBar) return;
+    bool on  = !g_replyMid.empty() && g_atNewest;
+    bool was = !lv_obj_has_flag(s_replyBar, LV_OBJ_FLAG_HIDDEN);
+    if (!on) {
+        lv_obj_add_flag(s_replyBar, LV_OBJ_FLAG_HIDDEN);
+        /* The strip is part of the scroll stream, so its going takes the entry
+         * with it — the bottom has to be re-pinned around it, both ways. */
+        if (was) scrollThreadBottom(false);
+        return;
+    }
+    const Msg* t = msgByKey(g_replyKey);
+    if (s_replyWho)
+        lv_label_set_text(s_replyWho,
+                          ("Replying to " + std::string(t && !t->in ? "You"
+                                                        : peerName(g_curPeer))).c_str());
+    if (s_replyLbl)
+        lv_label_set_text(s_replyLbl,
+                          quoteLine(!g_replyQuote.empty() ? g_replyQuote
+                                                          : (t ? t->content : std::string())).c_str());
+    lv_obj_remove_flag(s_replyBar, LV_OBJ_FLAG_HIDDEN);
+    if (!was) scrollThreadBottom(false);
+}
+
+void cancelReply() {
+    g_replyKey.clear(); g_replyMid.clear(); g_replyQuote.clear();
+    applyReplyBar();
+}
+
+/* Reply to a message, quoting `fragment` of it ("" = the whole message). An
+ * outbound message has no message_id until the firmware has packed it, and
+ * there is nothing to name until then. */
+void startReply(const std::string& key, const std::string& fragment) {
+    const Msg* m = msgByKey(key);
+    if (!m || m->message_id.empty()) return;
+    g_replyKey   = key;
+    g_replyMid   = m->message_id;
+    /* A fragment comes off the rendered lines, which have had unrenderable
+     * bytes dropped out of them. Only send one that is still found in the
+     * message itself — the far end looks for it there, and so does this one. */
+    g_replyQuote = (!fragment.empty() && m->content.find(fragment) != std::string::npos)
+                       ? fragment : std::string();
+    applyReplyBar();
+    /* Answering a message is the start of writing one: come back to the newest
+     * page, put the entry and its quote strip on the screen, and leave the
+     * cursor in the entry — including when the reply was started from a message
+     * scrolled far up, or from the history overlay. */
+    threadSnapNewest();
+    deferFocus(s_compose);
+}
+
+/* ---- the long-press popup ---- */
+
+void closeMsgActions() {
+    if (s_msgActs && lv_obj_is_valid(s_msgActs)) lv_obj_delete(s_msgActs);
+    s_msgActs = nullptr;
+    g_actsKey.clear();
+}
+
+/* Everything a tap outside the popup has to undo. */
+void dismissMsgActions() {
+    closeMsgActions();
+    clearSelection();
+}
+
+void closeMsgConfirm() {
+    if (s_msgConfirm && lv_obj_is_valid(s_msgConfirm)) lv_obj_delete(s_msgConfirm);
+    s_msgConfirm = nullptr;
+    g_delKey.clear();
+}
+
+void showMsgDeleteConfirm(const std::string& key) {
+    if (!s_thread || s_msgConfirm) return;
+    g_delKey = key;
+
+    s_msgConfirm = lv_obj_create(s_thread);
+    lv_obj_remove_style_all(s_msgConfirm);
+    lv_obj_set_size(s_msgConfirm, lv_pct(100), lv_pct(100));
+    lv_obj_add_flag(s_msgConfirm, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_style_bg_color(s_msgConfirm, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_msgConfirm, LV_OPA_50, 0);
+    lv_obj_add_flag(s_msgConfirm, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_msgConfirm, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* box = lv_obj_create(s_msgConfirm);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, lv_pct(80));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+    lv_obj_set_style_pad_all(box, 10, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 8, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* msg = mkLabel(box, "Delete this message? This cannot be undone.", lv_color_white());
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, lv_pct(100));
+
+    lv_obj_t* btns = lv_obj_create(box);
+    lv_obj_remove_style_all(btns);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btns, 8, 0);
+    lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* del = confirmButton(btns, "Delete", lv_color_hex(0x5a2a2a));
+    lv_obj_add_event_cb(del, [](lv_event_t*) {
+        if (g_id >= 0 && !g_curPeer.empty() && !g_delKey.empty()) {
+            /* One record: the firmware wipes it and the storage change rebuilds
+             * the thread without it. */
+            char k[48];
+            snprintf(k, sizeof k, "lxmf.id.%d.cmd.delete", g_id);
+            storageSet(k, (g_curPeer + "/" + g_delKey).c_str());
+            if (g_replyKey == g_delKey) cancelReply();
+        }
+        closeMsgConfirm();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cnc = confirmButton(btns, "Cancel", lv_color_hex(0x2a313a));
+    lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeMsgConfirm(); }, LV_EVENT_CLICKED, nullptr);
+    deferFocus(cnc);
+}
+
+/* One icon button of the popup. */
+lv_obj_t* actionButton(lv_obj_t* parent, const char* icon, lv_color_t tint,
+                       lv_event_cb_t cb) {
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, actionIconPx() + lcdPx(12), actionIconPx() + lcdPx(8));
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x2a313a), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(b, 4, 0);
+    lv_obj_t* img = lv_image_create(b);
+    lv_obj_center(img);
+    applyIcon(img, icon, actionIconPx(), tint);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+    return b;
+}
+
+/* The three things a message can have done to it, over the bubble itself:
+ * reply, what it is, delete. Tapping the bubble again (or scrolling, or acting)
+ * takes it away. */
+void showMsgActions(const std::string& key, lv_obj_t* bub) {
+    if (!s_thread || !bub) return;
+    closeMsgActions();
+    g_actsKey = key;
+
+    s_msgActs = lv_obj_create(s_thread);
+    lv_obj_remove_style_all(s_msgActs);
+    lv_obj_add_flag(s_msgActs, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(s_msgActs, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_msgActs, lv_color_hex(0x323a46), 0);
+    lv_obj_set_style_bg_opa(s_msgActs, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_msgActs, 6, 0);
+    lv_obj_set_style_pad_all(s_msgActs, lcdPx(2), 0);
+    lv_obj_set_style_pad_column(s_msgActs, lcdPx(2), 0);
+    lv_obj_set_style_border_color(s_msgActs, lv_color_hex(0x4a5563), 0);
+    lv_obj_set_style_border_width(s_msgActs, 1, 0);
+    lv_obj_set_flex_flow(s_msgActs, LV_FLEX_FLOW_ROW);
+    lv_obj_remove_flag(s_msgActs, LV_OBJ_FLAG_SCROLLABLE);
+
+    actionButton(s_msgActs, "reply", lv_color_hex(0xd8e2ee), [](lv_event_t*) {
+        std::string key = g_actsKey, frag = g_selText;
+        closeMsgActions();
+        clearSelection();
+        startReply(key, frag);
+    });
+    actionButton(s_msgActs, "info", lv_color_hex(0xd8e2ee), [](lv_event_t*) {
+        std::string key = g_actsKey;
+        dismissMsgActions();
+        showMsgDetail(key);
+    });
+    actionButton(s_msgActs, "trash", lv_color_hex(0xd98a8a), [](lv_event_t*) {
+        std::string key = g_actsKey;
+        dismissMsgActions();
+        showMsgDeleteConfirm(key);
+    });
+
+    /* Over the bubble's top edge, pulled back inside the screen if the bubble
+     * sits at an edge. */
+    lv_obj_update_layout(s_msgActs);
+    lv_obj_align_to(s_msgActs, bub, LV_ALIGN_OUT_TOP_MID, 0, -lcdPx(2));
+    int32_t w = lv_obj_get_width(s_msgActs);
+    int32_t x = lv_obj_get_x(s_msgActs);
+    int32_t maxX = lv_obj_get_width(s_thread) - w - lcdPx(2);
+    if (x > maxX) lv_obj_set_x(s_msgActs, maxX);
+    if (lv_obj_get_x(s_msgActs) < lcdPx(2)) lv_obj_set_x(s_msgActs, lcdPx(2));
+    if (lv_obj_get_y(s_msgActs) < HDR_H) lv_obj_align_to(s_msgActs, bub, LV_ALIGN_OUT_BOTTOM_MID, 0, lcdPx(2));
+}
+
+/* A bubble's quote block: who wrote the message being answered and the line of
+ * it this reply quotes, tapping back to it. */
+void addQuoteBlock(lv_obj_t* bub, const Msg& m) {
+    QuoteView q = quoteFor(m);
+    if (!q.have) return;
+
+    lv_obj_t* wrap = lv_obj_create(bub);
+    lv_obj_remove_style_all(wrap);
+    lv_obj_set_width(wrap, LV_SIZE_CONTENT);
+    lv_obj_set_height(wrap, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(wrap, 228, 0);
+    lv_obj_set_style_bg_color(wrap, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(wrap, LV_OPA_20, 0);
+    lv_obj_set_style_radius(wrap, 3, 0);
+    lv_obj_set_style_pad_all(wrap, lcdPx(2), 0);
+    lv_obj_set_style_pad_left(wrap, lcdPx(4), 0);
+    lv_obj_set_style_border_color(wrap, lv_color_hex(0xc8d4e2), 0);
+    lv_obj_set_style_border_width(wrap, lcdPx(2), 0);
+    lv_obj_set_style_border_side(wrap, LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_margin_bottom(wrap, lcdPx(2), 0);
+    lv_obj_set_flex_flow(wrap, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (!q.key.empty()) {
+        lv_obj_t* who = lv_label_create(wrap);
+        lv_obj_set_style_text_font(who, kFontSmall, 0);
+        lv_obj_set_style_text_color(who, lv_color_hex(0xb9c9dd), 0);
+        lv_label_set_text(who, q.who.c_str());
+    }
+    lv_obj_t* line = lv_label_create(wrap);
+    lv_obj_set_style_text_font(line, kFontSmall, 0);
+    lv_obj_set_style_text_color(line, lv_color_hex(0xc8c8c8), 0);
+    lv_label_set_long_mode(line, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_max_width(line, 220, 0);
+    lv_label_set_text(line, q.key.empty() ? "Replying to a message" : q.text.c_str());
+
+    /* Only a quote we can reach leads anywhere. */
+    if (!q.key.empty()) {
+        lv_obj_add_flag(wrap, LV_OBJ_FLAG_CLICKABLE);
+        bindPeer(wrap, [](lv_event_t* e) {
+            auto* mid = (std::string*)lv_event_get_user_data(e);
+            if (mid) jumpToMid(*mid);
+        }, m.reply_to);
+    }
+}
+
 /* Extra gap above a bubble, scaled with the UI zoom: 1px baseline between all
  * balloons, +3px when it's more than 15 min since the previous message. */
 int bubbleTopMargin(long prevAnchor, long curAnchor) {
@@ -2041,6 +2690,10 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     lv_obj_set_flex_flow(bub, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(bub, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_remove_flag(bub, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* What this message replies to, at the head of the balloon — the same block
+     * the composer showed while it was being written. */
+    addQuoteBlock(bub, m);
 
     if (m.body_absent) {
         /* The proxy server withheld this body — it is over the link's inline
@@ -2089,8 +2742,9 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     fillMeta(meta, m);
     layoutMeta(bub, meta, m.status);
 
-    /* Long-press a bubble → its detail screen. Clickable so LVGL raises the
-     * long-press; the record key rides as freed-with-widget user_data. */
+    /* Long-press a bubble → the three actions over it, selecting the word under
+     * the finger on the way if it landed on text. Clickable so LVGL raises the
+     * long press; the record key rides as freed-with-widget user_data. */
     lv_obj_add_flag(bub, LV_OBJ_FLAG_CLICKABLE);
     bindMsgDetail(bub, m.key);
 
@@ -2274,7 +2928,9 @@ void rebuildThread() {
         return;
     }
 
-    /* Fallback: structural change or a different conversation — full rebuild. */
+    /* Fallback: structural change or a different conversation — full rebuild.
+     * Every bubble goes, so anything anchored to one goes with it. */
+    dismissMsgActions();
     lv_obj_clean(s_bubbles);
     g_nomadTargets.clear();          /* link widgets are gone with the cleaned bubbles */
     g_dateSeps.clear();              /* separator widgets went with the clean */
@@ -2312,6 +2968,7 @@ void renderHistory() {
 
     lv_obj_clean(s_histBubbles);
     g_histDateSeps.clear();
+    g_histRefs.clear();
 
     std::vector<const Msg*> ms(all.begin() + h_winLo, all.begin() + h_winHi);
     auto anchorOf   = [](const Msg* m) -> long { return m->recv_ts > 0 ? m->recv_ts : m->ts; };
@@ -2327,23 +2984,44 @@ void renderHistory() {
     };
     for (size_t i = 0; i < ms.size(); i++) {
         maybeSep(i);
-        addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i])), s_histBubbles);
+        g_histRefs.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i])),
+                                       s_histBubbles));
     }
     updateHistButtons(total);
     lv_obj_update_layout(s_histList);
-    lv_obj_scroll_to_y(s_histList, LV_COORD_MAX, LV_ANIM_OFF);   /* the join with the resident page */
+    /* Land on the message this page was opened for (a conversation reopened where
+     * it was left), else on the join with the resident page. */
+    lv_obj_t* row = bubbleRow(g_histRefs, g_histAnchor);
+    if (row) lv_obj_scroll_to_y(s_histList, lv_obj_get_y(s_histBubbles) + lv_obj_get_y(row), LV_ANIM_OFF);
+    else     lv_obj_scroll_to_y(s_histList, LV_COORD_MAX, LV_ANIM_OFF);
+    g_histAnchor.clear();
 }
 
-/* Show the overlay at the page just before the resident's oldest, hiding the
- * resident (it stays built). No-op when nothing older exists. */
-void openHistory() {
+/* Show the overlay on the page holding `ix` (an index into the curPeer slice),
+ * hiding the resident page (it stays built), and land on `mid` — empty lands on
+ * the page's join with the resident one. Pages back from the resident boundary
+ * in the same PAGE_SIZE steps "load earlier" walks, so a reader coming back to a
+ * conversation returns to the page they were actually on. */
+void openHistoryAt(size_t ix, const std::string& mid) {
     if (!s_histWrap || g_winLo == 0) return;
     h_winHi = g_winLo;
     h_winLo = h_winHi > PAGE_SIZE ? h_winHi - PAGE_SIZE : 0;
+    while (h_winLo > ix) {
+        h_winHi = h_winLo;
+        h_winLo = h_winHi > PAGE_SIZE ? h_winHi - PAGE_SIZE : 0;
+    }
+    g_histAnchor = mid;
     if (s_stickyDate) lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
     if (s_msgList)    lv_obj_add_flag(s_msgList,    LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN);   /* show FIRST — a hidden list can't lay out */
-    renderHistory();                                      /* then render + land at the bottom */
+    renderHistory();                                      /* then render + land */
+}
+
+/* "Load earlier": the page just before the resident's oldest, at its bottom.
+ * No-op when nothing older exists. */
+void openHistory() {
+    if (!s_histWrap || g_winLo == 0) return;
+    openHistoryAt(g_winLo - 1, "");
 }
 
 /* Hide the overlay and reveal the resident newest page — instant, no re-render. */
@@ -2355,7 +3033,13 @@ void closeHistory() {
 
 /* ---- list rendering (two tabs: Contacts + On the Mesh) ---- */
 
-struct Conv { std::string peer, preview; long ts = 0; int unread = 0; long read_ts = 0; int count = 0; };
+struct Conv {
+    std::string peer, preview;
+    long ts = 0; int unread = 0; long read_ts = 0; int count = 0;
+    bool preview_mine = false;   /* the preview is the last message whichever way
+                                 * it went; this is which way, so the row can
+                                 * put "You: " in front of ours */
+};
 
 /* Conversation list built from the maintained directory (contacts.<peer>.*),
    NOT by walking messages — O(conversations), and it touches only the small
@@ -2382,6 +3066,7 @@ void convCb(const char* key, const char* val) {
     else if (!strcmp(field, "unread"))  c->unread  = val ? atoi(val) : 0;
     else if (!strcmp(field, "read_ts")) c->read_ts = val ? atol(val) : 0;
     else if (!strcmp(field, "preview")) c->preview = val ? val : "";
+    else if (!strcmp(field, "preview_mine")) c->preview_mine = val && atoi(val) != 0;
 }
 
 /* Compact "time since" badge shown at the right of every row: how long ago we
@@ -2570,12 +3255,6 @@ void showDeleteConfirm(lv_event_t*) {
  * rather than in a popover: the button stays reachable, so re-measuring is one
  * press. */
 
-/* One direction's path loss, or that the radio has not measured it — never a
- * zero standing in for an absent reading. */
-std::string pingLoss(const std::string& loss) {
-    return loss.empty() ? std::string("not measured") : loss + " dB";
-}
-
 /* Render the published record into the inline label. Called on open and on
  * every lxmf.ping.<peer> change, so `probing` becomes the measurement in place. */
 void pingLabelUpdate() {
@@ -2588,17 +3267,29 @@ void pingLabelUpdate() {
     else if (st == "probing") text = "Probing...";
     else if (st == "path")    text = "Finding a path...";
     else if (st == "ok") {
+        /* A link measures the round trip, not the path, so there is usually no
+         * hop count to state — and "0 hops" would be a made-up number where
+         * there is no answer. */
         std::string hops = fld("hops");
-        text = fld("rtt_ms") + " ms, " + hops + (hops == "1" ? " hop\n" : " hops\n")
-             + "path loss us->them " + pingLoss(fld("loss_to")) + "\n"
-             + "path loss them->us " + pingLoss(fld("loss_from"));
+        text = fld("rtt_ms") + " ms";
+        if (!hops.empty() && hops != "0")
+            text += ", " + hops + (hops == "1" ? " hop" : " hops");
     }
     else if (st == "no-proof") text = "Delivered, but no proof came back.";
     else if (st == "no-route") text = "No route to this contact.";
     else if (st == "timeout")  text = "No answer.";
     else if (st == "cancelled")text = "Probe cancelled.";
-    else if (st == "offline")  text = "This identity is not connected.";
     else                       text = "Probe failed.";
+    /* What the radio measured, in the same words the console uses — under
+     * every outcome, not just a good one. It is a measurement of the LINK and
+     * owes the probe nothing, and it is worth most where the probe came back
+     * empty: nothing answered while the peer is being heard at −95 dBm is a
+     * different fault from nothing answered by a peer never heard at all.
+     * Absent only when no radio has heard this contact. */
+    if (!st.empty() && st != "probing" && st != "path") {
+        std::string link = lxmfPingLink(g_infoPeer, "\n");
+        if (!link.empty()) text += (text.empty() ? "" : "\n") + link;
+    }
     lv_label_set_text(s_pingLbl, text.c_str());
 }
 
@@ -2610,8 +3301,11 @@ void onPingClick(lv_event_t*) {
     if (s_pingLbl) lv_label_set_text(s_pingLbl, "Probing...");
 }
 
-/* A ping record changed. Only the open info page cares, and only about its own
- * peer. Registered on the lcd task so it may touch LVGL. */
+/* A ping record changed — or the radio republished its measurements, which is
+ * the other half of what this label says and arrives on its own 15 s beat, well
+ * after a probe has settled. Only the open info page cares, and the guard is
+ * what keeps the measurement subscription from costing anything the rest of the
+ * time. Registered on the lcd task so it may touch LVGL. */
 void onPingChange(const char*, const char*) {
     if (s_info && s_pingLbl) pingLabelUpdate();
 }
@@ -2701,7 +3395,11 @@ void showInfo(const std::string& peer) {
         return b;
     };
     actButton("Delete", lv_color_hex(0x5a2a2a), showDeleteConfirm);
-    actButton("Ping",   lv_color_hex(0x2a313a), onPingClick);
+    /* Ping is live at every moment — it always has something to answer with,
+     * the radio's own reading if nothing else — so it carries the blue every
+     * other actionable control here carries. A neutral slate is this UI's
+     * dismiss colour and reads as a disabled control beside a coloured verb. */
+    actButton("Ping",   lv_color_hex(0x2563a0), onPingClick);
 
     s_pingLbl = mkLabel(body, "", lv_color_hex(0xc8d8c8));
     lv_label_set_long_mode(s_pingLbl, LV_LABEL_LONG_WRAP);
@@ -2912,6 +3610,7 @@ void showMsgDetail(const std::string& mkey) {
     std::string method  = rd("method");
     bool        readf   = storageGetInt((base + ".read").c_str(), 0) != 0;
     std::string reply   = rd("reply_to");
+    std::string quote   = rd("reply_quote");
     std::string mid     = rd("message_id");
 
     s_msgDetail = lv_obj_create(s_layer);
@@ -2958,8 +3657,13 @@ void showMsgDetail(const std::string& mkey) {
         detailRow(body, "Read", readf ? "yes" : "no");
     }
     detailRow(body, "Message ID", mid.empty() ? "" : groupHash(mid));
-    if (!reply.empty() && reply.find_first_not_of('0') != std::string::npos)
+    if (!reply.empty() && reply.find_first_not_of('0') != std::string::npos) {
         detailRow(body, "In reply to", groupHash(reply));
+        /* The fragment as it arrived, whether or not it is one this device can
+         * find in the message it names — the detail page is where a quote that
+         * the conversation refuses to draw can still be looked at. */
+        if (!quote.empty()) detailRow(body, "Quoting", quote);
+    }
     if (!title.empty()) detailRow(body, "Title", title);
     detailRow(body, "Content", content);
 
@@ -2983,13 +3687,38 @@ void showMsgDetail(const std::string& mkey) {
     deferFocus(back);
 }
 
+/* Long press: select the word under the finger, if it landed on the message's
+ * own text, and put the actions over the bubble. */
 void onMsgLongPress(lv_event_t* e) {
     auto* key = static_cast<std::string*>(lv_event_get_user_data(e));
-    if (key) showMsgDetail(*key);
+    lv_obj_t* bub = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    if (!key || !bub) return;
+    if (!selBegin(bub)) clearSelection();
+    showMsgActions(*key, bub);
 }
+
+/* A drag after that press grows the selection rather than scrolling the thread
+ * (which selBegin has switched off for the duration). */
+void onMsgPressing(lv_event_t* e) {
+    if (!g_selLabel) return;
+    lv_obj_t* bub = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+    if (!bub || lv_obj_get_parent(g_selLabel) != bub) return;
+    selExtend();
+}
+
+/* A plain tap on a bubble is how the popup and the selection are dismissed —
+ * the detail page is behind the (i) now, not behind every tap.
+ *
+ * SHORT_CLICKED, not CLICKED: LVGL sends CLICKED on the release that ENDS a
+ * long press too, which would take the selection away the moment the finger
+ * came off the word it had just selected. */
+void onMsgClick(lv_event_t*) { dismissMsgActions(); }
+
 void bindMsgDetail(lv_obj_t* o, const std::string& key) {
     auto* p = new std::string(key);
     lv_obj_add_event_cb(o, onMsgLongPress, LV_EVENT_LONG_PRESSED, p);
+    lv_obj_add_event_cb(o, onMsgPressing, LV_EVENT_PRESSING, nullptr);
+    lv_obj_add_event_cb(o, onMsgClick, LV_EVENT_SHORT_CLICKED, nullptr);
     lv_obj_add_event_cb(o, onRowDeletePeer, LV_EVENT_DELETE, p);   /* frees p */
 }
 
@@ -3321,7 +4050,8 @@ void rebuildList(bool keepScroll) {
         if (!qmatch(nC, nm, c.peer)) continue;
         long la = lastAnnounce(c.peer);
         RowSpec s; s.kind = RK_CONTACT; s.key = c.peer; s.peer = c.peer;
-        s.title = nm; s.sub = printable(c.preview, true);
+        s.title = nm;
+        s.sub = (c.preview_mine ? "You: " : "") + printable(c.preview, true);
         s.age = la > 0 ? relAge(now - la) : std::string();
         s.titleColor = lv_color_white(); s.unread = c.unread;
         s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread);   /* age excluded on purpose */
@@ -3859,12 +4589,17 @@ void onLayerDelete(lv_event_t*) {
     if (g_threadLoadTimer) { lv_timer_delete(g_threadLoadTimer); g_threadLoadTimer = nullptr; }
     if (g_stickyFadeTimer) { lv_timer_delete(g_stickyFadeTimer); g_stickyFadeTimer = nullptr; }
     if (g_iconSettle)      { lv_timer_delete(g_iconSettle);      g_iconSettle      = nullptr; }
+    if (g_flashTimer)      { lv_timer_delete(g_flashTimer);      g_flashTimer      = nullptr; }
+    g_flashObj = nullptr; g_selLabel = nullptr; g_selText.clear();
     g_needMsgLoad = false;
     /* A pending chunked populate would build rows into freed widgets — drop it,
      * then forget the list-row models (their widgets went with the layer). */
     cancelChunk(g_chunkC); cancelChunk(g_chunkM);
     g_rowsC.clear(); g_rowsM.clear();
     s_compose = nullptr; s_threadName = nullptr; s_threadDown = nullptr; s_threadLink = nullptr; s_threadSig = nullptr;
+    s_replyBar = nullptr; s_replyWho = nullptr; s_replyLbl = nullptr;
+    s_msgActs = nullptr; s_msgConfirm = nullptr; g_actsKey.clear(); g_delKey.clear();
+    g_replyKey.clear(); g_replyMid.clear(); g_replyQuote.clear();
     s_info = nullptr; s_msgDetail = nullptr; s_confirm = nullptr; s_pingLbl = nullptr; s_resendDlg = nullptr; s_resendDd = nullptr; g_infoPeer.clear();
     g_focusTarget = nullptr;
     g_refreshPending = false; g_refreshMsgs = false; g_refreshAnns = false;
@@ -3887,7 +4622,13 @@ void lxmfApp(void* arg) {
     s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
     s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
     s_send = nullptr; s_sendIcon = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_collapsePill = nullptr;
+    s_replyBar = nullptr; s_replyWho = nullptr; s_replyLbl = nullptr;
+    s_msgActs = nullptr; s_msgConfirm = nullptr; g_actsKey.clear(); g_delKey.clear();
+    g_replyKey.clear(); g_replyMid.clear(); g_replyQuote.clear();
+    g_selLabel = nullptr; g_selText.clear(); g_flashObj = nullptr; g_flashTimer = nullptr;
     g_bubbles.clear(); g_dateSeps.clear(); g_histDateSeps.clear();
+    g_histRefs.clear(); g_histAnchor.clear();
+    g_leftAt.clear();                          /* fresh layer: every conversation opens at its newest */
     g_threadLoadTimer = nullptr; g_stickyFadeTimer = nullptr; g_iconSettle = nullptr;   /* prior onLayerDelete freed them */
     g_needMsgLoad = false;
     g_winLo = g_winHi = 0; g_atNewest = true; g_anchorMid.clear();
@@ -3923,6 +4664,10 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("lxmf.announces", onStorageChange);   /* on-the-mesh column */
         storageSubscribeChanges("s.lxmf.pn",      onPnListChange);    /* show/hide the envelope button */
         storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
+        /* The radio's own measurements, which the same label prints. They are
+         * published on iface-lora's beat, not the probe's, so without this the
+         * line a first probe was too early to see never appears. */
+        storageSubscribeChanges("lora.",          onPingChange);
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }

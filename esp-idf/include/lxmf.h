@@ -24,6 +24,7 @@
 
 #include "service.h"
 #include <cstdint>
+#include <string>
 
 /* ── Message status (stored as the u8 `status` record field) ────────────────
  * A single unified state: lifecycle progress, terminal outcome, or gave-up
@@ -37,6 +38,13 @@
  * MIRROR: keep in exact sync with the TS `LxmfStatus` enum + STATUS_NAME in
  * lxmf/browser/src/modules/lxmf.ts (same names, same numbers). */
 static constexpr uint8_t LXMF_TRIES_GAVEUP = 255;
+
+/* Longest quoted fragment (FIELD_REPLY_QUOTE) kept from an inbound message. A
+ * quote is one line of a bubble; anything past this is a peer spending our
+ * flash on text no screen will show, so it is dropped rather than truncated —
+ * a cut fragment would no longer be found in the message it quotes and would
+ * be refused on display anyway. */
+static constexpr size_t LXMF_REPLY_QUOTE_MAX = 512;
 
 enum LxmfStatus : uint8_t {
     /* progress (tries < 255; a sweep may act) */
@@ -74,14 +82,29 @@ enum LxmfStatus : uint8_t {
                                       * proof came back — the peer may simply be offline,
                                       * so we can't claim it was received. Distinct from
                                       * NO_PROOF, which is a link send that went unproven. */
-    /* Proxy states, on a client whose account is served by an lxmproxy server
-     * (tries == 255 — out of our hands — yet still movable, since the server
-     * relays the account's real status back over the Channel: ON_PROXY →
-     * DELIVERED, or ON_PROXY → whatever the server's own send settled). */
-    LXMF_ST_ON_PROXY          = 29,  /* the proxy server holds it and is sending it */
+    /* Proxy states, on a client whose account is served by an lxmproxy server.
+     *
+     * An outbound that goes through a proxy has FIVE states and no others,
+     * however many the server itself passes through:
+     *
+     *   QUEUED             nothing has left this device yet
+     *   SENDING_TO_PROXY   handed to the Channel, not yet acknowledged   …
+     *   ON_OUR_PROXY       our proxy has it and is trying                ✓
+     *   OUR_PROXY_DELIVERED  it reached the recipient                    ✓✓
+     *   OUR_PROXY_GAVE_UP  our proxy tried and stopped                   ✕
+     *
+     * The server's own machinery — path requests, link retries, proof waits —
+     * is its business, not a state of ours: the record collapses every one of
+     * them to ON_OUR_PROXY and keeps the real `LxmfStatus` in `proxy_status`,
+     * where the message's detail page can say WHICH failure it gave up with.
+     * A refusal is not one of the five: PROXY_REFUSED is the server declining
+     * to take the message at all, which is trouble reaching the proxy rather
+     * than the proxy's verdict on reaching the recipient. */
+    LXMF_ST_ON_OUR_PROXY      = 29,  /* our proxy holds it and is sending it */
     LXMF_ST_PROXY_REFUSED     = 30,  /* the server refused it: over quota, or the
                                       * account is not one it serves */
-    /* 31, 32 free */
+    LXMF_ST_SENDING_TO_PROXY  = 31,  /* the SEND is on the Channel; no answer yet */
+    LXMF_ST_OUR_PROXY_DELIVERED = 32,/* our proxy says the recipient has it */
     /* 33 retired */
     LXMF_ST_RADIO_BUSY        = 34,  /* send failed while the local LoRa radio was
                                       * shedding frames to channel contention — the
@@ -94,7 +117,41 @@ enum LxmfStatus : uint8_t {
     LXMF_ST_PN_REJECTED       = 37,  /* the node refused the upload (stamp/access) */
     LXMF_ST_DELIVERY_TIMEOUT  = 38,  /* not delivered within s.lxmf.delivery_timeout
                                       * minutes of attempts from the delivery queue */
+    LXMF_ST_OUR_PROXY_GAVE_UP = 39,  /* our proxy stopped trying. WHY is in the
+                                      * record's `proxy_status`, verbatim from
+                                      * the server — this code says only that
+                                      * the attempt is over and that it is the
+                                      * proxy's verdict, not a failure to reach
+                                      * the proxy (that is PROXY_REFUSED, or a
+                                      * message still sitting at QUEUED). */
 };
+
+/* Has this outbound stopped moving? A VERDICT is a status nothing is going to
+ * change: delivered, cancelled, or one of the ways it failed. Everything else
+ * is still in play — the sender's own attempts, and the two states that mean
+ * another node is holding it.
+ *
+ * This is what a proxy relays, and it is the whole of what it relays: its
+ * client wants the outcome, not the commentary. One STATUS per outgoing
+ * message, at the end. That the server took the message at all is not news —
+ * the client saw its own SEND go out. */
+static inline bool lxmfStatusIsVerdict(uint8_t s) {
+    switch (s) {
+        case LXMF_ST_DRAFT:
+        case LXMF_ST_QUEUED:
+        case LXMF_ST_REQUESTING_PATH:
+        case LXMF_ST_SENDING:
+        case LXMF_ST_AWAITING_PROOF:
+        case LXMF_ST_RETRYING_DELIVERY:
+        case LXMF_ST_RETRYING_LINK:
+        case LXMF_ST_SENDING_TO_PROXY:
+        case LXMF_ST_ON_OUR_PROXY:
+        case LXMF_ST_ON_PN:
+            return false;
+        default:
+            return true;
+    }
+}
 
 /* status code → its ALL-CAPS enum name for display (meta line, CLI). This is the
  * only direction ever needed — a stored code is never parsed back from text.
@@ -130,13 +187,16 @@ static inline const char* lxmfStatusName(uint8_t s) {
         case LXMF_ST_LINK_CLOSED:       return "LINK_CLOSED";
         case LXMF_ST_UNKNOWN:           return "UNKNOWN";
         case LXMF_ST_NO_RESPONSE:       return "NO_RESPONSE";
-        case LXMF_ST_ON_PROXY:          return "ON_PROXY";
+        case LXMF_ST_ON_OUR_PROXY:      return "ON_OUR_PROXY";
         case LXMF_ST_PROXY_REFUSED:     return "PROXY_REFUSED";
+        case LXMF_ST_SENDING_TO_PROXY:  return "SENDING_TO_PROXY";
+        case LXMF_ST_OUR_PROXY_DELIVERED: return "OUR_PROXY_DELIVERED";
         case LXMF_ST_RADIO_BUSY:        return "RADIO_BUSY";
         case LXMF_ST_ON_PN:             return "ON_PN";
         case LXMF_ST_PN_FAIL:           return "PN_FAIL";
         case LXMF_ST_PN_REJECTED:       return "PN_REJECTED";
         case LXMF_ST_DELIVERY_TIMEOUT:  return "DELIVERY_TIMEOUT";
+        case LXMF_ST_OUR_PROXY_GAVE_UP: return "OUR_PROXY_GAVE_UP";
         default:                        return "";
     }
 }
@@ -191,3 +251,22 @@ int lxmfSlotForDest(const uint8_t dest_hash[16]);
  *  Returns true on success, false on validation error / timeout /
  *  lxmf-side failure. */
 bool lxmfDestroyIdentity(int n, bool sync = false);
+
+/** The radio's reading of the link to `peer_hex`, as a person reads it — one
+ *  line per direction the radio has measured, joined by `sep`:
+ *
+ *      us->them 91 dB path loss, SNR 11 dB @ tx +10 dBm (10 mW)
+ *      them->us 88 dB path loss, SNR 9 dB @ tx +22 dBm (158 mW)
+ *
+ *  A peer outside SUPE states no power, so neither direction has a loss; what
+ *  it has is what this radio knows on its own, and that is rendered instead
+ *  (`heard @ -95 dBm / SNR 9.5 dB @ tx +22 dBm (158 mW)`). Empty when no radio
+ *  has measured the peer at all.
+ *
+ *  Read LIVE from iface-lora's `lora.<n>.meas.*`, not from the ping record: the
+ *  measurement is republished on that straddle's own beat and owes the probe
+ *  nothing, so a copy taken when a probe settled was stale the next time the
+ *  radio heard the peer — and on a first probe, empty. One implementation so
+ *  that every frontend describes the same measurement the same way; the browser
+ *  mirror is `peerMeasOf` + `pingLinkLines` in lxmf/browser. */
+std::string lxmfPingLink(const std::string& peer_hex, const char* sep = "\n");
