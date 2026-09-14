@@ -33,8 +33,8 @@ Usage:
     sgdb_recover.py header FILE...            # just the file header line
     sgdb_recover.py recover FILE OUT.db.gz    # rewrite into the current layout
 
-`recover` targets the current committed schemas (msgs id=1 hdr=140,
-contacts id=2 hdr=143). It preserves every text field verbatim and copies the
+`recover` targets the current committed schemas (msgs id=1 hdr=116,
+contacts id=2 hdr=126). It preserves every text field verbatim and copies the
 fixed fields it can positively locate; fields absent from the source default to
 zero, exactly as the on-device auto-migrator would fill them.
 """
@@ -74,26 +74,28 @@ def msg_current():
       .u8("via_link").u8("proxy_status").u8("offered").u8("told")
       .u32("body_size").u32("recv_ts").fixstr("dir", 4).fixstr("method", 16)
       .u32("ts").u32("delivered_ts").data("message_id", 32).data("reply_to", 32)
-      .text("title").text("content"))
+      .text("title").text("content").text("reply_quote"))
     return s
 
 
 def contact_current():
     s = Schema(2, 2)
     (s.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
-      .u8("trust").u8("preview_mine").data("hash", 16).data("pn", 16)
+      .u8("trust").u8("preview_mine").data("hash", 16).data("pubkey", 64)
+      .data("pn", 16)
       .text("display_name").text("nick").text("preview"))
     return s
 
 
 def contact_predescriptor():
-    """The fixed prefix every id=2 layout from v2a (hdr 109) up to the last
-    format_ver-1 write shares. Kept separate from contact_current() because
-    those files predate `preview_mine`, and inserting it would shift `hash` and
-    `pn` off the offsets they actually sit at in an old image."""
+    """The last contact layout written without a descriptor (hdr exactly 109),
+    mirroring the firmware's own legacy hint `lxmfContactSchemaV2a`. Kept
+    separate from contact_current() because those files predate `preview_mine`
+    and `pn`: inserting either shifts `hash` and `pubkey` off the offsets they
+    actually sit at in an old image."""
     s = Schema(2, 2)
     (s.u32("count").u32("last_ts").u32("unread").u32("read_ts").u32("last_seen")
-      .u8("trust").data("hash", 16).data("pn", 16)
+      .u8("trust").data("hash", 16).data("pubkey", 64)
       .text("display_name").text("nick").text("preview"))
     return s
 
@@ -234,7 +236,7 @@ def cmd_dump(paths):
             fixed_schema.hdr = hdr
         elif sid == 2 and hdr >= 109:
             fixed_schema = CONTACT_PREFIX
-        elif sid == 1 and hdr == 140:
+        elif sid == 1 and hdr == MSG_CURRENT.hdr:
             fixed_schema = MSG_CURRENT
         live = 0
         for off, rlen, flags, key, texts in walk_records(img, hdr, rec_start, ntext):
@@ -316,7 +318,7 @@ def cmd_recover(src, out):
         src_fixed = None
         if fmt >= 2:
             src_fixed = Schema(sid, sver); src_fixed.fields = descriptor; src_fixed.hdr = hdr
-        elif hdr == 140:
+        elif hdr == MSG_CURRENT.hdr:
             src_fixed = MSG_CURRENT
     elif sid == 2:
         target = contact_current()

@@ -1059,7 +1059,7 @@ size gate), documented in [rns](../rns), not here.
 label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-if-one-exists)
 proxy_role               off (default) | server | client — which device registers and announces this account (§8c)
 proxy_dest               32-hex lxmproxy.server destination, while proxied
-contacts.<m>.{hash,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pn = the client-set per-contact propagation node, all-zero = none)
+contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none)
 
 msgs.<id>.dir            in | out
 msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)

@@ -860,7 +860,7 @@ default_method   link-always | link-if-one-exists | link-if-big | opportunistic-
 proxy_role       off (default) | server | client — which device registers and
                  announces this account (see Being proxied)
 proxy_dest       32-hex lxmproxy.server destination, while proxied
-contacts.<peer>.{hash,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pn = this contact's propagation node, all-zero = none)
+contacts.<peer>.{hash,pubkey,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pubkey = the contact's own key, so verifying a message from them needs no route and no announce; pn = this contact's propagation node, all-zero = none)
 msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,reply_quote,method,ts,recv_ts,
                    read,message_id,body_absent,body_size,handed,told,offered,
                    via_link,proxy_status}
