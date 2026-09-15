@@ -336,17 +336,24 @@ static void setStrIfChanged(const std::string& key, const char* v)
  *   link-if-big            opportunistic when it fits one packet, a Link
  *                          only when the wire is oversize.
  *   opportunistic-or-fail  never a Link; oversize hard-fails.
- * Legacy: auto→link-if-one-exists, direct→link-always,
+ *
+ * `link-always` is the default, and `auto` — the legacy spelling of "choose for
+ * me" — resolves to it. A Link asks whether the peer is there and is told;
+ * an opportunistic packet is a few hundred bytes put on the air in the dark,
+ * answered only by a delivery proof the peer may not send at all. Upstream
+ * LXMF makes the same call: `LXMessage` with no method picks DIRECT, and
+ * demotes to a packet only where the caller asked for one explicitly.
+ * Legacy: auto→link-always, direct→link-always,
  * opportunistic→opportunistic-or-fail. */
 static std::string canonMethod(const std::string& m)
 {
-    if (m == "auto")          return "link-if-one-exists";
+    if (m == "auto")          return "link-always";
     if (m == "direct")        return "link-always";
     if (m == "opportunistic") return "opportunistic-or-fail";
     if (m == "link-always" || m == "link-if-one-exists" ||
         m == "link-if-big"  || m == "opportunistic-or-fail")
         return m;
-    return "link-if-one-exists";
+    return "link-always";
 }
 
 /* Per-contact message store: s.lxmf.id.<n>.msgs.<peer>.<key>.<field>.
@@ -2284,7 +2291,17 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
     slot->tag         = tag;
     slot->handle      = lh;
     slot->last_used_s = (uint32_t)(nowUnixMs() / 1000);
-    slot->identified  = false;
+    /* Identify on the way up, before any message rides this link. A peer
+     * validates an LXM's signature against the sender identity it can recall,
+     * and a peer that has never heard our announce — anything past the
+     * interface's service radius — has none to recall: it drops the message
+     * unread and proves nothing. The LINKIDENTIFY on this link is where that
+     * peer gets our identity, so it has to arrive before the first message
+     * does. Identifying only after a delivery cannot work here: the delivery
+     * being waited for is the one the missing identity is preventing. rnsd
+     * holds the identify until the handshake completes and runs it ahead of
+     * everything queued on the link. */
+    slot->identified  = rnsdLinkIdentify(tag);
     /* Dialled, not up: rnsd still has to find a path and complete the
      * handshake, and either can fail. The link is established only when
      * `rnsd.links.<tag>.state` reads "active". */
@@ -2294,12 +2311,11 @@ static convlink_t* convGet(lxmf_id_t& id, const std::string& peer_hex,
 
 /* Post-settle bookkeeping shared by the three DIRECT settle paths
  * (resource fast-path aux, resource tick fallback, packet proof): on a
- * delivered settle keep the link warm and — once per conversation link,
- * mirroring upstream LXMRouter's identification after the first
- * successful delivery — identify to the peer so it can send replies back
- * over OUR link (which we accept). On a failed settle drop the link (it's
- * suspect). No-proof packet settles ("sent", message may have arrived)
- * call neither — the link is kept, unidentified. */
+ * delivered settle keep the link warm and, if the identify queued when the
+ * link was opened never reached rnsd, send it now — the peer needs our
+ * identity to address replies back over OUR link (which we accept). On a
+ * failed settle drop the link (it's suspect). No-proof packet settles
+ * ("sent", message may have arrived) call neither — the link is kept. */
 static void directLinkSettle(const std::string& tag, bool ok, uint32_t now_s)
 {
     for (auto& c : s_convlinks) {
@@ -2366,6 +2382,20 @@ static bool s_queueKicked = false;
  * its per-connection table, which is how four unreachable peers stopped every
  * further send to anyone without a known path. */
 static constexpr uint32_t LXMF_PATH_GRACE_S = 60;
+
+/* Seconds we wait for a delivery-proof outcome rnsd owes us before settling the
+ * send ourselves. rnsd settles its own receipt at s.rnsd.proof_timeout_s and
+ * reports the outcome then, so this only has to outlast that window: a backstop
+ * inside it takes the send back while rnsd is still waiting, and the real
+ * outcome then arrives for a send_id whose slot is gone. Read the same knob
+ * rather than assume its default, so raising the window there cannot invert the
+ * two. */
+static uint32_t proofBackstopS()
+{
+    int w = storageGetInt("s.rnsd.proof_timeout_s", 60);
+    if (w < 1) w = 1;
+    return (uint32_t)w + 30;
+}
 
 static uint32_t deliveryIntervalS()
 {
@@ -2641,10 +2671,20 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
         }
     }
 
+    /* The message's timestamp is WHEN IT WAS WRITTEN, and it is stamped once:
+     * a record that already carries one keeps it. A proxied account's draft was
+     * written on the owner's device and reproduced here, possibly hours before
+     * this box gets a path to send it; a composer writes the moment the user
+     * pressed send. Re-stamping at pack time would date the message to the
+     * transmission and hand a re-pack after a reboot a different `message_id`
+     * for the same message. A record with no timestamp is stamped now. */
+    uint64_t ts_ms = (uint64_t)storageGetInt(msgPath(id.index, peer_hex, mid, "ts").c_str(), 0)
+                     * 1000ull;
+    if (!ts_ms) ts_ms = wallUnixMs();
+
     /* Pack the LXM wire so the opportunistic-vs-DIRECT decision keys off
      * the *actual* packed size, not a content estimate that under-counts
      * the signature, fields/reply_to, stamp and msgpack framing. */
-    uint64_t ts_ms = wallUnixMs();
     uint8_t mid_raw[RNSD_HASH_LEN];
     wire = lxmPackWire(id.identity_key.c_str(), id.dest_hash, dh,
                        ts_ms, title, content, fields, stamp_cost, mid_raw);
@@ -2794,7 +2834,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     }
 
     /* Delivery-method selection. Resolution order is per-message override
-     * → per-identity default → global default → "link-if-one-exists". The
+     * → per-identity default → global default → "link-always". The
      * four methods form a spectrum of link eagerness (see canonMethod):
      * link-always always uses a Link; link-if-one-exists rides a warm link
      * to this peer if one exists (our own conversation link), else
@@ -2824,7 +2864,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     if (method.empty())
         method = storageGetStr(idPath(id.index, "default_method").c_str(), "");
     if (method.empty())
-        method = storageGetStr("s.lxmf.default_method", "link-if-one-exists");
+        method = storageGetStr("s.lxmf.default_method", "link-always");
     method = canonMethod(method);
 
     bool use_direct;
@@ -2848,7 +2888,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         use_direct = true;
     } else if (method == "link-if-big") {
         use_direct = false;                   /* oversize is already handled above */
-    } else {                                  /* link-if-one-exists (default) */
+    } else {                                  /* link-if-one-exists */
         /* Prefer the Link when our own conversation link to this peer is
          * already warm — an active chat rides a link for every message.
          * A peer's inbound link into us never counts: not every client
@@ -2956,8 +2996,21 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         o->is_resource       = as_resource;
         o->link_handle       = lhandle;
         o->link_tag          = ltag;
-        o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000)
-                             + (as_resource ? 120 : 45);
+        /* Outlast rnsd's own establishment budget rather than guess at it. rnsd
+         * scales that budget with the next hop's interface speed and the hop
+         * count — 66 s on a TCP route, 79-91 s over LoRa — and publishes it at
+         * kickoff. A flat constant here is shorter than all of them on a slow
+         * interface, and the send is taken back from a link that was still
+         * inside its own deadline, so the establishment never gets to finish.
+         * The key is absent until rnsd has processed the open, so the constant
+         * stays as the floor for that window and for a link already active. */
+        {
+            uint32_t estab = (uint32_t)storageGetInt(
+                ("rnsd.links." + ltag + ".estab_timeout_s").c_str(), 0);
+            uint32_t budget = as_resource ? 120u : 45u;
+            if (estab > budget) budget = estab;
+            o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000) + budget;
+        }
         /* Packet-class sends: baseline the link's delivery-proof counters
          * now so resolveDirectSends can settle "delivered" on the first
          * increment after the send (the link is serialized — only this
@@ -3747,7 +3800,7 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         if (id.pending > 0) id.pending--;
         id.sent++;
         o->awaiting_proof   = true;
-        o->proof_deadline_s = (uint32_t)(nowUnixMs() / 1000) + 90;
+        o->proof_deadline_s = (uint32_t)(nowUnixMs() / 1000) + proofBackstopS();
         storageBegin();
         storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_AWAITING_PROOF);
         storageEnd();
@@ -3779,6 +3832,14 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
              * timeout. */
             if (was_awaiting) { if (id.sent) id.sent--; }
             queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_DELIVERY);
+            /* Escalate now rather than at the next sweep. The cheap attempt has
+             * had its answer: the packet egressed and nothing came back, and the
+             * retry is a Link, which asks whether the peer is there instead of
+             * asserting it. Waiting out a delivery_interval to find that out
+             * spends ten minutes to learn nothing — and a peer that proves link
+             * traffic but not opportunistic packets (a stack whose prove sits on
+             * the link path alone) answers the Link in seconds. */
+            queueKickConversation(id.index, peer_hex);
             return;
         }
         case RNSD_DEST_STATUS_CANCELLED:
@@ -6382,6 +6443,7 @@ static void resolveDirectSends(void)
                     o.used = false;
                     o.awaiting_proof = false;
                     queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_DELIVERY);
+                    queueKickConversation(id.index, peer_hex);
                     dbg("id %d: msg %s proof backstop (no OUT_RESULT)",
                         id.index, mid.c_str());
                 }
@@ -6391,6 +6453,18 @@ static void resolveDirectSends(void)
             std::string base = "rnsd.links." + o.link_tag;
             std::string st   = storageGetStr((base + ".state").c_str(), "");
             int tx           = storageGetInt((base + ".tx_packets").c_str(), 0);
+
+            /* rnsd publishes its establishment budget when it processes the
+             * open, which can land after the send took its deadline — so adopt
+             * it here too. Only ever extends: a send already past its own
+             * deadline is not revived by a budget arriving late. */
+            {
+                uint32_t estab = (uint32_t)storageGetInt(
+                    (base + ".estab_timeout_s").c_str(), 0);
+                uint32_t floor_s = o.started_s + estab;
+                if (estab && floor_s > o.direct_deadline_s)
+                    o.direct_deadline_s = floor_s;
+            }
 
             bool done = false, ok = false;
             std::string err;               /* human text for the log only */
@@ -6471,7 +6545,10 @@ static void resolveDirectSends(void)
             } else if (st.empty() && now_s >= o.direct_deadline_s) {
                 done = true; err = "direct timeout";
             } else if (now_s >= o.direct_deadline_s + 15) {
-                done = true; err = "direct timeout";   /* stuck establishing */
+                /* Stuck establishing. The deadline already carries rnsd's own
+                 * budget for this link, so this is 15 s past the point rnsd
+                 * itself gives up — not a guess that undercuts it. */
+                done = true; err = "direct timeout";
             }
             if (!done) continue;
 
@@ -6491,7 +6568,7 @@ static void resolveDirectSends(void)
                     break;
                 }
                 o.awaiting_proof   = true;
-                o.proof_deadline_s = now_s + 60;
+                o.proof_deadline_s = now_s + proofBackstopS();
                 continue;                       /* slot stays — proof phase */
             }
 
@@ -6658,6 +6735,29 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
         if (!o.awaiting_proof && id.pending > 0) id.pending--;
         o.used = false;
         o.awaiting_proof = false;
+    }
+
+    /* The conversation directory is MAINTAINED, not derived (bumpConvDirectory):
+     * `count` and `unread` are counters, so a message that goes away has to be
+     * counted back out or the badge keeps a deleted message alive and the list
+     * shows a total the thread cannot account for. Read the two fields the
+     * correction needs while the record still exists. Unread-ness is not stored
+     * per message — it is `dir == "in"` and a timestamp past the conversation's
+     * read watermark, the same test the thread view applies. The whole-
+     * conversation branch below drops the contact subtree entirely, counters
+     * and all, so this is the single-message case only. */
+    if (!mid.empty()) {
+        bool inbound = storageGetStr(msgPath(id.index, peer_hex, mid, "dir").c_str(),
+                                     "") == "in";
+        int  ts      = storageGetInt(msgPath(id.index, peer_hex, mid, "ts").c_str(), 0);
+        int  count   = storageGetInt(contactPath(id.index, peer_hex, "count").c_str(), 0);
+        int  unread  = storageGetInt(contactPath(id.index, peer_hex, "unread").c_str(), 0);
+        storageBegin();
+        if (count > 0)
+            storageSet(contactPath(id.index, peer_hex, "count").c_str(), count - 1);
+        if (inbound && unread > 0 && ts > convReadTs(id.index, peer_hex))
+            storageSet(contactPath(id.index, peer_hex, "unread").c_str(), unread - 1);
+        storageEnd();
     }
 
     char path[160];

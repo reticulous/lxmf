@@ -37,7 +37,7 @@ format and the per-byte deltas from upstream are in
 - **Selectable delivery mode.** Per message, lxmf picks a single
   opportunistic packet, a Reticulum Link (DIRECT), or a Resource transfer for
   large bodies. A per-identity/global method chooses how eagerly to hold a
-  Link — from `link-always` through the default `link-if-one-exists` (ride a
+  Link — from the default `link-always` through `link-if-one-exists` (ride an
   already-open Link, else opportunistic) and `link-if-big` down to
   `opportunistic-or-fail`. The conversation header shows the live Link state
   and toggles it open/closed on tap.
@@ -122,7 +122,7 @@ key. Presence = request in flight; absence = done.
 |---|---|---|
 | `lxmf.id.<n>.cmd.send` | `<peer>/<key>[/pn:<hash>]` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>`; the optional `pn:` segment uploads to that propagation node instead |
 | `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` finishes every outbound of this identity that has not finished. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
-| `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation. A proxied outbound is dropped on the proxy too (`DROP`), so a message deleted here is not still being sent by a machine elsewhere |
+| `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation (and the contact with it). A proxied outbound is dropped on the proxy too (`DROP`), so a message deleted here is not still being sent by a machine elsewhere. Deleting one message counts it back out of the conversation directory — `count` always, and `unread` when it was an inbound past the read watermark — since those are maintained counters rather than derived, and a deleted message must not go on lighting the badge |
 | `lxmf.id.<n>.cmd.retry` | `<peer>/<key>` | try this one again NOW. Proxied, that is a `RETRY` frame naming the record — the body is already on the server, and putting it back on the air to say "again" would cost the whole message to carry one bit. Unproxied it is an ordinary send, since this device owns the queue |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — a link establishment where there is no link, else one packet on the open one (see **Ping**) |
@@ -248,11 +248,10 @@ nothing is held open: no outbox slot, no path search in rnsd. Local errors that
 another attempt cannot fix — a body too large for the chosen method, a
 malformed peer, a disabled identity — fail at once.
 
-**A sweep makes one attempt per conversation, over a Link.** The first attempt
-is the cheap one: a single opportunistic packet, no handshake, and for a peer
-who is there that is the end of it. Once that has failed, repeating it re-sends
-the whole message to learn nothing — an opportunistic packet is
-fire-and-forget. So every attempt after the first opens a Link instead, and the
+**A sweep makes one attempt per conversation, over a Link.** Repeating an
+opportunistic packet re-sends the whole message to learn nothing — it is
+fire-and-forget, and the silence that followed the first one is the only answer
+it can give. So every attempt after the first opens a Link instead, and the
 Link is what gets attempted: seven messages waiting for one peer are seven
 passengers on one attempt, not seven attempts. An unreachable peer therefore
 costs one Link open per sweep however much mail is waiting for them, and no
@@ -262,14 +261,22 @@ than waiting out another interval — so a conversation that comes back drains i
 seconds, not in one message per ten minutes. `opportunistic-or-fail` is
 exempt, being an explicit instruction never to open a Link.
 
+**An unproven opportunistic send escalates immediately, not at the next sweep.**
+Only the methods that lead with a packet reach this at all, and when one does,
+the proof timeout has already answered the question the cheap attempt was
+asking. Sitting out a `delivery_interval` before opening the Link spends ten
+minutes to learn nothing, so the conversation is kicked and the sweep runs in
+the same 1 Hz pass. A Link that fails is *not* kicked — it waits out the
+interval, or a peer that is simply away would cost a handshake per second.
+
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
-`link-if-one-exists`. The four methods form a spectrum of link eagerness:
+`link-always`. The four methods form a spectrum of link eagerness:
 
 | method | behaviour |
 | --- | --- |
-| `link-always` | always a Reticulum Link. |
-| `link-if-one-exists` *(default)* | ride our own already-open conversation Link to the peer if one exists, else opportunistic. A peer's inbound Link into us never counts — we only ride Links we opened. |
+| `link-always` *(default)* | always a Reticulum Link. |
+| `link-if-one-exists` | ride our own already-open conversation Link to the peer if one exists, else opportunistic. A peer's inbound Link into us never counts — we only ride Links we opened. |
 | `link-if-big` | opportunistic when the wire fits one packet, a Link only when it's oversize. |
 | `opportunistic-or-fail` | never a Link; oversize hard-fails with `last_error = "too large for opportunistic"`. |
 
@@ -278,8 +285,18 @@ packet (budget ~311 B). Oversize forces a Link in every mode **except**
 `opportunistic-or-fail`, and a Link carries large bodies as a Resource
 transfer. **A retry forces a Link on exactly the same terms** — the method
 describes the first attempt; the delivery queue decides the rest (above). The
-legacy names still parse: `auto`→`link-if-one-exists`,
+legacy names still parse: `auto`→`link-always`,
 `direct`→`link-always`, `opportunistic`→`opportunistic-or-fail`.
+
+**Why a Link by default.** An opportunistic packet is a few hundred bytes put
+on the air in the dark: the only thing that can answer it is a delivery proof,
+and a peer is free not to send one — a stack whose prove sits on the link path
+alone answers every packet with silence while its user reads the message.
+A Link asks whether the peer is there and is told, in one round trip, before
+any body goes out. Upstream LXMF resolves the same way: an `LXMessage` with no
+method set picks DIRECT, and only demotes to a packet where the caller asked
+for one. `link-if-one-exists` remains for a mesh where the handshake is the
+expensive part and the peers are known to prove.
 
 **Link toggle.** The conversation header (web and LCD) shows a link icon —
 green when a Link to the peer is open, amber while establishing, grey when
@@ -832,7 +849,7 @@ cost, and it may reject it (`PN_REJECTED`).
 | `s.lxmf.stamp_cost` | `8` | Advertised PoW cost (bits, 0–18; `0` = none). |
 | `s.lxmf.generate_stamps` | `1` | Pay a peer's advertised stamp cost when sending. |
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
-| `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. |
+| `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. Whichever decides it, rnsd publishes the result as `rnsd.links.<tag>.estab_timeout_s` and the send's own deadline adopts it — a DIRECT send never gives up on a link that is still inside the budget rnsd granted it. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
 | `s.lxmf.delivery_interval` | `10` | Minutes between sweeps of the delivery queue — how often a message that could not be delivered yet gets another attempt. |
 | `s.lxmf.delivery_timeout` | `60` | Minutes a message may sit in the delivery queue before it ends as `DELIVERY_TIMEOUT`. Measured from when it was first queued; a reboot restarts it. |
@@ -856,7 +873,7 @@ label            "main" | "imported" | user-set
 enabled          1 (default); 0 = disabled
 display_name     utf-8, advertised in announces
 default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
-                 (empty ⇒ inherit global s.lxmf.default_method, default link-if-one-exists)
+                 (empty ⇒ inherit global s.lxmf.default_method, default link-always)
 proxy_role       off (default) | server | client — which device registers and
                  announces this account (see Being proxied)
 proxy_dest       32-hex lxmproxy.server destination, while proxied

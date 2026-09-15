@@ -335,12 +335,20 @@ no local landing dest — so `onResourceAux` falls back to recovering the
 owning identity from the packed LXM's leading 16-byte destination hash
 (re-validated in `onInboundLxm`).
 
-**Link identification.** After the *first delivered* result on a
-conversation Link, `directLinkSettle` sends `rnsdLinkIdentify(tag)` —
-rnsd signs a `LINKIDENTIFY` with the identity the link was opened with —
-so the peer can send its replies back over *our* Link (which we accept)
-instead of paying for its own. Once per link; a lost aux merely degrades
-to the peer opening its own reply link.
+**Link identification.** `convGet` sends `rnsdLinkIdentify(tag)` the moment
+the conversation Link is dialled — rnsd holds it until the handshake
+completes and runs it ahead of anything queued on the link, so the
+`LINKIDENTIFY`, signed with the identity the link was opened with, lands
+before the first message does. That ordering is load-bearing in two
+directions. The peer needs it to address replies back over *our* Link
+(which we accept) instead of paying for its own. And a peer that has
+never heard our announce — anything past the interface's service radius —
+cannot recall our identity at all, so it cannot validate the signature on
+an LXM that arrives first: it drops the message unread and proves
+nothing. Identifying only after a delivery deadlocks exactly there, the
+delivery being waited for being the one the missing identity prevents.
+Once per link; `directLinkSettle` re-sends it on a delivered settle if
+the aux never reached rnsd.
 
 We do **not** send over a peer's inbound Link into us. Not every LXMF
 client accepts traffic on the Link it opened, so outgoing sends always
@@ -369,7 +377,7 @@ handleIdCmd → split val on '/' → delete command key → processSend(id,peer,
 processReady — method resolution (after the wire is packed, so oversize
   is measured on the real payload, not a content estimate):
   msgs.<id>.method → s.lxmf.id.<n>.default_method → s.lxmf.default_method
-                   → "link-if-one-exists"   (canonMethod maps legacy auto/direct/opportunistic)
+                   → "link-always"   (canonMethod maps legacy auto/direct/opportunistic)
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "link-always"           → use a Link
   "link-if-one-exists"    → use a Link if oversize OR our own conversation Link to peer is
@@ -389,6 +397,14 @@ propagation-node upload (§8b): RAM-outbox (`g_wireOutbox`) hit on a resend —
 no re-pack and no re-paid multi-second stamp — else pack, cache, and persist
 the firmware-owned record fields (`message_id`, `ts`, `status=queued`) plus
 the conversation-directory bump exactly once, on that first pack.
+
+**The payload timestamp is when the message was written, not when it is
+packed.** A record that already carries a `ts` is packed with it: the composer
+writes one when the user presses send, and a proxy server's `handleSend`
+reproduces the owner's, which may be hours old by the time this box has a path.
+Only a record with no `ts` — one the firmware itself drafted — is stamped at
+pack time. So the `message_id` is stable across a re-pack after a reboot, and a
+proxied account's message carries the same one on both devices.
 
 Local outbound key is `o_<unix_ms>_<rand4>` (the real `message_id` isn't
 stable while a draft mutates; it's carried as a sidecar). Inbound records key
@@ -1056,10 +1072,10 @@ size gate), documented in [rns](../rns), not here.
 ### Per-identity (`s.lxmf.id.<n>.*`)
 
 ```
-label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-if-one-exists)
+label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-always)
 proxy_role               off (default) | server | client — which device registers and announces this account (§8c)
 proxy_dest               32-hex lxmproxy.server destination, while proxied
-contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none)
+contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none; count/unread are maintained counters — bumpConvDirectory adds on write and processDelete subtracts on a single-message delete, so neither is ever re-derived from the store)
 
 msgs.<id>.dir            in | out
 msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)
