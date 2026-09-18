@@ -3067,7 +3067,7 @@ static void lxmfNotifySound()
 {
 #if CONFIG_STRADDLE_AUDIO
     if (storageGetInt("s.lxmf.sound_enabled", 1) == 0) return;
-    std::string p = storageGetStr("s.lxmf.sound", "/fixed/lxmf/ding.wav");
+    std::string p = storageGetStr("s.lxmf.sound", FS_FIXED "/lxmf/ding.wav");
     if (p.empty()) return;
     /* Half volume when the LCD is present AND awake (the user is right there);
      * full volume otherwise — asleep, or a headless node that relies on the ding
@@ -7780,7 +7780,8 @@ static std::vector<UnsettledRow> collectUnsettled(int sel)
 static std::string briefDur(long s)
 {
     if (s < 0) s = 0;
-    char b[16];
+    /* Sized for the widest `long` the compiler admits, plus its suffix. */
+    char b[24];
     if      (s < 90)      std::snprintf(b, sizeof b, "%lds", s);
     else if (s < 90 * 60) std::snprintf(b, sizeof b, "%ldm", s / 60);
     else                  std::snprintf(b, sizeof b, "%ldh", s / 3600);
@@ -9122,7 +9123,7 @@ void LxmfService::onInit()
      * users can point it at their own device-rate WAV. sound_enabled is the
      * on/off toggle exposed in the LXMF settings. Set unconditionally (not
      * behind the version gate) so they land on already-initialised devices. */
-    storageDefault("s.lxmf.sound",         "/fixed/lxmf/ding.wav");
+    storageDefault("s.lxmf.sound",         FS_FIXED "/lxmf/ding.wav");
     storageDefault("s.lxmf.sound_enabled", 1);
     /* strftime format for per-message timestamps in the thread, honoured by both
      * the LCD bubbles and the web UI (which runs a small strftime shim). */
