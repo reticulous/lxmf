@@ -3267,13 +3267,22 @@ void pingLabelUpdate() {
     else if (st == "probing") text = "Probing...";
     else if (st == "path")    text = "Finding a path...";
     else if (st == "ok") {
-        /* A link measures the round trip, not the path, so there is usually no
+        /* The round trip where something measured one, and otherwise how long
+         * the answer took — a different fact, said differently. A probe that
+         * had to find a path spends most of its wait there, and printing that
+         * as the round trip reads as a catastrophic link rather than a cold
+         * path table.
+         * A link measures the round trip, not the path, so there is usually no
          * hop count to state — and "0 hops" would be a made-up number where
          * there is no answer. */
-        std::string hops = fld("hops");
-        text = fld("rtt_ms") + " ms";
-        if (!hops.empty() && hops != "0")
-            text += ", " + hops + (hops == "1" ? " hop" : " hops");
+        std::string rtt = fld("rtt_ms"), hops = fld("hops");
+        if (!rtt.empty() && rtt != "0") {
+            text = rtt + " ms";
+            if (!hops.empty() && hops != "0")
+                text += ", " + hops + (hops == "1" ? " hop" : " hops");
+        } else {
+            text = "answered in " + fld("answer_ms") + " ms";
+        }
     }
     else if (st == "no-proof") text = "Delivered, but no proof came back.";
     else if (st == "no-route") text = "No route to this contact.";

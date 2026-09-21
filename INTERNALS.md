@@ -524,7 +524,14 @@ our_dest`), so rnsd strips the leading destination and the peer's plaintext is
 exactly our `lxmf.delivery` hash: the peer's lxmf names it as a probe and drops
 it after its rnsd has proved it. The probe measures the round trip and hop
 count, and the record is that and nothing more:
-`lxmf.ping.<peer>.{state,ts,rtt_ms,hops}`.
+`lxmf.ping.<peer>.{state,ts,rtt_ms,answer_ms,hops}`.
+
+`rtt_ms` is written only from a measurement: `rnsd.links.<tag>.rtt_ms` (µR's
+timing of the handshake, for a probe that dialled) or `.tx_rtt_ms` (its timing
+of the packet proof, for one riding an open link). `answer_ms` is the press to
+the outcome and is always written. Deriving the first from the second is wrong
+twice over: it reports a cold path table as a 30-second round trip, and the
+1 Hz tick it would be timed on rounds a fast link up to a whole second.
 
 The radio's own reading of the link sits beside it but is never copied into it.
 `lxmfPingLink` (lxmf.h) reads it at render time through `lxmfPeerMeas`, from
@@ -555,7 +562,15 @@ same counter as messages; `pingApplyOutResult` / `pingApplyOutStatus` claim that
 `SENT` is not an outcome (rnsd follows it with a second result when the proof
 lands or times out). Pressing again supersedes rather than queues — a
 measurement the user is watching should be the newest one, not the oldest
-queued. `pingTick` on the 1 Hz pass ends as `timeout` at `pingTimeoutS()`, which
+queued — and `pingAbandon` is what supersede means: the slot is dropped
+*without settling* (a stale result must not overwrite the one being waited
+for) **and the link the old probe dialled is disconnected**. A probe's link is
+the probe. rnsd holds a Link for exactly as long as the consumer's ITS handle
+and refuses that link's tag while the handle lives, so a forgotten handle is
+both a link keepaliving with nobody to answer for it and a tag that fails every
+later probe of the same contact at the dial. The tag carries a rotating
+counter (`lxmf.ping<n>.<peer8>.<xx>`) besides, so no probe can inherit the name
+— or the leftover `rnsd.links.<tag>.*` tree — of the one before it. `pingTick` on the 1 Hz pass ends as `timeout` at `pingTimeoutS()`, which
 covers the one case rnsd emits no result for at all: a send parked on a path
 search that never resolves. That deadline is **derived from the thing it is
 waiting on** — `s.rnsd.link.path_timeout_s` plus
@@ -567,7 +582,7 @@ flight. A late result for an abandoned probe falls through to `applyOutResult`
 and logs an unknown-send_id line at verb level.
 
 **The radio's reading is not part of the probe.** `pingSettle` writes only
-`state`, `ts`, `rtt_ms` and `hops`; the path losses and levels are read live
+`state`, `ts`, `answer_ms`, `rtt_ms` and `hops`; the path losses and levels are read live
 from `lora.<n>.meas.*` by `lxmfPingLink` at render time. iface-lora republishes
 those on its own 15 s beat, so a snapshot taken at settle was stale as soon as
 the radio heard the peer again — and on a first probe it was empty, the link
@@ -887,11 +902,12 @@ which only the conversation link's own receive path passes as true.
 
 **Ping is a link when there is no destination to probe from.** Proxied,
 `pingStart` dials `lxmf.delivery` on the account's identity with a
-`lxmf.ping<n>.<peer8>` tag and settles on `rnsd.links.<tag>.rtt_ms` when the
-state reaches `active` — µR's own measurement of the establishment exchange —
-then drops the link. Where a conversation link is already open the probe rides
-it as a 32-byte packet and settles on the same `tx_proven` / `proof_timeouts`
-counters a direct message does, baselined before the send. `link_handle >= 0`
+`lxmf.ping<n>.<peer8>.<xx>` tag and settles on `rnsd.links.<tag>.rtt_ms` when
+the state reaches `active` — µR's own measurement of the establishment
+exchange — then drops the link. Where a conversation link is already open the
+probe rides it as a 32-byte packet and settles on the same `tx_proven` /
+`proof_timeouts` counters a direct message does, baselined before the send,
+reading its round trip from the `tx_rtt_ms` rnsd publishes with the increment. `link_handle >= 0`
 is what distinguishes the two: a probe that dialled owns its link and must take
 it down, one riding somebody else's must leave it standing. The unproxied path
 is unchanged — a registration is there, and one packet is cheaper than a
@@ -1164,10 +1180,12 @@ lxmf.proxies_text                   the same, one finished line each
 lxmf.pn.sync                        node hash currently being synced, "" idle (§8b)
 lxmf.pn.<hash>.{last_check_s,last_err,last_got}   per-node sync results (RAM)
 
-lxmf.ping.<peer>.{state,ts,rtt_ms,hops}
+lxmf.ping.<peer>.{state,ts,rtt_ms,answer_ms,hops}
                                     latest probe (RAM, §6 Ping). The probe's own
                                     findings only — the radio's reading is read
-                                    live from lora.<n>.meas.*, never copied here
+                                    live from lora.<n>.meas.*, never copied here.
+                                    rtt_ms only where something measured a round
+                                    trip; answer_ms is always the press-to-outcome
 ```
 
 Record store schema id 4 is reserved and must not be assigned to a new store.

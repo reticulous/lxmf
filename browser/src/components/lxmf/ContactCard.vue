@@ -28,12 +28,20 @@
                    reading rides every outcome: it is a measurement of the link,
                    not of the probe, and it is worth most where the probe came
                    back empty. -->
-              <div v-if="ping.state === 'ok'" class="pingrtt">
-                <!-- A link measures the round trip, not the path, so it has no
-                     hop count to state. Saying "0 hops" would be a made-up
-                     number where there is simply no answer. -->
+              <!-- The round trip where something measured one, and otherwise
+                   how long the answer took, which is a different fact and says
+                   so. A probe that had to find a path first spends most of it
+                   there: calling that the round trip reads as a catastrophic
+                   link rather than a cold path table.
+                   A link measures the round trip, not the path, so it has no
+                   hop count to state. Saying "0 hops" would be a made-up
+                   number where there is simply no answer. -->
+              <div v-if="ping.state === 'ok' && ping.rttMs > 0" class="pingrtt">
                 {{ ping.rttMs }} ms<template v-if="ping.hops > 0">
                   · {{ ping.hops }} hop{{ ping.hops === 1 ? '' : 's' }}</template>
+              </div>
+              <div v-else-if="ping.state === 'ok'" class="pingrtt">
+                answered in {{ ping.answerMs }} ms
               </div>
               <div v-else class="pingrtt">{{ pingFailText }}</div>
               <div v-for="l in linkLines" :key="l" class="pingrow">{{ l }}</div>

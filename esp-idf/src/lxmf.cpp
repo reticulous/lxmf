@@ -199,7 +199,7 @@ struct ping_t {
     int         link_handle = -1;   /* >= 0 only for a link this probe dialled,
                                      * which is also what says the probe owns it
                                      * and must take it down again */
-    uint32_t    link_started_ms = 0;
+    uint32_t    started_ms = 0;     /* the press: what `answer_ms` is measured from */
     /* Probing over a link that was already open: the link's delivery-proof
      * counters as they stood before the probe, so the first increment after it
      * is this probe's answer. The link is serialized, so nothing else can move
@@ -217,6 +217,7 @@ struct lxmf_id_t {
     uint16_t    next_send_id;
     outbound_t  outboxes[8];                        /* in-flight send_id → message-key tracking */
     ping_t      ping;                               /* the contact page's Ping, at most one */
+    uint8_t     ping_seq;                           /* rotates the probe link tag (see pingStart) */
 
     /* Stats (mirrored to lxmf.id.<n>.stats.* at 1 Hz). */
     uint32_t      sent;
@@ -3424,7 +3425,7 @@ static void pingClear(const std::string& peer_hex)
      * found nothing, and stored nothing, so the reading stayed missing until
      * somebody pinged again. Live, it appears the moment the beat publishes and
      * stays current afterwards. */
-    static const char* kFields[] = { "state", "ts", "rtt_ms", "hops" };
+    static const char* kFields[] = { "state", "ts", "rtt_ms", "answer_ms", "hops" };
     storageBegin();
     for (const char* f : kFields) storageUnset(pingPath(peer_hex, f).c_str());
     storageEnd();
@@ -3543,8 +3544,19 @@ std::string lxmfPingLink(const std::string& peer_hex, const char* sep)
     return out;
 }
 
-/* Settle a ping: write the outcome word and the round trip and hop count where
- * there was one, then free the slot.
+/* Settle a ping: write the outcome word, how long the answer took, and the
+ * round trip and hop count where something MEASURED one, then free the slot.
+ *
+ * **A round trip is a measurement, not an elapsed time.** `rtt_ms` is written
+ * only from µR's own timing of the exchange the probe rode — the link
+ * establishment (`rnsd.links.<tag>.rtt_ms`) or the packet proof
+ * (`.tx_rtt_ms`) — and is absent when nothing measured one. What is always
+ * there is `answer_ms`, the time from the press to this outcome: on a probe
+ * that had to find a path first that is tens of seconds of path search, which
+ * is worth showing and is not a round trip. Reported as one number, a contact
+ * that merely took 30 s to find answers "rtt=30000 ms", which reads as a
+ * catastrophic link rather than a cold path table. `hops` rides `rtt_ms`,
+ * since it describes the same measured exchange.
  *
  * The RADIO's reading of the link is not written here. It is published
  * continuously by iface-lora and owes the probe nothing, so every surface reads
@@ -3557,6 +3569,7 @@ static void pingSettle(lxmf_id_t& id, const char* state,
 {
     if (!id.ping.used) return;
     std::string peer = id.ping.peer;
+    uint32_t started = id.ping.started_ms;
     id.ping.used = false;
     /* Whatever carried this probe is done with. The link a dial opened is
      * closed by the caller that knows the outcome; this only forgets it, so a
@@ -3564,18 +3577,57 @@ static void pingSettle(lxmf_id_t& id, const char* state,
     id.ping.by_link = false;
     id.ping.link_tag.clear();
     id.ping.link_handle = -1;
-    id.ping.link_started_ms = 0;
+    id.ping.started_ms = 0;
 
+    uint32_t answer_ms = started ? (uint32_t)nowUnixMs() - started : 0;
     storageBegin();
     storageSet(pingPath(peer, "state").c_str(), state);
     storageSet(pingPath(peer, "ts").c_str(),    (int)(nowUnixMs() / 1000));
+    if (started) storageSet(pingPath(peer, "answer_ms").c_str(), (int)answer_ms);
     if (hops >= 0) {
         storageSet(pingPath(peer, "rtt_ms").c_str(), (int)rtt_ms);
         storageSet(pingPath(peer, "hops").c_str(),   hops);
     }
     storageEnd();
-    info("id %d: ping %s → %s (rtt=%u ms)", id.index, peer.c_str(), state,
-         (unsigned)rtt_ms);
+    if (hops >= 0)
+        info("id %d: ping %s → %s (rtt=%u ms, answered in %u ms)", id.index,
+             peer.c_str(), state, (unsigned)rtt_ms, (unsigned)answer_ms);
+    else
+        info("id %d: ping %s → %s (answered in %u ms, nothing measured the "
+             "round trip)", id.index, peer.c_str(), state, (unsigned)answer_ms);
+}
+
+/* Abandon the probe in flight without settling it: the user has asked for a
+ * newer measurement of something, and a stale result landing under the old
+ * peer would overwrite the one they are waiting for.
+ *
+ * **The link it dialled goes with it.** A probe's link is the probe: rnsd holds
+ * a Link open for exactly as long as the consumer's ITS handle, and the tag it
+ * is registered under is refused to a second opener while that handle lives
+ * (`onLinkConnect`, "duplicate tag … still active"). Forgetting the handle
+ * instead of closing it leaves a link keepaliving on the air with nobody to
+ * answer for it AND — the tag naming the peer — fails every later probe of
+ * that contact at the dial, until µR lets the orphan go stale minutes later.
+ * Sending the contact a message would hide that, since a probe with a
+ * conversation link to ride never dials at all. */
+static void pingAbandon(lxmf_id_t& id)
+{
+    if (!id.ping.used) return;
+    if (id.ping.link_handle >= 0) itsDisconnect(id.ping.link_handle);
+    info("id %d: ping %s superseded", id.index, id.ping.peer.c_str());
+    /* Say so under the peer we are walking away from, or its row sits on
+     * `probing` for good — nothing will settle it now. A press on the same
+     * contact clears this again a line later (pingClear), so only the contact
+     * actually abandoned keeps the word. */
+    storageBegin();
+    storageSet(pingPath(id.ping.peer, "state").c_str(), "cancelled");
+    storageSet(pingPath(id.ping.peer, "ts").c_str(), (int)(nowUnixMs() / 1000));
+    storageEnd();
+    id.ping.used = false;
+    id.ping.by_link = false;
+    id.ping.link_tag.clear();
+    id.ping.link_handle = -1;
+    id.ping.started_ms = 0;
 }
 
 /* Start a probe to `peer_hex`, superseding any ping already in flight for this
@@ -3588,6 +3640,11 @@ static void pingStart(lxmf_id_t& id, const std::string& peer_hex)
         warn("id %d: ping bad peer \"%s\"", id.index, peer_hex.c_str());
         return;
     }
+    /* Supersede: one probe per identity is in flight, and a second press ends
+     * the first outright — link and all. After the hash check above, because a
+     * malformed argument is not a press and must not kill a running probe. */
+    pingAbandon(id);
+
     /* No registration with rnsd for this account — it has not come up yet, or
      * this is a proxied identity whose registrant is the server's device. The
      * 1 Hz tick retries anyway; a press is exactly when it is worth one more. */
@@ -3628,9 +3685,19 @@ static void pingStart(lxmf_id_t& id, const std::string& peer_hex)
              * cannot mistake somebody else's result for this ping's. */
             id.ping.send_id = 0;
             id.ping.deadline_s = (uint32_t)(nowUnixMs() / 1000) + pingTimeoutS();
-            id.ping.link_started_ms = (uint32_t)nowUnixMs();
+            id.ping.started_ms = (uint32_t)nowUnixMs();
+            /* A tag no earlier probe can still be holding. rnsd refuses a tag
+             * whose slot is live, and it keys the state tree this probe reads
+             * back — so a probe wearing the last one's name is refused at the
+             * dial if that one is somehow still up, and reads its leavings if
+             * it is not. pingAbandon closes the predecessor either way; the
+             * counter is belt and braces, and costs two characters. Two hex
+             * digits wrap harmlessly: the collision it guards against is with
+             * the probe just before, never with one 256 presses ago. Stays
+             * inside rnsd's 23-char tag: 9 + 1 + 1 + 8 + 1 + 2 = 22. */
             char tag[32];
-            std::snprintf(tag, sizeof tag, "lxmf.ping%d.%.8s", id.index, peer_hex.c_str());
+            std::snprintf(tag, sizeof tag, "lxmf.ping%d.%.8s.%02x", id.index,
+                          peer_hex.c_str(), (unsigned)(id.ping_seq++ & 0xff));
             id.ping.link_tag = tag;
             storageBegin();
             storageSet(pingPath(peer_hex, "state").c_str(), "probing");
@@ -3657,7 +3724,13 @@ static void pingStart(lxmf_id_t& id, const std::string& peer_hex)
         id.ping.by_link    = true;
         id.ping.send_id    = 0;              /* as above: no outbox send is ours */
         id.ping.link_tag   = have->tag;
-        id.ping.link_started_ms = (uint32_t)nowUnixMs();
+        /* Not ours to close: this link belongs to the conversation, and the
+         * handle field is what says which links a probe may take down. Set
+         * explicitly rather than left to carry over: a superseded dial's
+         * handle sitting here has the probe hang up on the conversation it is
+         * riding, and read that link's `active` as its own answer. */
+        id.ping.link_handle = -1;
+        id.ping.started_ms = (uint32_t)nowUnixMs();
         id.ping.deadline_s = (uint32_t)(nowUnixMs() / 1000) + pingTimeoutS();
         storageBegin();
         storageSet(pingPath(peer_hex, "state").c_str(), "probing");
@@ -3737,12 +3810,15 @@ static void pingTick(lxmf_id_t& id)
              * none and must leave it standing. */
             if (id.ping.link_handle >= 0) {
                 if (st == "active") {
+                    /* µR's own measurement of the handshake, or nothing. The
+                     * wall clock here would be the press to this 1 Hz tick —
+                     * path search included — which is not a round trip and
+                     * must not be published as one; `answer_ms` carries it. */
                     int rtt = storageGetInt((base + ".rtt_ms").c_str(), 0);
-                    if (rtt <= 0)   /* no measurement published: time it ourselves */
-                        rtt = (int)((uint32_t)nowUnixMs() - id.ping.link_started_ms);
                     itsDisconnect(id.ping.link_handle);
                     id.ping.link_handle = -1;
-                    pingSettle(id, "ok", (uint32_t)rtt, 0);
+                    pingSettle(id, "ok", (uint32_t)(rtt > 0 ? rtt : 0),
+                               rtt > 0 ? 0 : -1);
                     return;
                 }
                 if (st == "failed" || st == "closed") {
@@ -3755,8 +3831,13 @@ static void pingTick(lxmf_id_t& id)
                 int proven   = storageGetInt((base + ".tx_proven").c_str(), 0);
                 int timeouts = storageGetInt((base + ".proof_timeouts").c_str(), 0);
                 if (proven > id.ping.proof_base_proven) {
-                    pingSettle(id, "ok",
-                               (uint32_t)((uint32_t)nowUnixMs() - id.ping.link_started_ms), 0);
+                    /* rnsd publishes the round trip µR timed for the packet
+                     * this increment settled, in the same transaction as the
+                     * counter — so the measurement is here to be read, and
+                     * this tick's 1 Hz granularity never reaches the number. */
+                    int rtt = storageGetInt((base + ".tx_rtt_ms").c_str(), 0);
+                    pingSettle(id, "ok", (uint32_t)(rtt > 0 ? rtt : 0),
+                               rtt > 0 ? 0 : -1);
                     return;
                 }
                 if (timeouts > id.ping.proof_base_timeouts) {

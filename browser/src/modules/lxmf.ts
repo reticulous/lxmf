@@ -183,7 +183,14 @@ export interface Message {
 export interface PingResult {
   state: string        // probing | path | ok | no-proof | no-route | timeout | cancelled | failed
   ts: number           // unix seconds of the last state change
-  rttMs: number        // round trip, 0 unless state is 'ok'
+  /** Round trip as something MEASURED it — µR's timing of the link handshake
+   *  or of the packet proof. 0 when nothing did, which is not the same as a
+   *  fast link: show `answerMs` there instead. */
+  rttMs: number
+  /** Press to outcome. Always present on a settled probe, and on one that had
+   *  to find a path it is mostly path search — worth showing, never a round
+   *  trip. */
+  answerMs: number
   hops: number
 }
 
@@ -800,13 +807,22 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   /* Contacts + announces are record stores now, not cfgRoot subtrees, so they
    * don't ride the connect dump. Fetch them whenever the stream (re)syncs — the
    * device then live-mirrors their every change (browserMirror stores). Contacts
-   * are per-identity, so also re-fetch on a slot switch; announces are global. */
-  watch([() => device.synced, () => activeId.value], ([ok, id]) => {
-    if (ok && id != null && !Number.isNaN(id))
+   * are per-identity, so also re-fetch on a slot switch; announces are global.
+   *
+   * Keyed on `syncEpoch`, NOT on `synced`. "Once per stream" is the contract a
+   * browser-mirrored store is fetched under, and `synced` says once per page:
+   * it latches true on the first dump and never goes false again, so a tab that
+   * outlives a device reboot — the common way to watch one come up — never asks
+   * again and shows the mirror it had before, or an empty rail forever if it
+   * had none. `syncEpoch` counts completed dumps, which is exactly one per
+   * stream, and the thread watcher below already reads it for the same reason.
+   * A first load still fires: the epoch moves 0 → 1 when that dump lands. */
+  watch([() => device.syncEpoch, () => activeId.value], ([, id]) => {
+    if (device.synced && id != null && !Number.isNaN(id))
       device.sendCommand({ fetch: `s.lxmf.id.${id}.contacts` })
   }, { immediate: true })
-  watch(() => device.synced, (ok) => {
-    if (ok) device.sendCommand({ fetch: 'lxmf.announces' })
+  watch(() => device.syncEpoch, () => {
+    if (device.synced) device.sendCommand({ fetch: 'lxmf.announces' })
   }, { immediate: true })
 
   /* Message bodies live in the device's record store, not cfgRoot, so they ride
@@ -1140,6 +1156,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       state: str(r.state),
       ts: num(r.ts),
       rttMs: num(r.rtt_ms),
+      answerMs: num(r.answer_ms),
       hops: num(r.hops),
     }
   }

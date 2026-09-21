@@ -709,10 +709,22 @@ Results are published per peer, RAM-only, overwritten by the next probe:
 lxmf.ping.<peer>.state       probing | path | ok | no-proof | no-route |
                              timeout | cancelled | failed
 lxmf.ping.<peer>.ts          unix seconds of the last state change
-lxmf.ping.<peer>.rtt_ms      round trip; present on `ok`
+lxmf.ping.<peer>.rtt_ms      round trip, where something MEASURED one: µR's own
+                             timing of the link handshake or of the packet
+                             proof. Absent when nothing did
+lxmf.ping.<peer>.answer_ms   press to outcome. Always there on a settled probe
 lxmf.ping.<peer>.hops        0 — a link measures the round trip, not the path;
                              `rnpath <hash>` is what says how many hops it took
 ```
+
+**A round trip is a measurement, not an elapsed time.** The two are far apart
+on a first probe: a contact whose path is not cached spends tens of seconds
+finding one before anything is measured, and reporting that wait as `rtt_ms`
+said "30000 ms" about a link that answers in 300. So `rtt_ms` is written only
+from µR's own timing — `rnsd.links.<tag>.rtt_ms` for a probe that dialled,
+`.tx_rtt_ms` for one that rode an open link — and `answer_ms`, always present,
+is how long the operator waited. A surface with no `rtt_ms` to show says
+"answered in N ms" rather than dressing the wait up as a measurement.
 
 That is the whole record: **the probe's own findings, and nothing else.** What
 the radio measured is read live from `lora.<n>.meas.*` and never copied here.
@@ -754,6 +766,17 @@ just ran.
 One ping per identity is in flight at a time; pressing again supersedes rather
 than queues, and a probe that draws no result at all ends as `timeout` so the
 display never sticks on `probing`.
+
+**Superseding ends the old probe outright, link and all.** A probe's link *is*
+the probe: rnsd holds a Link for exactly as long as the consumer's ITS handle,
+and refuses that link's tag to anyone else while the handle lives. A supersede
+that only forgets the handle leaves a link keepaliving on the air with nobody
+to answer for it and — the tag naming the peer — fails every later probe of
+that contact at the dial, until µR lets the orphan go stale minutes later.
+Messaging the contact would appear to cure that, since a probe with a
+conversation link to ride never dials at all. The link tag also carries a
+rotating counter (`lxmf.ping<n>.<peer8>.<xx>`), so no probe can inherit the
+name, or the leftover state tree, of the one before it.
 
 **The probe's deadline is derived from what it waits on.** A probe with no link
 to ride first needs a path, and that search runs on rnsd's budget — so the
