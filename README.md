@@ -229,7 +229,7 @@ Messages are stored **per contact**: `<peer>` is the 32-hex destination,
    ```
    DRAFT → QUEUED → REQUESTING_PATH → SENDING → AWAITING_PROOF → DELIVERED
                  ↖ RETRYING_LINK / RETRYING_DELIVERY / REQUESTING_PATH ↙   (back in the queue)
-                                              ↘ DELIVERY_TIMEOUT | TOO_LARGE | … | CANCELLED
+                                              ↘ DELIVERY_TIMEOUT | LINK_FAIL | TOO_LARGE | … | CANCELLED
    ```
 
    The companion `…tries` byte counts delivery attempts, and `tries == 255`
@@ -243,7 +243,8 @@ within a minute, no proof back, a conversation Link that failed or is busy, no
 free outbox slot — puts the message in the delivery queue rather than failing
 it. The queue is swept every `s.lxmf.delivery_interval` minutes (default 10)
 while it holds anything, and a message queued for longer than
-`s.lxmf.delivery_timeout` minutes (default 60) ends as `DELIVERY_TIMEOUT`. A
+`s.lxmf.delivery_timeout` minutes (default 60) ends as `DELIVERY_TIMEOUT`; a
+message whose Link failed twice ends sooner, as `LINK_FAIL` (below). A
 reboot resumes every in-progress outbound it finds in storage. Between attempts
 nothing is held open: no outbox slot, no path search in rnsd. Local errors that
 another attempt cannot fix — a body too large for the chosen method, a
@@ -288,9 +289,27 @@ that peer follows it over the still-open Link at once rather than waiting out
 another interval — so a conversation that comes back drains in seconds, not in
 one message per ten minutes. A conversation whose oldest message has a re-send
 scheduled spends its sweep turn on that re-send. `opportunistic-or-fail` is
-exempt, being an explicit instruction never to open a Link. A Link that fails
-is *not* kicked — it waits out the interval, or a peer that is simply away
-would cost a handshake per second.
+exempt, being an explicit instruction never to open a Link.
+
+**A Link that fails gets one retry, five minutes later.**
+
+```
+A → B   Link        rnsd: up to 3 establishments while B was heard from lately
+A       failed      establish_timeout, or the link closed before the send
+A → B   Link        5 min later, the message's one retry
+A       LINK_FAIL   if that fails too — tries = 255
+```
+
+rnsd has already spent its own attempts on each of these (a fresh establishment
+per attempt, while the peer has been heard from in the last 15 minutes — rns
+`INTERNALS.md` §5.1), so what reaches lxmf as a failed Link is a peer that is
+there but hard to reach, or one that is not there at all. The first earns one
+more try after the medium has had time to change; the second says so within
+minutes instead of sitting in the queue for the whole delivery timeout. The
+retry is this conversation's turn: a sweep does not make a second attempt
+beside it. The count lives in the queue entry, so a reboot or a fresh
+`cmd.send` starts it over. A message that is waiting for a **path** is not a
+failed Link: it stays on the sweep and the delivery timeout above.
 
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
@@ -665,7 +684,7 @@ both frontends print; the numbers are persisted, so the list is append-only
 |---|---|---|
 | progress | `DRAFT` `QUEUED` `REQUESTING_PATH` `SENDING` `AWAITING_PROOF` `RETRYING_LINK` `RETRYING_DELIVERY` `SENDING_TO_PROXY` | still in play; the delivery queue will try again |
 | finished | `DELIVERED` `OUR_PROXY_DELIVERED` `CANCELLED` `RECEIVED` | proof received (ours, or relayed by our proxy) / user cancelled / inbound |
-| gave up | `DELIVERY_TIMEOUT` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` `OUR_PROXY_GAVE_UP` … | why it stopped: out of time, a local error another attempt cannot fix, or our proxy's own verdict (which failure is on the record as `proxy_status`) |
+| gave up | `DELIVERY_TIMEOUT` `LINK_FAIL` `TOO_LARGE` `BAD_PEER` `DISABLED` `PACK_FAIL` `RES_MALLOC` `RES_SEND` `EVICTED` `OUR_PROXY_GAVE_UP` … | why it stopped: out of time, a local error another attempt cannot fix, or our proxy's own verdict (which failure is on the record as `proxy_status`) |
 | held by another node | `ON_OUR_PROXY` `ON_PN` `PROXY_REFUSED` `PN_FAIL` `PN_REJECTED` | proxy-server / propagation-node states |
 
 The companion `tries` byte, not the status, is the definitive terminal marker:

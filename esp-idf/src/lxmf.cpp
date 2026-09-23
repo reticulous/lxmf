@@ -2394,6 +2394,11 @@ struct queued_t {
      * next one is due (unix s, 0 = none waiting). See oppProofMissed. */
     uint8_t  resends;
     uint32_t resend_at_s;
+    /* Link attempts for this message that failed to carry it — rnsd gave up
+     * establishing, or the link closed before the send — and when the one
+     * retry they earn is due (unix s, 0 = none waiting). See linkFailed. */
+    uint8_t  link_fails = 0;
+    uint32_t link_retry_at_s = 0;
 };
 static std::vector<queued_t> s_queue;
 static uint32_t s_queueNextSweep_s = 0;    /* 0 = no sweep armed (queue empty) */
@@ -2583,20 +2588,59 @@ static void oppProofMissed(lxmf_id_t& id, const std::string& peer,
     queueKickConversation(id.index, peer);
 }
 
-/* Fire the opportunistic re-sends that have come due (oppProofMissed). From
- * the 1 Hz tick. */
+/* A Link attempt for this message failed to carry it: rnsd's establishment
+ * ran out (after its own fresh attempts toward a peer it has heard from), or
+ * the link closed before the send went out.
+ *
+ *   A → B   Link        failed           (link_fails 1)
+ *   A → B   Link        5 min later      (the one retry)
+ *   A       LINK_FAIL   if that fails too
+ *
+ * rnsd has already spent its retries on this attempt, so a peer that is there
+ * but hard to reach gets one more try after the medium has had time to change,
+ * and a message that cannot get a link says so within minutes instead of
+ * sitting in the queue for the whole delivery timeout. A message waiting for a
+ * PATH is not this: that one stays on the sweep. */
+static constexpr uint8_t  LXMF_LINK_FAILS_MAX = 2;
+static constexpr uint32_t LXMF_LINK_RETRY_S   = 5 * 60;
+
+static void linkFailed(lxmf_id_t& id, const std::string& peer,
+                       const std::string& mid)
+{
+    queueRequeue(id, peer, mid, LXMF_ST_RETRYING_LINK);
+    queued_t* e = queueFind(id.index, peer, mid);
+    if (!e) return;
+    if (++e->link_fails >= LXMF_LINK_FAILS_MAX) {
+        uint32_t drops_base = e->tx_drops_base;
+        msgFail(id.index, peer, mid, radioBusyOr(drops_base, LXMF_ST_LINK_FAIL));
+        id.failed++;
+        warn("id %d: msg %s link failed twice — giving up", id.index, mid.c_str());
+        return;
+    }
+    e->link_retry_at_s = (uint32_t)(nowUnixMs() / 1000) + LXMF_LINK_RETRY_S;
+    info("id %d: msg %s link failed — one retry in %u min", id.index, mid.c_str(),
+         (unsigned)(LXMF_LINK_RETRY_S / 60));
+}
+
+/* Fire the opportunistic re-sends and link retries that have come due
+ * (oppProofMissed, linkFailed). From the 1 Hz tick. */
 static void queueResendDue(void)
 {
     uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
-    std::vector<queued_t> due;
+    std::vector<std::pair<queued_t, bool>> due;   /* (entry, link retry) */
     for (auto& e : s_queue) {
+        if (e.link_retry_at_s && now_s >= e.link_retry_at_s) {
+            e.link_retry_at_s = 0;
+            due.emplace_back(e, true);
+            continue;
+        }
         if (!e.resend_at_s || now_s < e.resend_at_s) continue;
         e.resend_at_s = 0;
         e.resends++;
-        due.push_back(e);
+        due.emplace_back(e, false);
     }
     /* processReady may queue again, so it runs on copies, off the list. */
-    for (auto& e : due) {
+    for (auto& [e, link_retry] : due) {
         if (e.id_index < 0 || e.id_index >= LXMF_MAX_IDENTITIES ||
             !s_ids[e.id_index].used) continue;
         lxmf_id_t& id = s_ids[e.id_index];
@@ -2604,6 +2648,11 @@ static void queueResendDue(void)
         int tries = storageGetInt(msgPath(id.index, e.peer, e.mid, "tries").c_str(),  0);
         if (!statusInProgress(st) || tries == LXMF_TRIES_GAVEUP) continue;
         if (outboxHolds(id, e.peer, e.mid)) continue;
+        if (link_retry) {
+            info("id %d: msg %s retrying its failed link", id.index, e.mid.c_str());
+            processReady(id, e.peer, e.mid, /*retry=*/true);
+            continue;
+        }
         info("id %d: msg %s message_id=%s re-sent as the same packet (attempt %u)",
              id.index, e.mid.c_str(),
              storageGetStr(msgPath(id.index, e.peer, e.mid, "message_id").c_str(), "?").c_str(),
@@ -2662,9 +2711,9 @@ static void queueSweep(void)
         /* One attempt per conversation per sweep: this peer's turn is already
          * spent, and this message rides the same Link when that one settles. */
         if (!claimAttempt(e.id_index, e.peer)) continue;
-        /* A re-send of the same packet is scheduled: that is this
-         * conversation's attempt (queueResendDue). */
-        if (e.resend_at_s) continue;
+        /* A re-send of the same packet, or a failed link's retry, is
+         * scheduled: that is this conversation's attempt (queueResendDue). */
+        if (e.resend_at_s || e.link_retry_at_s) continue;
         if (outboxHoldsPeer(id, e.peer)) continue;   /* its attempt is in flight */
         processReady(id, e.peer, e.mid, /*retry=*/true);
     }
@@ -6645,16 +6694,25 @@ static void resolveDirectSends(void)
              * open, which can land after the send took its deadline — so adopt
              * it here too. Only ever extends: a send already past its own
              * deadline is not revived by a budget arriving late. */
+            /* The budget is per attempt, and rnsd makes a fresh attempt
+             * toward a peer it has heard from when one times out, each of
+             * which may first wait for a path again: `attempt` counts them. */
             {
                 uint32_t estab = (uint32_t)storageGetInt(
                     (base + ".estab_timeout_s").c_str(), 0);
-                uint32_t floor_s = o.started_s + (uint32_t)rnsdPathBudgetS() + estab;
+                int attempt = storageGetInt((base + ".attempt").c_str(), 1);
+                if (attempt < 1) attempt = 1;
+                uint32_t floor_s = o.started_s +
+                    ((uint32_t)rnsdPathBudgetS() + estab) * (uint32_t)attempt;
                 if (estab && floor_s > o.direct_deadline_s)
                     o.direct_deadline_s = floor_s;
             }
 
             bool done = false, ok = false;
             std::string err;               /* human text for the log only */
+            /* The link never carried the send and it was not for want of a
+             * path: the capped retry (linkFailed), not the sweep. */
+            bool link_failed = false;
 
             if (o.is_resource) {
                 /* Resource sends settle on the transfer outcome, NOT on
@@ -6669,9 +6727,10 @@ static void resolveDirectSends(void)
                      * before the transfer began has neither: say which. */
                     done = true;
                     err  = storageGetStr((base + ".last_error").c_str(), "");
+                    bool began = !rst.empty() && rst != "sending";
+                    link_failed = !began && err != "no_path";
                     if (err.empty())
-                        err = !rst.empty() && rst != "sending"
-                                  ? rst : "link " + st + " before the transfer began";
+                        err = began ? rst : "link " + st + " before the transfer began";
                 } else if (now_s >= o.direct_deadline_s) {
                     done = true; err = "resource timeout";
                 }
@@ -6684,9 +6743,10 @@ static void resolveDirectSends(void)
                     info("id %d: DIRECT resource delivered mid=%s tag=%s",
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
-                    queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_LINK);
                     warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
                          id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
+                    if (link_failed) linkFailed(id, peer_hex, mid);
+                    else queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_LINK);
                 }
                 if (id.pending > 0) id.pending--;
                 /* The link persists across sends: keep + first-delivery
@@ -6731,9 +6791,14 @@ static void resolveDirectSends(void)
             } else if (st == "failed") {
                 done = true;
                 err  = storageGetStr((base + ".last_error").c_str(), "link failed");
+                link_failed = err != "no_path";
+                if (err == "establish_timeout") {
+                    std::string budget = storageGetStr((base + ".estab_budget").c_str(), "");
+                    if (!budget.empty()) err += " (" + budget + ")";
+                }
             } else if (st == "closed") {
                 done = true; ok = (tx >= 1);
-                if (!ok) err = "link closed before send";
+                if (!ok) { err = "link closed before send"; link_failed = true; }
             } else if (st.empty() && now_s >= o.direct_deadline_s) {
                 done = true; err = "direct timeout";
             } else if (now_s >= o.direct_deadline_s + 15) {
@@ -6741,6 +6806,7 @@ static void resolveDirectSends(void)
                  * budget for this link, so this is 15 s past the point rnsd
                  * itself gives up — not a guess that undercuts it. */
                 done = true; err = "direct timeout";
+                link_failed = st != "awaiting_path";
             }
             if (!done) continue;
 
@@ -6766,8 +6832,9 @@ static void resolveDirectSends(void)
 
             /* The link never carried the send. It is suspect: drop it, and the
              * message waits for the next sweep to relink. */
-            warn("id %d: DIRECT failed mid=%s tag=%s (%s)",
-                 id.index, mid.c_str(), o.link_tag.c_str(), err.c_str());
+            warn("id %d: DIRECT failed mid=%s tag=%s (%s, link attempts %d)",
+                 id.index, mid.c_str(), o.link_tag.c_str(), err.c_str(),
+                 storageGetInt((base + ".attempt").c_str(), 0));
             if (id.pending > 0) id.pending--;
             for (auto& c : s_convlinks) {
                 if (!c.used || c.tag != o.link_tag) continue;
@@ -6776,7 +6843,8 @@ static void resolveDirectSends(void)
             }
             o.used   = false;
             o.direct = false;
-            queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_LINK);
+            if (link_failed) linkFailed(id, peer_hex, mid);
+            else queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_LINK);
         }
     }
 }
@@ -8822,7 +8890,7 @@ static void lxmfTaskMain(void*)
             if (s_queueNextSweep_s &&
                 (uint32_t)(nowUnixMs() / 1000) >= s_queueNextSweep_s)
                 queueSweep();
-            queueResendDue();       /* unproven opportunistic packets, once more */
+            queueResendDue();       /* unproven opportunistic packets, failed links' retries */
             /* Reconnect anything that dropped since the last tick. */
             for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
                 lxmf_id_t& id = s_ids[n];
