@@ -8280,7 +8280,9 @@ static void cliLxmf(const char* args)
             return;
         }
         int slot = lxmfCreateIdentity(rest, /*sync=*/true);
-        if (slot < 0) {
+        if (slot == -2) {
+            cliPrintf("queued \"%s\": lxmf is not running yet, it creates the identity when it starts\n", rest);
+        } else if (slot < 0) {
             cliPrintf("create failed (see log)\n");
         } else {
             lxmf_id_t* id = idAt(slot);
@@ -9257,8 +9259,8 @@ int lxmfCreateIdentity(const char* display_name, bool sync)
     if (!sync) return 0;
 
     if (!waitForCmdProcessed("lxmf.cmd.identity_new", pdMS_TO_TICKS(5000))) {
-        warn("lxmfCreateIdentity: timeout waiting for lxmf task");
-        return -1;
+        info("lxmfCreateIdentity: lxmf task not running yet — \"%s\" is queued", display_name);
+        return -2;
     }
 
     /* Sentinel cleared — find the slot whose display_name matches our

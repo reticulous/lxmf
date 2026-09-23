@@ -221,8 +221,11 @@ public:
  *  Returns:
  *    sync=false : 0 on validation success, -1 if display_name is empty
  *    sync=true  : allocated slot index (0..LXMF_MAX_IDENTITIES-1) on
- *                 success, -1 on validation error, lxmf-side failure,
- *                 or 5 s timeout */
+ *                 success, -1 on validation error or lxmf-side failure,
+ *                 -2 when the lxmf task did not pick the sentinel up within
+ *                 5 s — which is not a failure: the task runs the command
+ *                 when it starts (it starts only once the device password
+ *                 is set, so a setup script's `lxmf create` lands here) */
 int lxmfCreateIdentity(const char* display_name, bool sync = false);
 
 /** Import an existing account into a free slot: `privkey_hex` is its 128-hex

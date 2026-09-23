@@ -955,7 +955,10 @@ All verbs act on the **selected identity** (`s.lxmf.cli.selected_id`,
 default 0) unless noted.
 
 ```
-lxmf create <name>          generate a new identity (prints the slot, or failure)
+lxmf create <name>          generate a new identity (prints the slot; "queued"
+                            when the lxmf task is not up yet — it starts once
+                            the device password is set, so a setup script's
+                            create lands there and is run at start; or failure)
 lxmf destroy <n>            wipe identity at slot <n> (secrets + storage)
 lxmf id                     list identities (* = selected): slot, label, the
                             lxmf.delivery destination, and the identity hash
