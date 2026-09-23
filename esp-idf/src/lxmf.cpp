@@ -162,6 +162,10 @@ struct outbound_t {
 
     /* Unix s the slot went in flight. */
     uint32_t    started_s;
+
+    /* Unix s rnsd reported the opportunistic packet on the air (SENT): what
+     * the next re-send of the same packet is spaced from. */
+    uint32_t    sent_s;
 };
 
 /* A received LXM we can't verify yet because the sender's identity
@@ -338,17 +342,16 @@ static void setStrIfChanged(const std::string& key, const char* v)
  *                          only when the wire is oversize.
  *   opportunistic-or-fail  never a Link; oversize hard-fails.
  *
- * `link-always` is the default, and `auto` — the legacy spelling of "choose for
- * me" — resolves to it. A Link asks whether the peer is there and is told;
- * an opportunistic packet is a few hundred bytes put on the air in the dark,
- * answered only by a delivery proof the peer may not send at all. Upstream
- * LXMF makes the same call: `LXMessage` with no method picks DIRECT, and
- * demotes to a packet only where the caller asked for one explicitly.
- * Legacy: auto→link-always, direct→link-always,
+ * `link-always` is the default, and `auto` — "choose for me" — resolves to it.
+ * A Link costs a request, a proof, a round-trip measurement and an identify
+ * (about 500 B of air) before the body goes out, where a packet that fits
+ * costs one packet; but the packet carries no sender key, so a recipient
+ * beyond every gateway's radius cannot verify it and never shows it, and its
+ * proof is a single packet that a long route loses. The Link identifies the
+ * sender and carries any size. Legacy: direct→link-always,
  * opportunistic→opportunistic-or-fail. */
 static std::string canonMethod(const std::string& m)
 {
-    if (m == "auto")          return "link-always";
     if (m == "direct")        return "link-always";
     if (m == "opportunistic") return "opportunistic-or-fail";
     if (m == "link-always" || m == "link-if-one-exists" ||
@@ -367,6 +370,20 @@ static std::string msgPath(int n, const std::string& peer,
     snprintf(buf, sizeof(buf), "s.lxmf.id.%d.msgs.%s.%s.%s",
              n, peer.c_str(), key.c_str(), field);
     return buf;
+}
+
+/* The method a message is sent by: its own override, else its identity's
+ * default, else the global default. Empty and `auto` at the first two levels
+ * mean "no choice here" and fall through; `auto` is what a new identity is
+ * created with. */
+static std::string resolveMethod(int n, const std::string& peer, const std::string& mid)
+{
+    std::string m = storageGetStr(msgPath(n, peer, mid, "method").c_str(), "");
+    if (m.empty() || m == "auto")
+        m = storageGetStr(idPath(n, "default_method").c_str(), "");
+    if (m.empty() || m == "auto")
+        m = storageGetStr("s.lxmf.default_method", "link-always");
+    return canonMethod(m);
 }
 
 /* RAM-only outbound wire cache ("the outbox"): the packed + signed + stamped LXM
@@ -2352,6 +2369,10 @@ static void directLinkSettle(const std::string& tag, bool ok, uint32_t now_s)
  *                           → DELIVERY_TIMEOUT, else ONE Link attempt per
  *                             conversation (processReady, retry = true)
  *
+ * An unproven opportunistic packet waits in the queue too, but its next
+ * attempts are the same packet again at a fixed spacing (oppProofMissed,
+ * queueResendDue) before its conversation is kicked into a sweep.
+ *
  * The sweep runs on this task from the 1 Hz tick: every piece of outbound state
  * (outbox, wire cache, conversation links) is task-local and lock-free, and a
  * task of its own would need locking on all of it for no gain. `queued_s` is
@@ -2369,6 +2390,10 @@ struct queued_t {
      * Growth by the time it gives up says the own channel was jammed, which is
      * what the give-up then names (radioBusyOr). */
     uint32_t tx_drops_base;
+    /* Opportunistic re-sends of the same packet already made, and when the
+     * next one is due (unix s, 0 = none waiting). See oppProofMissed. */
+    uint8_t  resends;
+    uint32_t resend_at_s;
 };
 static std::vector<queued_t> s_queue;
 static uint32_t s_queueNextSweep_s = 0;    /* 0 = no sweep armed (queue empty) */
@@ -2429,7 +2454,7 @@ static void queueAdd(int n, const std::string& peer, const std::string& mid)
     bool held = false;
     for (auto& e : s_queue)
         if (e.id_index == n && e.peer == peer && e.mid == mid) { held = true; break; }
-    if (!held) s_queue.push_back({ n, peer, mid, now_s, loraTxDroppedSum() });
+    if (!held) s_queue.push_back({ n, peer, mid, now_s, loraTxDroppedSum(), 0, 0 });
     if (!s_queueNextSweep_s) s_queueNextSweep_s = now_s + deliveryIntervalS();
 }
 
@@ -2504,6 +2529,89 @@ static void sendCancel(lxmf_id_t& id, uint16_t send_id)
 static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                          const std::string& mid, bool retry = false);   /* fwd */
 
+/* Re-sends of an unproven opportunistic packet before the conversation
+ * escalates to a Link. */
+static constexpr uint8_t LXMF_OPP_RESENDS = 2;
+
+/* Seconds between two sends of the same opportunistic packet: no sooner than
+ * a proof could have come back (rnsd's proof window) nor than a path could
+ * have been found again (rnsd's path budget), since a route that moved is one
+ * reason a proof goes missing. */
+static uint32_t oppResendSpacingS()
+{
+    uint32_t s = (uint32_t)storageGetInt("s.rnsd.proof_timeout_s", 60);
+    uint32_t b = (uint32_t)rnsdPathBudgetS();
+    return s > b ? s : b;
+}
+
+static queued_t* queueFind(int n, const std::string& peer, const std::string& mid)
+{
+    for (auto& e : s_queue)
+        if (e.id_index == n && e.peer == peer && e.mid == mid) return &e;
+    return nullptr;
+}
+
+/* An opportunistic packet went out and no proof came back.
+ *
+ *   A → B   LXM packet            (sent_s)
+ *   A       no proof within the proof window
+ *   A → B   the same packet       sent_s + spacing, same message_id
+ *   A → B   the same packet       again, spacing later
+ *   A → B   Link                  the sweep's attempt, if still unproven
+ *
+ * A missing proof is indistinguishable from a missing message: the proof is a
+ * packet on the same radio and is lost as easily. So the identical wire goes
+ * out again, spaced by oppResendSpacingS — the recipient's rnsd proves every
+ * copy that reaches it, and its lxmf stores the first and drops the rest on
+ * message_id, so a copy that was already delivered costs one packet and
+ * surfaces nothing. Only when LXMF_OPP_RESENDS re-sends have gone unanswered
+ * is the conversation kicked, and the sweep's Link attempt asks whether the
+ * peer is there at all. opportunistic-or-fail never escalates: it keeps
+ * re-sending at the same spacing until the delivery timeout. */
+static void oppProofMissed(lxmf_id_t& id, const std::string& peer,
+                           const std::string& mid, uint32_t sent_s)
+{
+    queueRequeue(id, peer, mid, LXMF_ST_RETRYING_DELIVERY);
+    queued_t* e = queueFind(id.index, peer, mid);
+    if (e && (e->resends < LXMF_OPP_RESENDS ||
+              resolveMethod(id.index, peer, mid) == "opportunistic-or-fail")) {
+        uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+        uint32_t at = (sent_s ? sent_s : now_s) + oppResendSpacingS();
+        e->resend_at_s = at > now_s ? at : now_s;
+        return;
+    }
+    queueKickConversation(id.index, peer);
+}
+
+/* Fire the opportunistic re-sends that have come due (oppProofMissed). From
+ * the 1 Hz tick. */
+static void queueResendDue(void)
+{
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    std::vector<queued_t> due;
+    for (auto& e : s_queue) {
+        if (!e.resend_at_s || now_s < e.resend_at_s) continue;
+        e.resend_at_s = 0;
+        e.resends++;
+        due.push_back(e);
+    }
+    /* processReady may queue again, so it runs on copies, off the list. */
+    for (auto& e : due) {
+        if (e.id_index < 0 || e.id_index >= LXMF_MAX_IDENTITIES ||
+            !s_ids[e.id_index].used) continue;
+        lxmf_id_t& id = s_ids[e.id_index];
+        int st    = storageGetInt(msgPath(id.index, e.peer, e.mid, "status").c_str(), 0);
+        int tries = storageGetInt(msgPath(id.index, e.peer, e.mid, "tries").c_str(),  0);
+        if (!statusInProgress(st) || tries == LXMF_TRIES_GAVEUP) continue;
+        if (outboxHolds(id, e.peer, e.mid)) continue;
+        info("id %d: msg %s message_id=%s re-sent as the same packet (attempt %u)",
+             id.index, e.mid.c_str(),
+             storageGetStr(msgPath(id.index, e.peer, e.mid, "message_id").c_str(), "?").c_str(),
+             (unsigned)e.resends + 1);
+        processReady(id, e.peer, e.mid, /*retry=*/false);
+    }
+}
+
 /* One pass over the queue. Runs from the 1 Hz tick when the interval has
  * elapsed, only while the queue holds something.
  *
@@ -2554,6 +2662,9 @@ static void queueSweep(void)
         /* One attempt per conversation per sweep: this peer's turn is already
          * spent, and this message rides the same Link when that one settles. */
         if (!claimAttempt(e.id_index, e.peer)) continue;
+        /* A re-send of the same packet is scheduled: that is this
+         * conversation's attempt (queueResendDue). */
+        if (e.resend_at_s) continue;
         if (outboxHoldsPeer(id, e.peer)) continue;   /* its attempt is in flight */
         processReady(id, e.peer, e.mid, /*retry=*/true);
     }
@@ -2678,10 +2789,12 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
      * this box gets a path to send it; a composer writes the moment the user
      * pressed send. Re-stamping at pack time would date the message to the
      * transmission and hand a re-pack after a reboot a different `message_id`
-     * for the same message. A record with no timestamp is stamped now. */
+     * for the same message. A record with no timestamp is stamped now, in
+     * whole seconds: the record keeps seconds, and the re-pack reads them back,
+     * so a fraction here would give the same message two ids. */
     uint64_t ts_ms = (uint64_t)storageGetInt(msgPath(id.index, peer_hex, mid, "ts").c_str(), 0)
                      * 1000ull;
-    if (!ts_ms) ts_ms = wallUnixMs();
+    if (!ts_ms) ts_ms = wallUnixMs() / 1000ull * 1000ull;
 
     /* Pack the LXM wire so the opportunistic-vs-DIRECT decision keys off
      * the *actual* packed size, not a content estimate that under-counts
@@ -2716,8 +2829,9 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
     return true;
 }
 
-/* `retry` = this is a sweep's attempt, not the first one. It changes exactly
- * one thing: the message rides a Link (see the method block below). */
+/* `retry` = this is a sweep's attempt, not the first one or an opportunistic
+ * re-send. It changes exactly one thing: the message rides a Link (see the
+ * method block below). */
 static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                          const std::string& mid, bool retry)
 {
@@ -2835,25 +2949,25 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     }
 
     /* Delivery-method selection. Resolution order is per-message override
-     * → per-identity default → global default → "link-always". The
-     * four methods form a spectrum of link eagerness (see canonMethod):
-     * link-always always uses a Link; link-if-one-exists rides a warm link
-     * to this peer if one exists (our own conversation link), else
-     * opportunistic; link-if-big goes
-     * opportunistic for anything that fits one packet and only opens a Link
-     * for an oversize wire; opportunistic-or-fail never uses a Link.
-     * Oversize forces a Link in every mode except opportunistic-or-fail,
-     * which hard-fails instead — the only mode that can fail on size.
+     * → per-identity default → global default → "link-always"
+     * (resolveMethod). The four methods form a spectrum of link eagerness
+     * (see canonMethod): link-always always uses a Link; link-if-one-exists
+     * rides a warm link to this peer if one exists (our own conversation
+     * link), else opportunistic; link-if-big goes opportunistic for anything
+     * that fits one packet and only opens a Link for an oversize wire;
+     * opportunistic-or-fail never uses a Link. Oversize forces a Link in
+     * every mode except opportunistic-or-fail, which hard-fails instead — the
+     * only mode that can fail on size.
      *
-     * A RETRY forces a Link on the same terms. The first attempt is the cheap
-     * one — a single packet, no handshake, and for a peer that is there it is
-     * usually the only one needed. Once that has failed, the method's premise
-     * has too: an opportunistic packet is fire-and-forget, so repeating it
-     * re-sends the whole message to learn nothing, while a Link asks whether
-     * the peer is reachable ONCE and then carries every message waiting for
-     * them. opportunistic-or-fail is the exception here as it is for oversize:
-     * it is an explicit instruction never to open a Link, and a retry does not
-     * overrule it.
+     * A RETRY — a sweep's attempt — forces a Link on the same terms. An
+     * unproven opportunistic packet does not come here as a retry: it is
+     * re-sent as the same packet first (oppProofMissed), because a lost proof
+     * looks exactly like a lost message and a packet is cheaper than a Link.
+     * Once those re-sends have gone unanswered too, the sweep's Link asks
+     * whether the peer is reachable ONCE and then carries every message
+     * waiting for them. opportunistic-or-fail is the exception here as it is
+     * for oversize: it is an explicit instruction never to open a Link, and a
+     * retry does not overrule it.
      *
      * Oversize is measured on the real opportunistic payload — the wire
      * minus the dest16 that rnsd strips and re-derives — against the RNS
@@ -2861,12 +2975,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * an over-MTU packet reaches rnsd, where Packet::pack() throws and
      * surfaces as a spurious "evicted (resource limit)". */
     bool oversize = (wire.size() - LXMF_DEST_HASH_LEN) > LXMF_OPP_PAYLOAD_MAX;
-    std::string method = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
-    if (method.empty())
-        method = storageGetStr(idPath(id.index, "default_method").c_str(), "");
-    if (method.empty())
-        method = storageGetStr("s.lxmf.default_method", "link-always");
-    method = canonMethod(method);
+    std::string method = resolveMethod(id.index, peer_hex, mid);
 
     bool use_direct;
     if (viaLink) {
@@ -2924,6 +3033,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     o->path_reqs           = 0;
     o->path_deadline_s     = 0;
     o->started_s           = (uint32_t)(nowUnixMs() / 1000);
+    o->sent_s              = 0;
 
     if (use_direct) {
         /* DIRECT: send the *full* LXM wire (incl. the 16-byte dest hash)
@@ -3009,7 +3119,10 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
             uint32_t estab = (uint32_t)storageGetInt(
                 ("rnsd.links." + ltag + ".estab_timeout_s").c_str(), 0);
             uint32_t budget = as_resource ? 120u : 45u;
-            if (estab > budget) budget = estab;
+            /* The link may first have to wait for a path, on rnsd's path
+             * budget, before its establishment budget even starts. */
+            uint32_t rnsd_budget = (uint32_t)rnsdPathBudgetS() + estab;
+            if (rnsd_budget > budget) budget = rnsd_budget;
             o->direct_deadline_s = (uint32_t)(nowUnixMs() / 1000) + budget;
         }
         /* Packet-class sends: baseline the link's delivery-proof counters
@@ -3393,17 +3506,16 @@ static void drainAllPendingVerify(lxmf_id_t& id)
  * in flight, then a settled word. The rest are present only when measured. */
 
 /* How long a probe waits before calling it. A probe with no link to ride first
- * needs a PATH, and that search runs on rnsd's budget — so a fixed deadline
- * here can only be wrong: at 20 s against rnsd's default 30 it gave up while
- * rnsd was still legitimately looking, and the first probe to any contact whose
- * path was not cached answered with nothing. The second one, path now cached,
- * measured fine. Derived instead, so the two cannot disagree and retuning the
- * path budget carries this with it. The margin covers the link handshake that
- * follows the path, which is the only other thing a probe waits on. */
+ * needs a PATH, and that search runs on rnsd's budget (rnsdPathBudgetS) — so
+ * the deadline is derived from it: a fixed one shorter than rnsd's gives up
+ * while rnsd is still legitimately looking, and the first probe to any contact
+ * whose path is not cached answers with nothing. The margin covers the link
+ * handshake that follows the path, which is the only other thing a probe waits
+ * on. */
 #define LXMF_PING_HANDSHAKE_MARGIN_S 10
 static uint32_t pingTimeoutS(void)
 {
-    int p = storageGetInt("s.rnsd.link.path_timeout_s", 30);
+    int p = rnsdPathBudgetS();
     if (p < 5) p = 5;
     return (uint32_t)p + LXMF_PING_HANDSHAKE_MARGIN_S;
 }
@@ -3881,7 +3993,8 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
         if (id.pending > 0) id.pending--;
         id.sent++;
         o->awaiting_proof   = true;
-        o->proof_deadline_s = (uint32_t)(nowUnixMs() / 1000) + proofBackstopS();
+        o->sent_s           = (uint32_t)(nowUnixMs() / 1000);
+        o->proof_deadline_s = o->sent_s + proofBackstopS();
         storageBegin();
         storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_AWAITING_PROOF);
         storageEnd();
@@ -3904,25 +4017,14 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
             status_code = LXMF_ST_DELIVERED; gaveup = false;
             if (!was_awaiting) id.sent++;
             break;
-        case RNSD_DEST_STATUS_PROOF_TIMEOUT: {
+        case RNSD_DEST_STATUS_PROOF_TIMEOUT:
             /* Egressed opportunistically (no link) and no delivery proof came
-             * back. The peer may simply be offline — or the own radio shed
-             * frames to contention (RADIO_BUSY). The identical wire goes out
-             * again at the next sweep — the recipient dedups on message_id, so
-             * a proof that was merely lost costs nothing — until the delivery
-             * timeout. */
+             * back. The message or its proof was lost, the peer is away, or the
+             * own radio shed frames to contention (RADIO_BUSY): the same packet
+             * goes out again, and then a Link (oppProofMissed). */
             if (was_awaiting) { if (id.sent) id.sent--; }
-            queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_DELIVERY);
-            /* Escalate now rather than at the next sweep. The cheap attempt has
-             * had its answer: the packet egressed and nothing came back, and the
-             * retry is a Link, which asks whether the peer is there instead of
-             * asserting it. Waiting out a delivery_interval to find that out
-             * spends ten minutes to learn nothing — and a peer that proves link
-             * traffic but not opportunistic packets (a stack whose prove sits on
-             * the link path alone) answers the Link in seconds. */
-            queueKickConversation(id.index, peer_hex);
+            oppProofMissed(id, peer_hex, mid, o->sent_s);
             return;
-        }
         case RNSD_DEST_STATUS_CANCELLED:
             status_code = LXMF_ST_CANCELLED; gaveup = false;
             if (!was_awaiting) id.failed++;
@@ -3971,8 +4073,11 @@ static void applyOutStatus(lxmf_id_t& id, uint16_t send_id, uint8_t type,
             ++o->path_reqs;
             /* Start the path grace: past it the 1 Hz pass takes the send back
              * from rnsd and queues the message (resolveDirectSends). */
-            if (!o->path_deadline_s)
-                o->path_deadline_s = (uint32_t)(nowUnixMs() / 1000) + LXMF_PATH_GRACE_S;
+            if (!o->path_deadline_s) {
+                uint32_t grace = LXMF_PATH_GRACE_S;
+                if ((uint32_t)rnsdPathBudgetS() > grace) grace = (uint32_t)rnsdPathBudgetS();
+                o->path_deadline_s = (uint32_t)(nowUnixMs() / 1000) + grace;
+            }
             st = LXMF_ST_REQUESTING_PATH; break;
         case RNSD_DEST_AUX_PATH_KNOWN:        o->path_reqs = 0;
                                               o->path_deadline_s = 0;
@@ -6459,8 +6564,10 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
                          id.index, mid.c_str(), o.link_tag.c_str());
                 } else {
                     queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_LINK);
-                    warn("id %d: DIRECT resource failed mid=%s tag=%s",
-                         id.index, mid.c_str(), o.link_tag.c_str());
+                    std::string rst = storageGetStr(
+                        ("rnsd.links." + o.link_tag + ".resource.state").c_str(), "");
+                    warn("id %d: DIRECT resource failed mid=%s tag=%s (%s)",
+                         id.index, mid.c_str(), o.link_tag.c_str(), rst.c_str());
                 }
                 if (id.pending > 0) id.pending--;
                 /* The link persists across sends (the fast settle path
@@ -6512,8 +6619,8 @@ static void resolveDirectSends(void)
                     o.used = false;
                     o.path_deadline_s = 0;
                     queueRequeue(id, peer_hex, mid, LXMF_ST_REQUESTING_PATH);
-                    dbg("id %d: msg %s no path in %us — queued", id.index,
-                        mid.c_str(), (unsigned)LXMF_PATH_GRACE_S);
+                    dbg("id %d: msg %s no path within the grace — queued", id.index,
+                        mid.c_str());
                     continue;
                 }
                 /* Opportunistic proof backstop: stage is "sent" and rnsd owes
@@ -6523,10 +6630,9 @@ static void resolveDirectSends(void)
                 if (o.awaiting_proof && now_s >= o.proof_deadline_s) {
                     o.used = false;
                     o.awaiting_proof = false;
-                    queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_DELIVERY);
-                    queueKickConversation(id.index, peer_hex);
                     dbg("id %d: msg %s proof backstop (no OUT_RESULT)",
                         id.index, mid.c_str());
+                    oppProofMissed(id, peer_hex, mid, o.sent_s);
                 }
                 continue;
             }
@@ -6542,7 +6648,7 @@ static void resolveDirectSends(void)
             {
                 uint32_t estab = (uint32_t)storageGetInt(
                     (base + ".estab_timeout_s").c_str(), 0);
-                uint32_t floor_s = o.started_s + estab;
+                uint32_t floor_s = o.started_s + (uint32_t)rnsdPathBudgetS() + estab;
                 if (estab && floor_s > o.direct_deadline_s)
                     o.direct_deadline_s = floor_s;
             }
@@ -6557,10 +6663,15 @@ static void resolveDirectSends(void)
                  * fast path; this is the timeout/teardown fallback. */
                 std::string rst = storageGetStr((base + ".resource.state").c_str(), "");
                 if (rst == "sent") { done = true; ok = true; }
-                else if (rst == "failed" || st == "failed" || st == "closed") {
+                else if (rst.rfind("failed", 0) == 0 || st == "failed" || st == "closed") {
+                    /* rnsd writes the transfer's outcome as `failed:<dir>:<n>`
+                     * and clears last_error at open, so a link that closed
+                     * before the transfer began has neither: say which. */
                     done = true;
-                    err  = storageGetStr((base + ".last_error").c_str(),
-                                         "resource failed");
+                    err  = storageGetStr((base + ".last_error").c_str(), "");
+                    if (err.empty())
+                        err = !rst.empty() && rst != "sending"
+                                  ? rst : "link " + st + " before the transfer began";
                 } else if (now_s >= o.direct_deadline_s) {
                     done = true; err = "resource timeout";
                 }
@@ -7437,7 +7548,6 @@ static void cliEnqueueSend(int id_n, const std::string& peer_hex,
     storageSet(msgPath(id_n, peer_hex, mid, "peer").c_str(),    peer_hex.c_str());
     storageSet(msgPath(id_n, peer_hex, mid, "title").c_str(),   "");
     storageSet(msgPath(id_n, peer_hex, mid, "content").c_str(), text.c_str());
-    storageSet(msgPath(id_n, peer_hex, mid, "method").c_str(),  "opp");
     storageSet(msgPath(id_n, peer_hex, mid, "status").c_str(), (int)LXMF_ST_DRAFT);
     /* cmd.send fires *last* so the record is fully present when the
      * lxmf task sees the sentinel. Value is "<peer>/<key>". */
@@ -8712,6 +8822,7 @@ static void lxmfTaskMain(void*)
             if (s_queueNextSweep_s &&
                 (uint32_t)(nowUnixMs() / 1000) >= s_queueNextSweep_s)
                 queueSweep();
+            queueResendDue();       /* unproven opportunistic packets, once more */
             /* Reconnect anything that dropped since the last tick. */
             for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
                 lxmf_id_t& id = s_ids[n];

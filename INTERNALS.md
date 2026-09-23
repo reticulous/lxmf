@@ -377,7 +377,8 @@ handleIdCmd → split val on '/' → delete command key → processSend(id,peer,
 processReady — method resolution (after the wire is packed, so oversize
   is measured on the real payload, not a content estimate):
   msgs.<id>.method → s.lxmf.id.<n>.default_method → s.lxmf.default_method
-                   → "link-always"   (canonMethod maps legacy auto/direct/opportunistic)
+                   → "link-if-big"   (resolveMethod; "auto"/empty fall through,
+                                      canonMethod maps legacy direct/opportunistic)
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "link-always"           → use a Link
   "link-if-one-exists"    → use a Link if oversize OR our own conversation Link to peer is
@@ -403,8 +404,9 @@ packed.** A record that already carries a `ts` is packed with it: the composer
 writes one when the user presses send, and a proxy server's `handleSend`
 reproduces the owner's, which may be hours old by the time this box has a path.
 Only a record with no `ts` — one the firmware itself drafted — is stamped at
-pack time. So the `message_id` is stable across a re-pack after a reboot, and a
-proxied account's message carries the same one on both devices.
+pack time, in whole seconds, because the record keeps seconds and a re-pack
+reads them back. So the `message_id` is stable across a re-pack after a reboot,
+and a proxied account's message carries the same one on both devices.
 
 Local outbound key is `o_<unix_ms>_<rand4>` (the real `message_id` isn't
 stable while a draft mutates; it's carried as a sidecar). Inbound records key
@@ -427,6 +429,9 @@ cmd.send ──► processReady (attempt) ──ok──► outbox slot ──�
             queueSweep: queued ≥ s.lxmf.delivery_timeout min (default 60)
                         → DELIVERY_TIMEOUT, else ONE Link attempt per
                           conversation (processReady, retry = true)
+
+            queueResendDue (1 Hz): an unproven opportunistic packet, the same
+                        wire again, twice, before its conversation is swept
 ```
 
 Every outbound that could not be delivered *yet* waits in `s_queue`
@@ -452,10 +457,35 @@ belongs to the pair, not to one message — so the sweep attempts each
 `(identity, peer)` once and pushes the rest of that conversation's mail back
 untouched, oldest first. Two things follow. The airtime of a retry is one Link
 open regardless of how many messages are waiting, and no body goes out until
-the peer has answered — where the per-message sweep re-sent every whole message
-into the void each interval to re-learn the one fact a Link establishes once.
-And `tries` stays honest: only the message actually attempted has one counted
-against it.
+the peer has answered — a per-message sweep would re-send every whole message
+each interval to re-learn the one fact a Link establishes once. And `tries`
+stays honest: only the message actually attempted has one counted against it.
+
+**An unproven opportunistic packet is re-sent before it is swept.**
+
+```
+rnsd → lxmf   OUT_RESULT PROOF_TIMEOUT (or the backstop)   oppProofMissed
+lxmf          queueRequeue RETRYING_DELIVERY; resend_at_s = sent_s + spacing
+lxmf → rnsd   OUT_PACKET, the same wire                    queueResendDue, 1 Hz
+  … twice (LXMF_OPP_RESENDS), then queueKickConversation → the sweep's Link
+```
+
+`oppProofMissed` is the one place both proof-timeout paths land. While fewer
+than `LXMF_OPP_RESENDS` (2) re-sends have been made — or always, for
+`opportunistic-or-fail` — it stamps the queue entry's `resend_at_s` at the
+opportunistic send's `sent_s` (the SENT result) plus `oppResendSpacingS`, the
+larger of `s.rnsd.proof_timeout_s` and `rnsdPathBudgetS`; otherwise it kicks
+the conversation as a delivered message does. `queueResendDue` runs on the 1 Hz
+tick, counts the re-send on the entry (`resends`), logs it at info with the
+`message_id` and attempt number, and calls `processReady` with `retry` false,
+so the method resolves as it did the first time and the cached wire goes out
+again unchanged. The sweep leaves an entry with a re-send scheduled alone and
+lets it hold its conversation's turn. The counters live on the queue entry and
+not in storage: after a reboot the rebuilt queue has none, and the first sweep
+makes its Link attempt. The wire is identical across a reboot as well — the
+timestamp is stamped once in whole seconds (`resolveOutboundWire`) and read
+back from the record — so the recipient's `message_id` dedup holds whichever
+copy arrives.
 
 **A delivery pulls the next message through.** Draining seven messages at one
 per interval would be its own defect, so `msgSetStatus` calls
@@ -475,8 +505,8 @@ What returns a message to the queue (`queueRequeue`: status, `tries++`,
 | outcome | requeued as |
 |---|---|
 | no free outbox slot; the conversation Link is busy with an earlier send; rnsd answered `QUEUE_FULL` | `QUEUED` |
-| rnsd still searching for a path after `LXMF_PATH_GRACE_S` (60 s); rnsd gave up its search (`FAILED`) | `REQUESTING_PATH` |
-| opportunistic proof timeout (rnsd's second `OUT_RESULT`, or the local backstop); the mailbox connection refused the frame | `RETRYING_DELIVERY` |
+| rnsd still searching for a path after the path grace (`LXMF_PATH_GRACE_S`, 60 s, or rnsd's path budget `rnsdPathBudgetS` if longer); rnsd gave up its search (`FAILED`) | `REQUESTING_PATH` |
+| opportunistic proof timeout (rnsd's second `OUT_RESULT`, or the local backstop) — a re-send of the same packet is scheduled first (above); the mailbox connection refused the frame | `RETRYING_DELIVERY` |
 | Link failed to establish, closed before the send, died or timed out; no proof on a Link packet; a Resource transfer failed; no Link to be had; the Link refused the frame | `RETRYING_LINK` |
 
 The path grace is what keeps rnsd's four-slot per-connection path table from
@@ -573,7 +603,7 @@ counter (`lxmf.ping<n>.<peer8>.<xx>`) besides, so no probe can inherit the name
 — or the leftover `rnsd.links.<tag>.*` tree — of the one before it. `pingTick` on the 1 Hz pass ends as `timeout` at `pingTimeoutS()`, which
 covers the one case rnsd emits no result for at all: a send parked on a path
 search that never resolves. That deadline is **derived from the thing it is
-waiting on** — `s.rnsd.link.path_timeout_s` plus
+waiting on** — rnsd's path budget (`rnsdPathBudgetS`) plus
 `LXMF_PING_HANDSHAKE_MARGIN_S` — because a probe with no link to ride waits on
 rnsd's path search first, and a deadline shorter than that search declares a
 probe dead while rnsd is still legitimately looking. It also has to stay inside
@@ -1088,7 +1118,7 @@ size gate), documented in [rns](../rns), not here.
 ### Per-identity (`s.lxmf.id.<n>.*`)
 
 ```
-label · enabled (1) · display_name · default_method (empty ⇒ global s.lxmf.default_method, default link-always)
+label · enabled (1) · display_name · default_method (auto or empty ⇒ global s.lxmf.default_method, default link-if-big)
 proxy_role               off (default) | server | client — which device registers and announces this account (§8c)
 proxy_dest               32-hex lxmproxy.server destination, while proxied
 contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none; count/unread are maintained counters — bumpConvDirectory adds on write and processDelete subtracts on a single-message delete, so neither is ever re-derived from the store)
@@ -1108,7 +1138,7 @@ msgs.<id>.peer           hex16 (redundant with the path segment, kept for indexe
 msgs.<id>.title / content
 msgs.<id>.reply_to       raw 32 B replied-to message hash (FIELD_REPLY_TO); all-zero = not a reply
 msgs.<id>.reply_quote    the fragment of that message this one quotes (FIELD_REPLY_QUOTE), UTF-8; empty = quotes the whole message, and each end draws the preview from its own copy. Dropped on receipt above LXMF_REPLY_QUOTE_MAX (512 B), and shown only where it really occurs in the message `reply_to` names
-msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; legacy auto/direct/opportunistic still parse)
+msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; auto/empty = none; legacy direct/opportunistic still parse)
 msgs.<id>.ts             unix s (sender clock; can be wrong — recv_ts is the display anchor)
 msgs.<id>.delivered_ts   u32 unix s the delivery proof finished DELIVERED; 0 = not delivered
 msgs.<id>.read           inbound only, 0 | 1

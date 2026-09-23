@@ -167,8 +167,9 @@ Per loaded identity you can observe:
 s.lxmf.id.<n>.label          "main" | "imported" | user-set
 s.lxmf.id.<n>.enabled        1 (default) — 0 = identity disabled: no announce, no send, inbound dropped
 s.lxmf.id.<n>.display_name   utf-8, advertised in announces
-s.lxmf.id.<n>.default_method  per-identity delivery method (see below); falls
-                             back to the global s.lxmf.default_method
+s.lxmf.id.<n>.default_method  per-identity delivery method (see below); `auto`
+                             (what a new identity gets) or empty falls back to
+                             the global s.lxmf.default_method
 lxmf.id.<n>.up               1 once the mailbox is connected — this device's own
                              delivery destination is registered with rnsd
 lxmf.id.<n>.ready            1 once the slot can take a message: `up`, or the
@@ -248,34 +249,58 @@ nothing is held open: no outbox slot, no path search in rnsd. Local errors that
 another attempt cannot fix — a body too large for the chosen method, a
 malformed peer, a disabled identity — fail at once.
 
-**A sweep makes one attempt per conversation, over a Link.** Repeating an
-opportunistic packet re-sends the whole message to learn nothing — it is
-fire-and-forget, and the silence that followed the first one is the only answer
-it can give. So every attempt after the first opens a Link instead, and the
-Link is what gets attempted: seven messages waiting for one peer are seven
-passengers on one attempt, not seven attempts. An unreachable peer therefore
-costs one Link open per sweep however much mail is waiting for them, and no
-body goes on the air until they have answered. As each delivery finishes, the
-next message for that peer follows it over the still-already-open Link at once rather
-than waiting out another interval — so a conversation that comes back drains in
-seconds, not in one message per ten minutes. `opportunistic-or-fail` is
-exempt, being an explicit instruction never to open a Link.
+**An unproven opportunistic packet is sent again, as it is, before anything
+opens a Link.**
 
-**An unproven opportunistic send escalates immediately, not at the next sweep.**
-Only the methods that lead with a packet reach this at all, and when one does,
-the proof timeout has already answered the question the cheap attempt was
-asking. Sitting out a `delivery_interval` before opening the Link spends ten
-minutes to learn nothing, so the conversation is kicked and the sweep runs in
-the same 1 Hz pass. A Link that fails is *not* kicked — it waits out the
-interval, or a peer that is simply away would cost a handshake per second.
+```
+A → B   LXM packet                   one packet; B's rnsd proves it
+A       no proof in s.rnsd.proof_timeout_s
+A → B   the same packet              ≥ the spacing after the first, same message_id
+A → B   the same packet              ≥ the spacing after that
+A → B   Link                         the sweep's attempt, if still unproven
+```
+
+A proof that went missing looks exactly like a message that went missing: the
+proof is a packet on the same radio and is lost as easily. So the identical
+wire — same bytes, same `message_id` — goes out again, twice, each no sooner
+than the larger of rnsd's proof window and its path budget (`rnsdPathBudgetS`,
+96 s) after the send before it. That is safe because B's rnsd proves every copy
+that reaches it and B's lxmf keeps the first and drops the rest on
+`message_id`, so a copy of a message already delivered costs one packet and
+shows nothing twice. It is cheaper than a Link on LoRa, where a Link spends a
+request (86 B), a proof (118 B), a round-trip measurement (83 B) and an
+identify (211 B) before the message itself. The message waits in the delivery
+queue meanwhile as `RETRYING_DELIVERY`; each re-send is logged at info
+("re-sent as the same packet (attempt n)"). Only when both re-sends have gone
+unanswered is the conversation kicked, and the sweep runs in the same 1 Hz pass
+with its Link. `opportunistic-or-fail` never escalates: it keeps re-sending at
+the same spacing until the delivery timeout. The `message_id` survives a reboot
+too: the timestamp is stamped once, in whole seconds, and kept on the record, so
+a re-pack from storage yields the same id.
+
+**A sweep makes one attempt per conversation, over a Link.** A sweep's attempt
+asks whether the peer is there at all, and a Link asks that once for every
+message waiting: seven messages waiting for one peer are seven passengers on
+one attempt, not seven attempts. An unreachable peer therefore costs one Link
+open per sweep however much mail is waiting for them, and no body goes on the
+air until they have answered. As each delivery finishes, the next message for
+that peer follows it over the still-open Link at once rather than waiting out
+another interval — so a conversation that comes back drains in seconds, not in
+one message per ten minutes. A conversation whose oldest message has a re-send
+scheduled spends its sweep turn on that re-send. `opportunistic-or-fail` is
+exempt, being an explicit instruction never to open a Link. A Link that fails
+is *not* kicked — it waits out the interval, or a peer that is simply away
+would cost a handshake per second.
 
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
-`link-always`. The four methods form a spectrum of link eagerness:
+`link-always`; `auto` or empty at the first two levels means "no choice here",
+and `auto` is what a new identity is created with. The four methods form a
+spectrum of link eagerness:
 
 | method | behaviour |
 | --- | --- |
-| `link-always` *(default)* | always a Reticulum Link. |
+| `link-always` *(default)* | always a Reticulum Link. The Link identifies the sender, which an opportunistic packet does not: a recipient that has no path to the sender cannot verify a packet and never shows it. |
 | `link-if-one-exists` | ride our own already-open conversation Link to the peer if one exists, else opportunistic. A peer's inbound Link into us never counts — we only ride Links we opened. |
 | `link-if-big` | opportunistic when the wire fits one packet, a Link only when it's oversize. |
 | `opportunistic-or-fail` | never a Link; oversize hard-fails with `last_error = "too large for opportunistic"`. |
@@ -283,20 +308,21 @@ interval, or a peer that is simply away would cost a handshake per second.
 A message fits opportunistic when `title + content + ~32 B` is within one
 packet (budget ~311 B). Oversize forces a Link in every mode **except**
 `opportunistic-or-fail`, and a Link carries large bodies as a Resource
-transfer. **A retry forces a Link on exactly the same terms** — the method
-describes the first attempt; the delivery queue decides the rest (above). The
-legacy names still parse: `auto`→`link-always`,
-`direct`→`link-always`, `opportunistic`→`opportunistic-or-fail`.
+transfer. **A sweep's attempt forces a Link on exactly the same terms** — the
+method describes the first attempt and its re-sends; the delivery queue decides
+the rest (above). The legacy names still parse: `direct`→`link-always`,
+`opportunistic`→`opportunistic-or-fail`.
 
-**Why a Link by default.** An opportunistic packet is a few hundred bytes put
-on the air in the dark: the only thing that can answer it is a delivery proof,
-and a peer is free not to send one — a stack whose prove sits on the link path
-alone answers every packet with silence while its user reads the message.
-A Link asks whether the peer is there and is told, in one round trip, before
-any body goes out. Upstream LXMF resolves the same way: an `LXMessage` with no
-method set picks DIRECT, and only demotes to a packet where the caller asked
-for one. `link-if-one-exists` remains for a mesh where the handshake is the
-expensive part and the peers are known to prove.
+**Why a packet by default.** On a radio mesh a message that fits one packet is
+cheapest as one packet: a Link costs about 500 B of air before the message, and
+most peers are there and prove. The case a Link answers better — a peer whose
+stack proves Link traffic but not opportunistic packets, answering every
+packet with silence while its user reads the message — costs the two re-sends
+and then gets its Link. Set `link-always` for a peer known to behave that way,
+or on a mesh where the handshake is cheap. Upstream LXMF leaves the choice to
+the application (an `LXMessage` with no method picks DIRECT) and its router
+re-sends an unproven opportunistic packet as it is, which is what the re-sends
+above do.
 
 **Link toggle.** The conversation header (web and LCD) shows a link icon —
 green when a Link to the peer is open, amber while establishing, grey when
@@ -780,8 +806,9 @@ name, or the leftover state tree, of the one before it.
 
 **The probe's deadline is derived from what it waits on.** A probe with no link
 to ride first needs a path, and that search runs on rnsd's budget — so the
-deadline is `s.rnsd.link.path_timeout_s` (default 30) plus 10 s for the
-handshake that follows, and the two cannot disagree. A deadline shorter than the
+deadline is rnsd's path budget (`rnsdPathBudgetS`: `s.rnsd.link.path_timeout_s`,
+or a round trip across the widest gateway distance if that is longer — 96 s)
+plus 10 s for the handshake that follows, and the two cannot disagree. A deadline shorter than the
 path search would declare a probe dead while rnsd is still legitimately looking,
 which shows up as a first ping that answers with nothing and a second one, path
 now cached, that measures fine.
@@ -805,9 +832,8 @@ is nothing to read, and a plain delay paces the loop instead.
 
 The probe's deadline must stay inside rnsd's proof window
 (`s.rnsd.proof_timeout_s`): a probe that gives up before the transport does
-reports `no-proof` for a proof still in flight. Raising
-`s.rnsd.link.path_timeout_s` raises the probe's deadline with it, so the two
-have to be read together.
+reports `no-proof` for a proof still in flight. Raising rnsd's path budget
+raises the probe's deadline with it, so the two have to be read together.
 
 ## Announces
 
@@ -874,6 +900,7 @@ cost, and it may reject it (`PN_REJECTED`).
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. Whichever decides it, rnsd publishes the result as `rnsd.links.<tag>.estab_timeout_s` and the send's own deadline adopts it — a DIRECT send never gives up on a link that is still inside the budget rnsd granted it. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
+| `s.lxmf.default_method` | `link-always` | The delivery method a message uses when neither it nor its identity names one (see "Delivery method"). |
 | `s.lxmf.delivery_interval` | `10` | Minutes between sweeps of the delivery queue — how often a message that could not be delivered yet gets another attempt. |
 | `s.lxmf.delivery_timeout` | `60` | Minutes a message may sit in the delivery queue before it ends as `DELIVERY_TIMEOUT`. Measured from when it was first queued; a reboot restarts it. |
 | `s.lxmf.pn.<i>.hash` | — | Propagation-node list, index-ordered (`i` = 0–7); non-32-hex = free slot. |
@@ -895,8 +922,8 @@ Resource and is consumed by rnsd, not lxmf — it is documented in
 label            "main" | "imported" | user-set
 enabled          1 (default); 0 = disabled
 display_name     utf-8, advertised in announces
-default_method   link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
-                 (empty ⇒ inherit global s.lxmf.default_method, default link-always)
+default_method   auto | link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
+                 (auto or empty ⇒ inherit global s.lxmf.default_method, default link-if-big)
 proxy_role       off (default) | server | client — which device registers and
                  announces this account (see Being proxied)
 proxy_dest       32-hex lxmproxy.server destination, while proxied
