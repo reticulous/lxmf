@@ -301,7 +301,7 @@ A       LINK_FAIL   if that fails too — tries = 255
 ```
 
 rnsd has already spent its own attempts on each of these (a fresh establishment
-per attempt, while the peer has been heard from in the last 15 minutes — rns
+per attempt, while the peer has been heard from in the last 30 minutes — rns
 `INTERNALS.md` §5.1), so what reaches lxmf as a failed Link is a peer that is
 there but hard to reach, or one that is not there at all. The first earns one
 more try after the medium has had time to change; the second says so within
@@ -310,6 +310,24 @@ retry is this conversation's turn: a sweep does not make a second attempt
 beside it. The count lives in the queue entry, so a reboot or a fresh
 `cmd.send` starts it over. A message that is waiting for a **path** is not a
 failed Link: it stays on the sweep and the delivery timeout above.
+
+**A message on a Link whose proof does not come back is sent once more on the
+same Link.**
+
+```
+A → B   LXM over the Link             one Link packet; B's rnsd proves it
+A       no proof in s.rnsd.proof_timeout_s, Link still active
+A → B   the same wire, same Link      once; logged "msg M resent over link T (proof lost)"
+A       no proof again                the Link is dropped, the message is queued (RETRYING_LINK)
+```
+
+The proof is one frame on its way back, and nothing along the path repairs a
+lost one, so a message whose proof went missing is most often already at B. The
+same wire goes out once over the Link that carried it; B's lxmf drops the
+`message_id` it holds and its rnsd proves the copy, which settles the message
+as `DELIVERED`. Only a second unproven send treats the Link as suspect. This
+applies to a message that fits one Link packet; a Resource settles on its own
+transfer acknowledgement.
 
 **Delivery method.** lxmf resolves per-message `method` →
 `s.lxmf.id.<n>.default_method` → global `s.lxmf.default_method` →
@@ -694,9 +712,9 @@ the status reads. A one-shot status sets it to 255 the moment it occurs.
 **Egress is not delivery.** Opportunistic packets get no native
 acknowledgement, so a proof timeout is *not* a failure — the message may well
 have arrived, the peer may not prove inbound, or the proof was lost. The
-message goes back to the delivery queue as `RETRYING_DELIVERY` (or
-`RETRYING_LINK` for a Link send) and the identical wire goes out again at the
-next sweep — the recipient dedups on `message_id`, so a proof that was merely
+message goes back to the delivery queue as `RETRYING_DELIVERY` (or, after its
+one re-send on the same Link, `RETRYING_LINK` for a Link send) and the identical
+wire goes out again at the next sweep — the recipient dedups on `message_id`, so a proof that was merely
 lost costs nothing — until the delivery timeout. Only a cryptographic delivery
 proof (or the proof-grade Resource transfer acknowledgement) produces
 `DELIVERED`.

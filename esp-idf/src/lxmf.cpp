@@ -148,6 +148,11 @@ struct outbound_t {
     uint32_t    proof_deadline_s;       /* unix s */
     int         proof_base_proven;      /* tx_proven at send time */
     int         proof_base_timeouts;    /* proof_timeouts at send time */
+    /* DIRECT packet: the wire as sent, for the one re-send over the same
+     * link when rnsd's receipt times out (resolveDirectSends), and whether
+     * that re-send has been made. */
+    std::vector<uint8_t> link_wire;
+    bool        link_resent;
 
     /* REQUESTING_PATH events for this send with no PATH_KNOWN in between.
      * rnsd emits one per park (initial no-path, and a re-park when the
@@ -3079,6 +3084,8 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     o->proof_deadline_s    = 0;
     o->proof_base_proven   = 0;
     o->proof_base_timeouts = 0;
+    o->link_wire.clear();
+    o->link_resent         = false;
     o->path_reqs           = 0;
     o->path_deadline_s     = 0;
     o->started_s           = (uint32_t)(nowUnixMs() / 1000);
@@ -3185,6 +3192,7 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
                 storageGetInt((base + ".tx_proven").c_str(), 0);
             o->proof_base_timeouts =
                 storageGetInt((base + ".proof_timeouts").c_str(), 0);
+            o->link_wire.assign(wire.begin(), wire.end());
         }
         storageBegin();
         storageSet(msgPath(id.index, peer_hex, mid, "method").c_str(),     "direct");
@@ -6770,6 +6778,22 @@ static void resolveDirectSends(void)
                          id.index, mid.c_str(), o.link_tag.c_str());
                     directLinkSettle(o.link_tag, true, now_s);
                     o.used = false; o.direct = false; o.awaiting_proof = false;
+                    o.link_wire.clear();
+                } else if (touts > o.proof_base_timeouts && st == "active" &&
+                           !o.link_resent && !o.link_wire.empty() &&
+                           itsSend(o.link_handle, o.link_wire.data(), o.link_wire.size(), 0) != 0) {
+                    /* rnsd's receipt timed out on a link that is still up.
+                     * A proof is one frame on the way back and nothing
+                     * repairs it, so the message may well be there: send
+                     * the same wire once more on the same link. The
+                     * recipient drops a message id it holds and proves the
+                     * copy all the same. */
+                    o.link_resent         = true;
+                    o.proof_base_timeouts = touts;
+                    o.proof_base_proven   = proven;
+                    o.proof_deadline_s    = now_s + proofBackstopS();
+                    info("id %d: msg %s resent over link %s (proof lost)",
+                         id.index, mid.c_str(), o.link_tag.c_str());
                 } else if (touts > o.proof_base_timeouts ||
                            st == "failed" || st == "closed" || st.empty() ||
                            now_s >= o.proof_deadline_s) {
@@ -6778,6 +6802,7 @@ static void resolveDirectSends(void)
                      * drop it, so the next sweep relinks — and the message goes
                      * back to the queue. */
                     o.used = false; o.direct = false; o.awaiting_proof = false;
+                    o.link_wire.clear();
                     directLinkSettle(o.link_tag, false, now_s);
                     queueRequeue(id, peer_hex, mid, LXMF_ST_RETRYING_LINK);
                     dbg("id %d: DIRECT no delivery proof mid=%s tag=%s",
