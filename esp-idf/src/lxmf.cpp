@@ -8405,7 +8405,7 @@ static void cliSend(const char* rest)
     /* Test-rig affordance (mirrors `rnsd link`/`clink`): `@randN`
      * substitutes an N-byte incompressible printable body so a
      * >74-part outbound Resource can be exercised without typing it
-     * (device CLI line buffer is 128 B). */
+     * (a CLI command line is bounded at 4096 B). */
     if (text.size() > 5 && text.compare(0, 5, "@rand") == 0) {
         char* end = nullptr;
         long n = std::strtol(text.c_str() + 5, &end, 10);
