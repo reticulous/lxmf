@@ -23,6 +23,6 @@ Declared in `esp-idf/idf_component.yml` and `browser/package.json`:
 | ESP-IDF (platform) | espressif/esp-idf | Apache-2.0 |
 | Browser peer deps (Vue, Quasar, Pinia, vue-router) | npm | MIT |
 
-LXMF is a protocol developed by Mark Qvist (`markqvist/LXMF`, MIT).
+LXMF is a protocol developed by Mark Qvist (`markqvist/LXMF`, Reticulum License).
 This implementation is independent; no LXMF source code is incorporated
 from the upstream reference.
