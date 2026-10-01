@@ -4675,8 +4675,12 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
         /* The radio's own measurements, which the same label prints. They are
          * published on iface-lora's beat, not the probe's, so without this the
-         * line a first probe was too early to see never appears. */
-        storageSubscribeChanges("lora.",          onPingChange);
+         * line a first probe was too early to see never appears. One prefix
+         * per radio slot: "lora." would fire on every stat. */
+        storageSubscribeChanges("lora.0.meas",    onPingChange);
+        storageSubscribeChanges("lora.1.meas",    onPingChange);
+        storageSubscribeChanges("lora.2.meas",    onPingChange);
+        storageSubscribeChanges("lora.3.meas",    onPingChange);
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }

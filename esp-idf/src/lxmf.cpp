@@ -39,6 +39,7 @@
 #include <string_view>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <algorithm>
 #include <array>
 #include <map>
@@ -7596,12 +7597,15 @@ static int selectedId(void)
 
 /* Generic walker: collect every distinct `<token>` matching keys of the
  * form `<prefix><token>.<anything>` under storage. Sorted alphabetically
- * by token. */
+ * by token. Callable from any task: storageForEach's callback carries no
+ * context, so the walk's context is a static, and the mutex keeps a second
+ * caller's walk from landing in this one's. */
 struct CollectTokensCtx {
     std::string              prefix;
     std::vector<std::string> tokens;
 };
 static CollectTokensCtx* s_collect_ctx = nullptr;
+static std::mutex        s_collect_lock;
 
 static void collectTokenLeaf(const char* key, const char* /*val*/)
 {
@@ -7619,6 +7623,7 @@ static void collectTokenLeaf(const char* key, const char* /*val*/)
 static std::vector<std::string> collectTokens(const std::string& prefix)
 {
     CollectTokensCtx ctx{prefix, {}};
+    std::lock_guard<std::mutex> g(s_collect_lock);
     s_collect_ctx = &ctx;
     storageForEach(prefix.c_str(), collectTokenLeaf);
     s_collect_ctx = nullptr;
