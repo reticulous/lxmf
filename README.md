@@ -350,13 +350,13 @@ method describes the first attempt and its re-sends; the delivery queue decides
 the rest (above). The legacy names still parse: `direct`→`link-always`,
 `opportunistic`→`opportunistic-or-fail`.
 
-**Why a packet by default.** On a radio mesh a message that fits one packet is
-cheapest as one packet: a Link costs about 500 B of air before the message, and
-most peers are there and prove. The case a Link answers better — a peer whose
-stack proves Link traffic but not opportunistic packets, answering every
-packet with silence while its user reads the message — costs the two re-sends
-and then gets its Link. Set `link-always` for a peer known to behave that way,
-or on a mesh where the handshake is cheap. Upstream LXMF leaves the choice to
+**Packet or Link.** The default is `link-always`, because the Link identifies
+the sender: a recipient without a path to the sender cannot verify an
+opportunistic packet and never shows it. On a radio mesh a message that fits
+one packet is cheaper as one packet: a Link costs about 500 B of air before the
+message, and most peers are there and prove. `link-if-big` takes that saving;
+a peer whose stack proves Link traffic but not opportunistic packets then
+costs the two re-sends before it gets its Link. Upstream LXMF leaves the choice to
 the application (an `LXMessage` with no method picks DIRECT) and its router
 re-sends an unproven opportunistic packet as it is, which is what the re-sends
 above do.
@@ -960,7 +960,7 @@ label            "main" | "imported" | user-set
 enabled          1 (default); 0 = disabled
 display_name     utf-8, advertised in announces
 default_method   auto | link-always | link-if-one-exists | link-if-big | opportunistic-or-fail
-                 (auto or empty ⇒ inherit global s.lxmf.default_method, default link-if-big)
+                 (auto or empty ⇒ inherit global s.lxmf.default_method, default link-always)
 proxy_role       off (default) | server | client — which device registers and
                  announces this account (see Being proxied)
 proxy_dest       32-hex lxmproxy.server destination, while proxied
