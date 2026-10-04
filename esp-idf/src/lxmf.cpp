@@ -4100,8 +4100,11 @@ static void applyOutResult(lxmf_id_t& id, uint16_t send_id, uint8_t status,
     }
     if (gaveup) msgFail(id.index, peer_hex, mid, status_code);
     else        msgSetStatus(id.index, peer_hex, mid, status_code);
-    dbg("id %d: msg %s → %s (tries %s)", id.index, mid.c_str(),
-        lxmfStatusName(status_code), gaveup ? "255" : "n");
+    if (status_code == LXMF_ST_DELIVERED)
+        info("id %d: OPPORTUNISTIC delivered mid=%s", id.index, mid.c_str());
+    else
+        dbg("id %d: msg %s → %s (tries %s)", id.index, mid.c_str(),
+            lxmfStatusName(status_code), gaveup ? "255" : "n");
 }
 
 /* Human-readable RNSD_DEST_AUX_RETRY reason byte. The reason *values* are
