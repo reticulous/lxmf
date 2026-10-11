@@ -275,7 +275,9 @@ queue meanwhile as `RETRYING_DELIVERY`; each re-send is logged at info
 ("re-sent as the same packet (attempt n)"). Only when both re-sends have gone
 unanswered is the conversation kicked, and the sweep runs in the same 1 Hz pass
 with its Link. `opportunistic-or-fail` never escalates: it keeps re-sending at
-the same spacing until the delivery timeout. The `message_id` survives a reboot
+the same spacing until the delivery timeout. With `s.lxmf.small_retry
+opportunistic`, the sweep's attempt for a message that fits one packet is that
+packet again rather than a Link. The `message_id` survives a reboot
 too: the timestamp is stamped once, in whole seconds, and kept on the record, so
 a re-pack from storage yields the same id.
 
@@ -938,6 +940,7 @@ cost, and it may reject it (`PN_REJECTED`).
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. Whichever decides it, rnsd publishes the result as `rnsd.links.<tag>.estab_timeout_s` and the send's own deadline adopts it — a DIRECT send never gives up on a link that is still inside the budget rnsd granted it. |
 | `s.lxmf.link.idle_s` | `600` | Close a conversation Link idle past this many seconds (10 min); `0` = keep open (LRU at the 4-link cap and Reticulum's STALE teardown still bound it). |
 | `s.lxmf.default_method` | `link-always` | The delivery method a message uses when neither it nor its identity names one (see "Delivery method"). |
+| `s.lxmf.small_retry` | `link` | What a sweep's retry of a message that fits one packet is, once its packet re-sends have gone unproven: `link` opens a Link; `opportunistic` sends the packet again, at every sweep until the delivery timeout. Oversize always takes a Link, and under `link-always` the first attempt was one already. |
 | `s.lxmf.delivery_interval` | `10` | Minutes between sweeps of the delivery queue — how often a message that could not be delivered yet gets another attempt. |
 | `s.lxmf.delivery_timeout` | `60` | Minutes a message may sit in the delivery queue before it ends as `DELIVERY_TIMEOUT`. Measured from when it was first queued; a reboot restarts it. |
 | `s.lxmf.pn.<i>.hash` | — | Propagation-node list, index-ordered (`i` = 0–7); non-32-hex = free slot. |

@@ -377,7 +377,7 @@ handleIdCmd → split val on '/' → delete command key → processSend(id,peer,
 processReady — method resolution (after the wire is packed, so oversize
   is measured on the real payload, not a content estimate):
   msgs.<id>.method → s.lxmf.id.<n>.default_method → s.lxmf.default_method
-                   → "link-if-big"   (resolveMethod; "auto"/empty fall through,
+                   → "link-always"   (resolveMethod; "auto"/empty fall through,
                                       canonMethod maps legacy direct/opportunistic)
   oversize = (wire.size() - 16 > LXMF_OPP_PAYLOAD_MAX=383)   # strip dest16, vs ENCRYPTED_MDU
   "link-always"           → use a Link
@@ -385,6 +385,9 @@ processReady — method resolution (after the wire is packed, so oversize
                             already open (a peer's inbound Link into us never counts)
   "link-if-big"           → use a Link only if oversize, else OUT_PACKET
   "opportunistic-or-fail" → fail if oversize, else OUT_PACKET on the mailbox handle
+  a sweep's retry → a Link, as oversize is, except under opportunistic-or-fail
+                    and, with s.lxmf.small_retry opportunistic, for a message
+                    that fits one packet (OUT_PACKET again)
   large + Link    → rnsdLinkSendResource (Resource over the Link)
 
 publishLinks (1 Hz) re-derives lxmf.id.<n>.link.<peer> = active|establishing (unset =

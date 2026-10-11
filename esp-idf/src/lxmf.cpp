@@ -3031,6 +3031,14 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
      * surfaces as a spurious "evicted (resource limit)". */
     bool oversize = (wire.size() - LXMF_DEST_HASH_LEN) > LXMF_OPP_PAYLOAD_MAX;
     std::string method = resolveMethod(id.index, peer_hex, mid);
+    /* s.lxmf.small_retry: what a sweep's retry of a message that fits one
+     * packet is. `link` (the default) opens a Link, which asks whether the
+     * peer is there at all; `opportunistic` sends the packet again, for a
+     * mesh where a Link's round trips cost more air than the packet and fail
+     * more often. Under link-always the first attempt was a Link already. */
+    if (retry && !oversize && method != "link-always" &&
+        storageGetStr("s.lxmf.small_retry", "link") == "opportunistic")
+        retry = false;
 
     bool use_direct;
     if (viaLink) {
@@ -3200,9 +3208,10 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
         storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_SENDING);
         storageEnd();
         id.pending++;
-        info("id %d: send DIRECT mid=%s peer=%s tag=%s wire=%zuB",
-             id.index, mid.c_str(), peer_hex.c_str(), ltag.c_str(),
-             wire.size());
+        info("id %d: send DIRECT mid=%s message_id=%s peer=%s tag=%s wire=%zuB",
+             id.index, mid.c_str(),
+             storageGetStr(msgPath(id.index, peer_hex, mid, "message_id").c_str(), "?").c_str(),
+             peer_hex.c_str(), ltag.c_str(), wire.size());
         return;
     }
 
@@ -3224,9 +3233,10 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
     storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_SENDING);
     storageEnd();
     id.pending++;
-    info("id %d: send mid=%s peer=%s send_id=%u wire=%zuB",
-         id.index, mid.c_str(), peer_hex.c_str(),
-         (unsigned)o->send_id, wire.size());
+    info("id %d: send mid=%s message_id=%s peer=%s send_id=%u wire=%zuB",
+         id.index, mid.c_str(),
+         storageGetStr(msgPath(id.index, peer_hex, mid, "message_id").c_str(), "?").c_str(),
+         peer_hex.c_str(), (unsigned)o->send_id, wire.size());
 }
 
 /* ─────────────── inbound: verify + dedup + store ─────────────── */
