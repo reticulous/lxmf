@@ -169,6 +169,70 @@ export interface Message {
   // between "this went straight there" and "somebody else sent it for me";
   // unproxied every message is direct and the mark would say nothing.
   viaLink: boolean
+  // A group message relayed to us: the destination of the member who wrote it
+  // and the message_id of their original. A group signs a separate copy for
+  // every member, so the original's id is the one every member shares — what a
+  // reply in the group names. '' / all-zero on an ordinary message.
+  groupFrom?: string
+  origId?: string
+  // A notice from the group itself (groupFrom === peer): what happened —
+  // GroupEvent — and the 32-hex destinations it happened to.
+  groupEvent?: GroupEvent
+  groupSubjects?: string[]
+  // In a group, a reply names its target by 3 bytes (6 hex) — the target's
+  // `origId` when it has one, else the head of its message_id — in place of
+  // the 32-byte `replyTo`. '' / all-zero when not a group reply.
+  replyShort?: string
+  // A command this device sent the group (/leave, /info, /members, /member):
+  // traffic for the group, never drawn as something said.
+  command?: boolean
+  // Who the group delivered this to, as last asked (cmd.group_info), and when
+  // that answer landed — `groupReceiptsTs` moves with every answer.
+  groupReceipts?: string
+  groupReceiptsTs?: number
+}
+
+/** What a group's own notice reports (message field `group_event`). */
+export enum GroupEvent { None = 0, Added = 1, Removed = 2, Left = 3, Deleted = 4 }
+
+/** Where this account stands in a group (contact field `group_state`). */
+export enum GroupState { Member = 0, Leaving = 1, Left = 2, Removed = 3, Deleted = 4 }
+
+/** True for a notice from the group itself — drawn as a system line, not a
+ *  bubble from a member. */
+export function isGroupNotice(m: Message): boolean {
+  return hasDest(m.groupFrom ?? '') && (m.groupFrom ?? '').toLowerCase() === m.peer
+}
+
+/** One recipient of a group message as the group reports it: the first 3
+ *  bytes of the member's destination, and the status of the group's copy to
+ *  them. */
+export interface GroupReceipt {
+  prefix: string
+  status: LxmfStatus
+}
+
+/** The `group_receipts` text, "hex6:status,hex6:status,…", as rows. */
+export function parseGroupReceipts(raw: string): GroupReceipt[] {
+  const out: GroupReceipt[] = []
+  for (const part of raw.split(',')) {
+    const [p, s] = part.split(':')
+    if (!p || !/^[0-9a-f]{6}$/i.test(p) || s === undefined) continue
+    out.push({ prefix: p.toLowerCase(), status: num(s) as LxmfStatus })
+  }
+  return out
+}
+
+/** The `members` text on a group contact, lines "32hex|name", as members. */
+export function parseGroupMembers(raw: string): GroupMember[] {
+  const out: GroupMember[] = []
+  for (const line of raw.split('\n')) {
+    const bar = line.indexOf('|')
+    const peer = (bar < 0 ? line : line.slice(0, bar)).trim().toLowerCase()
+    if (!/^[0-9a-f]{32}$/.test(peer)) continue
+    out.push({ peer, name: bar < 0 ? '' : line.slice(bar + 1).trim() })
+  }
+  return out
 }
 
 /* One probe outcome from lxmf.ping.<peer>.*, RAM-only and overwritten by the
@@ -294,6 +358,23 @@ export interface Contact {
   trust: number
   lastSeen: number
   pn: string           // per-contact propagation node (32-hex); '' / all-zero = none set
+  group: boolean       // this peer is an LXMF group (s.lxmf.id.<n>.contacts.<peer>.group)
+  groupState: GroupState  // where this account stands in it; Member on a non-group
+}
+
+/** A group slot on this device (`s.lxmf.id.<n>.kind = group`): its own
+ *  destination and the slot of the account that owns it. */
+export interface GroupSlot {
+  n: number
+  dest: string
+  name: string
+  owner: number
+}
+
+/** One member of a group, as the owner's members list shows it. */
+export interface GroupMember {
+  peer: string
+  name: string
 }
 
 /** One entry of the global propagation-node list (s.lxmf.pn.<i>), in
@@ -346,6 +427,39 @@ function str(v: unknown): string { return v == null ? '' : String(v) }
  *  dest — non-empty and not the all-zero placeholder. */
 export function hasDest(v: string): boolean {
   return /[1-9a-f]/i.test(v)
+}
+
+/** Who wrote a group message, and its text without the name the group put in
+ *  front of it. A group relays every member's message from its own address
+ *  with `"<name>: "` prepended (so a client that knows nothing of groups still
+ *  shows who spoke) and the writer's destination in a field; this undoes the
+ *  prefix where the field says who it was. */
+export interface GroupSender {
+  from: string
+  name: string
+  body: string
+  hue: number
+}
+
+/** The sender of `m` when it is a group message from somebody other than the
+ *  group itself, else null. `knownName` answers '' for a peer this account has
+ *  no name for; the prefix the group wrote stands in for it then. */
+export function groupSender(m: Message,
+                            knownName: (peer: string) => string): GroupSender | null {
+  const from = (m.groupFrom ?? '').toLowerCase()
+  if (!hasDest(from) || from === m.peer) return null
+  let prefix = '', body = m.content
+  const at = m.content.indexOf(': ')
+  if (at > 0 && at <= 64 && !m.content.slice(0, at).includes('\n')) {
+    prefix = m.content.slice(0, at)
+    body = m.content.slice(at + 2)
+  }
+  return {
+    from,
+    name: knownName(from) || prefix || from.slice(0, 8),
+    body,
+    hue: peerAvatar(from, '').hue,
+  }
 }
 
 /* status code → its ALL-CAPS enum name for display. The only direction needed —
@@ -636,21 +750,59 @@ export interface QuoteView {
   text: string
 }
 
-/** The quote block for `m`, or null when `m` is not a reply. `byId` maps
- *  message_id → the message, over the conversation this bubble lives in. */
-export function quoteView(m: Message, byId: Map<string, Message>,
-                          nameOf: (peer: string) => string): QuoteView | null {
-  const id = m.replyTo ?? ''
-  if (!id || /^0+$/.test(id)) return null
-  const t = byId.get(id)
+/** Whether `m` is a reply at all — by the group's 3-byte reference or by the
+ *  full message hash. */
+export function isReply(m: Message): boolean {
+  return hasDest(m.replyShort ?? '') || hasDest(m.replyTo ?? '')
+}
+
+/** The message `m` replies to, over `msgs` (the conversation it lives in), or
+ *  null when this device does not hold it. A group reply names its target by 6
+ *  hex — the target's `origId`, or the head of its message_id when it has
+ *  none; any other reply by the whole message_id. */
+export function replyTarget(m: Message, msgs: Iterable<Message>): Message | null {
+  const short = (m.replyShort ?? '').toLowerCase()
+  const full = (m.replyTo ?? '').toLowerCase()
+  if (hasDest(short)) {
+    for (const t of msgs)
+      if ((t.origId ?? '').toLowerCase() === short ||
+          t.messageId.toLowerCase().startsWith(short)) return t
+    return null
+  }
+  if (!hasDest(full)) return null
+  for (const t of msgs) if (t.messageId.toLowerCase() === full) return t
+  return null
+}
+
+/** The quote block for `m`, or null when `m` is not a reply. `targetOf`
+ *  resolves the replied-to message over the conversation this bubble lives in
+ *  (`replyTarget`). `senderOf` names the member behind a group message, so a
+ *  quote of one says who wrote it rather than the group's name, and shows the
+ *  text without the prefix. */
+export function quoteView(m: Message, targetOf: (m: Message) => Message | null,
+                          nameOf: (peer: string) => string,
+                          senderOf?: (t: Message) => GroupSender | null): QuoteView | null {
+  if (!isReply(m)) return null
+  const t = targetOf(m)
   if (!t) return { key: '', label: '', text: '' }
+  const g = senderOf?.(t) ?? null
+  const whole = g ? g.body : t.content
   const frag = m.replyQuote ?? ''
-  const text = frag && t.content.includes(frag) ? frag : t.content
+  const text = frag && t.content.includes(frag) ? frag : whole
   return {
     key: t.key,
-    label: t.dir === 'out' ? 'You' : nameOf(t.peer),
+    label: t.dir === 'out' ? 'You' : g ? g.name : nameOf(t.peer),
     text: quoteLine(text),
   }
+}
+
+/** How a reply to `m` names it. In a group, by 3 bytes every member holds it
+ *  under: the member's original (`origId`) when `m` is relayed, else the head
+ *  of its own message_id — and never the 32-byte hash, which differs between
+ *  members' copies. Elsewhere by the message_id itself. */
+export function replyRefOf(m: Message, inGroup: boolean): { replyTo?: string; replyShort?: string } {
+  if (!inGroup) return { replyTo: m.messageId }
+  return { replyShort: hasDest(m.origId ?? '') ? m.origId! : m.messageId.slice(0, 6) }
 }
 
 /** Open a Nomad page URL tapped in a message (writes the shared sentinel). */
@@ -674,16 +826,37 @@ export interface UseLxmf {
   activeConversation: ComputedRef<{ day: string; messages: Message[] }[]>
   contacts: ComputedRef<Record<string, Contact>>
   announces: ComputedRef<Announce[]>
-  peerDirectory: ComputedRef<{ peer: string; name: string; known: boolean }[]>
+  peerDirectory: ComputedRef<{ peer: string; name: string; known: boolean; group: boolean }[]>
   unreadTotal: ComputedRef<number>
   displayName: (peer: string) => string
+  /** The name this account knows `peer` by, '' when it knows none. */
+  knownName: (peer: string) => string
+  /** Every destination this device's own slots answer on, groups included. */
+  ownDests: ComputedRef<Set<string>>
+  /** The group slot behind `peer` when the open account owns it, else null. */
+  ownedGroup: (peer: string) => GroupSlot | null
+  /** Members of group slot `g` (its contacts marked `member`). */
+  groupMembers: (g: number) => GroupMember[]
+  /** Ship group slot `g`'s contacts (its member list) into the mirror. */
+  fetchGroupMembers: (g: number) => void
+  createGroup: (name: string, peers: string[], hidden: boolean) => Promise<void>
+  addGroupMembers: (g: number, peers: string[]) => Promise<void>
+  removeGroupMember: (g: number, peer: string) => Promise<void>
+  deleteGroup: (g: number) => Promise<void>
+  leaveGroup: (peer: string) => Promise<void>
+  /** Ask the group who it delivered message `key` to. */
+  groupInfo: (peer: string, key: string) => Promise<void>
+  /** Ask the group for its member list again. */
+  groupRefreshMembers: (peer: string) => Promise<void>
+  /** The group's member list as the group last sent it (contacts.<peer>.members). */
+  groupRoster: (peer: string) => GroupMember[]
   reachability: (peer: string) => Reachability | null
   contactOf: (peer: string) => Contact | null
   draftFor: (peer: string) => string
   setDraft: (peer: string, text: string) => void
   openPeer: (peer: string) => void
   send: (peer: string, content: string,
-         opts?: { method?: string; replyTo?: string; replyQuote?: string }) => Promise<void>
+         opts?: { method?: string; replyTo?: string; replyShort?: string; replyQuote?: string }) => Promise<void>
   resend: (peer: string, key: string) => Promise<void>
   /** Resend through a propagation node (via = 32-hex node); '' = direct. */
   resendVia: (peer: string, key: string, via: string) => Promise<void>
@@ -743,9 +916,12 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
    * of an `s.lxmf.id.<n>` subtree is not enough: a destroyed slot's contacts
    * store is a separate structured-DB instance that a later fetch can ship back
    * into the mirror, and that must not resurrect the identity's row. */
+  /* A group (`kind = group`) takes a slot too, but it is nobody's account: it
+   * is never offered as one to send from or to open a window on. */
   const identities = computed<Identity[]>(() =>
     Object.keys(idTree.value)
-      .map(Number).filter(n => !Number.isNaN(n) && idTree.value[n]?.label !== undefined)
+      .map(Number).filter(n => !Number.isNaN(n) && idTree.value[n]?.label !== undefined &&
+                               str(idTree.value[n]?.kind) !== 'group')
       .sort((a, b) => a - b)
       .map((n) => {
         const s = idTree.value[n] ?? {}
@@ -863,6 +1039,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         trust: num(c.trust),
         lastSeen: num(c.last_seen),
         pn: str(c.pn),
+        group: num(c.group) === 1,
+        groupState: num(c.group_state) as GroupState,
       }
     }
     return out
@@ -908,6 +1086,82 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   })
   const displayName = (peer: string) =>
     nameMap.value.get(peer) ?? shortHash(peer)
+  const knownName = (peer: string) => nameMap.value.get(peer) ?? ''
+
+  /* ── Groups ──
+   * A group is a slot of its own whose contacts are its members. The owner's
+   * account holds the group as an ordinary contact marked `group`; what makes
+   * the open account the OWNER is a group slot here naming it in `group_owner`. */
+  const ownDests = computed(() => {
+    const s = new Set<string>()
+    for (const k of Object.keys(liveTree.value)) {
+      const d = str(liveTree.value[k]?.dest_hash).toLowerCase()
+      if (d) s.add(d)
+    }
+    return s
+  })
+  const groupSlots = computed<GroupSlot[]>(() =>
+    Object.keys(idTree.value).map(Number)
+      .filter(n => !Number.isNaN(n) && str(idTree.value[n]?.kind) === 'group')
+      .map(n => ({
+        n,
+        dest: str(liveTree.value[n]?.dest_hash).toLowerCase(),
+        name: str(idTree.value[n]?.display_name) || str(idTree.value[n]?.label),
+        owner: num(idTree.value[n]?.group_owner, -1),
+      })))
+  const ownedGroup = (peer: string): GroupSlot | null =>
+    groupSlots.value.find(g => g.dest === peer && g.owner === activeId.value) ?? null
+  const groupMembers = (g: number): GroupMember[] => {
+    const raw = device.get(`s.lxmf.id.${g}.contacts`) ?? {}
+    return Object.keys(raw)
+      .filter(peer => num(raw[peer]?.member) === 1)
+      .map(peer => ({
+        peer,
+        name: str(raw[peer]?.display_name) || str(raw[peer]?.nick) ||
+              knownName(peer) || shortHash(peer),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }
+  const fetchGroupMembers = (g: number) => {
+    if (device.synced) device.sendCommand({ fetch: `s.lxmf.id.${g}.contacts` })
+  }
+  /* `|` separates the command's fields, so it cannot be part of a name. */
+  /* `hidden` keeps the name out of the group's announce; members learn it from
+   * the group itself. */
+  const createGroup = (name: string, peers: string[], hidden: boolean) =>
+    queue('lxmf.cmd.group_new').enqueue(
+      `${activeId.value}|${name.replace(/\|/g, ' ').trim()}|${peers.join(',')}|${hidden ? 1 : 0}`)
+  const addGroupMembers = (g: number, peers: string[]) =>
+    queue(`lxmf.id.${g}.cmd.member_add`).enqueue(peers.join(','), {
+      settle: () => peers.every(p =>
+        num(device.get(`s.lxmf.id.${g}.contacts.${p}.member`)) === 1),
+    })
+  const removeGroupMember = (g: number, peer: string) =>
+    queue(`lxmf.id.${g}.cmd.member_del`).enqueue(peer, {
+      settle: () => num(device.get(`s.lxmf.id.${g}.contacts.${peer}.member`)) !== 1,
+    })
+  /* The owner takes the group down: the firmware tells every member, then the
+   * group's slot removes itself. */
+  const deleteGroup = (g: number) =>
+    queue('lxmf.cmd.group_delete').enqueue(String(g))
+  /* Ask the group who it delivered one message to; the answer lands on the
+   * record as group_receipts, with group_receipts_ts moving. */
+  const groupInfo = (peer: string, key: string) =>
+    queue(`lxmf.id.${activeId.value}.cmd.group_info`).enqueue(`${peer}/${key}`)
+  /* Ask the group for its member list again; it lands on contacts.<peer>.members. */
+  const groupRefreshMembers = (peer: string) =>
+    queue(`lxmf.id.${activeId.value}.cmd.group_members`).enqueue(peer)
+  /* The group's own member list, as every member sees it. */
+  const groupRoster = (peer: string): GroupMember[] =>
+    parseGroupMembers(str(device.get(`s.lxmf.id.${activeId.value}.contacts.${peer}.members`)))
+  /* A member leaves: the firmware sends the group "/leave" and the contact
+   * stands at Leaving until the group answers. */
+  const leaveGroup = (peer: string) => {
+    const n = activeId.value
+    return queue(`lxmf.id.${n}.cmd.group_leave`).enqueue(peer, {
+      settle: () => num(device.get(`s.lxmf.id.${n}.contacts.${peer}.group_state`)) !== 0,
+    })
+  }
 
   const reachMap = computed<Map<string, Reachability>>(() => {
     const m = new Map<string, Reachability>()
@@ -935,6 +1189,14 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       bodySize: num(r.body_size),
       proxyStatus: num(r.proxy_status),
       viaLink: num(r.via_link) !== 0,
+      groupFrom: str(r.group_from),
+      origId: str(r.orig_id),
+      groupEvent: num(r.group_event) as GroupEvent,
+      groupSubjects: str(r.group_subjects).split(',').filter(s => s.length === 32),
+      replyShort: str(r.reply_short),
+      command: num(r.command) === 1,
+      groupReceipts: str(r.group_receipts),
+      groupReceiptsTs: num(r.group_receipts_ts),
     }
   }
 
@@ -948,7 +1210,9 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     for (const peer of Object.keys(raw)) {
       const c = raw[peer] ?? {}
       const count = num(c.count)
-      if (count <= 0) continue // announce-only contact, no messages exchanged
+      // No messages and not kept: an announce-only peer. `kept` marks a
+      // contact whose messages were deleted without deleting the contact.
+      if (count <= 0 && !num(c.kept)) continue
       const lastTs = num(c.last_ts)
       // The preview is the last message whichever way it went; preview_mine is
       // which way, so the list labels ours "You:" and theirs with nothing.
@@ -974,9 +1238,11 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     // order the keys were shipped/merged in. We do NOT sort by ts: the ESP RTC
     // drifts too far to order reliably, and insertion order is exactly "as
     // received/sent".
+    // A command to a group (/leave, /info, …) is not something we said: what
+    // the thread shows for it is the group's answer, if any.
     const msgs = Object.keys(thread)
       .map(key => readMsg(peer, key, thread[key] ?? {}))
-      .filter(m => m.status !== LxmfStatus.Draft)
+      .filter(m => m.status !== LxmfStatus.Draft && !m.command)
     // Day separators anchor to recvTs (monotonic receive time), NOT the sender's
     // ts — a message with a skewed clock can't shove a separator to the wrong day
     // or make the date jump backward mid-thread.
@@ -992,7 +1258,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   })
 
   /* A contact is a peer with at least one stored message, in or out — i.e. a
-   * conversation (directory count > 0). The mere existence of a
+   * conversation (directory count > 0), or one whose messages were deleted
+   * with the contact kept (`kept`). The mere existence of a
    * contacts.<peer> record is NOT the test: a record also carries per-peer
    * settings (pn) and the announced display_name, so a peer merely opened
    * from "On the Mesh" must not be promoted out of that section. */
@@ -1000,16 +1267,16 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
 
   const peerDirectory = computed(() => {
     const seen = new Set<string>()
-    const rows: { peer: string; name: string; known: boolean }[] = []
+    const rows: { peer: string; name: string; known: boolean; group: boolean }[] = []
     for (const c of Object.values(contacts.value)) {
       if (!contactPeers.value.has(c.peer)) continue   // record, but no messages
       seen.add(c.peer)
-      rows.push({ peer: c.peer, name: displayName(c.peer), known: true })
+      rows.push({ peer: c.peer, name: displayName(c.peer), known: true, group: c.group })
     }
     for (const a of announces.value) {
       if (seen.has(a.hash)) continue
       seen.add(a.hash)
-      rows.push({ peer: a.hash, name: displayName(a.hash), known: false })
+      rows.push({ peer: a.hash, name: displayName(a.hash), known: false, group: false })
     }
     return rows
   })
@@ -1024,7 +1291,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   }
 
   async function send(peer: string, content: string,
-                      opts?: { method?: string; replyTo?: string; replyQuote?: string }) {
+                      opts?: { method?: string; replyTo?: string; replyShort?: string; replyQuote?: string }) {
     const n = activeId.value
     // Fail fast on a down/keyless identity rather than writing a
     // sentinel nothing will ever process (6 s CmdQueue timeout).
@@ -1037,13 +1304,14 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       ts: Math.floor(Date.now() / 1000),
     }
     if (opts?.method) rec.method = opts.method
-    /* A reply names the message it answers by that message's id; the quote is
-     * the fragment of it the user picked out, and rides only with the hash it
+    /* A reply names the message it answers — by its id, or in a group by the
+     * 3 bytes every member holds it under (replyRefOf); the quote is the
+     * fragment of it the user picked out, and rides only with the reference it
      * belongs to. */
-    if (opts?.replyTo) {
-      rec.reply_to = opts.replyTo
-      if (opts.replyQuote) rec.reply_quote = opts.replyQuote
-    }
+    if (opts?.replyShort) rec.reply_short = opts.replyShort
+    else if (opts?.replyTo) rec.reply_to = opts.replyTo
+    if ((opts?.replyShort || opts?.replyTo) && opts.replyQuote)
+      rec.reply_quote = opts.replyQuote
     const data = nest(`s.lxmf.id.${n}.msgs.${peer}.${key}`, rec)
     if (_draftsById[n]) delete _draftsById[n]![peer]
     // The record is written optimistically as `queued` so the bubble
@@ -1312,7 +1580,10 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     identities, usableIdentities, identitiesKnown, activeIdentityReady,
     conversations, activeConversation, contacts, announces,
     peerDirectory, unreadTotal,
-    displayName, reachability, contactOf, draftFor, setDraft, openPeer,
+    displayName, knownName, ownDests, ownedGroup, groupMembers, fetchGroupMembers,
+    createGroup, addGroupMembers, removeGroupMember, deleteGroup, leaveGroup,
+    groupInfo, groupRefreshMembers, groupRoster,
+    reachability, contactOf, draftFor, setDraft, openPeer,
     send, resend, resendVia, retryNow, cancel, deleteMessage, deleteConversation,
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
     pnStatus, setContactPn,

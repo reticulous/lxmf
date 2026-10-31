@@ -2,9 +2,11 @@
  *
  *   C → S   CHANNEL (rnsd identifies with the account identity)
  *   S → C   HELLO    [label, limits, serving?]        as soon as the identify is read
- *   C → S   HANDOVER [privkey, display_name, ratchets]
+ *   C → S   HANDOVER [privkey, display_name, ratchets, members]
  *   S → C   SERVING  [ok, reason]                     the account is on the air
- *   S → C   MSG      [msg_id, peer, name, ts, title, size, body?, reply_to, quote]
+ *   S → C   MSG      [msg_id, peer, name, ts, title, size, body?, reply_to, quote,
+ *                     group_from, orig_id, group_event, group_subjects, group_data,
+ *                     group_name]
  *   C → S   FETCH    [msg_id, peer]                   a withheld body
  *   S → C   BODY     [msg_id, peer, content, reply_to, quote]  Resource when large
  *   C → S   HANDED   [msg_id, peer]                   after persist
@@ -16,6 +18,7 @@
  *   C → S   RETRY    [key, peer]                      try that one now, body stays put
  *   C → S   RELEASE  []                               deprovision
  *   S → C   RATCHETS [record]                         release hands the set back
+ *   C → S   ADOPT    [identity, label]                approve that group of mine
  *
  * One device — the **server** — holds an LXMF account's keys, registers and
  * announces its `lxmf.delivery`, and does all the sending and receiving. The
@@ -51,9 +54,12 @@
  *  this project, so another implementation can speak it. */
 #define LXMPROXY_ASPECT      "lxmproxy.server"
 
-/** Destination-hash and message-id widths, matching LXMF's own. */
-#define LXMPROXY_DEST_LEN    16
-#define LXMPROXY_MID_LEN     32
+/** Destination-hash and message-id widths, matching LXMF's own, and the 3-byte
+ *  id a group names a message by (lxmf INTERNALS §8d). A reply reference is
+ *  either: a bin of 32 or of 3. */
+#define LXMPROXY_DEST_LEN     16
+#define LXMPROXY_MID_LEN      32
+#define LXMPROXY_SHORT_ID_LEN 3
 
 /** ITS port on the SERVER task where rnsd back-connects each accepted inbound
  *  Channel (rnsdDestListenChannels). The Resource lifecycle for those Channels
@@ -71,12 +77,14 @@ enum LxmproxyFrameType : uint8_t {
      * that is simply resumes. */
     LXMPROXY_FR_HELLO    = 1,
 
-    /* C→S  [2, privkey b64, display_name str, ratchets str]
+    /* C→S  [2, privkey b64, display_name str, ratchets str, members str]
      * `privkey` is the account's raw 64-byte Ed25519+X25519 private key.
      * `ratchets` is rnsd's whole retained ratchet record for the account's
      * delivery destination, verbatim — peers encrypt to the ratchet in the last
      * announce they heard, so a server that started fresh could not read
-     * anything sent before its own announce reached each peer. */
+     * anything sent before its own announce reached each peer. `members` is
+     * empty for an account; for a group it is the member list, one
+     * `dest|pubkey|name` line each (the CONFIG key `members` carries the same). */
     LXMPROXY_FR_HANDOVER = 2,
 
     /* S→C  [3, ok u32, reason str, hold u32]
@@ -92,7 +100,9 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_SERVING  = 3,
 
     /* S→C  [4, msg_id b32, peer b16, peer_name str, ts u32, title str,
-     *          size u32, body str|nil, reply_to b32|nil, quote str]
+     *          size u32, body str|nil, reply_to b32|b3|nil, quote str,
+     *          group_from b16|nil, orig_id b3|nil, group_event u32,
+     *          group_subjects str, group_data str, group_name str]
      * One inbound message the server holds and the client does not. `size` is
      * the body length whether or not the body rides along; a nil body is a
      * withheld one the client fetches on demand. `peer_name` is an
@@ -100,13 +110,16 @@ enum LxmproxyFrameType : uint8_t {
      * `reply_to` is the message this one replies to and `quote` the fragment of
      * it the sender picked out (empty when the reply quotes the whole message):
      * both ride here as well as on BODY, because a reply whose body fits inline
-     * is never fetched and would otherwise reach the client as a bare message. */
+     * is never fetched and would otherwise reach the client as a bare message.
+     * `group_from` / `orig_id` / `group_event` / `group_subjects` /
+     * `group_data` / `group_name` are the message's FIELD_GROUP as lxmf stores
+     * it: nil, nil, 0 and empty when it is not a group message. */
     LXMPROXY_FR_MSG      = 4,
 
     /* C→S  [5, msg_id b32, peer b16] — send me the body you withheld. */
     LXMPROXY_FR_FETCH    = 5,
 
-    /* S→C  [6, msg_id b32, peer b16, content str, reply_to b32|nil, quote str]
+    /* S→C  [6, msg_id b32, peer b16, content str, reply_to b32|b3|nil, quote str]
      * The withheld body. Rides a Resource on the Channel's Link when it does
      * not fit one Channel message. */
     LXMPROXY_FR_BODY     = 6,
@@ -118,7 +131,7 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_HANDED   = 7,
 
     /* C→S  [8, local_key str, peer b16, ts u32, title str, content str,
-     *          reply_to b32|nil, quote str, method str, pn b16|nil]
+     *          reply_to b32|b3|nil, quote str, method str, pn b16|nil]
      * Reproduce this draft on the server and send it. `local_key` is the
      * client's own `o_<unix_ms>_<rand4>`, and it is the idempotency key: a SEND
      * repeated after a reconnect meets the same record and gets the same
@@ -176,6 +189,12 @@ enum LxmproxyFrameType : uint8_t {
      * up is queued afresh, and one merely waiting for the next sweep stops
      * waiting. The answer is the ordinary STATUS that follows. */
     LXMPROXY_FR_RETRY    = 16,
+
+    /* C→S  [17, identity b16, label str]
+     * On a serving account's Channel: host that group of this account's too.
+     * The group then asks on its own Channel like any account, and is already
+     * approved. */
+    LXMPROXY_FR_ADOPT    = 17,
 };
 
 /** Every field any frame can carry, filled by lxmproxyParse. Unset fields keep
@@ -196,6 +215,11 @@ struct LxmproxyFrame {
     bool        have_privkey = false;
     std::string display_name;
     std::string ratchets;
+    std::string members;                /* a group's `dest|pubkey|name` lines */
+
+    /* ADOPT */
+    uint8_t     ident[LXMPROXY_DEST_LEN] = {};
+    bool        have_ident = false;
 
     /* SERVING */
     uint32_t    ok = 0;
@@ -214,10 +238,19 @@ struct LxmproxyFrame {
     bool        have_body = false;      /* MSG carried its body inline */
     uint8_t     reply_to[LXMPROXY_MID_LEN] = {};
     bool        have_reply_to = false;
+    uint8_t     reply_short[LXMPROXY_SHORT_ID_LEN] = {};   /* a group's reply */
+    bool        have_reply_short = false;
     std::string reply_quote;            /* the fragment of the replied-to message
                                          * this one quotes (FIELD_REPLY_QUOTE);
                                          * empty on a reply that quotes the whole
                                          * message */
+    uint8_t     group_from[LXMPROXY_DEST_LEN] = {};
+    uint8_t     orig_id[LXMPROXY_SHORT_ID_LEN] = {};
+    bool        have_group = false;     /* MSG: both of the above are set */
+    uint32_t    group_event = 0;        /* what the group says, 0 = a member's message */
+    std::string group_subjects;         /* comma-separated 32-hex */
+    std::string group_data;             /* an answer's data, as lxmf stores it */
+    std::string group_name;             /* a members answer: the group's name */
 
     /* SEND */
     std::string key;                    /* the client's local key, or a message id */
@@ -242,21 +275,30 @@ std::vector<uint8_t> lxmproxyBuildHello(const char* label, uint32_t quota_kb,
                                         const char* reason);
 std::vector<uint8_t> lxmproxyBuildHandover(const uint8_t privkey[64],
                                            const char* display_name,
-                                           const std::string& ratchets);
+                                           const std::string& ratchets,
+                                           const std::string& members);
+std::vector<uint8_t> lxmproxyBuildAdopt(const uint8_t ident[LXMPROXY_DEST_LEN],
+                                        const char* label);
 std::vector<uint8_t> lxmproxyBuildServing(bool ok, const char* reason, bool hold = false);
 std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                       const uint8_t peer[LXMPROXY_DEST_LEN],
                                       const char* peer_name, uint32_t ts,
                                       const std::string& title, uint32_t size,
                                       const std::string* body,
-                                      const uint8_t* reply_to,
-                                      const std::string& reply_quote);
+                                      const uint8_t* reply_to, size_t reply_len,
+                                      const std::string& reply_quote,
+                                      const uint8_t* group_from,
+                                      const uint8_t* orig_id,
+                                      uint32_t group_event,
+                                      const std::string& group_subjects,
+                                      const std::string& group_data,
+                                      const std::string& group_name);
 std::vector<uint8_t> lxmproxyBuildFetch(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                         const uint8_t peer[LXMPROXY_DEST_LEN]);
 std::vector<uint8_t> lxmproxyBuildBody(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                        const uint8_t peer[LXMPROXY_DEST_LEN],
                                        const std::string& content,
-                                       const uint8_t* reply_to,
+                                       const uint8_t* reply_to, size_t reply_len,
                                        const std::string& reply_quote);
 std::vector<uint8_t> lxmproxyBuildHanded(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                          const uint8_t peer[LXMPROXY_DEST_LEN]);
@@ -264,7 +306,7 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
                                        const uint8_t peer[LXMPROXY_DEST_LEN],
                                        uint32_t ts, const std::string& title,
                                        const std::string& content,
-                                       const uint8_t* reply_to,
+                                       const uint8_t* reply_to, size_t reply_len,
                                        const std::string& reply_quote,
                                        const char* method, const uint8_t* pn);
 std::vector<uint8_t> lxmproxyBuildStatus(const std::string& key,

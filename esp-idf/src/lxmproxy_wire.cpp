@@ -135,6 +135,18 @@ static bool mpInBinN(MpIn& s, uint8_t* out, size_t want, bool* have)
     return true;
 }
 
+/* A reply reference: the full 32-byte message id, or a group's 3-byte one. */
+static bool mpInReply(MpIn& s, LxmproxyFrame& out)
+{
+    const uint8_t* p; size_t l; bool nil = false;
+    if (!mpInBin(s, p, l, &nil)) return false;
+    if (nil) return true;
+    if (l == LXMPROXY_MID_LEN) { std::memcpy(out.reply_to, p, l); out.have_reply_to = true; }
+    else if (l == LXMPROXY_SHORT_ID_LEN) { std::memcpy(out.reply_short, p, l);
+                                           out.have_reply_short = true; }
+    return true;
+}
+
 static bool mpInArr(MpIn& s, size_t& cnt)
 {
     if (s.i >= s.n) return false;
@@ -176,14 +188,27 @@ std::vector<uint8_t> lxmproxyBuildHello(const char* label, uint32_t quota_kb,
 
 std::vector<uint8_t> lxmproxyBuildHandover(const uint8_t privkey[64],
                                            const char* display_name,
-                                           const std::string& ratchets)
+                                           const std::string& ratchets,
+                                           const std::string& members)
 {
     std::vector<uint8_t> o;
-    mpArr(o, 4);
+    mpArr(o, 5);
     mpUint(o, LXMPROXY_FR_HANDOVER);
     mpBin(o, privkey, 64);
     mpStrC(o, display_name);
     mpStr(o, ratchets);
+    mpStr(o, members);
+    return o;
+}
+
+std::vector<uint8_t> lxmproxyBuildAdopt(const uint8_t ident[LXMPROXY_DEST_LEN],
+                                        const char* label)
+{
+    std::vector<uint8_t> o;
+    mpArr(o, 3);
+    mpUint(o, LXMPROXY_FR_ADOPT);
+    mpBin(o, ident, LXMPROXY_DEST_LEN);
+    mpStrC(o, label);
     return o;
 }
 
@@ -203,11 +228,17 @@ std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                       const char* peer_name, uint32_t ts,
                                       const std::string& title, uint32_t size,
                                       const std::string* body,
-                                      const uint8_t* reply_to,
-                                      const std::string& reply_quote)
+                                      const uint8_t* reply_to, size_t reply_len,
+                                      const std::string& reply_quote,
+                                      const uint8_t* group_from,
+                                      const uint8_t* orig_id,
+                                      uint32_t group_event,
+                                      const std::string& group_subjects,
+                                      const std::string& group_data,
+                                      const std::string& group_name)
 {
     std::vector<uint8_t> o;
-    mpArr(o, 10);
+    mpArr(o, 16);
     mpUint(o, LXMPROXY_FR_MSG);
     mpBin(o, msg_id, LXMPROXY_MID_LEN);
     mpBin(o, peer, LXMPROXY_DEST_LEN);
@@ -216,8 +247,14 @@ std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
     mpStr(o, title);
     mpUint(o, size);
     if (body) mpStr(o, *body); else mpNil(o);
-    mpBinOrNil(o, reply_to, LXMPROXY_MID_LEN);
+    mpBinOrNil(o, reply_len ? reply_to : nullptr, reply_len);
     mpStr(o, reply_quote);
+    mpBinOrNil(o, group_from, LXMPROXY_DEST_LEN);
+    mpBinOrNil(o, orig_id, LXMPROXY_SHORT_ID_LEN);
+    mpUint(o, group_event);
+    mpStr(o, group_subjects);
+    mpStr(o, group_data);
+    mpStr(o, group_name);
     return o;
 }
 
@@ -235,7 +272,7 @@ std::vector<uint8_t> lxmproxyBuildFetch(const uint8_t msg_id[LXMPROXY_MID_LEN],
 std::vector<uint8_t> lxmproxyBuildBody(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                        const uint8_t peer[LXMPROXY_DEST_LEN],
                                        const std::string& content,
-                                       const uint8_t* reply_to,
+                                       const uint8_t* reply_to, size_t reply_len,
                                        const std::string& reply_quote)
 {
     std::vector<uint8_t> o;
@@ -244,7 +281,7 @@ std::vector<uint8_t> lxmproxyBuildBody(const uint8_t msg_id[LXMPROXY_MID_LEN],
     mpBin(o, msg_id, LXMPROXY_MID_LEN);
     mpBin(o, peer, LXMPROXY_DEST_LEN);
     mpStr(o, content);
-    mpBinOrNil(o, reply_to, LXMPROXY_MID_LEN);
+    mpBinOrNil(o, reply_len ? reply_to : nullptr, reply_len);
     mpStr(o, reply_quote);
     return o;
 }
@@ -264,7 +301,7 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
                                        const uint8_t peer[LXMPROXY_DEST_LEN],
                                        uint32_t ts, const std::string& title,
                                        const std::string& content,
-                                       const uint8_t* reply_to,
+                                       const uint8_t* reply_to, size_t reply_len,
                                        const std::string& reply_quote,
                                        const char* method, const uint8_t* pn)
 {
@@ -276,7 +313,7 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
     mpUint(o, ts);
     mpStr(o, title);
     mpStr(o, content);
-    mpBinOrNil(o, reply_to, LXMPROXY_MID_LEN);
+    mpBinOrNil(o, reply_len ? reply_to : nullptr, reply_len);
     mpStr(o, reply_quote);
     mpStrC(o, method);
     mpBinOrNil(o, pn, LXMPROXY_DEST_LEN);
@@ -389,12 +426,19 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             return true;
         }
         case LXMPROXY_FR_HANDOVER: {
-            if (cnt < 4) return false;
+            if (cnt < 5) return false;
             if (!mpInBinN(s, out.privkey, 64, &out.have_privkey)) return false;
             if (!out.have_privkey)                 return false;
             if (!mpInStr(s, out.display_name))     return false;
             if (!mpInStr(s, out.ratchets))         return false;
+            if (!mpInStr(s, out.members))          return false;
             return true;
+        }
+        case LXMPROXY_FR_ADOPT: {
+            if (cnt < 3) return false;
+            if (!mpInBinN(s, out.ident, LXMPROXY_DEST_LEN, &out.have_ident)) return false;
+            if (!mpInStr(s, out.label)) return false;
+            return out.have_ident;
         }
         case LXMPROXY_FR_SERVING: {
             if (cnt < 4) return false;
@@ -404,7 +448,7 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             return true;
         }
         case LXMPROXY_FR_MSG: {
-            if (cnt < 10) return false;
+            if (cnt < 16) return false;
             if (!mpInBinN(s, out.msg_id, LXMPROXY_MID_LEN, &out.have_msg_id)) return false;
             if (!mpInBinN(s, out.peer, LXMPROXY_DEST_LEN, &out.have_peer))    return false;
             if (!out.have_msg_id || !out.have_peer) return false;
@@ -418,8 +462,16 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
                 if (!nil) { out.content.assign(bp ? (const char*)bp : "", bl);
                             out.have_body = true; }
             }
-            if (!mpInBinN(s, out.reply_to, LXMPROXY_MID_LEN, &out.have_reply_to)) return false;
+            if (!mpInReply(s, out))           return false;
             if (!mpInStr(s, out.reply_quote)) return false;
+            if (!mpInBinN(s, out.group_from, LXMPROXY_DEST_LEN, &out.have_group)) return false;
+            bool have_orig = false;
+            if (!mpInBinN(s, out.orig_id, LXMPROXY_SHORT_ID_LEN, &have_orig)) return false;
+            out.have_group = out.have_group && have_orig;
+            if (!mpInUint(s, out.group_event))   return false;
+            if (!mpInStr(s, out.group_subjects)) return false;
+            if (!mpInStr(s, out.group_data))     return false;
+            if (!mpInStr(s, out.group_name))     return false;
             return true;
         }
         case LXMPROXY_FR_FETCH:
@@ -436,7 +488,7 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             if (!out.have_msg_id || !out.have_peer) return false;
             if (!mpInStr(s, out.content)) return false;
             out.have_body = true;
-            if (!mpInBinN(s, out.reply_to, LXMPROXY_MID_LEN, &out.have_reply_to)) return false;
+            if (!mpInReply(s, out))           return false;
             if (!mpInStr(s, out.reply_quote)) return false;
             return true;
         }
@@ -448,7 +500,7 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             if (!mpInUint(s, out.ts))                                      return false;
             if (!mpInStr(s, out.title))                                    return false;
             if (!mpInStr(s, out.content))                                  return false;
-            if (!mpInBinN(s, out.reply_to, LXMPROXY_MID_LEN, &out.have_reply_to)) return false;
+            if (!mpInReply(s, out))                                        return false;
             if (!mpInStr(s, out.reply_quote))                              return false;
             if (!mpInStr(s, out.method))                                   return false;
             if (!mpInBinN(s, out.pn, LXMPROXY_DEST_LEN, &out.have_pn))     return false;
@@ -515,6 +567,7 @@ const char* lxmproxyFrameName(uint8_t type)
         case LXMPROXY_FR_STATE:    return "STATE";
         case LXMPROXY_FR_RELEASE:  return "RELEASE";
         case LXMPROXY_FR_RATCHETS: return "RATCHETS";
+        case LXMPROXY_FR_ADOPT:    return "ADOPT";
         default:                   return "?";
     }
 }

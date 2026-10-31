@@ -32,6 +32,28 @@
       <div class="sect">Content</div>
       <div class="sn text">{{ m.content || '—' }}</div>
 
+      <!-- Who the group got this message to, as the group answers when asked.
+           The detail page asks on opening; until the answer lands it says so. -->
+      <template v-if="asksReceipts">
+        <div class="sect">Delivered by the group to</div>
+        <div v-if="!receiptsIn" class="sn small asking">
+          <span class="spin"></span> Asking the group…
+        </div>
+        <div v-else class="receipts">
+          <div v-if="!receipts.length" class="rempty">No recipients.</div>
+          <div v-for="r in receipts" :key="r.prefix" class="rrow">
+            <span class="rname">{{ r.name }}</span>
+            <span v-if="r.delivered" class="rtick"><DeliveryTicks variant="delivered" /></span>
+            <span v-else class="rstat">{{ r.statusName }}</span>
+          </div>
+        </div>
+      </template>
+
+      <!-- A message a member wrote: the way to talk to them on their own. -->
+      <button v-if="memberFrom" class="resend dm" @click="emit('message-member', memberFrom)">
+        Message {{ memberName }}
+      </button>
+
       <div class="sect">Peer</div>
       <div class="addr">
         <span class="addrhex">{{ peerName }}<br>{{ grouped(m.peer) }}</span>
@@ -51,7 +73,7 @@
 
       <template v-if="isReply">
         <div class="sect">In reply to</div>
-        <div class="sn small">{{ grouped(m.replyTo!) }}</div>
+        <div class="sn small">{{ grouped(hasDest(m.replyShort ?? '') ? m.replyShort! : m.replyTo!) }}</div>
         <!-- The fragment as it arrived, whether or not it is one the
              conversation will draw — that needs it to occur in the message
              above, and this is where an unverifiable quote can still be read. -->
@@ -101,12 +123,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
-import { type Message, type PnNode, lxmfStatusName, LxmfStatus,
-         hasDest, LXMF_TRIES_GAVEUP, RESEND_RETRY } from '../../modules/lxmf'
+import DeliveryTicks from './DeliveryTicks.vue'
+import { type GroupMember, type Message, type PnNode, lxmfStatusName, LxmfStatus,
+         hasDest, isGroupNotice, parseGroupReceipts, LXMF_TRIES_GAVEUP, RESEND_RETRY }
+  from '../../modules/lxmf'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   m: Message
   peerName: string
   pnNodes: PnNode[]
@@ -115,13 +139,65 @@ const props = defineProps<{
   proxied?: boolean
   /** A conversation link to this peer is up, so this device can carry it. */
   linkUp?: boolean
-}>()
+  /** The conversation is a group. */
+  group?: boolean
+  /** The group's member list, which names a receipt by its 6-hex prefix. */
+  roster?: GroupMember[]
+  /** The open account's own address — its receipt reads "You". */
+  selfDest?: string
+  /** The name this account knows a peer by, '' when none. */
+  knownName?: (peer: string) => string
+}>(), { group: false, roster: () => [], selfDest: '', knownName: () => '' })
 const emit = defineEmits<{
   close: []
   /** via = '' → resend directly, RESEND_RETRY → ask our proxy to try again
    *  without moving the body, else the 32-hex propagation node. */
   resend: [m: Message, via: string]
+  /** Ask the group who it delivered this message to. */
+  'group-info': [m: Message]
+  /** Open (or start) the direct conversation with this group member. */
+  'message-member': [peer: string]
 }>()
+
+/* ── Group receipts ──
+ * Asked on opening, answered on the record: `groupReceiptsTs` moves when the
+ * answer lands, so the list shows once it has moved past where it stood when
+ * the question went out — an older answer is not this one. */
+const asksReceipts = computed(() => props.group && !isGroupNotice(props.m))
+const askedAtTs = ref(-1)
+onMounted(() => {
+  if (!asksReceipts.value) return
+  askedAtTs.value = props.m.groupReceiptsTs ?? 0
+  emit('group-info', props.m)
+})
+const receiptsIn = computed(() =>
+  askedAtTs.value >= 0 && (props.m.groupReceiptsTs ?? 0) !== askedAtTs.value)
+const receipts = computed(() => {
+  const self = props.selfDest.slice(0, 6).toLowerCase()
+  return parseGroupReceipts(props.m.groupReceipts ?? '').map(r => {
+    const mb = props.roster.find(x => x.peer.startsWith(r.prefix))
+    const name = r.prefix === self ? 'You'
+      : mb ? (mb.name || props.knownName(mb.peer) || mb.peer.slice(0, 8))
+      : r.prefix
+    return {
+      prefix: r.prefix, name,
+      delivered: r.status === LxmfStatus.Delivered || r.status === LxmfStatus.OurProxyDelivered,
+      statusName: lxmfStatusName(r.status) || String(r.status),
+    }
+  })
+})
+
+/* The member who wrote this, for a group message relayed from somebody else. */
+const memberFrom = computed(() => {
+  const f = (props.m.groupFrom ?? '').toLowerCase()
+  return props.group && hasDest(f) && f !== props.m.peer ? f : ''
+})
+const memberName = computed(() => {
+  const f = memberFrom.value
+  if (!f) return ''
+  const mb = props.roster.find(x => x.peer === f)
+  return props.knownName(f) || mb?.name || f.slice(0, 8)
+})
 
 /* ── Resend ──
  *
@@ -194,10 +270,8 @@ const proxyGaveUpWith = computed(() =>
 
 const grouped = (hex: string) => (hex.match(/.{1,4}/g) ?? []).join(' ')
 
-const isReply = computed(() => {
-  const r = props.m.replyTo ?? ''
-  return r.length > 0 && !/^0+$/.test(r)
-})
+const isReply = computed(() =>
+  hasDest(props.m.replyShort ?? '') || hasDest(props.m.replyTo ?? ''))
 
 const sentTime = computed(() =>
   props.m.ts ? new Date(props.m.ts * 1000).toLocaleString() : '—')
@@ -271,6 +345,23 @@ async function copy(key: string, val: string) {
   font-size: calc(13px * var(--rfs, 1)); cursor: pointer;
 }
 .resend:hover { background: #46704f; }
+.resend.dm { margin-top: 12px; }
+.asking { display: flex; align-items: center; gap: 8px; font-family: inherit; }
+.spin {
+  width: 12px; height: 12px; border-radius: 50%; flex: none;
+  border: 2px solid rgba(255,255,255,0.2); border-top-color: #9fe0b0;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.receipts { background: #232323; border-radius: 8px; padding: 6px 12px; }
+.rrow { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.rname {
+  flex: 1; min-width: 0; color: #e0e0e0; font-size: calc(12px * var(--rfs, 1));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtick { color: #4abf6a; display: inline-flex; }
+.rstat { color: #8a93a0; font-size: calc(10px * var(--rfs, 1)); letter-spacing: 0.03em; }
+.rempty { color: #888; font-style: italic; font-size: calc(12px * var(--rfs, 1)); }
 /* The receipt for an action with nothing else to show for itself. */
 .done {
   margin-top: 8px; color: #9ecf9e; text-align: center;

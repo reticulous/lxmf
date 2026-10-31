@@ -4,15 +4,21 @@
      search box on top filters two sections: "Contacts" (peers you've
      messaged — shown with rich conversation preview / unread / time) and
      "On the Mesh" (announced peers you haven't talked to yet). A bare
-     32-hex query offers "message this address". Presentational: props in,
+     32-hex query offers "message this address". The button right of the
+     search box starts a new group. Presentational: props in,
      intent out — no device-store access, no pane/screen knowledge. -->
 <template>
   <div class="list">
-    <input
-      v-model="q" class="search"
-      placeholder="Search or 32-hex address" autocomplete="off"
-      @keydown.enter="onEnter" @keydown.esc="q = ''"
-    />
+    <div class="searchrow">
+      <input
+        v-model="q" class="search"
+        placeholder="Search or 32-hex address" autocomplete="off"
+        @keydown.enter="onEnter" @keydown.esc="q = ''"
+      />
+      <button class="newgroup" title="New group" @click="emit('new-group')">
+        <q-icon :name="matGroupAdd" size="20px" />
+      </button>
+    </div>
 
     <div class="conv-scroll">
       <div v-if="rawHexReady" class="grp">New</div>
@@ -29,7 +35,7 @@
         <div v-for="c in contacts" :key="'k' + c.peer"
              class="conv" :class="{ active: c.peer === activePeer }"
              @click="emit('open-peer', c.peer)">
-          <PeerAvatar :peer="c.peer" :name="c.name" :size="40" />
+          <PeerAvatar :peer="c.peer" :name="c.name" :size="40" :group="c.group" />
           <div class="mid">
             <div class="line1">
               <span class="name">{{ c.name }}</span>
@@ -72,16 +78,17 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { matGroupAdd } from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import ContactSignal from './ContactSignal.vue'
 import type { Conversation } from '../../modules/lxmf'
 
 const props = defineProps<{
   conversations: Conversation[]
-  directory: { peer: string; name: string; known: boolean }[]
+  directory: { peer: string; name: string; known: boolean; group: boolean }[]
   activePeer: string
 }>()
-const emit = defineEmits<{ 'open-peer': [peer: string] }>()
+const emit = defineEmits<{ 'open-peer': [peer: string]; 'new-group': [] }>()
 
 const q = ref('')
 
@@ -140,8 +147,14 @@ function formatAge(epochSecs: number): string {
 
 <style scoped>
 .list { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.searchrow { display: flex; align-items: center; gap: 4px; margin: 10px 6px 10px 10px; }
+.newgroup {
+  flex: none; background: none; border: none; color: #9a9a9a;
+  cursor: pointer; padding: 5px; border-radius: 6px; display: flex;
+}
+.newgroup:hover { background: rgba(255,255,255,0.08); color: #e8e8e8; }
 .search {
-  margin: 10px; background: #2a2a2a; color: #e8e8e8;
+  flex: 1; min-width: 0; background: #2a2a2a; color: #e8e8e8;
   border: 1px solid rgba(255,255,255,0.12); border-radius: 8px;
   padding: 8px 12px; font-size: calc(13px * var(--rfs, 1)); outline: none;
 }

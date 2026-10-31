@@ -63,6 +63,7 @@
               :directory="lxmf.peerDirectory.value"
               :active-peer="lxmf.activePeer.value"
               @open-peer="openPeer"
+              @new-group="showGroupCreate = true"
             />
           </div>
 
@@ -82,6 +83,8 @@
                 :reach="lxmf.reachability(lxmf.activePeer.value)"
                 :link-state="lxmf.linkState(lxmf.activePeer.value)"
                 :proxied="lxmf.proxied.value"
+                :group="!!lxmf.contactOf(lxmf.activePeer.value)?.group"
+                :known-name="lxmf.knownName"
                 :show-back="compact"
                 @resend="m => lxmf.resend(m.peer, m.key)"
                 @msg-menu="m => (menuMsg = m)"
@@ -94,7 +97,11 @@
                 @back="lxmf.activePeer.value = ''"
                 @read="p => lxmf.markConversationRead(p)"
               />
+              <!-- A group this account is no longer in takes nothing more: the
+                   composer gives way to the one line that says why. -->
+              <div v-if="groupClosedLine" class="groupclosed">{{ groupClosedLine }}</div>
               <Composer
+                v-else
                 :model-value="draft"
                 :quote="composerQuote"
                 @update:model-value="setDraft"
@@ -114,16 +121,41 @@
           :ratchet="ratchetOf(lxmf.activePeer.value)"
           :pn-nodes="lxmf.pnNodes.value"
           :ping="lxmf.pingResult(lxmf.activePeer.value)"
+          :group="!!lxmf.contactOf(lxmf.activePeer.value)?.group || !!cardGroup"
+          :owned-group="cardGroup"
+          :members="cardMembers"
+          :addable="cardAddable"
+          :self-dest="selfDest"
+          :group-state="lxmf.contactOf(lxmf.activePeer.value)?.groupState ?? GroupState.Member"
           @close="showContact = false"
           @delete-conversation="onDeleteConversation"
           @set-pn="(peer, hash) => lxmf.setContactPn(peer, hash)"
           @ping="onPing"
+          @add-members="(g, peers) => lxmf.addGroupMembers(g, peers)"
+          @remove-member="(g, peer) => lxmf.removeGroupMember(g, peer)"
+          @delete-group="onDeleteGroup"
+          @leave-group="onLeaveGroup"
+          :roster="lxmf.groupRoster(lxmf.activePeer.value)"
+          @refresh-members="p => lxmf.groupRefreshMembers(p)"
+        />
+
+        <GroupCreate
+          v-if="showGroupCreate"
+          :candidates="groupCandidates"
+          @close="showGroupCreate = false"
+          @create="onCreateGroup"
         />
 
         <MessageDetail
-          v-if="detailMsg"
-          :m="detailMsg"
-          :peer-name="lxmf.displayName(detailMsg.peer)"
+          v-if="detailMsg && liveDetail"
+          :m="liveDetail"
+          :group="!!lxmf.contactOf(liveDetail.peer)?.group"
+          :roster="lxmf.groupRoster(liveDetail.peer)"
+          :self-dest="selfDest"
+          :known-name="lxmf.knownName"
+          @group-info="m => lxmf.groupInfo(m.peer, m.key)"
+          @message-member="onMessageMember"
+          :peer-name="lxmf.displayName(liveDetail.peer)"
           :pn-nodes="lxmf.pnNodes.value"
           :contact-pn="lxmf.contactOf(detailMsg.peer)?.pn ?? ''"
           :proxied="lxmf.proxied.value"
@@ -155,7 +187,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, toRef } from 'vue'
+import { computed, onBeforeUnmount, ref, toRef, watch } from 'vue'
 import { matMail } from '@quasar/extras/material-icons'
 import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import ConversationList from '../components/lxmf/ConversationList.vue'
@@ -163,7 +195,9 @@ import ConversationThread from '../components/lxmf/ConversationThread.vue'
 import Composer from '../components/lxmf/Composer.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import MessageDetail from '../components/lxmf/MessageDetail.vue'
-import { useLxmf, quoteLine, type Message, LxmfStatus, RESEND_RETRY } from '../modules/lxmf'
+import GroupCreate from '../components/lxmf/GroupCreate.vue'
+import { useLxmf, quoteLine, groupSender, replyRefOf, type Message, LxmfStatus,
+         GroupState, RESEND_RETRY } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
 import { useCompact } from 'spangap-browser/lib/viewport'
 
@@ -203,6 +237,22 @@ function startResize(e: MouseEvent) {
 const showContact = ref(false)
 const menuMsg = ref<Message | null>(null)
 const detailMsg = ref<Message | null>(null)
+/* The detail page follows the record as it changes — a group's receipts land
+ * on it after the page has opened — so it reads the live copy by key, and the
+ * one it was opened with only once that is gone. */
+const liveDetail = computed(() => {
+  const d = detailMsg.value
+  if (!d) return null
+  for (const b of lxmf.activeConversation.value)
+    for (const m of b.messages) if (m.key === d.key && m.peer === d.peer) return m
+  return d
+})
+
+/* Open (or start) the direct conversation with a group member. */
+function onMessageMember(peer: string) {
+  detailMsg.value = null
+  openPeer(peer)
+}
 const thread = ref<InstanceType<typeof ConversationThread> | null>(null)
 
 const draft = computed(() => lxmf.draftFor(lxmf.activePeer.value))
@@ -217,9 +267,65 @@ const replyTo = ref<{ m: Message; fragment: string } | null>(null)
 const composerQuote = computed(() => {
   const r = replyTo.value
   if (!r) return null
+  const g = groupSender(r.m, lxmf.knownName)
   return {
-    label: r.m.dir === 'out' ? 'You' : lxmf.displayName(r.m.peer),
-    text: quoteLine(r.fragment || r.m.content),
+    label: r.m.dir === 'out' ? 'You' : g ? g.name : lxmf.displayName(r.m.peer),
+    text: quoteLine(r.fragment || (g ? g.body : r.m.content)),
+  }
+})
+
+/* ── Groups ── */
+const showGroupCreate = ref(false)
+const selfDest = computed(() =>
+  lxmf.identities.value.find(i => i.n === props.identity)?.destHash.toLowerCase() ?? '')
+
+/* Who a new group can start with: the account's contacts, less other groups
+ * and this device's own addresses — the owner joins its group by owning it. */
+const groupCandidates = computed(() =>
+  lxmf.peerDirectory.value
+    .filter(d => d.known && !d.group && !lxmf.ownDests.value.has(d.peer))
+    .map(d => ({ peer: d.peer, name: d.name }))
+    .sort((a, b) => a.name.localeCompare(b.name)))
+
+function onCreateGroup(name: string, peers: string[], hidden: boolean) {
+  showGroupCreate.value = false
+  void lxmf.createGroup(name, peers, hidden)
+}
+
+/* The open contact is a group this account owns: its member list lives in the
+ * group's own slot, shipped into the mirror while the card is up. */
+const cardGroup = computed(() =>
+  showContact.value && lxmf.activePeer.value ? lxmf.ownedGroup(lxmf.activePeer.value) : null)
+watch(() => cardGroup.value?.n, g => { if (g !== undefined) lxmf.fetchGroupMembers(g) },
+      { immediate: true })
+const cardMembers = computed(() => cardGroup.value ? lxmf.groupMembers(cardGroup.value.n) : [])
+const cardAddable = computed(() => {
+  const have = new Set(cardMembers.value.map(m => m.peer))
+  return groupCandidates.value.filter(c => !have.has(c.peer))
+})
+
+function onDeleteGroup(g: number) {
+  if (!window.confirm('Delete this group for everyone? Every member is told, and nobody can ' +
+                      'send to it again.'))
+    return
+  void lxmf.deleteGroup(g)
+  showContact.value = false
+}
+
+function onLeaveGroup(peer: string) {
+  if (!window.confirm('Leave this group? You stop receiving its messages.')) return
+  void lxmf.leaveGroup(peer)
+}
+
+/* The line that stands in for the composer in a group this account is out of. */
+const groupClosedLine = computed(() => {
+  const c = lxmf.contactOf(lxmf.activePeer.value)
+  if (!c?.group) return ''
+  switch (c.groupState) {
+    case GroupState.Left:    return 'You left this group'
+    case GroupState.Removed: return 'You were removed from this group'
+    case GroupState.Deleted: return 'This group was deleted'
+    default:                 return ''
   }
 })
 
@@ -250,7 +356,7 @@ async function onSend(content: string) {
   replyTo.value = null
   try {
     await lxmf.send(peer, content, r ? {
-      replyTo: r.m.messageId,
+      ...replyRefOf(r.m, !!lxmf.contactOf(peer)?.group),
       /* Only a fragment the user picked out travels; a reply to the whole
        * message needs no quote on the wire, because the other end has that
        * message and draws the line from its own copy. */
@@ -348,6 +454,11 @@ function askDeleteMsg(m: Message) {
 .idsel {
   background: #2a2a2a; color: #e8e8e8; border: 1px solid rgba(255,255,255,0.12);
   border-radius: 6px; padding: 3px 8px; font-size: 12px; outline: none;
+}
+.groupclosed {
+  border-top: 1px solid rgba(255,255,255,0.08); padding: 12px 10px;
+  text-align: center; color: #9a9a9a; font-size: calc(12px * var(--rfs, 1));
+  font-style: italic;
 }
 .noident { color: #9a9a9a; font-size: calc(13px * var(--rfs, 1)); padding: 24px; text-align: center; line-height: 1.5; }
 .rfs-btn {

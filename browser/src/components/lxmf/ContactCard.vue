@@ -15,8 +15,22 @@
       <!-- Action row. Each button is its own text's width — they are a row of
            verbs, not a stack of full-width choices. -->
       <div class="actions">
-        <button class="act danger" @click="emit('delete-conversation', peer)">Delete</button>
-        <div class="pingwrap">
+        <!-- A group is deleted three ways. One this account is no longer in is
+             just a conversation to throw away; the owner deleting it takes it
+             down for everyone; a member's way out is leaving, which waits on
+             the group's answer. -->
+        <button v-if="!group" class="act danger"
+                @click="emit('delete-conversation', peer)">Delete</button>
+        <button v-else-if="groupState >= GroupState.Left" class="act danger"
+                @click="emit('delete-conversation', peer)">Delete group</button>
+        <button v-else-if="ownedGroup" class="act danger"
+                @click="emit('delete-group', ownedGroup.n)">Delete group</button>
+        <button v-else-if="groupState === GroupState.Leaving" class="act" disabled>Leaving…</button>
+        <button v-else class="act danger" @click="emit('leave-group', peer)">Leave group</button>
+        <!-- A group is a relay on somebody's device, not a person: probing it
+             measures the way to that device and says nothing about anyone in
+             it, so a group has no Ping. -->
+        <div v-if="!group" class="pingwrap">
           <button class="act" @click="onPing">Ping</button>
           <!-- Result popover. A touch anywhere — the backdrop below or the
                popover itself — dismisses it. -->
@@ -52,15 +66,57 @@
       <div v-if="showPing" class="pingbg" @click="showPing = false"></div>
 
       <div class="hero">
-        <PeerAvatar :peer="peer" :name="name" :size="72" />
+        <PeerAvatar :peer="peer" :name="name" :size="72" :group="group" />
         <div class="hname">{{ name }}</div>
-        <div v-if="verified" class="verified">
+        <div v-if="group" class="unverified">Group</div>
+        <div v-else-if="verified" class="verified">
           <q-icon :name="matVerifiedUser" size="15px" /> Verified
         </div>
         <div v-else class="unverified">Not verified</div>
       </div>
 
       <div v-if="reachLine" class="reach">{{ reachLine }}</div>
+
+      <!-- The owner's admin of a group it holds: who is in it, adding and
+           removing them. The owner's own account is a member by owning the
+           group and is not removable. Gone once the group is deleted. -->
+      <template v-if="ownedGroup && groupState !== GroupState.Deleted">
+        <div class="sect">Members</div>
+        <div class="members">
+          <div v-for="mb in members" :key="mb.peer" class="member">
+            <PeerAvatar :peer="mb.peer" :name="mb.name" :size="26" />
+            <span class="mname">{{ mb.peer === selfDest ? 'You' : mb.name }}</span>
+            <button v-if="mb.peer !== selfDest" class="mrm" title="Remove from group"
+                    @click="emit('remove-member', ownedGroup.n, mb.peer)">
+              <q-icon :name="matPersonRemove" size="17px" />
+            </button>
+          </div>
+          <div v-if="!members.length" class="mempty">Loading…</div>
+        </div>
+        <div v-if="addable.length" class="addrow">
+          <select v-model="addPeer" class="pnsel">
+            <option value="">Add member…</option>
+            <option v-for="c in addable" :key="c.peer" :value="c.peer">{{ c.name }}</option>
+          </select>
+          <button class="pnset" :disabled="!addPeer" @click="addMember">Add</button>
+        </div>
+      </template>
+      <!-- A member's view: the list the group itself last sent, read-only,
+           and a way to ask for it again. -->
+      <template v-else-if="group && groupState < GroupState.Left">
+        <div class="sect sectrow">
+          <span>Members</span>
+          <button class="refresh" title="Ask the group again"
+                  @click="emit('refresh-members', peer)">Refresh</button>
+        </div>
+        <div class="members">
+          <div v-for="mb in roster" :key="mb.peer" class="member">
+            <PeerAvatar :peer="mb.peer" :name="mb.name" :size="26" />
+            <span class="mname">{{ mb.peer === selfDest ? 'You' : mb.name || mb.peer.slice(0, 8) }}</span>
+          </div>
+          <div v-if="!roster.length" class="mempty">Not known yet — Refresh asks the group.</div>
+        </div>
+      </template>
 
       <!-- Grouped in fours for eye comparison; the copy button still yields
            the bare hex (paste targets want it unspaced). -->
@@ -73,7 +129,9 @@
       </div>
 
       <!-- Per-contact propagation node: offered as the second option of the
-           resend dialog for this contact's messages. -->
+           resend dialog for this contact's messages. A group relays live and
+           has none. -->
+      <template v-if="!group">
       <div class="sect">Propagation node</div>
       <select class="pnsel" :value="pnSelValue" @change="onPnSelect">
         <option value="">None</option>
@@ -89,6 +147,7 @@
         <input v-model="pnCustomHash" class="pnfld" placeholder="32-hex node dest hash" />
         <button class="pnset" :disabled="!validCustomPn" @click="applyCustomPn">Set</button>
       </div>
+      </template>
 
       <template v-if="ratchet">
         <div class="sect">Ratchet</div>
@@ -101,14 +160,15 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { matArrowBack, matVerifiedUser, matContentCopy, matCheck }
+import { matArrowBack, matVerifiedUser, matContentCopy, matCheck, matPersonRemove }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
-import { hasDest, pingLinkLines, peerMeasOf,
-         type Contact, type PingResult, type PnNode, type Reachability }
+import { hasDest, pingLinkLines, peerMeasOf, GroupState,
+         type Contact, type GroupMember, type GroupSlot, type PingResult, type PnNode,
+         type Reachability }
   from '../../modules/lxmf'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   peer: string
   name: string
   contact: Contact | null
@@ -116,13 +176,40 @@ const props = defineProps<{
   ratchet: string
   pnNodes: PnNode[]
   ping: PingResult | null
-}>()
+  /* This peer is an LXMF group. */
+  group?: boolean
+  /* The group's slot here, when the open account owns it — what offers the
+   * members admin. Null on a member's device, or for an ordinary contact. */
+  ownedGroup?: GroupSlot | null
+  members?: GroupMember[]
+  /* Contacts that could still be added. */
+  addable?: { peer: string; name: string }[]
+  /* The open account's own address, which is a member and never removable. */
+  selfDest?: string
+  /* Where this account stands in the group. */
+  groupState?: GroupState
+  /* The group's member list as the group last sent it — a member's view. */
+  roster?: GroupMember[]
+}>(), { group: false, ownedGroup: null, members: () => [], addable: () => [], selfDest: '',
+        groupState: GroupState.Member, roster: () => [] })
 const emit = defineEmits<{
   close: []
   'delete-conversation': [peer: string]
   'set-pn': [peer: string, hash: string]
   ping: [peer: string]
+  'add-members': [g: number, peers: string[]]
+  'remove-member': [g: number, peer: string]
+  'delete-group': [g: number]
+  'leave-group': [peer: string]
+  'refresh-members': [peer: string]
 }>()
+
+const addPeer = ref('')
+function addMember() {
+  if (!props.ownedGroup || !addPeer.value) return
+  emit('add-members', props.ownedGroup.n, [addPeer.value])
+  addPeer.value = ''
+}
 
 /* ── Ping ──
  * The button starts a probe and opens the popover; the popover then just
@@ -298,4 +385,26 @@ const reachLine = computed(() => {
   cursor: pointer;
 }
 .pnset:disabled { background: #333; color: #777; cursor: default; }
+.members { background: #232323; border-radius: 8px; padding: 4px 8px; }
+.member { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.mname {
+  flex: 1; min-width: 0; color: #d8d8d8; font-size: calc(13px * var(--rfs, 1));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mrm {
+  flex: none; background: none; border: none; color: #9a9a9a;
+  cursor: pointer; padding: 3px; border-radius: 5px;
+}
+.mrm:hover { background: rgba(217,138,138,0.14); color: #d98a8a; }
+.mempty { color: #888; font-style: italic; font-size: calc(12px * var(--rfs, 1)); padding: 4px 0; }
+.sectrow { display: flex; align-items: center; justify-content: space-between; }
+.refresh {
+  background: none; border: 1px solid rgba(255,255,255,0.18); color: #bdbdbd;
+  border-radius: 6px; padding: 1px 8px; font-size: calc(11px * var(--rfs, 1));
+  text-transform: none; letter-spacing: 0; cursor: pointer;
+}
+.refresh:hover { background: rgba(255,255,255,0.08); }
+.addrow { display: flex; gap: 8px; margin-top: 8px; }
+.addrow .pnsel { flex: 1; min-width: 0; width: auto; }
+.act:disabled { color: #777; border-color: rgba(255,255,255,0.1); cursor: default; background: none; }
 </style>

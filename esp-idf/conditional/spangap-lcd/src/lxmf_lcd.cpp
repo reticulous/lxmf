@@ -15,7 +15,7 @@
  *       Contacts:    peers you've messaged, newest-comms first; name +
  *                     last-message preview, a last-heard-announce age badge at
  *                     the right, and a circled-i button opening the contact
- *                     info page (which holds the delete-conversation flow). A
+ *                     info page (which holds the delete flow). A
  *                     bare 32-hex query offers "message this address".
  *       On the Mesh:  every dest heard announcing within s.lxmf.on_mesh_expire
  *                     seconds (default 3600; 0 = all), newest first, age-badged.
@@ -32,8 +32,9 @@
  *     Send button mean what they mean everywhere. The thread runs fullscreen (no
  *     system status bar).
  *   - Contact info: peer name + the destination hash grouped in fours + a
- *     last-heard line + a Delete-conversation button behind an explicit
- *     "Are you sure?" confirm. Opened from a contact row's circled-i or the
+ *     last-heard line + a Delete button: a choice of what to delete
+ *     (conversation and contact, messages only, messages older than an age),
+ *     then a confirm naming it. Opened from a contact row's circled-i or the
  *     thread top bar; its back chevron returns to whichever screen opened it.
  *
  * Layout is tuned for density: 1px vertical padding throughout, a smaller font,
@@ -193,6 +194,20 @@ struct Msg {
      * on the record and never inferred. */
     bool body_absent = false;
     long body_size = 0;
+    /* A group's copy of a member's message: who wrote it (32-hex) and the
+     * message_id of their original, which is what a reply names so the quote
+     * resolves on every member's device. All-zero / empty = not a group copy. */
+    std::string group_from;
+    std::string orig_id;
+    /* A notice from the group itself: what happened (1 added, 2 removed, 3 left,
+     * 4 deleted; 0 = not a notice) and whom it happened to (comma-separated
+     * 32-hex). */
+    uint8_t group_event = 0;
+    std::string group_subjects;
+    /* In a group a reply names its target by this 6-hex short id (the target's
+     * orig_id, or the head of its message_id) instead of reply_to. */
+    std::string reply_short;
+    bool command = false;     /* a command this device sent a group — never drawn */
 };
 
 struct Ann { std::string hash, name; long last = 0; };   /* a heard announce */
@@ -228,6 +243,7 @@ struct RowSpec {
     std::string peer, title, sub, age;
     lv_color_t  titleColor{};
     int         unread = 0;
+    bool        group = false;          /* the peer is a group: the row carries its icon */
 };
 struct ListRow { std::string key, sig; lv_obj_t* obj = nullptr; };   /* one live row */
 std::vector<ListRow> g_rowsC;           /* Contacts rows in render order (search box excluded) */
@@ -279,6 +295,11 @@ lv_obj_t* s_tabBtnC  = nullptr;         /* "Contacts" tab button */
 lv_obj_t* s_tabBtnM  = nullptr;         /* "On the Mesh" tab button */
 lv_obj_t* s_pnBtn    = nullptr;         /* envelope button right of the tabs: check the
                                            propagation nodes now (hidden with none set) */
+lv_obj_t* s_grpBtn   = nullptr;         /* new-group button, left of the envelope (an
+                                           account must be open) */
+lv_obj_t* s_grpBtnImg = nullptr;        /* its group glyph */
+lv_timer_t* g_grpIconTimer = nullptr;   /* re-applies the glyph until its raster lands */
+lv_obj_t* s_grpPage  = nullptr;         /* create-group / add-members page (rebuilt per open) */
 lv_obj_t* s_pnToast   = nullptr;        /* its buttonless acknowledgement, self-closing */
 lv_timer_t* s_pnToastTimer = nullptr;
 lv_obj_t* s_tabContacts = nullptr;      /* Contacts page (search + list); shown when tab 0 */
@@ -341,7 +362,7 @@ lv_obj_t* s_gwBars     = nullptr;       /* system status-bar signal bars (rnsd.g
 lv_obj_t* s_proxyInd   = nullptr;       /* system status-bar proxy arrow (lxmf.id.<n>.proxy_link), created once */
 lv_obj_t* s_info     = nullptr;         /* contact info page (covers list or thread; rebuilt per open) */
 lv_obj_t* s_msgDetail = nullptr;        /* per-message detail page (covers the thread; rebuilt per open) */
-lv_obj_t* s_confirm  = nullptr;         /* delete-conversation confirm overlay (child of s_info) */
+lv_obj_t* s_confirm  = nullptr;         /* delete choice / confirm overlay (child of s_info) */
 lv_obj_t* s_pingLbl  = nullptr;         /* Ping result, under the info page's button row (child of s_info) */
 std::string g_infoPeer;                 /* peer shown on the contact info page */
 bool      g_infoFromThread = false;     /* where its back chevron returns to */
@@ -401,6 +422,9 @@ void maybeOpenPending();
 void onLcdOpenUrl(const char* key, const char* val);
 void showInfo(const std::string& peer);
 void closeInfo();
+void closeGroupPage();
+void reflectGroupButton();
+const char* groupEndedLine(const std::string& peer);
 void updateThreadDownVis();
 void updateThreadLink();
 lv_obj_t* confirmButton(lv_obj_t* parent, const char* text, lv_color_t bg);
@@ -483,6 +507,48 @@ bool qmatch(const std::string& needle, const std::string& name, const std::strin
 
 /* ---- identity ---- */
 
+/* A group (`s.lxmf.id.<n>.kind = group`) occupies an identity slot but is not an
+ * account: it is never listed, picked or opened as one. Its owner reaches it as
+ * a contact. */
+bool isGroupSlot(int n) {
+    char k[40];
+    snprintf(k, sizeof k, "s.lxmf.id.%d.kind", n);
+    return storageGetStr(k, "") == "group";
+}
+
+/* The group slot on this device whose address is `peer` and which the open
+ * account owns, or -1. Only the owner administers a group's members. */
+int ownedGroupSlot(const std::string& peer) {
+    if (g_id < 0 || peer.empty()) return -1;
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        if (!isGroupSlot(n)) continue;
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.dest_hash", n);
+        if (storageGetStr(k, "") != peer) continue;
+        snprintf(k, sizeof k, "s.lxmf.id.%d.group_owner", n);
+        if (storageGetInt(k, -1) == g_id) return n;
+    }
+    return -1;
+}
+
+/* The open account's contact `peer` is a group (`contacts.<peer>.group`). */
+bool peerIsGroup(const std::string& peer) {
+    if (g_id < 0 || peer.empty()) return false;
+    char k[96];
+    snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.group", g_id, peer.c_str());
+    return storageGetInt(k, 0) != 0;
+}
+
+/* Where the open account stands with group `peer` (`contacts.<peer>.group_state`):
+ * 0 member, 1 leaving (asked, not yet answered), 2 left, 3 removed, 4 deleted. */
+enum { GS_MEMBER = 0, GS_LEAVING = 1, GS_LEFT = 2, GS_REMOVED = 3, GS_DELETED = 4 };
+int groupState(const std::string& peer) {
+    if (g_id < 0 || peer.empty()) return GS_MEMBER;
+    char k[104];
+    snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.group_state", g_id, peer.c_str());
+    return storageGetInt(k, GS_MEMBER);
+}
+
 /* Loaded = the firmware has published this slot's delivery address. That happens
  * from local crypto at boot, before the mailbox connects — so a loaded
  * identity's stored history is viewable straight away, and only sending waits
@@ -490,7 +556,8 @@ bool qmatch(const std::string& needle, const std::string& name, const std::strin
  * excluded — which is exactly right, it can never come up. */
 void loadedIds(std::vector<int>& out) {
     out.clear();
-    for (int n = 0; n < 4; n++) {
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        if (isGroupSlot(n)) continue;
         char k[40];
         snprintf(k, sizeof k, "lxmf.id.%d.dest_hash", n);
         if (!storageGetStr(k, "").empty()) out.push_back(n);
@@ -517,7 +584,8 @@ bool idReady(int n) {
  * instead of falsely telling the user to create one. */
 void configuredIds(std::vector<int>& enabled, std::vector<int>& disabled) {
     enabled.clear(); disabled.clear();
-    for (int n = 0; n < 4; n++) {
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        if (isGroupSlot(n)) continue;
         char k[48];
         snprintf(k, sizeof k, "s.lxmf.id.%d.label", n);
         if (!storageExists(k)) continue;
@@ -541,6 +609,7 @@ void selectId(int n) {
     g_msgsPrefix = (n >= 0) ? ("s.lxmf.id." + std::to_string(n) + ".msgs") : "";
     refreshMsgs();
     proxyStatusUpdate();  /* the status-bar proxy arrow follows the selected slot */
+    reflectGroupButton();
 }
 
 std::string peerName(const std::string& peer) {
@@ -589,6 +658,74 @@ void msgCb(const char* key, const char* val) {
     else if (!strcmp(field, "reply_quote")) m->reply_quote = val ? val : "";
     else if (!strcmp(field, "body_absent")) m->body_absent = val && atoi(val) != 0;
     else if (!strcmp(field, "body_size"))   m->body_size   = val ? atol(val) : 0;
+    else if (!strcmp(field, "group_from"))  m->group_from  = val ? val : "";
+    else if (!strcmp(field, "orig_id"))     m->orig_id     = val ? val : "";
+    else if (!strcmp(field, "group_event")) m->group_event = val ? (uint8_t)atoi(val) : 0;
+    else if (!strcmp(field, "group_subjects")) m->group_subjects = val ? val : "";
+    else if (!strcmp(field, "reply_short")) m->reply_short = val ? val : "";
+    else if (!strcmp(field, "command"))     m->command = val && atoi(val) != 0;
+}
+
+/* A line the group itself wrote ("Ann added Bob"): drawn as a centred system
+ * line, not a balloon. */
+bool isGroupNotice(const Msg& m) {
+    return m.in && !m.group_from.empty() && m.group_from == m.peer;
+}
+
+/* A hex id that names something: non-empty and not the all-zero unset value. */
+bool hexSet(const std::string& h) {
+    return !h.empty() && h.find_first_not_of('0') != std::string::npos;
+}
+
+/* What a reply to `m` names. In a group it is the 6-hex short id — the
+ * sender's original (orig_id) when `m` is a group's copy, else the head of its
+ * own message_id — so every member's quote resolves to the same message.
+ * Elsewhere it is the full message_id. Empty until there is an id to name. */
+std::string replyIdOf(const Msg& m, bool inGroup) {
+    if (!inGroup) return m.message_id;
+    if (hexSet(m.orig_id)) return m.orig_id;
+    return m.message_id.size() >= 6 ? m.message_id.substr(0, 6) : std::string();
+}
+
+/* A group copy of somebody else's message: its sender is not the conversation
+ * peer (a notice from the group itself names the group). */
+bool fromGroupMember(const Msg& m) {
+    return m.in && hexSet(m.group_from) && m.group_from != m.peer;
+}
+
+/* The "<name>: " a group puts in front of a member's text, for clients that know
+ * nothing of groups. Returns the name and sets `body` to the text after it; an
+ * absent prefix returns "" and leaves the whole text as the body. */
+std::string splitGroupPrefix(const std::string& text, std::string& body) {
+    body = text;
+    size_t c = text.find(": ");
+    if (c == std::string::npos || c == 0 || c > 64) return "";
+    std::string pfx = text.substr(0, c);
+    if (pfx.find('\n') != std::string::npos) return "";
+    body = text.substr(c + 2);
+    return pfx;
+}
+
+/* Who wrote a group copy, as this account knows them: its own contact's name,
+ * else the name the group put in front of the text, else the short hash. */
+std::string groupSenderName(const Msg& m, const std::string& prefix) {
+    for (const char* f : { "nick", "display_name" }) {
+        char k[112];
+        snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.%s", g_id, m.group_from.c_str(), f);
+        std::string n = storageGetStr(k, "");
+        if (!n.empty()) return printable(n, true);
+    }
+    if (!prefix.empty()) return printable(prefix, true);
+    return m.group_from.substr(0, 8);
+}
+
+/* A stable colour per sender, so a run of one member's messages reads as theirs. */
+lv_color_t senderColor(const std::string& hash) {
+    static const uint32_t kPal[] = { 0xE57373, 0xF0A04B, 0xD4C24A, 0x81C784,
+                                     0x4DB6AC, 0x64B5F6, 0x9575CD, 0xF06292 };
+    uint32_t h = 2166136261u;
+    for (char c : hash) h = (h ^ (uint8_t)c) * 16777619u;
+    return lv_color_hex(kPal[h % (sizeof kPal / sizeof kPal[0])]);
 }
 
 void refreshMsgs() {
@@ -602,8 +739,12 @@ void refreshMsgs() {
     if (g_id < 0 || g_curPeer.empty()) return;
     std::string prefix = g_msgsPrefix + "." + g_curPeer;
     storageForEach(prefix.c_str(), msgCb);
+    /* A command this device sent a group (/leave, /info, …) is not something
+     * we said: what the thread shows is the group's answer. */
     g_msgs.erase(std::remove_if(g_msgs.begin(), g_msgs.end(),
-                                [](const Msg& m) { return m.status == LXMF_ST_DRAFT; }),
+                                [](const Msg& m) {
+                                    return m.status == LXMF_ST_DRAFT || m.command;
+                                }),
                  g_msgs.end());
 }
 
@@ -661,8 +802,11 @@ void sendMessage(const std::string& peer, const std::string& text,
     setf("peer", peer.c_str());
     setf("title", "");
     setf("content", text.c_str());
+    /* In a group the reply rides as the 6-hex short id (startReply chose it)
+     * and reply_to stays unwritten. */
+    const bool inGroup = peerIsGroup(peer);
     if (!reply_to.empty()) {
-        setf("reply_to", reply_to.c_str());
+        setf(inGroup ? "reply_short" : "reply_to", reply_to.c_str());
         if (!quote.empty()) setf("reply_quote", quote.c_str());
     }
     /* Optimistic status: QUEUED (not draft) so the bubble appears the instant we
@@ -687,7 +831,8 @@ void sendMessage(const std::string& peer, const std::string& text,
     Msg m;
     m.peer = peer; m.key = key; m.content = text; m.status = LXMF_ST_QUEUED;
     m.ts = ts; m.in = false;
-    m.reply_to = reply_to; m.reply_quote = quote;
+    (inGroup ? m.reply_short : m.reply_to) = reply_to;
+    m.reply_quote = quote;
     g_msgs.push_back(std::move(m));
 }
 
@@ -716,6 +861,7 @@ void loadDraft(const std::string& peer) {
 void onSend(lv_event_t*) {
     if (!s_compose || g_curPeer.empty()) return;
     if (g_id < 0 || !idReady(g_id)) return;   /* slot can't take it yet — sending is held */
+    if (*groupEndedLine(g_curPeer)) return;    /* a group this account is no longer in */
     const char* t = lcdInputBoxText(s_compose);   /* trailing whitespace stripped */
     if (t && *t) {
         /* The reply the strip above the entry has been holding goes with this
@@ -793,6 +939,8 @@ int linkIconPx() { return lcdPx(18); }
 int sendIconPx() { return lcdPx(22); }
 /* reply / details / delete, in the popup a long press puts over a bubble. */
 int actionIconPx() { return lcdPx(20); }
+/* The group glyph: the tab bar's new-group button and a group's contact row. */
+int groupIconPx() { return lcdPx(16); }
 
 /* Point an lv_image at a runtime-rasterized icon, tinted to `col` (the rasters
  * are monochrome, so image-recolor at COVER paints the glyph shape any colour).
@@ -951,7 +1099,8 @@ void threadSnapNewest() {
 
 void showContacts() {
     closeInfo();                            /* a leftover info page would sit on top */
-    rememberThreadPos();                    /* before the overlay goes — it may be what's on screen */
+    closeGroupPage();                       /* …and so would a group page */
+    rememberThreadPos();                   /* before the overlay goes — it may be what's on screen */
     closeHistory();                         /* don't leave the overlay up for the next open */
     lcdProgramFullscreen(false);            /* status bar back for the list screen */
     if (s_thread) lv_obj_add_flag(s_thread, LV_OBJ_FLAG_HIDDEN);
@@ -1568,9 +1717,26 @@ void buildThreadShell() {
  * the slot is ready (the post-reset window while rnsd connects), history is
  * readable but a send would be held — so disable the field and say why, rather
  * than take text that can't go out. Re-run whenever `ready` may have flipped. */
+/* A group this account is no longer in takes no messages: the entry is shut
+ * and its one line says why. "" while it still does. */
+const char* groupEndedLine(const std::string& peer) {
+    if (!peerIsGroup(peer)) return "";
+    switch (groupState(peer)) {
+        case GS_LEFT:    return "You left this group";
+        case GS_REMOVED: return "You were removed from this group";
+        case GS_DELETED: return "This group was deleted";
+        default:         return "";
+    }
+}
+
 void composeReflectUp() {
     if (!s_compose) return;
-    if (g_id >= 0 && idReady(g_id)) {
+    const char* ended = groupEndedLine(g_curPeer);
+    if (*ended) {
+        lv_textarea_set_text(s_compose, "");
+        lv_obj_add_state(s_compose, LV_STATE_DISABLED);
+        lv_textarea_set_placeholder_text(s_compose, ended);
+    } else if (g_id >= 0 && idReady(g_id)) {
         lv_obj_remove_state(s_compose, LV_STATE_DISABLED);
         lv_textarea_set_placeholder_text(s_compose, "LXMF Message");
     } else {
@@ -2250,22 +2416,56 @@ const Msg* msgByMid(const std::string& mid) {
     return nullptr;
 }
 
+/* The message `m` replies to, if this device holds it. In a group a reply names
+ * its target by a 6-hex short id: a group copy's orig_id, or the head of the
+ * message_id of one this device wrote or received unrelayed. Elsewhere it is the
+ * full reply_to. */
+bool isReply(const Msg& m) { return hexSet(m.reply_short) || hexSet(m.reply_to); }
+const Msg* replyTarget(const Msg& m) {
+    if (hexSet(m.reply_short)) {
+        for (auto& t : g_msgs)
+            if (t.peer == g_curPeer && (t.orig_id == m.reply_short ||
+                                        t.message_id.compare(0, m.reply_short.size(),
+                                                             m.reply_short) == 0))
+                return &t;
+        return nullptr;
+    }
+    return hexSet(m.reply_to) ? msgByMid(m.reply_to) : nullptr;
+}
+
+/* The text a message shows: a group copy without the sender prefix. */
+std::string shownText(const Msg& m) {
+    if (!fromGroupMember(m)) return m.content;
+    std::string body;
+    splitGroupPrefix(m.content, body);
+    return body;
+}
+
+/* Who wrote a message, as a quote or reply strip names them. */
+std::string authorOf(const Msg& m) {
+    if (!m.in) return "You";
+    if (fromGroupMember(m)) {
+        std::string body;
+        return groupSenderName(m, splitGroupPrefix(m.content, body));
+    }
+    return peerName(m.peer);
+}
+
 /* What a bubble's quote block says. `have` is "this message is a reply"; a `key`
  * means the quoted message is here, and `text` the line to draw. */
 struct QuoteView { std::string key, who, text; bool have = false; };
 
 QuoteView quoteFor(const Msg& m) {
     QuoteView q;
-    if (m.reply_to.empty() || m.reply_to.find_first_not_of('0') == std::string::npos)
-        return q;
+    if (!isReply(m)) return q;
     q.have = true;
-    const Msg* t = msgByMid(m.reply_to);
+    const Msg* t = replyTarget(m);
     if (!t) return q;
     q.key  = t->key;
-    q.who  = t->in ? peerName(t->peer) : std::string("You");
+    q.who  = authorOf(*t);
     q.text = quoteLine(!m.reply_quote.empty() &&
                        t->content.find(m.reply_quote) != std::string::npos
-                           ? m.reply_quote : t->content);
+                           ? m.reply_quote : shownText(*t));
     return q;
 }
 
@@ -2292,8 +2492,8 @@ void flashBubble(lv_obj_t* row) {
 
 /* Follow a quote back to the message it came from. On this page that is a
  * scroll; older than this page it is the history overlay, opened on it. */
-void jumpToMid(const std::string& mid) {
-    const Msg* t = msgByMid(mid);
+void jumpToKey(const std::string& key) {
+    const Msg* t = msgByKey(key);
     if (!t) return;
     size_t ix = 0; bool found = false;
     for (auto& m : g_msgs) {
@@ -2430,12 +2630,11 @@ void applyReplyBar() {
     const Msg* t = msgByKey(g_replyKey);
     if (s_replyWho)
         lv_label_set_text(s_replyWho,
-                          ("Replying to " + std::string(t && !t->in ? "You"
-                                                        : peerName(g_curPeer))).c_str());
+                          ("Replying to " + (t ? authorOf(*t) : peerName(g_curPeer))).c_str());
     if (s_replyLbl)
         lv_label_set_text(s_replyLbl,
                           quoteLine(!g_replyQuote.empty() ? g_replyQuote
-                                                          : (t ? t->content : std::string())).c_str());
+                                                          : (t ? shownText(*t) : std::string())).c_str());
     lv_obj_remove_flag(s_replyBar, LV_OBJ_FLAG_HIDDEN);
     if (!was) scrollThreadBottom(false);
 }
@@ -2450,9 +2649,10 @@ void cancelReply() {
  * there is nothing to name until then. */
 void startReply(const std::string& key, const std::string& fragment) {
     const Msg* m = msgByKey(key);
-    if (!m || m->message_id.empty()) return;
+    std::string rid = m ? replyIdOf(*m, peerIsGroup(g_curPeer)) : std::string();
+    if (rid.empty()) return;
     g_replyKey   = key;
-    g_replyMid   = m->message_id;
+    g_replyMid   = rid;   /* in a group, the short id every member resolves alike */
     /* A fragment comes off the rendered lines, which have had unrenderable
      * bytes dropped out of them. Only send one that is still found in the
      * message itself — the far end looks for it there, and so does this one. */
@@ -2650,9 +2850,9 @@ void addQuoteBlock(lv_obj_t* bub, const Msg& m) {
     if (!q.key.empty()) {
         lv_obj_add_flag(wrap, LV_OBJ_FLAG_CLICKABLE);
         bindPeer(wrap, [](lv_event_t* e) {
-            auto* mid = (std::string*)lv_event_get_user_data(e);
-            if (mid) jumpToMid(*mid);
-        }, m.reply_to);
+            auto* key = (std::string*)lv_event_get_user_data(e);
+            if (key) jumpToKey(*key);
+        }, q.key);
     }
 }
 
@@ -2665,7 +2865,10 @@ int bubbleTopMargin(long prevAnchor, long curAnchor) {
     return m;
 }
 
-BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) {
+/* `prev` is the message rendered above this one, if any: a group member's name
+ * heads only the first bubble of a run of theirs, as Signal does. */
+BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr,
+                    const Msg* prev = nullptr) {
     lv_obj_t* row = lv_obj_create(container ? container : s_bubbles);
     lv_obj_remove_style_all(row);
     lv_obj_set_style_margin_top(row, topMargin, 0);
@@ -2675,6 +2878,36 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     lv_obj_set_flex_align(row, m.in ? LV_FLEX_ALIGN_START : LV_FLEX_ALIGN_END,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* A notice from the group itself ("Ann added Bob"): a small centred line,
+     * no balloon. Its label stands where a bubble's meta row would, two levels
+     * under the row, so the lookups that find a row by its meta find this one.
+     * A long press offers only deleting it. */
+    if (isGroupNotice(m)) {
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_t* wrap = lv_obj_create(row);
+        lv_obj_remove_style_all(wrap);
+        lv_obj_set_size(wrap, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_ver(wrap, 2, 0);
+        lv_obj_remove_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* l = lv_label_create(wrap);
+        lv_obj_set_style_text_font(l, kFontSmall, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(0x8a93a0), 0);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_max_width(l, 240, 0);
+        lv_label_set_text(l, printable(m.content, false).c_str());
+        lv_obj_add_flag(wrap, LV_OBJ_FLAG_CLICKABLE);
+        auto* k = new std::string(m.key);
+        lv_obj_add_event_cb(wrap, [](lv_event_t* e) {
+            auto* key = (std::string*)lv_event_get_user_data(e);
+            if (key) showMsgDeleteConfirm(*key);
+        }, LV_EVENT_LONG_PRESSED, k);
+        lv_obj_add_event_cb(wrap, [](lv_event_t* e) {
+            delete (std::string*)lv_event_get_user_data(e);
+        }, LV_EVENT_DELETE, k);
+        return BubbleRef{ m.key, m.status, m.tries, l };
+    }
 
     lv_obj_t* bub = lv_obj_create(row);
     lv_obj_remove_style_all(bub);
@@ -2690,6 +2923,20 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
     lv_obj_set_flex_flow(bub, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(bub, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_remove_flag(bub, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* A group's copy of a member's message: the member's name heads the balloon
+     * and the "<name>: " the group wrote for clients that know nothing of groups
+     * comes off the text. */
+    bool grp = fromGroupMember(m);
+    std::string body;
+    std::string pfx = grp ? splitGroupPrefix(m.content, body) : std::string();
+    if (!grp) body = m.content;
+    if (grp && !(prev && fromGroupMember(*prev) && prev->group_from == m.group_from)) {
+        lv_obj_t* who = lv_label_create(bub);
+        lv_obj_set_style_text_font(who, kFontSmall, 0);
+        lv_obj_set_style_text_color(who, senderColor(m.group_from), 0);
+        lv_label_set_text(who, groupSenderName(m, pfx).c_str());
+    }
 
     /* What this message replies to, at the head of the balloon — the same block
      * the composer showed while it was being written. */
@@ -2718,7 +2965,7 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr) 
             storageSet(k, pk->c_str());
         }, m.peer + "/" + m.key);
     } else {
-        addBubbleText(bub, m.content);                /* text + tappable Nomad links, wrapped to 228 */
+        addBubbleText(bub, body);                     /* text + tappable Nomad links, wrapped to 228 */
     }
 
     /* Meta row: status name + timestamp + delivery glyph. CONTENT-sized (not
@@ -2879,6 +3126,10 @@ void rebuildThread() {
         if (i > 0) return anchorOf(ms[i - 1]);
         return g_winLo > 0 ? anchorOf(all[g_winLo - 1]) : 0;
     };
+    auto prevMsg = [&](size_t i) -> const Msg* {
+        if (i > 0) return ms[i - 1];
+        return g_winLo > 0 ? all[g_winLo - 1] : nullptr;
+    };
     /* Add a date separator before ms[i] when the day changes. The window's first
        message (i == 0) ALWAYS gets one so the top of the scroll always carries a
        date — marked "(continued)" when the message just above the window shares
@@ -2905,6 +3156,7 @@ void rebuildThread() {
         bool resized = false;
         for (size_t i = 0; i < g_bubbles.size(); i++)
             if (ms[i]->status != g_bubbles[i].status || ms[i]->tries != g_bubbles[i].tries) {
+                if (isGroupNotice(*ms[i])) continue;      /* no meta row to re-render */
                 fillMeta(g_bubbles[i].meta, *ms[i]);     /* status name + glyph re-render */
                 layoutMeta(lv_obj_get_parent(g_bubbles[i].meta), g_bubbles[i].meta, ms[i]->status);
                 g_bubbles[i].status = ms[i]->status;
@@ -2914,7 +3166,8 @@ void rebuildThread() {
         bool appended = false;
         for (size_t i = g_bubbles.size(); i < ms.size(); i++) {
             maybeSep(i);
-            g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i]))));
+            g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i])),
+                                          nullptr, prevMsg(i)));
             appended = true;
         }
         /* Re-pin the composer on ANY height change — a new bubble OR a status
@@ -2937,7 +3190,8 @@ void rebuildThread() {
     g_bubbles.clear();
     for (size_t i = 0; i < ms.size(); i++) {
         maybeSep(i);
-        g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i]))));
+        g_bubbles.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i])),
+                                      nullptr, prevMsg(i)));
     }
     scrollThreadBottom(false);                          /* newest + compose at bottom */
 }
@@ -2976,6 +3230,10 @@ void renderHistory() {
         if (i > 0) return anchorOf(ms[i - 1]);
         return h_winLo > 0 ? anchorOf(all[h_winLo - 1]) : 0;
     };
+    auto prevMsg = [&](size_t i) -> const Msg* {
+        if (i > 0) return ms[i - 1];
+        return h_winLo > 0 ? all[h_winLo - 1] : nullptr;
+    };
     auto maybeSep = [&](size_t i) {
         long a = anchorOf(ms[i]);
         if (a <= 0) return;
@@ -2985,7 +3243,7 @@ void renderHistory() {
     for (size_t i = 0; i < ms.size(); i++) {
         maybeSep(i);
         g_histRefs.push_back(addBubble(*ms[i], bubbleTopMargin(prevAnchor(i), anchorOf(ms[i])),
-                                       s_histBubbles));
+                                       s_histBubbles, prevMsg(i)));
     }
     updateHistButtons(total);
     lv_obj_update_layout(s_histList);
@@ -3036,6 +3294,8 @@ void closeHistory() {
 struct Conv {
     std::string peer, preview;
     long ts = 0; int unread = 0; long read_ts = 0; int count = 0;
+    bool kept = false;           /* a contact with its messages deleted */
+    bool group = false;          /* the peer is a group */
     bool preview_mine = false;   /* the preview is the last message whichever way
                                  * it went; this is which way, so the row can
                                  * put "You: " in front of ours */
@@ -3067,6 +3327,8 @@ void convCb(const char* key, const char* val) {
     else if (!strcmp(field, "read_ts")) c->read_ts = val ? atol(val) : 0;
     else if (!strcmp(field, "preview")) c->preview = val ? val : "";
     else if (!strcmp(field, "preview_mine")) c->preview_mine = val && atoi(val) != 0;
+    else if (!strcmp(field, "kept"))    c->kept    = val && atoi(val) != 0;
+    else if (!strcmp(field, "group"))   c->group   = val && atoi(val) != 0;
 }
 
 /* Compact "time since" badge shown at the right of every row: how long ago we
@@ -3101,7 +3363,7 @@ long lastAnnounce(const std::string& peer) {
 /* ---- contact info page (mirrors the web ContactCard) ----
  * A full-size page on the app layer showing peer name, the destination hash
  * grouped in fours for eye comparison, the last-heard line, and the
- * delete-conversation flow behind an explicit confirm. The screen it covers is
+ * delete flow (choice, then confirm). The screen it covers is
  * hidden while it's up (so keyboard focus can't reach covered widgets) and
  * restored by the back chevron — thread or list, whichever opened it. */
 
@@ -3150,11 +3412,164 @@ std::string groupHash(const std::string& h) {
     return out;
 }
 
+/* ---- groups ----
+ * A group is an identity slot of its own (`s.lxmf.id.<g>.kind = group`) from
+ * which the firmware fans each member's message out to the others. This app
+ * creates one from the open account's contacts and, on the owner's device,
+ * administers its members from the group's contact page. Every action is a
+ * command key the firmware consumes: lxmf.cmd.group_new / group_delete and
+ * lxmf.id.<g>.cmd.member_add / member_del. */
+
+void showGroupPage(int slot, const std::string& groupPeer);
+
+/* One contact record, as the group screens need it. */
+struct CRec {
+    std::string peer, name, nick;
+    bool member = false, group = false, kept = false;
+    int count = 0;
+};
+std::vector<CRec> g_crScan;
+void crCb(const char* key, const char* val) {
+    const char* rest = strstr(key, ".contacts.");
+    if (!rest) return;
+    rest += sizeof(".contacts.") - 1;
+    const char* dot = strchr(rest, '.');
+    if (!dot) return;
+    std::string peer(rest, dot - rest);
+    const char* field = dot + 1;
+    if (strchr(field, '.')) return;
+    CRec* c = (!g_crScan.empty() && g_crScan.back().peer == peer) ? &g_crScan.back() : nullptr;
+    if (!c) { CRec r; r.peer = peer; g_crScan.push_back(std::move(r)); c = &g_crScan.back(); }
+    if      (!strcmp(field, "display_name")) c->name   = val ? val : "";
+    else if (!strcmp(field, "nick"))         c->nick   = val ? val : "";
+    else if (!strcmp(field, "member"))       c->member = val && atoi(val) != 0;
+    else if (!strcmp(field, "group"))        c->group  = val && atoi(val) != 0;
+    else if (!strcmp(field, "kept"))         c->kept   = val && atoi(val) != 0;
+    else if (!strcmp(field, "count"))        c->count  = val ? atoi(val) : 0;
+}
+std::vector<CRec> scanContacts(int slot) {
+    g_crScan.clear();
+    char pre[48];
+    snprintf(pre, sizeof pre, "s.lxmf.id.%d.contacts", slot);
+    storageForEach(pre, crCb);
+    std::vector<CRec> out;
+    out.swap(g_crScan);
+    return out;
+}
+
+/* One of this device's own addresses, account or group. */
+bool isOwnDest(const std::string& peer) {
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
+        char k[40];
+        snprintf(k, sizeof k, "lxmf.id.%d.dest_hash", n);
+        if (storageGetStr(k, "") == peer) return true;
+    }
+    return false;
+}
+
+/* A contact's name: its nick, its announced name, else what the open account
+ * knows it as. */
+std::string recName(const CRec& c) {
+    if (!c.nick.empty()) return printable(c.nick, true);
+    if (!c.name.empty()) return printable(c.name, true);
+    return peerName(c.peer);
+}
+
+/* The group's membership as the open account last heard it from the group
+ * (`contacts.<group>.members`, lines "32hex|name"), owner included. */
+std::vector<std::pair<std::string, std::string>> groupMembers(const std::string& group) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (g_id < 0) return out;
+    char k[104];
+    snprintf(k, sizeof k, "s.lxmf.id.%d.contacts.%s.members", g_id, group.c_str());
+    std::string txt = storageGetStr(k, "");
+    size_t at = 0;
+    while (at < txt.size()) {
+        size_t nl = txt.find('\n', at);
+        std::string line = txt.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        size_t bar = line.find('|');
+        if (bar == 32) out.emplace_back(line.substr(0, 32), line.substr(33));
+        if (nl == std::string::npos) break;
+        at = nl + 1;
+    }
+    return out;
+}
+
+/* The open account's own address. */
+std::string myDest() {
+    char k[40];
+    snprintf(k, sizeof k, "lxmf.id.%d.dest_hash", g_id);
+    return storageGetStr(k, "");
+}
+
+lv_obj_t* s_members  = nullptr;         /* the member list on a group's info page
+                                           (child of s_info) */
+int       g_infoGroup = -1;             /* the group slot that page administers, -1 = none:
+                                           the list is then the read-only one the group
+                                           reported */
+
+/* (Re)draw the member list. The owner's is the group slot's own directory, with
+ * the control that removes each member; a member's is what the group last
+ * reported, read-only. The open account reads "You" in both. Redrawn on every
+ * change to whichever it came from. */
+void fillMembers() {
+    if (!s_members) return;
+    lv_obj_clean(s_members);
+    std::string me = myDest();
+    if (g_infoGroup < 0) {
+        auto ms = groupMembers(g_infoPeer);
+        if (ms.empty())
+            mkLabel(s_members, "Not heard from the group yet.", lv_color_hex(0x8a93a0));
+        for (auto& p : ms) {
+            lv_obj_t* nm = mkLabel(s_members, p.first == me ? std::string("You")
+                                                            : printable(p.second, true),
+                                   lv_color_hex(0xc8d8c8));
+            lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(nm, lv_pct(100));
+        }
+        return;
+    }
+    for (auto& c : scanContacts(g_infoGroup)) {
+        if (!c.member) continue;
+        lv_obj_t* row = lv_obj_create(s_members);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* nm = mkLabel(row, c.peer == me ? std::string("You") : recName(c),
+                               lv_color_hex(0xc8d8c8));
+        lv_obj_set_flex_grow(nm, 1);
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        if (c.peer == me) continue;
+        lv_obj_t* x = lv_button_create(row);
+        lv_obj_remove_style_all(x);
+        lv_obj_set_size(x, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(x, lv_color_hex(0x5a2a2a), 0);
+        lv_obj_set_style_bg_opa(x, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(x, 4, 0);
+        lv_obj_set_style_pad_ver(x, 1, 0);
+        lv_obj_set_style_pad_hor(x, 8, 0);
+        mkLabel(x, LV_SYMBOL_CLOSE, lv_color_white());
+        bindPeer(x, [](lv_event_t* e) {
+            auto* p = (std::string*)lv_event_get_user_data(e);
+            if (!p || g_infoGroup < 0) return;
+            char ck[48];
+            snprintf(ck, sizeof ck, "lxmf.id.%d.cmd.member_del", g_infoGroup);
+            storageSet(ck, p->c_str());
+        }, c.peer);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), x);
+    }
+}
+
 void closeInfo() {
     if (s_info) lv_obj_delete(s_info);   /* s_confirm + s_pingLbl are children — die with it */
     s_info = nullptr;
     s_confirm = nullptr;
     s_pingLbl = nullptr;
+    s_members = nullptr;
+    g_infoGroup = -1;
     g_infoPeer.clear();
 }
 
@@ -3176,16 +3591,39 @@ void infoBack() {
     }
 }
 
-void onConfirmDelete(lv_event_t*) {
+/* What the info page's Delete offers. `age` < 0 is the whole conversation and
+ * the contact with it (cmd.delete); otherwise cmd.prune, which keeps the
+ * contact: 0 = every message, else messages older than that many seconds. */
+struct DelOpt { const char* label; const char* what; long age; };
+const DelOpt kDelOpts[] = {
+    { "Delete conversation and contact info", "",              -1 },
+    { "Delete messages only",                 "",               0 },
+    { "Delete messages older than 1 day",     "1 day",      86400 },
+    { "Delete messages older than 3 days",    "3 days",   3*86400 },
+    { "Delete messages older than 1 week",    "1 week",   7*86400 },
+    { "Delete messages older than 1 month",   "1 month", 30*86400 },
+};
+
+void onConfirmDelete(lv_event_t* e) {
+    const DelOpt& o = kDelOpts[(intptr_t)lv_event_get_user_data(e)];
     if (g_id >= 0 && !g_infoPeer.empty()) {
-        /* Whole-conversation delete: lxmf wipes the msgs + contact subtree; the
-         * storage change rebuilds the list without this peer. */
         char k[48];
-        snprintf(k, sizeof k, "lxmf.id.%d.cmd.delete", g_id);
-        storageSet(k, g_infoPeer.c_str());
+        if (o.age < 0) {
+            /* Whole-conversation delete: lxmf wipes the msgs + contact subtree;
+             * the storage change rebuilds the list without this peer. */
+            snprintf(k, sizeof k, "lxmf.id.%d.cmd.delete", g_id);
+            storageSet(k, g_infoPeer.c_str());
+        } else {
+            snprintf(k, sizeof k, "lxmf.id.%d.cmd.prune", g_id);
+            storageSet(k, (g_infoPeer + "/" + std::to_string(o.age)).c_str());
+        }
     }
-    closeInfo();
-    showContacts();               /* the conversation is gone from either origin */
+    if (o.age < 0) {
+        closeInfo();
+        showContacts();           /* the conversation is gone from either origin */
+    } else {
+        infoBack();               /* the contact stays; back to whatever opened us */
+    }
 }
 
 lv_obj_t* confirmButton(lv_obj_t* parent, const char* text, lv_color_t bg) {
@@ -3203,9 +3641,9 @@ lv_obj_t* confirmButton(lv_obj_t* parent, const char* text, lv_color_t bg) {
     return b;
 }
 
-void showDeleteConfirm(lv_event_t*) {
-    if (!s_info || s_confirm) return;
-
+/* The scrim + centred box both delete dialogs sit in, as s_confirm. The box
+ * scrolls if the content outgrows the screen. */
+lv_obj_t* confirmBox() {
     /* Full-page scrim absorbing taps outside the box. */
     s_confirm = lv_obj_create(s_info);
     lv_obj_remove_style_all(s_confirm);
@@ -3227,9 +3665,28 @@ void showDeleteConfirm(lv_event_t*) {
     lv_obj_set_style_pad_all(box, 10, 0);
     lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(box, 8, 0);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_max_height(box, lv_pct(95), 0);
+    return box;
+}
 
-    lv_obj_t* msg = mkLabel(box, "Are you sure? This cannot be undone!", lv_color_white());
+/* Second step: say exactly what goes, then Delete / Cancel. */
+void showDeleteFinal(intptr_t opt) {
+    closeConfirm();
+    if (!s_info) return;
+    const DelOpt& o = kDelOpts[opt];
+    const std::string name = peerName(g_infoPeer);
+    std::string text;
+    if (o.age < 0)
+        text = "Delete every message with " + name + " and the contact info?";
+    else if (o.age == 0)
+        text = "Delete every message with " + name + "? The contact stays.";
+    else
+        text = std::string("Delete messages with ") + name + " older than " + o.what
+             + "? Newer messages and the contact stay.";
+    text += " This cannot be undone.";
+
+    lv_obj_t* box = confirmBox();
+    lv_obj_t* msg = mkLabel(box, text, lv_color_white());
     lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(msg, lv_pct(100));
 
@@ -3242,10 +3699,146 @@ void showDeleteConfirm(lv_event_t*) {
     lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* del = confirmButton(btns, "Delete", lv_color_hex(0x5a2a2a));
-    lv_obj_add_event_cb(del, onConfirmDelete, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(del, onConfirmDelete, LV_EVENT_CLICKED, (void*)opt);
     lv_obj_t* cnc = confirmButton(btns, "Cancel", lv_color_hex(0x2a313a));
     lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeConfirm(); }, LV_EVENT_CLICKED, nullptr);
     deferFocus(cnc);   /* safe default under the cursor */
+}
+
+/* First step: what to delete. No option is preselected — focus sits on Cancel.
+ * The by-age options need a wall clock to measure against, so they are only
+ * offered once the device has the time. */
+void showGroupDeleteConfirm(lv_event_t*);
+void showGroupLeaveConfirm(lv_event_t*);
+
+void showDeleteChoice(lv_event_t*) {
+    if (!s_info || s_confirm) return;
+    lv_obj_t* box = confirmBox();
+    const bool timeOk = storageGetInt("sys.time.valid", 0) != 0;
+    /* A group's first choice is what ending it means for this account: one it
+     * is no longer in is deleted like any conversation; the owner deletes it
+     * for everyone; a member leaves it (and waits, greyed, for the answer). */
+    const bool grp = peerIsGroup(g_infoPeer);
+    const int  gst = grp ? groupState(g_infoPeer) : GS_MEMBER;
+    if (grp && gst < GS_LEFT) {
+        bool owned = ownedGroupSlot(g_infoPeer) >= 0;
+        lv_obj_t* b = lv_button_create(box);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x5a2a2a), 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x3a414a), LV_STATE_DISABLED);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(b, 4, 0);
+        lv_obj_set_style_pad_ver(b, 4, 0);
+        lv_obj_set_style_pad_hor(b, 8, 0);
+        const char* lbl = owned ? "Delete group"
+                        : gst == GS_LEAVING ? "Leaving…" : "Leave group";
+        mkLabel(b, lbl, lv_color_white());
+        if (!owned && gst == GS_LEAVING) lv_obj_add_state(b, LV_STATE_DISABLED);
+        else lv_obj_add_event_cb(b, owned ? showGroupDeleteConfirm : showGroupLeaveConfirm,
+                                 LV_EVENT_CLICKED, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+    }
+    for (intptr_t i = 0; i < (intptr_t)(sizeof kDelOpts / sizeof kDelOpts[0]); i++) {
+        if (kDelOpts[i].age > 0 && !timeOk) continue;
+        /* The whole-conversation delete is a group's only once it has ended. */
+        if (grp && kDelOpts[i].age < 0 && gst < GS_LEFT) continue;
+        lv_obj_t* b = lv_button_create(box);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x5a2a2a), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(b, 4, 0);
+        lv_obj_set_style_pad_ver(b, 4, 0);
+        lv_obj_set_style_pad_hor(b, 8, 0);
+        lv_obj_t* l = mkLabel(b, grp && kDelOpts[i].age < 0 ? "Delete group"
+                                                             : kDelOpts[i].label,
+                              lv_color_white());
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(l, lv_pct(100));
+        lv_obj_add_event_cb(b, [](lv_event_t* e) {
+            showDeleteFinal((intptr_t)lv_event_get_user_data(e));
+        }, LV_EVENT_CLICKED, (void*)i);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+    }
+    lv_obj_t* cnc = lv_button_create(box);
+    lv_obj_remove_style_all(cnc);
+    lv_obj_set_size(cnc, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(cnc, lv_color_hex(0x2a313a), 0);
+    lv_obj_set_style_bg_opa(cnc, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(cnc, 4, 0);
+    lv_obj_set_style_pad_ver(cnc, 4, 0);
+    lv_obj_center(mkLabel(cnc, "Cancel", lv_color_white()));
+    lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeConfirm(); }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), cnc);
+    deferFocus(cnc);
+}
+
+/* The owner deleting the group, for everyone: every member is told, and the
+ * group's slot then removes itself. Replaces the delete choice it came from. */
+void showGroupDeleteConfirm(lv_event_t*) {
+    closeConfirm();
+    if (!s_info || ownedGroupSlot(g_infoPeer) < 0) return;
+    lv_obj_t* box = confirmBox();
+    lv_obj_t* msg = mkLabel(box, "Delete the group " + peerName(g_infoPeer) +
+                                 " for everyone? Every member is told, and nobody can"
+                                 " write to it again. This cannot be undone.",
+                            lv_color_white());
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, lv_pct(100));
+
+    lv_obj_t* btns = lv_obj_create(box);
+    lv_obj_remove_style_all(btns);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btns, 8, 0);
+    lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* del = confirmButton(btns, "Delete", lv_color_hex(0x5a2a2a));
+    lv_obj_add_event_cb(del, [](lv_event_t*) {
+        int g = ownedGroupSlot(g_infoPeer);
+        if (g >= 0) storageSet("lxmf.cmd.group_delete", std::to_string(g).c_str());
+        /* The conversation stays, now saying the group was deleted. */
+        infoBack();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cnc = confirmButton(btns, "Cancel", lv_color_hex(0x2a313a));
+    lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeConfirm(); }, LV_EVENT_CLICKED, nullptr);
+    deferFocus(cnc);
+}
+
+/* A member leaving: the firmware tells the group ("/leave") and the contact
+ * reads `leaving` until the group answers. */
+void showGroupLeaveConfirm(lv_event_t*) {
+    closeConfirm();
+    if (!s_info || g_id < 0) return;
+    lv_obj_t* box = confirmBox();
+    lv_obj_t* msg = mkLabel(box, "Leave the group " + peerName(g_infoPeer) +
+                                 "? You stop receiving its messages, and only its owner"
+                                 " can add you back.", lv_color_white());
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, lv_pct(100));
+
+    lv_obj_t* btns = lv_obj_create(box);
+    lv_obj_remove_style_all(btns);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btns, 8, 0);
+    lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* go = confirmButton(btns, "Leave", lv_color_hex(0x5a2a2a));
+    lv_obj_add_event_cb(go, [](lv_event_t*) {
+        if (g_id >= 0 && !g_infoPeer.empty()) {
+            char k[48];
+            snprintf(k, sizeof k, "lxmf.id.%d.cmd.group_leave", g_id);
+            storageSet(k, g_infoPeer.c_str());
+        }
+        infoBack();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* cnc = confirmButton(btns, "Cancel", lv_color_hex(0x2a313a));
+    lv_obj_add_event_cb(cnc, [](lv_event_t*) { closeConfirm(); }, LV_EVENT_CLICKED, nullptr);
+    deferFocus(cnc);
 }
 
 /* ---- Ping (contact info page) ----
@@ -3403,12 +3996,16 @@ void showInfo(const std::string& peer) {
         if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
         return b;
     };
-    actButton("Delete", lv_color_hex(0x5a2a2a), showDeleteConfirm);
+    /* A group is reached through whoever hosts it, so there is no one radio
+     * peer to probe and no propagation node of its own to name. */
+    const int  gslot = ownedGroupSlot(peer);
+    const bool isGrp = gslot >= 0 || peerIsGroup(peer);
+    actButton("Delete", lv_color_hex(0x5a2a2a), showDeleteChoice);
     /* Ping is live at every moment — it always has something to answer with,
      * the radio's own reading if nothing else — so it carries the blue every
      * other actionable control here carries. A neutral slate is this UI's
      * dismiss colour and reads as a disabled control beside a coloured verb. */
-    actButton("Ping",   lv_color_hex(0x2563a0), onPingClick);
+    if (!isGrp) actButton("Ping", lv_color_hex(0x2563a0), onPingClick);
 
     s_pingLbl = mkLabel(body, "", lv_color_hex(0xc8d8c8));
     lv_label_set_long_mode(s_pingLbl, LV_LABEL_LONG_WRAP);
@@ -3424,6 +4021,45 @@ void showInfo(const std::string& peer) {
     if (la > 0)
         mkLabel(body, "Heard on the mesh " + relAge(nowMonoS() - la) + " ago",
                 lv_color_hex(0x8a93a0));
+
+    const int gst = isGrp ? groupState(peer) : GS_MEMBER;
+    if (isGrp && (gslot >= 0 ? gst != GS_DELETED : gst < GS_LEFT)) {
+        /* Who is in the group. The owner's list is the group's own and carries
+         * adding and removing people (deleting it for everyone is the Delete
+         * button's first choice); a member's is what the group last reported,
+         * with a way to ask again. */
+        g_infoGroup = gslot;
+        mkLabel(body, "Members", lv_color_hex(0x8a93a0));
+        s_members = lv_obj_create(body);
+        lv_obj_remove_style_all(s_members);
+        lv_obj_set_width(s_members, lv_pct(100));
+        lv_obj_set_height(s_members, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(s_members, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(s_members, 2, 0);
+        lv_obj_remove_flag(s_members, LV_OBJ_FLAG_SCROLLABLE);
+        fillMembers();
+
+        lv_obj_t* gacts = lv_obj_create(body);
+        lv_obj_remove_style_all(gacts);
+        lv_obj_set_width(gacts, lv_pct(100));
+        lv_obj_set_height(gacts, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(gacts, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(gacts, 8, 0);
+        lv_obj_remove_flag(gacts, LV_OBJ_FLAG_SCROLLABLE);
+        acts = gacts;   /* actButton builds into the row `acts` names */
+        if (gslot >= 0)
+            actButton("Add member", lv_color_hex(0x2563a0), [](lv_event_t*) {
+                if (g_infoGroup >= 0) showGroupPage(g_infoGroup, g_infoPeer);
+            });
+        else
+            actButton("Refresh", lv_color_hex(0x2563a0), [](lv_event_t*) {
+                if (g_id < 0 || g_infoPeer.empty()) return;
+                char k[48];
+                snprintf(k, sizeof k, "lxmf.id.%d.cmd.group_members", g_id);
+                storageSet(k, g_infoPeer.c_str());
+            });
+    }
+    if (isGrp) { deferFocus(back); return; }
 
     /* Per-contact propagation node — offered as the second option of the
      * resend dialog for this contact's messages. Options: none, the
@@ -3584,11 +4220,90 @@ void showResendDialog(lv_event_t*) {
     deferFocus(go);
 }
 
+/* ---- who got a group message (message detail page) ----
+ * Opening the page asks the group (cmd.group_info); its answer lands on the
+ * record as group_receipts ("hex6:status,…" — the head of each recipient's
+ * address and the status of the group's copy to them), and group_receipts_ts
+ * moves each time one does. Until it moves the page says it is asking. */
+lv_obj_t*   s_rcptBox = nullptr;        /* the receipts list (child of s_msgDetail) */
+std::string g_rcptBase;                 /* the record's storage path */
+std::string g_rcptGroup;                /* the group it was sent in */
+int         g_rcptAskedTs = 0;          /* group_receipts_ts when the question went out */
+
+void fillReceipts() {
+    if (!s_rcptBox) return;
+    lv_obj_clean(s_rcptBox);
+    int ts = storageGetInt((g_rcptBase + ".group_receipts_ts").c_str(), 0);
+    if (ts == g_rcptAskedTs) {
+        lv_obj_t* row = lv_obj_create(s_rcptBox);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* sp = lv_spinner_create(row);
+        int px = lv_font_get_line_height(kFont);
+        lv_obj_set_size(sp, px, px);
+        lv_obj_set_style_arc_width(sp, 2, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(sp, 2, LV_PART_INDICATOR);
+        mkLabel(row, "Asking the group…", lv_color_hex(0x8a93a0));
+        return;
+    }
+    auto members = groupMembers(g_rcptGroup);
+    std::string me = myDest();
+    std::string txt = storageGetStr((g_rcptBase + ".group_receipts").c_str(), "");
+    size_t at = 0;
+    int rows = 0;
+    while (at < txt.size()) {
+        size_t c = txt.find(',', at);
+        std::string item = txt.substr(at, c == std::string::npos ? std::string::npos : c - at);
+        at = c == std::string::npos ? txt.size() : c + 1;
+        size_t colon = item.find(':');
+        if (colon == std::string::npos) continue;
+        std::string pfx = item.substr(0, colon);
+        uint8_t st = (uint8_t)atoi(item.c_str() + colon + 1);
+        std::string name = pfx;
+        if (!me.empty() && me.compare(0, pfx.size(), pfx) == 0) name = "You";
+        else for (auto& p : members)
+            if (p.first.compare(0, pfx.size(), pfx) == 0) { name = printable(p.second, true); break; }
+
+        lv_obj_t* row = lv_obj_create(s_rcptBox);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* nm = mkLabel(row, name, lv_color_hex(0xc8d8c8));
+        lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+        lv_obj_set_flex_grow(nm, 1);
+        /* The status in the words and glyphs a bubble uses: the same meta row,
+         * for an outbound record at that status (a verdict short of delivery is
+         * a give-up). */
+        lv_obj_t* meta = lv_obj_create(row);
+        lv_obj_remove_style_all(meta);
+        lv_obj_set_size(meta, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(meta, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(meta, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(meta, 4, 0);
+        lv_obj_remove_flag(meta, LV_OBJ_FLAG_SCROLLABLE);
+        Msg fake;
+        fake.in = false;
+        fake.status = st;
+        fake.tries = (lxmfStatusIsVerdict(st) && st != LXMF_ST_DELIVERED &&
+                      st != LXMF_ST_OUR_PROXY_DELIVERED) ? LXMF_TRIES_GAVEUP : 0;
+        fillMeta(meta, fake);
+        rows++;
+    }
+    if (!rows) mkLabel(s_rcptBox, "The group named nobody.", lv_color_hex(0x8a93a0));
+}
+
 void closeMsgDetail() {
     if (s_msgDetail) lv_obj_delete(s_msgDetail);   /* s_resendDlg is a child — dies with it */
     s_msgDetail = nullptr;
     s_resendDlg = nullptr;
     s_resendDd = nullptr;
+    s_rcptBox = nullptr;
 }
 
 void msgDetailBack() {
@@ -3619,8 +4334,13 @@ void showMsgDetail(const std::string& mkey) {
     std::string method  = rd("method");
     bool        readf   = storageGetInt((base + ".read").c_str(), 0) != 0;
     std::string reply   = rd("reply_to");
+    std::string rshort  = rd("reply_short");
+    if (!hexSet(reply) && hexSet(rshort)) reply = rshort;   /* a group reply's short id */
     std::string quote   = rd("reply_quote");
     std::string mid     = rd("message_id");
+    std::string gfrom   = rd("group_from");
+    const bool inGroup  = peerIsGroup(g_curPeer);
+    const bool notice   = in && hexSet(gfrom) && gfrom == g_curPeer;
 
     s_msgDetail = lv_obj_create(s_layer);
     lv_obj_remove_style_all(s_msgDetail);
@@ -3675,6 +4395,51 @@ void showMsgDetail(const std::string& mkey) {
     }
     if (!title.empty()) detailRow(body, "Title", title);
     detailRow(body, "Content", content);
+
+    if (inGroup && !notice) {
+        /* Who the group delivered this to — asked afresh on every open. */
+        g_rcptBase     = base;
+        g_rcptGroup    = g_curPeer;
+        g_rcptAskedTs  = storageGetInt((base + ".group_receipts_ts").c_str(), 0);
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.cmd.group_info", g_id);
+        storageSet(k, (g_curPeer + "/" + mkey).c_str());
+        lv_obj_t* hd = mkLabel(body, "Delivered by the group to", lv_color_hex(0x8a93a0));
+        lv_obj_set_style_margin_top(hd, 6, 0);
+        s_rcptBox = lv_obj_create(body);
+        lv_obj_remove_style_all(s_rcptBox);
+        lv_obj_set_size(s_rcptBox, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(s_rcptBox, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(s_rcptBox, 2, 0);
+        lv_obj_remove_flag(s_rcptBox, LV_OBJ_FLAG_SCROLLABLE);
+        fillReceipts();
+
+        /* Another member wrote it: talking to them directly is one press. */
+        if (in && hexSet(gfrom) && gfrom != g_curPeer) {
+            Msg probe; probe.in = true; probe.peer = g_curPeer;
+            probe.group_from = gfrom; probe.content = content;
+            std::string body2;
+            std::string who = groupSenderName(probe, splitGroupPrefix(content, body2));
+            lv_obj_t* dm = lv_button_create(body);
+            lv_obj_remove_style_all(dm);
+            lv_obj_set_width(dm, lv_pct(100));
+            lv_obj_set_height(dm, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(dm, lv_color_hex(0x2563a0), 0);
+            lv_obj_set_style_bg_opa(dm, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(dm, 4, 0);
+            lv_obj_set_style_pad_ver(dm, 4, 0);
+            lv_obj_set_style_margin_top(dm, 10, 0);
+            lv_obj_center(mkLabel(dm, "Message " + who, lv_color_white()));
+            bindPeer(dm, [](lv_event_t* e) {
+                auto* p = (std::string*)lv_event_get_user_data(e);
+                if (!p) return;
+                std::string peer = *p;     /* the widget (and *p) go with the page */
+                closeMsgDetail();
+                openThread(peer);
+            }, gfrom);
+            if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), dm);
+        }
+    }
 
     if (!in) {
         /* Resend — directly or through a propagation node (dialog). */
@@ -3802,7 +4567,7 @@ lv_obj_t* buildPeerRow(lv_obj_t* list, const RowSpec& s) {
  * the mesh rows, which tap reliably; the earlier swipe-to-delete foreground was
  * the one thing unique to this list and made taps miss, so it's gone. A small
  * circled-i sits at the right edge (no background) and opens the contact info
- * page, which holds the delete-conversation flow behind an explicit confirm. */
+ * page, which holds the delete flow. */
 lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
     int lineH = lv_font_get_line_height(kFont);
 
@@ -3821,7 +4586,16 @@ lv_obj_t* buildContactRow(lv_obj_t* list, const RowSpec& s) {
     bindPeer(row, onContactClick, s.peer);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
-    fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);   /* row → flex: [body][age] */
+    /* A group leads its row with the group icon, with as much room after it as
+     * the row's own padding leaves before it. */
+    if (s.group) {
+        lv_obj_t* gi = lv_image_create(row);
+        lv_obj_remove_flag(gi, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_margin_right(gi, 6, 0);
+        applyIcon(gi, "group", groupIconPx(), lv_color_hex(0xb9c9dd));
+    }
+
+    fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);   /* row → flex: [icon][body][age] */
 
     /* Per-contact signal bars, shown when a radio has heard this peer (SUPE's
      * lora.<n>.meas.* holds a record for it). */
@@ -3996,6 +4770,7 @@ RowSpec emptySpec(const std::string& t) {
 void rebuildList(bool keepScroll) {
     if (!s_listC || !s_listM) return;
     refreshFont();
+    reflectGroupButton();   /* follows whether an account is open */
     /* The mesh column reads g_anns; reload the (up to thousands) announce catalogue
      * only when it actually changed or has never been walked — a Contacts-only
      * change (a new message) no longer drags the whole catalogue through a sort.
@@ -4028,14 +4803,15 @@ void rebuildList(bool keepScroll) {
      * last-heard-announce badge. ---- */
     std::string nC = lower(trim(g_qContacts));
     /* Read the conversation list from the maintained directory — never the
-       message store. Only peers with at least one message (count>0) are
-       conversations; the rest are announce-only contacts. */
+       message store. Peers with at least one message (count>0) are
+       conversations, and so are those whose messages the user deleted while
+       keeping the contact (kept); the rest are announce-only contacts. */
     g_convScan.clear();
     char cprefix[64];
     snprintf(cprefix, sizeof cprefix, "s.lxmf.id.%d.contacts", g_id);
     storageForEach(cprefix, convCb);
     std::vector<Conv> convs;
-    for (auto& c : g_convScan) if (c.count > 0) convs.push_back(c);
+    for (auto& c : g_convScan) if (c.count > 0 || c.kept) convs.push_back(c);
     std::sort(convs.begin(), convs.end(), [](const Conv& a, const Conv& b) { return a.ts > b.ts; });
 
     int cRows = 0;
@@ -4063,7 +4839,11 @@ void rebuildList(bool keepScroll) {
         s.sub = (c.preview_mine ? "You: " : "") + printable(c.preview, true);
         s.age = la > 0 ? relAge(now - la) : std::string();
         s.titleColor = lv_color_white(); s.unread = c.unread;
+        s.group = c.group;
         s.sig = "C|" + nm + "|" + s.sub + "|" + std::to_string(c.unread);   /* age excluded on purpose */
+        /* The icon raster lands off-task; a row drawn before it did is rebuilt
+         * once it has (groupIconSettle dirties the list). */
+        if (c.group) s.sig += lcdIconReady("group", groupIconPx()) ? "|G" : "|g";
         tC.push_back(std::move(s));
         cRows++;
     }
@@ -4284,6 +5064,216 @@ void reflectPnButton() {
     else                  lv_obj_remove_flag(s_pnBtn, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* ---- new group (group glyph, left of the envelope) ---- */
+
+/* Present while an account is open: a group is made from its contacts and
+ * owned by it. */
+void reflectGroupButton() {
+    if (!s_grpBtn) return;
+    if (g_id < 0) lv_obj_add_flag   (s_grpBtn, LV_OBJ_FLAG_HIDDEN);
+    else          lv_obj_remove_flag(s_grpBtn, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* The group glyph rasterizes off-task. Re-apply it until it lands, then let the
+ * contact rows that were drawn without it rebuild. */
+int g_grpIconTicks = 0;
+bool applyGroupIcon() {
+    if (s_grpBtnImg) applyIcon(s_grpBtnImg, "group", groupIconPx(), lv_color_hex(0xc0c8d0));
+    else             lcdIconRequest("group", groupIconPx());
+    return lcdIconReady("group", groupIconPx());
+}
+void groupIconSettle() {
+    if (g_grpIconTimer || applyGroupIcon()) return;
+    g_grpIconTicks = 0;
+    g_grpIconTimer = lv_timer_create([](lv_timer_t* t) {
+        bool ready = applyGroupIcon();
+        if (!ready && ++g_grpIconTicks < 40) return;   /* ~4 s cap */
+        lv_timer_delete(t);
+        g_grpIconTimer = nullptr;
+        if (ready) { g_listDirty = true; scheduleRefresh(); }
+    }, 100, nullptr);
+}
+
+/* The create-group page, and the same page adding members to an existing group:
+ * the open account's conversations as a checklist (never a group, never one of
+ * this device's own addresses, never somebody already in it), plus a name when
+ * creating. */
+lv_obj_t* s_grpName = nullptr;          /* the name field (creating only) */
+lv_obj_t* s_grpHide = nullptr;          /* "Hide group name" — kept out of the group's
+                                           announce (creating only) */
+lv_obj_t* s_grpGo   = nullptr;          /* Create / Add */
+std::vector<std::pair<lv_obj_t*, std::string>> g_grpPicks;   /* checkbox → peer */
+int         g_grpSlot = -1;             /* -1 = creating; else the group slot being added to */
+std::string g_grpPeer;                  /* that group's address — the way back to its page */
+bool        g_grpInfoFromThread = false;
+
+void closeGroupPage() {
+    if (s_grpPage) lv_obj_delete(s_grpPage);
+    s_grpPage = nullptr; s_grpName = nullptr; s_grpGo = nullptr; s_grpHide = nullptr;
+    g_grpPicks.clear();
+}
+
+void groupPageBack() {
+    int slot = g_grpSlot;
+    std::string peer = g_grpPeer;
+    bool fromThread = g_grpInfoFromThread;
+    closeGroupPage();
+    lcdKeyboardClose();
+    if (slot >= 0 && !peer.empty()) {
+        showInfo(peer);
+        g_infoFromThread = fromThread;   /* its back chevron returns where it did before */
+    } else {
+        showContacts();
+    }
+}
+
+/* Create / Add is live once somebody is ticked and, when creating, named. */
+void groupPageReflect() {
+    if (!s_grpGo) return;
+    bool any = false;
+    for (auto& p : g_grpPicks) if (lv_obj_has_state(p.first, LV_STATE_CHECKED)) { any = true; break; }
+    bool named = g_grpSlot >= 0 ||
+                 (s_grpName && !trim(lv_textarea_get_text(s_grpName)).empty());
+    if (any && named) lv_obj_remove_state(s_grpGo, LV_STATE_DISABLED);
+    else              lv_obj_add_state(s_grpGo, LV_STATE_DISABLED);
+}
+
+void onGroupGo(lv_event_t*) {
+    if (g_id < 0 || !s_grpGo || lv_obj_has_state(s_grpGo, LV_STATE_DISABLED)) return;
+    std::string list;
+    for (auto& p : g_grpPicks) {
+        if (!lv_obj_has_state(p.first, LV_STATE_CHECKED)) continue;
+        if (!list.empty()) list += ',';
+        list += p.second;
+    }
+    if (list.empty()) return;
+    if (g_grpSlot < 0) {
+        std::string name = trim(lv_textarea_get_text(s_grpName));
+        if (name.empty()) return;
+        for (auto& c : name) if (c == '|') c = '/';   /* '|' separates the command's fields */
+        bool hide = s_grpHide && lv_obj_has_state(s_grpHide, LV_STATE_CHECKED);
+        storageSet("lxmf.cmd.group_new",
+                   (std::to_string(g_id) + "|" + name + "|" + list + "|" +
+                    (hide ? "1" : "0")).c_str());
+    } else {
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.cmd.member_add", g_grpSlot);
+        storageSet(k, list.c_str());
+    }
+    groupPageBack();
+}
+
+void showGroupPage(int slot, const std::string& groupPeer) {
+    if (g_id < 0 || !s_layer) return;
+    refreshFont();
+    g_grpInfoFromThread = slot >= 0 && g_infoFromThread;
+    closeInfo();
+    closeGroupPage();
+    if (s_thread)   lv_obj_add_flag(s_thread,   LV_OBJ_FLAG_HIDDEN);
+    if (s_contacts) lv_obj_add_flag(s_contacts, LV_OBJ_FLAG_HIDDEN);
+    g_grpSlot = slot;
+    g_grpPeer = groupPeer;
+
+    s_grpPage = lv_obj_create(s_layer);
+    lv_obj_remove_style_all(s_grpPage);
+    lv_obj_set_size(s_grpPage, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_grpPage, lv_color_hex(0x10141a), 0);
+    lv_obj_set_style_bg_opa(s_grpPage, LV_OPA_COVER, 0);
+    lv_obj_set_flex_flow(s_grpPage, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t* hdr = lv_obj_create(s_grpPage);
+    lv_obj_remove_style_all(hdr);
+    lv_obj_set_size(hdr, lv_pct(100), HDR_H);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x222b38), 0);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
+    lv_obj_t* back = mkLabel(hdr, LV_SYMBOL_LEFT, lv_color_white());
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 6, 0);
+    lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(back, 12);
+    lv_obj_add_event_cb(back, [](lv_event_t*) { groupPageBack(); }, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), back);
+    lv_obj_t* title = mkLabel(hdr, slot < 0 ? std::string("New group")
+                                            : "Add to " + peerName(groupPeer),
+                              lv_color_white());
+    lv_obj_align(title, LV_ALIGN_LEFT_MID, 28, 0);
+
+    lv_obj_t* body = lv_obj_create(s_grpPage);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(body, 8, 0);
+    lv_obj_set_style_pad_ver(body, 6, 0);
+    lv_obj_set_style_pad_row(body, 4, 0);
+
+    if (slot < 0) {
+        mkLabel(body, "Name", lv_color_hex(0x8a93a0));
+        s_grpName = lv_textarea_create(body);
+        lv_textarea_set_one_line(s_grpName, true);
+        lv_textarea_set_placeholder_text(s_grpName, "Group name");
+        lv_obj_set_style_text_font(s_grpName, kFont, 0);
+        lv_obj_set_style_pad_ver(s_grpName, 2, 0);
+        lv_obj_set_style_pad_hor(s_grpName, 6, 0);
+        lv_obj_set_width(s_grpName, lv_pct(100));
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_grpName);
+        lcdKeyboardAttach(s_grpName);
+        lv_obj_add_event_cb(s_grpName, [](lv_event_t*) { groupPageReflect(); },
+                            LV_EVENT_VALUE_CHANGED, nullptr);
+        /* Hidden by default: the name stays out of the group's announce, and
+         * members learn it from the group itself. */
+        s_grpHide = lv_checkbox_create(body);
+        lv_checkbox_set_text(s_grpHide, "Hide group name");
+        lv_obj_set_style_text_font(s_grpHide, kFont, 0);
+        lv_obj_set_style_text_color(s_grpHide, lv_color_white(), 0);
+        lv_obj_add_state(s_grpHide, LV_STATE_CHECKED);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_grpHide);
+    }
+
+    mkLabel(body, slot < 0 ? "Members" : "Add", lv_color_hex(0x8a93a0));
+    std::set<std::string> already;
+    if (slot >= 0)
+        for (auto& c : scanContacts(slot)) if (c.member) already.insert(c.peer);
+    std::vector<CRec> cands;
+    for (auto& c : scanContacts(g_id)) {
+        if (c.group || (c.count <= 0 && !c.kept)) continue;
+        if (already.count(c.peer) || isOwnDest(c.peer)) continue;
+        cands.push_back(c);
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const CRec& a, const CRec& b) { return lower(recName(a)) < lower(recName(b)); });
+    for (auto& c : cands) {
+        lv_obj_t* cb = lv_checkbox_create(body);
+        lv_checkbox_set_text(cb, recName(c).c_str());
+        lv_obj_set_style_text_font(cb, kFont, 0);
+        lv_obj_set_style_text_color(cb, lv_color_white(), 0);
+        lv_obj_add_event_cb(cb, [](lv_event_t*) { groupPageReflect(); },
+                            LV_EVENT_VALUE_CHANGED, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), cb);
+        g_grpPicks.emplace_back(cb, c.peer);
+    }
+    if (g_grpPicks.empty())
+        mkLabel(body, slot < 0 ? "No conversations to make a group from."
+                               : "Everyone you talk to is in it already.",
+                lv_color_hex(0x8a93a0));
+
+    s_grpGo = lv_button_create(body);
+    lv_obj_remove_style_all(s_grpGo);
+    lv_obj_set_size(s_grpGo, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_grpGo, lv_color_hex(0x2563a0), 0);
+    lv_obj_set_style_bg_color(s_grpGo, lv_color_hex(0x3a414a), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_opa(s_grpGo, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_grpGo, 4, 0);
+    lv_obj_set_style_pad_ver(s_grpGo, 4, 0);
+    lv_obj_set_style_pad_hor(s_grpGo, 14, 0);
+    lv_obj_set_style_margin_top(s_grpGo, 4, 0);
+    mkLabel(s_grpGo, slot < 0 ? "Create" : "Add", lv_color_white());
+    lv_obj_add_event_cb(s_grpGo, onGroupGo, LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_grpGo);
+    groupPageReflect();
+
+    deferFocus(s_grpName ? s_grpName : back);
+}
+
 /* Record USER scrolls on the mesh list so the live announce-refresh backs off
  * while you're browsing (see refreshTimerCb's MESH_SCROLL_QUIET_MS gate). A user
  * drag is dispatched while an input device is being processed; the rebuild's own
@@ -4314,6 +5304,31 @@ void buildContactsScreen() {
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
     s_tabBtnC = mkTabButton(bar, "Contacts",    0);
     s_tabBtnM = mkTabButton(bar, "On the Mesh", 1);
+
+    /* New group: not a tab either, the group glyph at its own width. */
+    s_grpBtn = lv_button_create(bar);
+    lv_obj_remove_style_all(s_grpBtn);
+    lv_obj_set_size(s_grpBtn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(s_grpBtn, lv_color_hex(0x20262e), 0);
+    lv_obj_set_style_bg_opa(s_grpBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_grpBtn, 4, 0);
+    lv_obj_set_style_pad_ver(s_grpBtn, 3, 0);
+    lv_obj_set_style_pad_hor(s_grpBtn, 6, 0);
+    lv_obj_set_style_min_height(s_grpBtn, lv_font_get_line_height(kFont) + 6, 0);
+    lv_obj_remove_flag(s_grpBtn, LV_OBJ_FLAG_SCROLLABLE);
+    /* "+" and the group glyph: this makes a new group, it does not open one. */
+    lv_obj_set_flex_flow(s_grpBtn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_grpBtn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_grpBtn, 2, 0);
+    mkLabel(s_grpBtn, "+", lv_color_hex(0xc0c8d0));
+    s_grpBtnImg = lv_image_create(s_grpBtn);
+    lv_obj_remove_flag(s_grpBtnImg, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_grpBtn, [](lv_event_t*) { showGroupPage(-1, ""); },
+                        LV_EVENT_CLICKED, nullptr);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), s_grpBtn);
+    reflectGroupButton();
+    groupIconSettle();
 
     /* Not a tab: no flex-grow (it takes only the envelope's width), no active
      * styling, and it never changes which page is shown. */
@@ -4528,7 +5543,8 @@ bool identitySetKey(const char* key) {
     if (!dot) return false;
     const char* f = dot + 1;
     return !strcmp(f, "dest_hash") || !strcmp(f, "ready") ||
-           !strcmp(f, "label")     || !strcmp(f, "enabled");
+           !strcmp(f, "label")     || !strcmp(f, "enabled") ||
+           !strcmp(f, "kind");     /* a slot turning out to be a group is no account */
 }
 
 void onStorageChange(const char* key, const char*) {
@@ -4539,6 +5555,18 @@ void onStorageChange(const char* key, const char*) {
         if (key && identitySetKey(key)) routeByIdentity();
         return;
     }
+    /* The owner's member list on an open group page follows the group's own
+     * contacts directory. */
+    if (key && s_members) {
+        char gp[112];
+        if (g_infoGroup >= 0)
+            snprintf(gp, sizeof gp, "s.lxmf.id.%d.contacts", g_infoGroup);
+        else
+            snprintf(gp, sizeof gp, "s.lxmf.id.%d.contacts.%s.members", g_id, g_infoPeer.c_str());
+        if (!strncmp(key, gp, strlen(gp))) fillMembers();
+    }
+    /* A group's answer to "who got this" lands on the record the detail page shows. */
+    if (key && s_rcptBox && strstr(key, ".group_receipts")) fillReceipts();
     /* Flag which walk the change dirtied and coalesce; refreshTimerCb does the
        expensive work once per window. Announce churn touches only the mesh
        column, never the msg walk or the open thread. */
@@ -4584,6 +5612,10 @@ void onLayerDelete(lv_event_t*) {
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_pnBtn = nullptr; s_pnToast = nullptr;   /* widgets went with the layer */
     if (s_pnToastTimer) { lv_timer_delete(s_pnToastTimer); s_pnToastTimer = nullptr; }
+    s_grpBtn = nullptr; s_grpBtnImg = nullptr; s_grpPage = nullptr;
+    s_grpName = nullptr; s_grpGo = nullptr; s_grpHide = nullptr; g_grpPicks.clear();
+    s_members = nullptr; g_infoGroup = -1; s_rcptBox = nullptr;
+    if (g_grpIconTimer) { lv_timer_delete(g_grpIconTimer); g_grpIconTimer = nullptr; }
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
     s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
@@ -4624,6 +5656,9 @@ void lxmfApp(void* arg) {
     s_idpick = nullptr; s_contacts = nullptr;
     s_tabBtnC = nullptr; s_tabBtnM = nullptr; s_tabContacts = nullptr; s_tabMesh = nullptr;
     s_pnBtn = nullptr; s_pnToast = nullptr; s_pnToastTimer = nullptr;   /* prior onLayerDelete freed the timer */
+    s_grpBtn = nullptr; s_grpBtnImg = nullptr; s_grpPage = nullptr; g_grpIconTimer = nullptr;
+    s_grpName = nullptr; s_grpGo = nullptr; s_grpHide = nullptr; g_grpPicks.clear();
+    s_members = nullptr; g_infoGroup = -1; s_rcptBox = nullptr;
     s_searchC = nullptr; s_searchM = nullptr; s_listC = nullptr; s_listM = nullptr;
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
     s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;

@@ -74,9 +74,6 @@ constexpr size_t LXMF_OVERHEAD      = LXMF_DEST_HASH_LEN * 2 + LXMF_SIG_LEN;  /*
  * spurious "evicted"). Derived from MTU=500: ((464-48-32)/16)*16-1. */
 constexpr size_t LXMF_OPP_PAYLOAD_MAX = 383;
 
-/* Max concurrent LXMF identities. Schema is an array (id.<n>). */
-#define LXMF_MAX_IDENTITIES 4
-
 /* In-RAM dedup hashlist depth — last N inbound message_ids. Cheap
  * defence against accidental duplicates from path-flapping repeats.
  * Storage existence is the authoritative dedup. */
@@ -496,6 +493,7 @@ static const sdb_schema& lxmfMsgSchema()
         x.schema_id = 1;
         x.schema_ver = 4;
         x.u8("tries").u8("status")
+         .u8("group_event")   /* FIELD_GROUP notice: LXMF_GROUP_EV_*, 0 = none */
          .u8("body_absent")   /* 1 = the content is not here yet: a proxy server
                                * withheld a body over its inline threshold and
                                * the client fetches it on demand. Absence cannot
@@ -554,11 +552,31 @@ static const sdb_schema& lxmfMsgSchema()
          .u32("delivered_ts") /* unix s the delivery proof settled DELIVERED;
                                * 0 = not delivered */
          .data("message_id", 32).data("reply_to", 32)
+         .data("group_from", 16)  /* FIELD_GROUP: who wrote it; all-zero = not a
+                                   * group message */
+         .data("orig_id", 3)      /* FIELD_GROUP: the first 3 bytes of the
+                                   * writer's own message_id — what replies,
+                                   * /info and receipts in a group name */
+         .data("reply_short", 3)  /* FIELD_REPLY_TO as a group sends it: the
+                                   * replied-to message's 3-byte id */
+         .u8("command")           /* 1 = a command this device sent its group
+                                   * (/leave, /info, /members, /member): never
+                                   * drawn, never the conversation's preview */
+         .u32("group_receipts_ts")/* moves every time an /info answer lands */
          .text("title").text("content")
-         .text("reply_quote");  /* the fragment of the replied-to message this
+         .text("reply_quote")   /* the fragment of the replied-to message this
                                  * one quotes (FIELD_REPLY_QUOTE); empty when the
                                  * reply quotes the message as a whole and each
                                  * end draws the preview from its own copy */
+         .text("group_subjects")  /* FIELD_GROUP notice: whom it is about,
+                                   * comma-separated 32-hex */
+         .text("group_data")      /* FIELD_GROUP answer (/info, /members), kept
+                                   * only where it is to be passed on to a
+                                   * proxied owner — see groupHear */
+         .text("group_name")      /* FIELD_GROUP members answer: the group's own
+                                   * name, kept for the same reason */
+         .text("group_receipts"); /* who has this message: "hex6:status,…", one
+                                   * per member the group sent it to */
         return x;
     }();
     return s;
@@ -600,6 +618,13 @@ static const sdb_schema& lxmfContactSchema()
                                 * second preview — `preview` is the last message
                                 * whoever wrote it, and this byte is the only
                                 * thing needed to label it. */
+         .u8("group")           /* 1 = this peer is a group */
+         .u8("member")          /* in a group's own slot: 1 = a member */
+         .u8("group_state")     /* a group as its member sees it: LXMF_GROUP_ST_* */
+         .u8("kept")            /* 1 = a contact even with no messages: the
+                                * user emptied the conversation (cmd.prune)
+                                * but kept the contact. Without it count 0
+                                * reads as an announce-only peer. */
          .data("hash", 16)
          .data("pubkey", 64)   /* X25519(32) ‖ Ed25519(32), as rnsd hands it
                                 * out; unset until an announce is heard or a
@@ -607,7 +632,9 @@ static const sdb_schema& lxmfContactSchema()
          .data("pn", 16)       /* the contact's preferred classic
                                 * lxmf.propagation node, client-set from the
                                 * contact details page; all-zero = none */
-         .text("display_name").text("nick").text("preview");
+         .text("display_name").text("nick").text("preview")
+         .text("members");     /* a group: its members as this account knows
+                                * them, "hex32|name" lines (/members) */
         return x;
     }();
     return s;
@@ -1238,7 +1265,43 @@ struct LxmFields {
      * put words in anyone's mouth. */
     std::string reply_quote;
     std::string ticket;        /* raw msgpack value of FIELD_TICKET, empty if none */
-    /* Future: telemetry, attachments, etc. */
+    /* FIELD_REPLY_TO cut to 3 bytes: how a reply inside a group names its
+     * target (hex6). Exclusive with reply_to. */
+    std::string reply_short;
+    /* FIELD_GROUP: [sender dest (16 B), the first 3 bytes of the sender's own
+     * message_id], and on what the group itself says two more: [event, data].
+     * Held as hex32 / hex6; empty when absent. `group_subjects` (events 1–4,
+     * comma-separated hex32) and `group_data` (events 5–7, see groupDataOf)
+     * are the decoded data element. */
+    std::string group_from;
+    std::string orig_id;
+    int         group_event = 0;      /* LXMF_GROUP_EV_*, 0 = a member's message */
+    std::string group_subjects;
+    std::string group_data;
+    /* The group's own name, on a members answer (6, 7): how a member learns
+     * it when the group keeps it out of its announce. */
+    std::string group_name;
+};
+
+/* What the group itself says (FIELD_GROUP element [2]). 1–4 are notices to
+ * everyone, 5–7 answers to one member's command. */
+enum : int {
+    LXMF_GROUP_EV_ADDED   = 1,    /* [subject dest…] */
+    LXMF_GROUP_EV_REMOVED = 2,
+    LXMF_GROUP_EV_LEFT    = 3,
+    LXMF_GROUP_EV_DELETED = 4,
+    LXMF_GROUP_EV_INFO    = 5,    /* bin: 4 B per copy — dest[0..2], LxmfStatus */
+    LXMF_GROUP_EV_MEMBERS = 6,    /* [[dest, name]…] — the whole list */
+    LXMF_GROUP_EV_MEMBER  = 7,    /* [[dest, name]] — one member */
+};
+
+/* contacts.<group>.group_state, as a member's device sees its group. */
+enum : int {
+    LXMF_GROUP_ST_MEMBER  = 0,
+    LXMF_GROUP_ST_LEAVING = 1,   /* "/leave" sent, the group has not answered */
+    LXMF_GROUP_ST_LEFT    = 2,
+    LXMF_GROUP_ST_REMOVED = 3,
+    LXMF_GROUP_ST_DELETED = 4,
 };
 
 /* Pack the msgpack payload alone (no dest/src/sig). title/content may
@@ -1274,25 +1337,25 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
     /* [3] fields — map of int → value. Only emit non-empty entries, so a
      * normal (non-reply) message carries no reply field at all. */
     size_t field_count = 0;
-    if (!fields.reply_to.empty())      field_count++;
+    bool reply_short = fields.reply_short.size() == 6;
+    bool reply = reply_short || !fields.reply_to.empty();
+    if (reply)                         field_count++;
     /* A quote without the hash it belongs to is not addressable, so the pair
      * travels together or not at all. */
-    bool quote = !fields.reply_to.empty() && !fields.reply_quote.empty();
+    bool quote = reply && !fields.reply_quote.empty();
     if (quote)                         field_count++;
+    bool group = fields.group_from.size() == 32 && fields.orig_id.size() == 6;
+    if (group)                         field_count++;
     mpPackMapHeader(out, field_count);
-    if (!fields.reply_to.empty()) {
+    if (reply) {
         mpPackInt(out, LXMF_FIELD_REPLY_TO);
-        /* FIELD_REPLY_TO is the raw 32-byte replied-to message hash. Stored
-         * as hex64; convert back to raw 32 B for the wire. */
+        /* FIELD_REPLY_TO is the raw 32-byte replied-to message hash — or,
+         * inside a group, its first 3 bytes (see LxmFields::reply_short). */
         uint8_t raw[32] = {};
-        if (fields.reply_to.size() == 64) {
-            for (int k = 0; k < 32; ++k) {
-                unsigned x = 0;
-                std::sscanf(fields.reply_to.c_str() + 2*k, "%2x", &x);
-                raw[k] = (uint8_t)x;
-            }
-        }
-        mpPackBin(out, raw, sizeof(raw));
+        size_t len = reply_short ? 3 : 32;
+        hexToBytes(reply_short ? fields.reply_short.c_str() : fields.reply_to.c_str(),
+                   len * 2, raw, len);
+        mpPackBin(out, raw, len);
     }
     if (quote) {
         mpPackInt(out, LXMF_FIELD_REPLY_QUOTE);
@@ -1301,6 +1364,73 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
          * to .decode(). */
         mpPackBin(out, reinterpret_cast<const uint8_t*>(fields.reply_quote.data()),
                   fields.reply_quote.size());
+    }
+    if (group) {
+        uint8_t from[16], orig[3];
+        hexToBytes(fields.group_from.c_str(), 32, from, 16);
+        hexToBytes(fields.orig_id.c_str(), 6, orig, 3);
+        mpPackInt(out, LXMF_FIELD_GROUP);
+        bool members_ev = fields.group_event == LXMF_GROUP_EV_MEMBERS ||
+                          fields.group_event == LXMF_GROUP_EV_MEMBER;
+        mpPackArrayHeader(out, !fields.group_event ? 2 : members_ev ? 5 : 4);
+        mpPackBin(out, from, sizeof from);
+        mpPackBin(out, orig, sizeof orig);
+        int ev = fields.group_event;
+        if (ev >= LXMF_GROUP_EV_ADDED && ev <= LXMF_GROUP_EV_DELETED) {
+            std::vector<std::array<uint8_t, 16>> subj;
+            const std::string& s = fields.group_subjects;
+            for (size_t at = 0; at + 32 <= s.size(); at += 33) {
+                std::array<uint8_t, 16> d;
+                if (hexToBytes(s.c_str() + at, 32, d.data(), 16)) subj.push_back(d);
+            }
+            mpPackInt(out, ev);
+            mpPackArrayHeader(out, subj.size());
+            for (auto& d : subj) mpPackBin(out, d.data(), d.size());
+        } else if (ev == LXMF_GROUP_EV_INFO) {
+            /* "hex6:status,…" → 4 bytes a copy */
+            std::vector<uint8_t> blocks;
+            const std::string& s = fields.group_data;
+            size_t at = 0;
+            while (at + 8 <= s.size()) {
+                uint8_t d[3];
+                size_t comma = s.find(',', at);
+                std::string item = s.substr(at, comma == std::string::npos ? std::string::npos
+                                                                            : comma - at);
+                if (item.size() >= 8 && item[6] == ':' && hexToBytes(item.c_str(), 6, d, 3)) {
+                    blocks.insert(blocks.end(), d, d + 3);
+                    blocks.push_back((uint8_t)std::atoi(item.c_str() + 7));
+                }
+                if (comma == std::string::npos) break;
+                at = comma + 1;
+            }
+            mpPackInt(out, ev);
+            mpPackBin(out, blocks.data(), blocks.size());
+        } else if (ev == LXMF_GROUP_EV_MEMBERS || ev == LXMF_GROUP_EV_MEMBER) {
+            /* "hex32|name\n…" → [[dest, name]…] */
+            std::vector<std::pair<std::array<uint8_t, 16>, std::string>> list;
+            const std::string& s = fields.group_data;
+            size_t at = 0;
+            while (at < s.size()) {
+                size_t nl = s.find('\n', at);
+                std::string line = s.substr(at, nl == std::string::npos ? std::string::npos
+                                                                         : nl - at);
+                at = nl == std::string::npos ? s.size() : nl + 1;
+                std::array<uint8_t, 16> d;
+                if (line.size() >= 33 && line[32] == '|' &&
+                    hexToBytes(line.c_str(), 32, d.data(), 16))
+                    list.emplace_back(d, line.substr(33));
+            }
+            mpPackInt(out, ev);
+            mpPackArrayHeader(out, list.size());
+            for (auto& e : list) {
+                mpPackArrayHeader(out, 2);
+                mpPackBin(out, e.first.data(), e.first.size());
+                mpPackBin(out, reinterpret_cast<const uint8_t*>(e.second.data()),
+                          e.second.size());
+            }
+            mpPackBin(out, reinterpret_cast<const uint8_t*>(fields.group_name.data()),
+                      fields.group_name.size());
+        }
     }
     return out;
 }
@@ -1373,12 +1503,10 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
         if (key == LXMF_FIELD_REPLY_TO) {
             std::string raw;
             if (!mpReadStrOrBin(s, raw)) { if (!mpScanNext(s)) return false; continue; }
-            if (raw.size() == 32 && fields_out) {
-                char hex[65];
-                for (int j = 0; j < 32; ++j)
-                    std::snprintf(hex + 2*j, 3, "%02x", (uint8_t)raw[j]);
-                fields_out->reply_to.assign(hex, 64);
-            }
+            if (raw.size() == 32 && fields_out)
+                fields_out->reply_to = bytesToHex((const uint8_t*)raw.data(), 32);
+            else if (raw.size() == 3 && fields_out)
+                fields_out->reply_short = bytesToHex((const uint8_t*)raw.data(), 3);
         } else if (key == LXMF_FIELD_REPLY_QUOTE) {
             std::string q;
             if (!mpReadStrOrBin(s, q)) { if (!mpScanNext(s)) return false; continue; }
@@ -1392,6 +1520,79 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
             if (!mpScanNext(s)) return false;
             if (fields_out)
                 fields_out->ticket.assign((const char*)s.p + v0, s.i - v0);
+        } else if (key == LXMF_FIELD_GROUP) {
+            size_t v0 = s.i;
+            std::string from, orig, subjects, data, gname;
+            uint64_t ev = 0;
+            auto arrHdr = [&](size_t& cnt) -> bool {
+                if (s.i >= s.n) return false;
+                uint8_t b = s.p[s.i];
+                if (b >= 0x90 && b <= 0x9F) { ++s.i; cnt = b & 0x0F; return true; }
+                if (b == 0xDC) { ++s.i; uint64_t c; if (!mpReadBe(s, 2, c)) return false;
+                                 cnt = (size_t)c; return true; }
+                return false;
+            };
+            size_t top = 0;
+            bool ok = arrHdr(top) && (top == 2 || top == 4 || top == 5);
+            if (ok) ok = mpReadStrOrBin(s, from) && mpReadStrOrBin(s, orig);
+            if (ok && top >= 4) {
+                ok = mpReadUint(s, ev);
+                if (ok && ev >= LXMF_GROUP_EV_ADDED && ev <= LXMF_GROUP_EV_DELETED) {
+                    size_t cnt = 0;
+                    ok = arrHdr(cnt);
+                    for (size_t k = 0; ok && k < cnt; ++k) {
+                        std::string d;
+                        ok = mpReadStrOrBin(s, d) && d.size() == 16;
+                        if (ok) {
+                            if (!subjects.empty()) subjects += ',';
+                            subjects += bytesToHex((const uint8_t*)d.data(), 16);
+                        }
+                    }
+                } else if (ok && ev == LXMF_GROUP_EV_INFO) {
+                    std::string b;
+                    ok = mpReadStrOrBin(s, b) && b.size() % 4 == 0;
+                    for (size_t k = 0; ok && k < b.size(); k += 4) {
+                        char item[16];
+                        std::snprintf(item, sizeof item, "%s%02x%02x%02x:%u",
+                                      data.empty() ? "" : ",", (uint8_t)b[k], (uint8_t)b[k + 1],
+                                      (uint8_t)b[k + 2], (unsigned)(uint8_t)b[k + 3]);
+                        data += item;
+                    }
+                } else if (ok && (ev == LXMF_GROUP_EV_MEMBERS || ev == LXMF_GROUP_EV_MEMBER)) {
+                    size_t cnt = 0;
+                    ok = arrHdr(cnt);
+                    for (size_t k = 0; ok && k < cnt; ++k) {
+                        size_t two = 0;
+                        std::string d, nm;
+                        ok = arrHdr(two) && two == 2 && mpReadStrOrBin(s, d) &&
+                             d.size() == 16 && mpReadStrOrBin(s, nm);
+                        if (ok) {
+                            for (auto& c : nm) if (c == '\n' || c == '|') c = ' ';
+                            if (!data.empty()) data += '\n';
+                            data += bytesToHex((const uint8_t*)d.data(), 16) + "|" + nm;
+                        }
+                    }
+                } else if (ok) {
+                    ok = mpScanNext(s);           /* an event this build does not know */
+                }
+                if (ok && top == 5) {
+                    ok = mpReadStrOrBin(s, gname);
+                    for (auto& c : gname) if (c == '\n' || c == '|') c = ' ';
+                }
+            }
+            if (ok && from.size() == 16 && orig.size() == 3) {
+                if (fields_out) {
+                    fields_out->group_from     = bytesToHex((const uint8_t*)from.data(), 16);
+                    fields_out->orig_id        = bytesToHex((const uint8_t*)orig.data(), 3);
+                    fields_out->group_event    = (int)ev;
+                    fields_out->group_subjects = subjects;
+                    fields_out->group_data     = data;
+                    fields_out->group_name     = gname;
+                }
+            } else {
+                s.i = v0;
+                if (!mpScanNext(s)) return false;
+            }
         } else {
             /* Skip everything else but stay parseable. */
             if (!mpScanNext(s)) return false;
@@ -2086,13 +2287,32 @@ static bool sendFrame(lxmf_id_t& id, const uint8_t* frame, size_t n)
  * It is entirely rnsd's business: rnsd holds the destination, rotates its
  * ratchets and puts the current one on the air (s.rnsd.ratchets), so nothing
  * here has to ask for it or know it happened. */
+static bool idIsGroup(int n)
+{
+    return storageGetStr(idPath(n, "kind").c_str(), "") == "group";
+}
+
+/* A group takes mail from its members only, so it asks no stamp of them. */
+static int advertisedStampCost(int n)
+{
+    return idIsGroup(n) ? 0 : storageGetInt("s.lxmf.stamp_cost", 0);
+}
+
+/* A group whose name is its members' business announces none: its members learn
+ * it from the group (the members answer), nobody else needs it. */
+static bool groupNameHidden(int n)
+{
+    return idIsGroup(n) && storageGetInt(idPath(n, "hide_name").c_str(), 1) != 0;
+}
+
 static std::vector<uint8_t> buildAnnounceAppData(int id_n)
 {
-    std::string name = storageGetStr(idPath(id_n, "display_name").c_str(), "");
+    std::string name = groupNameHidden(id_n)
+                     ? "" : storageGetStr(idPath(id_n, "display_name").c_str(), "");
     /* Advertised stamp cost is a single global knob (0 = advertise none).
      * Whether we *require* it on inbound is the separate enforce_stamps
      * toggle. */
-    int cost = storageGetInt("s.lxmf.stamp_cost", 8);
+    int cost = advertisedStampCost(id_n);
 
     /* Plain LXMF: `[display_name, stamp_cost]` and nothing else. We used to
      * append a capability bitfield as element [2]; nothing ever read one back
@@ -2154,7 +2374,7 @@ static void sendAnnounce(lxmf_id_t& id)
      * so don't claim "sent" here. Pretty-print the app_data we built: name + cost
      * (the [d] shape from parseLxmfAnnounce), keeping the line self-contained. */
     std::string name = storageGetStr(idPath(id.index, "display_name").c_str(), "");
-    int cost = storageGetInt("s.lxmf.stamp_cost", 8);
+    int cost = advertisedStampCost(id.index);
     info("id %d: announcing name=\"%s\" cost=%d (%zu B app_data)",
          id.index, sanitizeForLog(name).c_str(), cost, app_data.size());
 }
@@ -2820,6 +3040,14 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
     LxmFields fields;
     fields.reply_to    = reply_to;
     fields.reply_quote = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_quote").c_str(), "");
+    fields.group_from  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_from").c_str(), "");
+    fields.orig_id     = storageGetStr(msgPath(id.index, peer_hex, mid, "orig_id").c_str(), "");
+    fields.group_event = storageGetInt(msgPath(id.index, peer_hex, mid, "group_event").c_str(), 0);
+    fields.group_subjects =
+        storageGetStr(msgPath(id.index, peer_hex, mid, "group_subjects").c_str(), "");
+    fields.group_data  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_data").c_str(), "");
+    fields.group_name  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_name").c_str(), "");
+    fields.reply_short = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_short").c_str(), "");
 
     /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
      * but only when generation is enabled and they actually advertise a
@@ -2869,7 +3097,9 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
      * never the store. The conversation directory is bumped once per message:
      * a re-pack after a reboot (the RAM outbox is empty, the record already has
      * a message_id) is the same message, not a second one. */
-    bool first = storageGetStr(msgPath(id.index, peer_hex, mid, "message_id").c_str(), "").empty();
+    /* A command to a group is not something said in the conversation. */
+    bool first = storageGetStr(msgPath(id.index, peer_hex, mid, "message_id").c_str(), "").empty() &&
+                 storageGetInt(msgPath(id.index, peer_hex, mid, "command").c_str(), 0) == 0;
     storageBegin();
     storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
     storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
@@ -2923,6 +3153,14 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 
     if (!idEnabled(id.index)) {
         warn("id %d: msg %s not sent (identity disabled)", id.index, mid.c_str());
+        msgFail(id.index, peer_hex, mid, LXMF_ST_DISABLED);
+        return;
+    }
+    /* A group we have left, been removed from, or that was deleted takes
+     * nothing more from us. */
+    if (storageGetInt(contactPath(id.index, peer_hex, "group_state").c_str(), 0) >=
+        LXMF_GROUP_ST_LEFT) {
+        warn("id %d: msg %s not sent (no longer in that group)", id.index, mid.c_str());
         msgFail(id.index, peer_hex, mid, LXMF_ST_DISABLED);
         return;
     }
@@ -3273,6 +3511,556 @@ static void dedupAdd(const std::string& mid_hex)
     s_dedup_head = (s_dedup_head + 1) % LXMF_DEDUP_RING;
 }
 
+/* ─────────────── groups ───────────────
+ *
+ *   member A → group   LXM
+ *   group → B, C, …    LXM "<A's name>: <text>", FIELD_GROUP [A, A's message_id]
+ *   member B → group   "/leave"
+ *   group → A, B, C    LXM "B left", FIELD_GROUP [group, random, LEFT, [B]]
+ *
+ * A group is an identity slot (`s.lxmf.id.<g>.kind = group`) whose contacts
+ * flagged `member` are its members. Whatever a member sends it is sent on, from
+ * the group's own identity, to every other member; every change of membership,
+ * and the group's deletion, is a notice from the group to all of them. See
+ * INTERNALS §8d. */
+
+static void processSend(lxmf_id_t& id, const std::string& peer_hex,
+                        const std::string& mid);                       /* fwd */
+static std::vector<std::string> collectTokens(const std::string& prefix);   /* fwd */
+
+static bool groupIsMember(int g, const std::string& peer)
+{
+    return storageGetInt(contactPath(g, peer, "member").c_str(), 0) == 1;
+}
+
+static std::vector<std::string> groupMembers(int g)
+{
+    std::vector<std::string> out;
+    for (auto& p : collectTokens("s.lxmf.id." + std::to_string(g) + ".contacts."))
+        if (p.size() == 32 && groupIsMember(g, p)) out.push_back(p);
+    return out;
+}
+
+static std::string groupMemberName(int g, const std::string& peer)
+{
+    std::string nm = storageGetStr(contactPath(g, peer, "display_name").c_str(), "");
+    if (nm.empty()) nm = bestHeardName(peer);
+    if (nm.empty()) nm = peer.substr(0, 8);
+    return nm;
+}
+
+/* The member list as it crosses to a proxy: one `dest|pubkey|name` line each. */
+static std::string groupMembersWire(int g)
+{
+    std::string out;
+    for (const auto& m : groupMembers(g)) {
+        if (!out.empty()) out += '\n';
+        out += m; out += '|';
+        out += storageGetStr(contactPath(g, m, "pubkey").c_str(), ""); out += '|';
+        out += storageGetStr(contactPath(g, m, "display_name").c_str(), "");
+    }
+    return out;
+}
+
+static std::string newOutKey(void)
+{
+    char key[40];
+    std::snprintf(key, sizeof key, "o_%lld_%04x", (long long)nowUnixMs(),
+                  (unsigned)(cheapRand() & 0xFFFF));
+    return key;
+}
+
+/* Group copies written but not yet sent. They are sent from the task loop
+ * (groupDrainSends), never from where they were written: that is often already
+ * deep in a send — a member's message delivered on this same device arrives in
+ * the middle of its sender's processReady — and a copy to another identity here
+ * is delivered inline in turn, which on the lxmf task's stack is an overflow. */
+struct GroupSend { int g; std::string peer, key; };
+static std::vector<GroupSend> s_groupSends;
+
+static void groupDrainSends(void)
+{
+    while (!s_groupSends.empty()) {
+        std::vector<GroupSend> batch;
+        batch.swap(s_groupSends);
+        for (const auto& s : batch)
+            if (s_ids[s.g].used) processSend(s_ids[s.g], s.peer, s.key);
+    }
+}
+
+/* One message from group g to `peer`, written and queued to send. */
+static void groupPost(lxmf_id_t& g, const std::string& peer, const std::string& title,
+                      const std::string& content, const LxmFields& f)
+{
+    std::string k = newOutKey();
+    storageBegin();
+    storageSet(msgPath(g.index, peer, k, "dir").c_str(),     "out");
+    storageSet(msgPath(g.index, peer, k, "peer").c_str(),    peer.c_str());
+    storageSet(msgPath(g.index, peer, k, "title").c_str(),   title.c_str());
+    storageSet(msgPath(g.index, peer, k, "content").c_str(), content.c_str());
+    if (!f.reply_to.empty() || !f.reply_short.empty()) {
+        if (!f.reply_to.empty())
+            storageSet(msgPath(g.index, peer, k, "reply_to").c_str(), f.reply_to.c_str());
+        else
+            storageSet(msgPath(g.index, peer, k, "reply_short").c_str(), f.reply_short.c_str());
+        if (!f.reply_quote.empty())
+            storageSet(msgPath(g.index, peer, k, "reply_quote").c_str(), f.reply_quote.c_str());
+    }
+    storageSet(msgPath(g.index, peer, k, "group_from").c_str(), f.group_from.c_str());
+    storageSet(msgPath(g.index, peer, k, "orig_id").c_str(),    f.orig_id.c_str());
+    if (f.group_event) {
+        storageSet(msgPath(g.index, peer, k, "group_event").c_str(), f.group_event);
+        storageSet(msgPath(g.index, peer, k, "group_subjects").c_str(), f.group_subjects.c_str());
+        storageSet(msgPath(g.index, peer, k, "group_data").c_str(), f.group_data.c_str());
+        storageSet(msgPath(g.index, peer, k, "group_name").c_str(), f.group_name.c_str());
+    }
+    storageSet(msgPath(g.index, peer, k, "status").c_str(), (int)LXMF_ST_DRAFT);
+    storageEnd();
+    s_groupSends.push_back({ g.index, peer, k });
+}
+
+/* A command from account n to its group `peer` ("/leave", "/info <id>",
+ * "/members", "/member <id>"): an ordinary message any client could type, kept
+ * out of sight here (`command`), and queued like a group copy since it is often
+ * written from deep in the inbound path. */
+static void groupSendCommand(int n, const std::string& peer, const std::string& text)
+{
+    std::string k = newOutKey();
+    storageBegin();
+    storageSet(msgPath(n, peer, k, "dir").c_str(),     "out");
+    storageSet(msgPath(n, peer, k, "peer").c_str(),    peer.c_str());
+    storageSet(msgPath(n, peer, k, "title").c_str(),   "");
+    storageSet(msgPath(n, peer, k, "content").c_str(), text.c_str());
+    storageSet(msgPath(n, peer, k, "command").c_str(), 1);
+    storageSet(msgPath(n, peer, k, "status").c_str(), (int)LXMF_ST_DRAFT);
+    storageEnd();
+    s_groupSends.push_back({ n, peer, k });
+    info("id %d: \"%s\" to group %s", n, text.c_str(), peer.c_str());
+}
+
+static std::string shortRandomId(void)
+{
+    uint8_t rnd[3];
+    esp_fill_random(rnd, sizeof rnd);
+    return bytesToHex(rnd, sizeof rnd);
+}
+
+static bool groupEnded(int g)
+{
+    return storageGetInt(idPath(g, "ended").c_str(), 0) != 0;
+}
+
+/* The owning account's slot: `group_owner` where the group was made, else — on a
+ * proxy — the member hosted beside the group. -1 when neither is here. */
+static int groupOwnerSlot(int g)
+{
+    int o = storageGetInt(idPath(g, "group_owner").c_str(), -1);
+    for (const auto& m : groupMembers(g)) {
+        uint8_t dh[16];
+        if (o < 0 && hexToDestHash(m, dh)) o = lxmfSlotForDest(dh);
+    }
+    return o;
+}
+
+static std::string groupOwnerName(int g)
+{
+    int o = groupOwnerSlot(g);
+    std::string nm = o >= 0 ? storageGetStr(idPath(o, "display_name").c_str(), "") : "";
+    return nm.empty() ? "The owner" : nm;
+}
+
+/* "a", "a and b", "a, b and c". */
+static std::string groupNameList(int g, const std::vector<std::string>& dests)
+{
+    std::string out;
+    for (size_t i = 0; i < dests.size(); ++i) {
+        if (i) out += i + 1 == dests.size() ? " and " : ", ";
+        out += groupMemberName(g, dests[i]);
+    }
+    return out;
+}
+
+/* A notice from the group itself, to every member and to `extra` — someone who
+ * has just stopped being one. FIELD_GROUP names the group as its sender and
+ * carries what happened and to whom, so members' devices can act on it; the
+ * text is what everyone else reads. */
+static void groupNotice(lxmf_id_t& g, int event, const std::vector<std::string>& subjects,
+                        const std::string& text, const std::vector<std::string>& extra = {})
+{
+    LxmFields f;
+    f.group_from  = bytesToHex(g.dest_hash, LXMF_DEST_HASH_LEN);
+    f.orig_id     = shortRandomId();
+    f.group_event = event;
+    for (const auto& s : subjects) {
+        if (!f.group_subjects.empty()) f.group_subjects += ',';
+        f.group_subjects += s;
+    }
+    std::vector<std::string> to = groupMembers(g.index);
+    for (const auto& e : extra)
+        if (std::find(to.begin(), to.end(), e) == to.end()) to.push_back(e);
+    for (const auto& m : to) groupPost(g, m, "", text, f);
+    info("id %d: group notice \"%s\" to %zu", g.index, text.c_str(), to.size());
+}
+
+/* A member's command to its group: "/leave", "/members", or "/info" or
+ * "/member" with a 3-byte id as 6 hex. Case and surrounding space are not
+ * significant. The three that answer with data also come with a trailing "_"
+ * ("/info_ 3a91f0"): the same answer with no text, for a device that reads
+ * FIELD_GROUP and has no use for the sentence. Returns the verb without the
+ * "_" ("" when the text is not a command), the id, and whether it was there. */
+static std::string groupCommandOf(const std::string& content, std::string& id6, bool& terse)
+{
+    id6.clear();
+    terse = false;
+    size_t a = content.find_first_not_of(" \t\r\n");
+    size_t b = content.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos || content[a] != '/') return "";
+    std::string t = content.substr(a, b - a + 1);
+    for (auto& c : t) c = (char)std::tolower((unsigned char)c);
+    if (t == "/leave" || t == "/members") return t;
+    if (t == "/members_") { terse = true; return "/members"; }
+    for (const char* v : { "/info ", "/member ", "/info_ ", "/member_ " }) {
+        size_t vl = std::strlen(v);
+        if (t.compare(0, vl, v) != 0) continue;
+        std::string h = t.substr(vl);
+        h.erase(0, h.find_first_not_of(' '));
+        uint8_t d[3];
+        if (h.size() != 6 || !hexToBytes(h.c_str(), 6, d, 3)) return "";
+        id6 = h;
+        std::string cmd(v, vl - 1);
+        if (cmd.back() == '_') { terse = true; cmd.pop_back(); }
+        return cmd;
+    }
+    return "";
+}
+
+/* Who group g sent the message with 3-byte id `id6` to, and how each copy is
+ * doing: "hex6:status,…", the first 3 bytes of each member's dest. */
+static std::string groupReceipts(int g, const std::string& id6)
+{
+    std::string out;
+    for (const auto& peer : collectTokens("s.lxmf.id." + std::to_string(g) + ".contacts.")) {
+        int st = -1;
+        for (const auto& key : collectTokens(msgPrefix(g, peer))) {
+            if (storageGetStr(msgPath(g, peer, key, "dir").c_str(), "") != "out") continue;
+            if (storageGetStr(msgPath(g, peer, key, "orig_id").c_str(), "") != id6) continue;
+            st = storageGetInt(msgPath(g, peer, key, "status").c_str(), 0);
+        }
+        if (st < 0) continue;
+        char item[16];
+        std::snprintf(item, sizeof item, "%s%s:%d", out.empty() ? "" : ",",
+                      peer.substr(0, 6).c_str(), st);
+        out += item;
+    }
+    return out;
+}
+
+/* The receipts in words, for a member on a client that only shows text. */
+static std::string groupReceiptsText(int g, const std::string& id6, const std::string& r)
+{
+    if (r.empty()) return "No record of " + id6 + ".";
+    std::vector<std::string> got, going, failed;
+    size_t at = 0;
+    while (at < r.size()) {
+        size_t c = r.find(',', at);
+        std::string item = r.substr(at, c == std::string::npos ? std::string::npos : c - at);
+        at = c == std::string::npos ? r.size() : c + 1;
+        std::string who;
+        for (const auto& m : collectTokens("s.lxmf.id." + std::to_string(g) + ".contacts."))
+            if (m.compare(0, 6, item, 0, 6) == 0) { who = groupMemberName(g, m); break; }
+        if (who.empty()) who = item.substr(0, 6);
+        int st = std::atoi(item.c_str() + 7);
+        if (st == LXMF_ST_DELIVERED)  got.push_back(who);
+        else if (statusInProgress(st)) going.push_back(who);
+        else                           failed.push_back(who);
+    }
+    auto list = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? ", " : "") + v[i];
+        return s;
+    };
+    std::string out = id6 + ":";
+    if (!got.empty())    out += " delivered to " + list(got) + ".";
+    if (!going.empty())  out += " On its way to " + list(going) + ".";
+    if (!failed.empty()) out += " Not delivered to " + list(failed) + ".";
+    return out;
+}
+
+/* "hex32|name" lines for group g's members — all of them, or the one whose
+ * dest starts with `id6`. */
+static std::string groupMemberLines(int g, const std::string& id6 = "")
+{
+    std::string out;
+    for (const auto& m : groupMembers(g)) {
+        if (!id6.empty() && m.compare(0, 6, id6) != 0) continue;
+        std::string nm = groupMemberName(g, m);
+        for (auto& c : nm) if (c == '\n' || c == '|') c = ' ';
+        if (!out.empty()) out += '\n';
+        out += m + "|" + nm;
+    }
+    return out;
+}
+
+/* An answer from group g to one member's command: the text for anybody, and
+ * FIELD_GROUP's event and data for a device that acts on it. */
+static void groupAnswer(lxmf_id_t& g, const std::string& to, int event,
+                        const std::string& orig, const std::string& data,
+                        const std::string& text)
+{
+    LxmFields f;
+    f.group_from  = bytesToHex(g.dest_hash, LXMF_DEST_HASH_LEN);
+    f.orig_id     = orig.empty() ? shortRandomId() : orig;
+    f.group_event = event;
+    f.group_data  = data;
+    if (event == LXMF_GROUP_EV_MEMBERS || event == LXMF_GROUP_EV_MEMBER)
+        f.group_name = storageGetStr(idPath(g.index, "display_name").c_str(), "");
+    groupPost(g, to, "", text, f);
+}
+
+/* A verified, de-duplicated message to group g from `from`: send it on to every
+ * other member — or, when it is a command, carry it out. The record kept here
+ * is the dedup marker and carries no body. */
+static void groupFanOut(lxmf_id_t& g, const std::string& from, const std::string& mid_hex,
+                        uint64_t ts_ms, const std::string& title,
+                        const std::string& content, const LxmFields& in)
+{
+    if (groupEnded(g.index)) {
+        info("id %d: group is deleted — drops a message from %s", g.index, from.c_str());
+        return;
+    }
+    if (!in.group_from.empty()) {
+        info("id %d: group drops a message that is itself a group message (from %s)",
+             g.index, from.c_str());
+        return;
+    }
+    if (!groupIsMember(g.index, from)) {
+        info("id %d: group drops a message from non-member %s", g.index, from.c_str());
+        return;
+    }
+    storageBegin();
+    storageSet(msgPath(g.index, from, mid_hex, "status").c_str(), (int)LXMF_ST_RECEIVED);
+    storageSet(msgPath(g.index, from, mid_hex, "dir").c_str(), "in");
+    storageSet(msgPath(g.index, from, mid_hex, "peer").c_str(), from.c_str());
+    storageSet(msgPath(g.index, from, mid_hex, "ts").c_str(), (int)(ts_ms / 1000));
+    storageSet(msgPath(g.index, from, mid_hex, "message_id").c_str(), mid_hex.c_str());
+    storageEnd();
+
+    std::string id6;
+    bool terse = false;
+    std::string cmd = groupCommandOf(content, id6, terse);
+    if (cmd == "/leave") {
+        int o = groupOwnerSlot(g.index);
+        if (o >= 0 && from == bytesToHex(s_ids[o].dest_hash, LXMF_DEST_HASH_LEN)) {
+            info("id %d: the owner cannot leave its group — /leave ignored", g.index);
+            return;
+        }
+        /* Said while they are still a member, so the leaver is among those it
+         * goes to; they stop being one only after. */
+        groupNotice(g, LXMF_GROUP_EV_LEFT, { from }, groupMemberName(g.index, from) + " left");
+        setIntIfChanged(contactPath(g.index, from, "member"), 0);
+        return;
+    }
+    if (cmd == "/info") {
+        std::string r = groupReceipts(g.index, id6);
+        groupAnswer(g, from, LXMF_GROUP_EV_INFO, id6, r,
+                    terse ? "" : groupReceiptsText(g.index, id6, r));
+        return;
+    }
+    if (cmd == "/members" || cmd == "/member") {
+        std::string lines = groupMemberLines(g.index, id6);
+        std::string text;
+        if (!terse) {
+            std::vector<std::string> names;
+            for (const auto& m : groupMembers(g.index))
+                if (id6.empty() || m.compare(0, 6, id6) == 0) names.push_back(m);
+            text = names.empty() ? "No member " + id6 + "."
+                                 : "Members: " + groupNameList(g.index, names);
+        }
+        groupAnswer(g, from, cmd == "/members" ? LXMF_GROUP_EV_MEMBERS : LXMF_GROUP_EV_MEMBER,
+                    "", lines, text);
+        return;
+    }
+
+    LxmFields out;
+    out.reply_to    = in.reply_to;
+    out.reply_short = in.reply_short;
+    out.reply_quote = in.reply_quote;
+    out.group_from  = from;
+    out.orig_id     = mid_hex.substr(0, 6);
+    std::string body = groupMemberName(g.index, from) + ": " + content;
+    int sent = 0;
+    for (const auto& m : groupMembers(g.index)) {
+        if (m == from) continue;
+        groupPost(g, m, title, body, out);
+        sent++;
+    }
+    g.received++;
+    info("id %d: group message %s from %s sent on to %d member(s)",
+         g.index, mid_hex.c_str(), from.c_str(), sent);
+}
+
+/* ── a member's side of its groups ── */
+
+/* The group slot behind `peer` when account n owns it and it lives here, else
+ * -1. Such an account knows its group's members and receipts first-hand. */
+static int groupHeldHere(int n, const std::string& peer)
+{
+    for (int g = 0; g < LXMF_MAX_IDENTITIES; ++g)
+        if (s_ids[g].used && idIsGroup(g) &&
+            storageGetInt(idPath(g, "group_owner").c_str(), -1) == n &&
+            bytesToHex(s_ids[g].dest_hash, LXMF_DEST_HASH_LEN) == peer)
+            return g;
+    return -1;
+}
+
+static bool idIsServerHosted(int n)
+{
+    return storageGetStr(idPath(n, "proxy_role").c_str(), "") == "server";
+}
+
+/* Merge "hex32|name" lines into a members list, by dest; drop the dests in
+ * `gone` (comma-separated hex32). */
+static std::string groupListMerge(const std::string& cur, const std::string& add,
+                                  const std::string& gone = "")
+{
+    std::vector<std::pair<std::string, std::string>> rows;
+    auto feed = [&](const std::string& s) {
+        size_t at = 0;
+        while (at < s.size()) {
+            size_t nl = s.find('\n', at);
+            std::string line = s.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+            at = nl == std::string::npos ? s.size() : nl + 1;
+            if (line.size() < 33 || line[32] != '|') continue;
+            std::string d = line.substr(0, 32);
+            bool found = false;
+            for (auto& r : rows) if (r.first == d) { r.second = line.substr(33); found = true; }
+            if (!found) rows.emplace_back(d, line.substr(33));
+        }
+    };
+    feed(cur);
+    feed(add);
+    std::string out;
+    for (const auto& r : rows) {
+        if (gone.find(r.first) != std::string::npos) continue;
+        if (!out.empty()) out += '\n';
+        out += r.first + "|" + r.second;
+    }
+    return out;
+}
+
+/* The receipts for message `id6` in account n's conversation with group
+ * `peer` — the writer's own copy (whose message_id starts with it) or a
+ * member's (whose orig_id is it). `group_receipts_ts` moves on every answer, so
+ * a page waiting on one sees it land even when nothing in it changed. */
+static void groupTakeReceipts(int n, const std::string& peer, const std::string& id6,
+                              const std::string& receipts)
+{
+    static uint32_t s_seq = 0;
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    s_seq = now_s > s_seq ? now_s : s_seq + 1;
+    for (const auto& key : collectTokens(msgPrefix(n, peer))) {
+        std::string orig = storageGetStr(msgPath(n, peer, key, "orig_id").c_str(), "");
+        std::string mid  = storageGetStr(msgPath(n, peer, key, "message_id").c_str(), "");
+        if (orig != id6 && mid.compare(0, 6, id6) != 0) continue;
+        storageBegin();
+        storageSet(msgPath(n, peer, key, "group_receipts").c_str(), receipts.c_str());
+        storageSet(msgPath(n, peer, key, "group_receipts_ts").c_str(), (int)s_seq);
+        storageEnd();
+    }
+}
+
+/* `lxmf.id.<n>.cmd.group_info = <group>/<key>`: who has that message. Asked of
+ * the group, unless this account holds it here and can read it off. */
+static void groupAskInfo(int n, const std::string& peer, const std::string& key)
+{
+    std::string id6 = storageGetStr(msgPath(n, peer, key, "orig_id").c_str(), "");
+    if (id6.size() != 6)
+        id6 = storageGetStr(msgPath(n, peer, key, "message_id").c_str(), "").substr(0, 6);
+    if (id6.size() != 6) { warn("id %d: group_info: %s has no id yet", n, key.c_str()); return; }
+    int g = groupHeldHere(n, peer);
+    if (g >= 0 && !proxyIsClient(g)) groupTakeReceipts(n, peer, id6, groupReceipts(g, id6));
+    else                             groupSendCommand(n, peer, "/info_ " + id6);
+}
+
+/* `lxmf.id.<n>.cmd.group_members = <group>`, and what a member does by itself
+ * when it finds itself in a group whose members it does not know. */
+static void groupAskMembers(int n, const std::string& peer)
+{
+    int g = groupHeldHere(n, peer);
+    if (g >= 0) setStrIfChanged(contactPath(n, peer, "members"), groupMemberLines(g).c_str());
+    else        groupSendCommand(n, peer, "/members_");
+}
+
+/* Something group `peer` itself sent account n (its FIELD_GROUP names the
+ * group as writer), or any message from it. Keeps where n stands in the group
+ * and what n knows of its members. Returns true for an answer to one of n's
+ * commands, which is taken here and not stored as a message — except on a
+ * proxy hosting n, where it is stored for n's own device to take. */
+static bool groupHear(int n, const std::string& peer, const LxmFields& f)
+{
+    if (idIsServerHosted(n)) return false;
+    bool held = groupHeldHere(n, peer) >= 0;
+    std::string members = storageGetStr(contactPath(n, peer, "members").c_str(), "");
+
+    if (f.group_from == peer) {
+        std::string me = bytesToHex(s_ids[n].dest_hash, LXMF_DEST_HASH_LEN);
+        bool about_me = f.group_subjects.find(me) != std::string::npos;
+        int st = -1;
+        switch (f.group_event) {
+        case LXMF_GROUP_EV_INFO:
+            groupTakeReceipts(n, peer, f.orig_id, f.group_data);
+            return true;
+        case LXMF_GROUP_EV_MEMBERS:
+        case LXMF_GROUP_EV_MEMBER:
+            setStrIfChanged(contactPath(n, peer, "members"),
+                            f.group_event == LXMF_GROUP_EV_MEMBERS
+                                ? f.group_data.c_str()
+                                : groupListMerge(members, f.group_data).c_str());
+            /* The group's name: the only way to learn it when the group keeps
+             * it out of its announce. */
+            if (!f.group_name.empty())
+                setStrIfChanged(contactPath(n, peer, "display_name"), f.group_name.c_str());
+            return true;
+        case LXMF_GROUP_EV_ADDED:
+            if (about_me) {
+                st = LXMF_GROUP_ST_MEMBER;
+                if (!held) groupSendCommand(n, peer, "/members_");
+            } else if (!held) {
+                for (size_t at = 0; at + 32 <= f.group_subjects.size(); at += 33)
+                    groupSendCommand(n, peer, "/member_ " + f.group_subjects.substr(at, 6));
+            }
+            break;
+        case LXMF_GROUP_EV_REMOVED:
+        case LXMF_GROUP_EV_LEFT:
+            if (about_me) st = f.group_event == LXMF_GROUP_EV_LEFT ? LXMF_GROUP_ST_LEFT
+                                                                   : LXMF_GROUP_ST_REMOVED;
+            if (!held)
+                setStrIfChanged(contactPath(n, peer, "members"),
+                                groupListMerge(members, "", f.group_subjects).c_str());
+            break;
+        case LXMF_GROUP_EV_DELETED:
+            st = LXMF_GROUP_ST_DELETED;
+            break;
+        default:
+            break;
+        }
+        if (st >= 0) setIntIfChanged(contactPath(n, peer, "group_state"), st);
+        if (f.group_event == LXMF_GROUP_EV_ADDED && about_me) return false;
+    }
+
+    /* A group whose members this account has never been told — one it was in
+     * before members were asked for, or whose answer went missing. Asked once
+     * a boot. */
+    static std::set<std::string> s_asked;
+    std::string tag = std::to_string(n) + "/" + peer;
+    if (members.empty() && !s_asked.count(tag) &&
+        storageGetInt(contactPath(n, peer, "group_state").c_str(), 0) < LXMF_GROUP_ST_LEFT) {
+        s_asked.insert(tag);
+        groupAskMembers(n, peer);
+    }
+    return false;
+}
+
 static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_link)
 {
     if (!idEnabled(id.index)) {
@@ -3406,7 +4194,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
      * just log whether a stamp rode along. Either path runs only here,
      * for novel messages, after dedup. */
     if (storageGetInt("s.lxmf.enforce_stamps", 0) != 0) {
-        int required = storageGetInt("s.lxmf.stamp_cost", 8);
+        int required = advertisedStampCost(id.index);
         if (required > 0) {
             if (lxmfStampValid(mid_hash, required,
                                stamp_bytes.data(), stamp_bytes.size(),
@@ -3437,10 +4225,41 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
              sh_hex.c_str(), mid_hex.c_str());
     }
 
+    if (idIsGroup(id.index)) {
+        groupFanOut(id, sh_hex, mid_hex, ts, title, content, fields);
+        stampYield();
+        return;
+    }
+    if (!fields.group_from.empty() && groupHear(id.index, sh_hex, fields)) {
+        info("id %d: group %s answered (event %d)", id.index, sh_hex.c_str(),
+             fields.group_event);
+        stampYield();
+        return;
+    }
+
     /* Persist. */
     ensureConvFile(id.index, sh_hex);
     storageBegin();
     storageSet(stage_key.c_str(), (int)LXMF_ST_RECEIVED);
+    if (!fields.group_from.empty()) {
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "group_from").c_str(),
+                   fields.group_from.c_str());
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "orig_id").c_str(),
+                   fields.orig_id.c_str());
+        if (fields.group_event) {
+            storageSet(msgPath(id.index, sh_hex, mid_hex, "group_event").c_str(),
+                       fields.group_event);
+            storageSet(msgPath(id.index, sh_hex, mid_hex, "group_subjects").c_str(),
+                       fields.group_subjects.c_str());
+            storageSet(msgPath(id.index, sh_hex, mid_hex, "group_data").c_str(),
+                       fields.group_data.c_str());
+            storageSet(msgPath(id.index, sh_hex, mid_hex, "group_name").c_str(),
+                       fields.group_name.c_str());
+        }
+    }
+    if (!fields.reply_short.empty())
+        storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_short").c_str(),
+                   fields.reply_short.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "dir").c_str(),        "in");
     storageSet(msgPath(id.index, sh_hex, mid_hex, "peer").c_str(),       sh_hex.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "title").c_str(),      title.c_str());
@@ -3451,7 +4270,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
     storageSet(msgPath(id.index, sh_hex, mid_hex, "body_size").c_str(), (int)content.size());
     if (!fields.reply_to.empty())
         storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_to").c_str(), fields.reply_to.c_str());
-    if (!fields.reply_to.empty() && !fields.reply_quote.empty())
+    if ((!fields.reply_to.empty() || !fields.reply_short.empty()) && !fields.reply_quote.empty())
         storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_quote").c_str(),
                    fields.reply_quote.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "ts").c_str(),         (int)(ts / 1000));
@@ -3470,6 +4289,8 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
         if (!peer_name.empty())
             storageSet(contactPath(id.index, sh_hex, "display_name").c_str(), peer_name.c_str());
     }
+    if (!fields.group_from.empty())
+        setIntIfChanged(contactPath(id.index, sh_hex, "group"), 1);
     /* Floor to the whole minute and write only when it advances: contacts then
      * all age in lockstep, and a burst of messages within a minute doesn't
      * re-trigger the on-device UI rebuild. */
@@ -4477,6 +5298,9 @@ struct proxy_t {
                                        * costs the airtime of the thing being
                                        * refused is the one error worth
                                        * knowing before sending. */
+    /* Groups only. A group follows its owner account onto and off the owner's
+     * proxy; this paces the next attempt. */
+    uint32_t    follow_after_s = 0;
 };
 static proxy_t s_proxy[LXMF_MAX_IDENTITIES];
 static uint16_t s_proxyTagSeq = 0;
@@ -4779,10 +5603,19 @@ static std::string proxyPnList(void)
     return out;
 }
 
+/* A group's settings are its name, its switch and its members; the device-wide
+ * stamp and propagation-node knobs are its owner account's to push. */
 static std::string proxyConfigSig(int n)
 {
     std::string s = storageGetStr(idPath(n, "display_name").c_str(), "");
-    s += '\x1f'; s += std::to_string(storageGetInt("s.lxmf.stamp_cost", 8));
+    if (idIsGroup(n)) {
+        s += '\x1f'; s += std::to_string(storageGetInt(idPath(n, "enabled").c_str(), 1));
+        s += '\x1f'; s += groupMembersWire(n);
+        s += '\x1f'; s += groupEnded(n) ? '1' : '0';
+        s += '\x1f'; s += groupNameHidden(n) ? '1' : '0';
+        return s;
+    }
+    s += '\x1f'; s += std::to_string(storageGetInt("s.lxmf.stamp_cost", 0));
     s += '\x1f'; s += std::to_string(storageGetInt("s.lxmf.enforce_stamps", 0));
     s += '\x1f'; s += std::to_string(storageGetInt(idPath(n, "enabled").c_str(), 1));
     s += '\x1f'; s += proxyPnList();
@@ -4793,10 +5626,16 @@ static void proxyPushConfig(int n)
 {
     std::vector<std::pair<std::string, std::string>> m;
     m.emplace_back("display_name",   storageGetStr(idPath(n, "display_name").c_str(), ""));
-    m.emplace_back("stamp_cost",     std::to_string(storageGetInt("s.lxmf.stamp_cost", 8)));
-    m.emplace_back("enforce_stamps", std::to_string(storageGetInt("s.lxmf.enforce_stamps", 0)));
     m.emplace_back("enabled",        std::to_string(storageGetInt(idPath(n, "enabled").c_str(), 1)));
-    m.emplace_back("pn",             proxyPnList());
+    if (idIsGroup(n)) {
+        m.emplace_back("members", groupMembersWire(n));
+        m.emplace_back("ended",   groupEnded(n) ? "1" : "0");
+        m.emplace_back("hide_name", groupNameHidden(n) ? "1" : "0");
+    } else {
+        m.emplace_back("stamp_cost",     std::to_string(storageGetInt("s.lxmf.stamp_cost", 0)));
+        m.emplace_back("enforce_stamps", std::to_string(storageGetInt("s.lxmf.enforce_stamps", 0)));
+        m.emplace_back("pn",             proxyPnList());
+    }
     if (proxySendFrame(n, lxmproxyBuildConfig(m)))
         s_proxy[n].cfg_sig = proxyConfigSig(n);
 }
@@ -4821,6 +5660,19 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
         storageGetInt(msgPath(id.index, peer_hex, mid_hex, "body_absent").c_str(), 0) != 0;
     if (exists && !absent) return true;    /* already whole — re-ack and move on */
 
+    /* From a group: where this account stands in it, and an answer to one of its
+     * commands is taken here and not kept as a message. */
+    if (!exists && fr.have_group) {
+        LxmFields gf;
+        gf.group_from     = bytesToHex(fr.group_from, 16);
+        gf.orig_id        = bytesToHex(fr.orig_id, LXMPROXY_SHORT_ID_LEN);
+        gf.group_event    = (int)fr.group_event;
+        gf.group_subjects = fr.group_subjects;
+        gf.group_data     = fr.group_data;
+        gf.group_name     = fr.group_name;
+        if (groupHear(id.index, peer_hex, gf)) return true;
+    }
+
     bool withheld = !fr.have_body;
     storageBegin();
     if (!exists) {
@@ -4834,12 +5686,28 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
         /* What this message replies to travels with the offer and not only with
          * the body, so a reply whose body fits inline — never fetched, so no
          * BODY frame ever follows — still lands here as a reply. */
-        if (fr.have_reply_to) {
-            storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_to").c_str(),
-                       bytesToHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+        if (fr.have_reply_to || fr.have_reply_short) {
+            if (fr.have_reply_to)
+                storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_to").c_str(),
+                           bytesToHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+            else
+                storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_short").c_str(),
+                           bytesToHex(fr.reply_short, LXMPROXY_SHORT_ID_LEN).c_str());
             if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
                 storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_quote").c_str(),
                            fr.reply_quote.c_str());
+        }
+        if (fr.have_group) {
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "group_from").c_str(),
+                       bytesToHex(fr.group_from, 16).c_str());
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "orig_id").c_str(),
+                       bytesToHex(fr.orig_id, LXMPROXY_SHORT_ID_LEN).c_str());
+            if (fr.group_event) {
+                storageSet(msgPath(id.index, peer_hex, mid_hex, "group_event").c_str(),
+                           (int)fr.group_event);
+                storageSet(msgPath(id.index, peer_hex, mid_hex, "group_subjects").c_str(),
+                           fr.group_subjects.c_str());
+            }
         }
     }
     storageSet(msgPath(id.index, peer_hex, mid_hex, "body_size").c_str(), (int)fr.size);
@@ -4857,6 +5725,8 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
         }
         if (!nm.empty())
             storageSet(contactPath(id.index, peer_hex, "display_name").c_str(), nm.c_str());
+        if (fr.have_group)
+            setIntIfChanged(contactPath(id.index, peer_hex, "group"), 1);
         setIntIfChanged(contactPath(id.index, peer_hex, "last_seen"),
                         (int)(nowUnixMs() / 60000) * 60);
         /* A withheld body has no preview to show, so the title stands in — the
@@ -4901,7 +5771,12 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
     std::string method   = storageGetStr(msgPath(id.index, peer_hex, mid, "method").c_str(), "");
     std::string pn       = storageGetStr(contactPath(id.index, peer_hex, "pn").c_str(), "");
 
-    uint8_t rt[32]; bool have_rt = hexToBytes(reply_to.c_str(), reply_to.size(), rt, 32);
+    uint8_t rt[32]; size_t rt_len = 0;
+    if (hexToBytes(reply_to.c_str(), reply_to.size(), rt, 32)) rt_len = 32;
+    else {
+        std::string rs = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_short").c_str(), "");
+        if (hexToBytes(rs.c_str(), rs.size(), rt, 3)) rt_len = 3;
+    }
     uint8_t pnh[16]; bool have_pn = hexToBytes(pn.c_str(), pn.size(), pnh, 16);
     /* An all-zero `pn` is "none set", not a node. */
     if (have_pn) {
@@ -4929,7 +5804,8 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
      * last. `recv_ts` is the once-marker: bumpConvDirectory returns it and
      * nothing else writes it, so a resend after a reconnect finds it set and
      * does not count the same message twice. */
-    if (storageGetInt(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), 0) == 0) {
+    if (storageGetInt(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), 0) == 0 &&
+        storageGetInt(msgPath(id.index, peer_hex, mid, "command").c_str(), 0) == 0) {
         int recv = bumpConvDirectory(id.index, peer_hex, ts, content,
                                      /*inbound=*/false);
         storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
@@ -4948,7 +5824,7 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
     }
 
     std::vector<uint8_t> f = lxmproxyBuildSend(mid, dh, (uint32_t)ts, title, content,
-                                               have_rt ? rt : nullptr, reply_quote,
+                                               rt, rt_len, reply_quote,
                                                method.c_str(),
                                                have_pn ? pnh : nullptr);
     uint32_t opaque = 0;
@@ -5045,7 +5921,8 @@ static void proxyHandleFrame(int n, const LxmproxyFrame& fr)
             std::string dn = storageGetStr(idPath(n, "display_name").c_str(), "");
             info("id %d: proxy handover → %s (%zuB ratchet record)", n,
                  p.label.c_str(), ratchets.size());
-            proxySendFrame(n, lxmproxyBuildHandover(priv, dn.c_str(), ratchets));
+            proxySendFrame(n, lxmproxyBuildHandover(priv, dn.c_str(), ratchets,
+                                                    idIsGroup(n) ? groupMembersWire(n) : ""));
         } else {
             /* Not serving us and we are not asking it to — the operator has not
              * approved the account yet. Say so and keep the Channel. */
@@ -5114,9 +5991,13 @@ static void proxyHandleFrame(int n, const LxmproxyFrame& fr)
         storageSet(msgPath(n, peer_hex, mid_hex, "body_absent").c_str(), 0);
         storageSet(msgPath(n, peer_hex, mid_hex, "body_size").c_str(),
                    (int)fr.content.size());
-        if (fr.have_reply_to) {
-            storageSet(msgPath(n, peer_hex, mid_hex, "reply_to").c_str(),
-                       bytesToHex(fr.reply_to, 32).c_str());
+        if (fr.have_reply_to || fr.have_reply_short) {
+            if (fr.have_reply_to)
+                storageSet(msgPath(n, peer_hex, mid_hex, "reply_to").c_str(),
+                           bytesToHex(fr.reply_to, 32).c_str());
+            else
+                storageSet(msgPath(n, peer_hex, mid_hex, "reply_short").c_str(),
+                           bytesToHex(fr.reply_short, LXMPROXY_SHORT_ID_LEN).c_str());
             if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
                 storageSet(msgPath(n, peer_hex, mid_hex, "reply_quote").c_str(),
                            fr.reply_quote.c_str());
@@ -5294,6 +6175,11 @@ static void proxyForceOff(lxmf_id_t& id)
     proxyCloseChannel(id.index);
     proxyArmReopen(id.index);
     proxyPublish(id.index);
+    /* Its groups sit on the same dead server. */
+    for (int g = 0; g < LXMF_MAX_IDENTITIES; ++g)
+        if (g != id.index && s_ids[g].used && idIsGroup(g) && proxyIsClient(g) &&
+            storageGetInt(idPath(g, "group_owner").c_str(), -1) == id.index)
+            proxyForceOff(s_ids[g]);
 }
 
 /* ── heard servers (the picker) ── */
@@ -5397,6 +6283,39 @@ static bool proxyResourceAux(const rnsd_link_resource_done_t& d)
     return false;
 }
 
+/* ── groups follow their owner ──
+ *
+ *   owner proxied, group not:  owner Channel  ADOPT [group identity, label]
+ *                              group          proxy_on <owner's server>
+ *   owner not proxied, group is: group        proxy_off
+ */
+#define LXMF_GROUP_FOLLOW_RETRY_S 300
+
+static void groupFollowOwner(int g, uint32_t now_s)
+{
+    proxy_t& p = s_proxy[g];
+    int o = storageGetInt(idPath(g, "group_owner").c_str(), -1);
+    if (o < 0 || o >= LXMF_MAX_IDENTITIES || o == g || !s_ids[o].used || groupEnded(g)) return;
+    if (p.phase != PROXY_PH_IDLE || s_proxy[o].phase != PROXY_PH_IDLE) return;
+    if (now_s < p.follow_after_s) return;
+    bool owner_proxied = proxyIsClient(o);
+    proxy_role_t role  = proxyRole(g);
+    if (owner_proxied && role == PROXY_ROLE_OFF) {
+        if (!proxyReady(o)) return;
+        uint8_t ident[RNSD_IDENT_HASH_LEN];
+        if (!rnsdIdentityHash(s_ids[g].identity_key.c_str(), ident)) return;
+        std::string label = storageGetStr(idPath(g, "display_name").c_str(), "") + " (group)";
+        if (!proxySendFrame(o, lxmproxyBuildAdopt(ident, label.c_str()))) return;
+        p.follow_after_s = now_s + LXMF_GROUP_FOLLOW_RETRY_S;
+        info("id %d: group follows id %d onto its proxy", g, o);
+        proxyOn(s_ids[g], storageGetStr(idPath(o, "proxy_dest").c_str(), ""));
+    } else if (!owner_proxied && role == PROXY_ROLE_CLIENT) {
+        p.follow_after_s = now_s + LXMF_GROUP_FOLLOW_RETRY_S;
+        info("id %d: group follows id %d off its proxy", g, o);
+        proxyOff(s_ids[g]);
+    }
+}
+
 /* ── 1 Hz housekeeping ── */
 
 static void proxyClientTick(void)
@@ -5409,6 +6328,7 @@ static void proxyClientTick(void)
         proxy_t&   p  = s_proxy[n];
         if (!id.used) continue;
         proxyPublish(n);   /* the pane's rows follow the role and the Channel */
+        if (idIsGroup(n)) groupFollowOwner(n, now_s);
 
         /* A deferred re-registration whose deregistration has had time to land
          * on rnsd's own task. connectOurDest re-issues the inbound-Link listen. */
@@ -5828,12 +6748,11 @@ static void onSetProxy(int n, const char* key, const char* val)
     storageSet((std::string(want) + ".done").c_str(), ++ack);
 }
 
-static void onSetProxy0(const char* k, const char* v) { onSetProxy(0, k, v); }
-static void onSetProxy1(const char* k, const char* v) { onSetProxy(1, k, v); }
-static void onSetProxy2(const char* k, const char* v) { onSetProxy(2, k, v); }
-static void onSetProxy3(const char* k, const char* v) { onSetProxy(3, k, v); }
+template <int N>
+static void onSetProxyN(const char* k, const char* v) { onSetProxy(N, k, v); }
 static storage_change_cb_t s_setproxy_stubs[LXMF_MAX_IDENTITIES] = {
-    onSetProxy0, onSetProxy1, onSetProxy2, onSetProxy3,
+    onSetProxyN<0>, onSetProxyN<1>, onSetProxyN<2>, onSetProxyN<3>, onSetProxyN<4>,
+    onSetProxyN<5>, onSetProxyN<6>, onSetProxyN<7>, onSetProxyN<8>, onSetProxyN<9>,
 };
 
 /* The configured node list, in index order, malformed/empty slots skipped. */
@@ -7086,6 +8005,326 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
     }
 }
 
+/* cmd.prune — delete a conversation's messages but keep the contact: every
+ * message when `age` is "0" or empty, else those whose `ts` is more than `age`
+ * seconds before now. Drafts are not messages yet and stay. Each one goes
+ * through processDelete, so the proxy DROP, the outbox cancel and the directory
+ * counters are the single-message delete's own. A conversation left empty has
+ * its preview cleared too — the preview names the last message, which is gone —
+ * and is marked `kept`, which is what keeps it a contact at count 0. */
+static void processPrune(lxmf_id_t& id, const std::string& peer_hex,
+                         const std::string& age)
+{
+    long age_s = age.empty() ? 0 : std::atol(age.c_str());
+    if (age_s < 0) {
+        warn("id %d: cmd.prune bad age \"%s\"", id.index, age.c_str());
+        return;
+    }
+    /* An age is measured against the wall clock; a device that has never had
+     * the time counts from 1970 and would call every message new. */
+    if (age_s > 0 && storageGetInt("sys.time.valid", 0) == 0) {
+        warn("id %d: cmd.prune by age with no valid wall clock", id.index);
+        return;
+    }
+    const long cutoff = (long)(wallUnixMs() / 1000) - age_s;
+
+    /* Collected before acting: processDelete mutates the tree being walked. */
+    std::vector<std::string> doomed;
+    int kept = 0;
+    for (const auto& key : collectTokens(msgPrefix(id.index, peer_hex))) {
+        const int st = storageGetInt(msgPath(id.index, peer_hex, key, "status").c_str(), 0);
+        const long ts = storageGetInt(msgPath(id.index, peer_hex, key, "ts").c_str(), 0);
+        if (st == LXMF_ST_DRAFT || (age_s > 0 && ts >= cutoff)) { kept++; continue; }
+        doomed.push_back(key);
+    }
+    for (const auto& key : doomed) processDelete(id, peer_hex, key);
+
+    if (kept == 0) {
+        storageBegin();
+        storageSet(contactPath(id.index, peer_hex, "count").c_str(), 0);
+        storageSet(contactPath(id.index, peer_hex, "unread").c_str(), 0);
+        storageSet(contactPath(id.index, peer_hex, "preview").c_str(), "");
+        storageSet(contactPath(id.index, peer_hex, "preview_mine").c_str(), 0);
+        storageSet(contactPath(id.index, peer_hex, "kept").c_str(), 1);
+        storageEnd();
+    }
+    info("id %d: pruned %zu msg(s) from %s (age %lds), %d left", id.index,
+         doomed.size(), peer_hex.c_str(), age_s, kept);
+}
+
+/* ── group membership ── */
+
+struct GroupMember { std::string dest, pubkey, name; };
+
+static std::vector<GroupMember> groupParseMembers(const std::string& wire)
+{
+    std::vector<GroupMember> out;
+    size_t at = 0;
+    while (at < wire.size()) {
+        size_t nl = wire.find('\n', at);
+        std::string line = wire.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        at = nl == std::string::npos ? wire.size() : nl + 1;
+        size_t b1 = line.find('|');
+        size_t b2 = b1 == std::string::npos ? std::string::npos : line.find('|', b1 + 1);
+        GroupMember m;
+        m.dest = line.substr(0, b1);
+        if (b2 != std::string::npos) {
+            m.pubkey = line.substr(b1 + 1, b2 - b1 - 1);
+            m.name   = line.substr(b2 + 1);
+        }
+        uint8_t dh[16];
+        if (hexToDestHash(m.dest, dh)) out.push_back(std::move(m));
+    }
+    return out;
+}
+
+/* What account slot `n` knows of `peer`, as a member record. */
+static GroupMember groupMemberFrom(int n, const std::string& peer)
+{
+    GroupMember m;
+    m.dest = peer;
+    m.name = storageGetStr(contactPath(n, peer, "display_name").c_str(), "");
+    if (m.name.empty()) m.name = bestHeardName(peer);
+    m.pubkey = storageGetStr(contactPath(n, peer, "pubkey").c_str(), "");
+    uint8_t dh[16], pk[RNSD_PUBKEY_LEN];
+    if (m.pubkey.size() != RNSD_PUBKEY_LEN * 2 && hexToDestHash(peer, dh) &&
+        rnsdRecallPubkey(dh, pk))
+        m.pubkey = bytesToHex(pk, RNSD_PUBKEY_LEN);
+    return m;
+}
+
+/* How a member-list change is told: not at all (a proxy taking over a list
+ * everyone already knows), as the group's creation, or as additions/removals. */
+enum GroupTell { GROUP_TELL_NONE, GROUP_TELL_CREATED, GROUP_TELL_CHANGES };
+
+/* Make group g's member set exactly `want`. A removed member keeps its contact
+ * with `member` 0, so the notice saying so still reaches it. Changes are told
+ * only where the group is registered: a proxied group's server tells them when
+ * the list reaches it. */
+static void groupApplyMembers(lxmf_id_t& g, const std::vector<GroupMember>& want,
+                              GroupTell tell = GROUP_TELL_CHANGES)
+{
+    std::vector<std::string> cur = groupMembers(g.index), added;
+    for (const auto& m : want) {
+        if (std::find(cur.begin(), cur.end(), m.dest) == cur.end()) added.push_back(m.dest);
+        storageBegin();
+        storageSet(contactPath(g.index, m.dest, "hash").c_str(),   m.dest.c_str());
+        storageSet(contactPath(g.index, m.dest, "member").c_str(), 1);
+        storageSet(contactPath(g.index, m.dest, "kept").c_str(),   1);
+        if (!m.name.empty())
+            storageSet(contactPath(g.index, m.dest, "display_name").c_str(), m.name.c_str());
+        storageEnd();
+        uint8_t pk[RNSD_PUBKEY_LEN], dh[16];
+        if (m.pubkey.size() == RNSD_PUBKEY_LEN * 2 &&
+            hexToBytes(m.pubkey.c_str(), m.pubkey.size(), pk, RNSD_PUBKEY_LEN)) {
+            contactSetPubkey(g.index, m.dest, pk);
+            if (hexToDestHash(m.dest, dh)) rnsdSeedPubkey(dh, pk);
+        }
+        lxmfClaimContact(m.dest);
+    }
+    std::vector<std::string> removed;
+    for (const auto& c : cur) {
+        bool keep = false;
+        for (const auto& m : want) if (m.dest == c) { keep = true; break; }
+        if (!keep) {
+            setIntIfChanged(contactPath(g.index, c, "member"), 0);
+            removed.push_back(c);
+        }
+    }
+    info("id %d: group has %zu member(s), %zu new, %zu removed", g.index, want.size(),
+         added.size(), removed.size());
+    /* The owner's own view of the list, the one every member keeps (groupHear). */
+    int os = storageGetInt(idPath(g.index, "group_owner").c_str(), -1);
+    if (os >= 0 && s_ids[os].used)
+        setStrIfChanged(contactPath(os, bytesToHex(g.dest_hash, LXMF_DEST_HASH_LEN),
+                                    "members"), groupMemberLines(g.index).c_str());
+    if (tell == GROUP_TELL_NONE || g.handle < 0) return;
+    std::string owner = groupOwnerName(g.index);
+    if (tell == GROUP_TELL_CREATED) {
+        /* The owner is not news to anyone. */
+        int o = groupOwnerSlot(g.index);
+        std::string od = o >= 0 ? bytesToHex(s_ids[o].dest_hash, LXMF_DEST_HASH_LEN) : "";
+        std::vector<std::string> others;
+        for (const auto& a : added) if (a != od) others.push_back(a);
+        groupNotice(g, LXMF_GROUP_EV_ADDED, others,
+                    owner + " created " +
+                    storageGetStr(idPath(g.index, "display_name").c_str(), "") +
+                    (others.empty() ? std::string() : " and added " + groupNameList(g.index, others)));
+        return;
+    }
+    if (!added.empty())
+        groupNotice(g, LXMF_GROUP_EV_ADDED, added,
+                    owner + " added " + groupNameList(g.index, added));
+    if (!removed.empty())
+        groupNotice(g, LXMF_GROUP_EV_REMOVED, removed,
+                    owner + " removed " + groupNameList(g.index, removed), removed);
+}
+
+static std::vector<GroupMember> groupCurrentMembers(int g)
+{
+    std::vector<GroupMember> out;
+    for (const auto& m : groupMembers(g)) {
+        GroupMember gm;
+        gm.dest   = m;
+        gm.pubkey = storageGetStr(contactPath(g, m, "pubkey").c_str(), "");
+        gm.name   = storageGetStr(contactPath(g, m, "display_name").c_str(), "");
+        out.push_back(std::move(gm));
+    }
+    return out;
+}
+
+static std::vector<std::string> splitComma(const std::string& s)
+{
+    std::vector<std::string> out;
+    size_t at = 0;
+    while (at <= s.size()) {
+        size_t c = s.find(',', at);
+        std::string t = s.substr(at, c == std::string::npos ? std::string::npos : c - at);
+        if (!t.empty()) out.push_back(t);
+        if (c == std::string::npos) break;
+        at = c + 1;
+    }
+    return out;
+}
+
+/* `lxmf.cmd.group_new = <owner>|<name>|<peer>,<peer>,…[|<hide name 1|0>]` —
+ * the name is hidden from the group's announce unless that says 0. */
+static void groupCreate(const std::string& val)
+{
+    size_t b1 = val.find('|');
+    size_t b2 = b1 == std::string::npos ? std::string::npos : val.find('|', b1 + 1);
+    if (b2 == std::string::npos) { warn("group_new: expect <owner>|<name>|<peers>"); return; }
+    size_t b3 = val.find('|', b2 + 1);
+    bool hide = b3 == std::string::npos || val.substr(b3 + 1) != "0";
+    std::string peers = val.substr(b2 + 1, b3 == std::string::npos ? std::string::npos
+                                                                   : b3 - b2 - 1);
+    int o = std::atoi(val.substr(0, b1).c_str());
+    std::string name = val.substr(b1 + 1, b2 - b1 - 1);
+    lxmf_id_t* owner = idAt(o);
+    if (!owner || !owner->used || idIsGroup(o)) { warn("group_new: no account in slot %d", o); return; }
+    int g = idAllocSlot();
+    if (g < 0) { err("group_new: no free slot"); return; }
+    if (!createIdentityForSlot(g, name)) { err("group_new: create failed"); return; }
+    lxmf_id_t& gid = s_ids[g];
+    storageBegin();
+    storageSet(idPath(g, "kind").c_str(), "group");
+    storageSet(idPath(g, "group_owner").c_str(), o);
+    storageSet(idPath(g, "default_method").c_str(), "link-if-big");
+    storageSet(idPath(g, "hide_name").c_str(), hide ? 1 : 0);
+    storageEnd();
+
+    std::string gdest = bytesToHex(gid.dest_hash, LXMF_DEST_HASH_LEN);
+    storageBegin();
+    storageSet(contactPath(o, gdest, "hash").c_str(), gdest.c_str());
+    storageSet(contactPath(o, gdest, "trust").c_str(), 0);
+    storageSet(contactPath(o, gdest, "display_name").c_str(), name.c_str());
+    storageSet(contactPath(o, gdest, "group").c_str(), 1);
+    storageSet(contactPath(o, gdest, "kept").c_str(), 1);
+    storageEnd();
+
+    std::vector<GroupMember> want;
+    GroupMember me;
+    me.dest = bytesToHex(owner->dest_hash, LXMF_DEST_HASH_LEN);
+    me.name = storageGetStr(idPath(o, "display_name").c_str(), "");
+    uint8_t pk[RNSD_PUBKEY_LEN];
+    if (rnsdIdentityPubkey(owner->identity_key.c_str(), pk))
+        me.pubkey = bytesToHex(pk, RNSD_PUBKEY_LEN);
+    want.push_back(me);
+    for (const auto& p : splitComma(peers)) {
+        uint8_t dh[16];
+        if (p == me.dest || !hexToDestHash(p, dh)) continue;
+        want.push_back(groupMemberFrom(o, p));
+    }
+
+    /* Registered here first even under a proxied owner: the creation notice
+     * goes out from here, and groupFollowOwner then hands the group, and
+     * whatever of it is still queued, to the owner's proxy. */
+    if (connectOurDest(gid)) sendAnnounce(gid);
+    groupApplyMembers(gid, want, GROUP_TELL_CREATED);
+    info("id %d: group \"%s\" created for id %d", g, name.c_str(), o);
+}
+
+/* `lxmf.cmd.group_delete = <g>`: the owner ends the group. Everyone is told,
+ * the group takes nothing more, and the slot goes once the notices are out
+ * (groupReap). A proxied group says so in its CONFIG — its server tells
+ * everyone — and is dropped here once that has gone. */
+static void groupDelete(int g)
+{
+    lxmf_id_t* gid = idAt(g);
+    if (!gid || !gid->used || !idIsGroup(g)) { warn("group_delete: slot %d is not a group", g); return; }
+    if (groupEnded(g)) return;
+    int o = storageGetInt(idPath(g, "group_owner").c_str(), -1);
+    if (o >= 0 && s_ids[o].used)
+        setIntIfChanged(contactPath(o, bytesToHex(gid->dest_hash, LXMF_DEST_HASH_LEN),
+                                    "group_state"), LXMF_GROUP_ST_DELETED);
+    if (!proxyIsClient(g))
+        groupNotice(*gid, LXMF_GROUP_EV_DELETED, {}, groupOwnerName(g) + " deleted the group");
+    int now_s = (int)(wallUnixMs() / 1000);
+    storageSet(idPath(g, "ended").c_str(), now_s > 0 ? now_s : 1);
+}
+
+/* `lxmf.id.<n>.cmd.group_leave = <group>`: "/leave" to the group, which answers
+ * with a notice naming us (groupHear). */
+static void groupLeave(lxmf_id_t& id, const std::string& peer)
+{
+    uint8_t dh[16];
+    if (!hexToDestHash(peer, dh)) { warn("id %d: group_leave bad peer", id.index); return; }
+    storageSet(contactPath(id.index, peer, "group_state").c_str(), LXMF_GROUP_ST_LEAVING);
+    groupSendCommand(id.index, peer, "/leave");
+}
+
+/* An ended group goes once nothing it sent is still in flight, or once the
+ * delivery timeout says nothing still in flight ever will be. A proxied one goes
+ * as soon as its server has the news. */
+#define LXMF_GROUP_REAP_S 60
+static void groupReap(void)
+{
+    static uint32_t s_next_s = 0;
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    if (now_s < s_next_s) return;
+    s_next_s = now_s + LXMF_GROUP_REAP_S;
+    uint32_t wall_s = (uint32_t)(wallUnixMs() / 1000);
+    for (int g = 0; g < LXMF_MAX_IDENTITIES; ++g) {
+        if (!s_ids[g].used || !idIsGroup(g) || !groupEnded(g)) continue;
+        if (proxyIsClient(g)) {
+            if (!proxyReady(g) || s_proxy[g].cfg_sig != proxyConfigSig(g)) continue;
+            proxyCloseChannel(g);
+        } else {
+            uint32_t ended = (uint32_t)storageGetInt(idPath(g, "ended").c_str(), 0);
+            bool busy = false;
+            for (const auto& peer : collectTokens("s.lxmf.id." + std::to_string(g) + ".contacts."))
+                for (const auto& key : collectTokens(msgPrefix(g, peer))) {
+                    if (storageGetStr(msgPath(g, peer, key, "dir").c_str(), "") != "out") continue;
+                    int st = storageGetInt(msgPath(g, peer, key, "status").c_str(), 0);
+                    int tr = storageGetInt(msgPath(g, peer, key, "tries").c_str(), 0);
+                    if (statusInProgress(st) && tr != LXMF_TRIES_GAVEUP) busy = true;
+                }
+            if (busy && wall_s < ended + deliveryTimeoutS() + 120) continue;
+        }
+        info("id %d: deleted group goes", g);
+        destroyIdentity(g);
+        s_proxy[g] = proxy_t{};
+    }
+}
+
+/* Lines a group slot keeps: what it sent and the markers of what it received
+ * age out after a day. */
+#define LXMF_GROUP_KEEP_S   86400
+#define LXMF_GROUP_PRUNE_S  3600
+static void groupPrune(void)
+{
+    static uint32_t s_next_s = 0;
+    uint32_t now_s = (uint32_t)(nowUnixMs() / 1000);
+    if (now_s < s_next_s) return;
+    s_next_s = now_s + LXMF_GROUP_PRUNE_S;
+    if (storageGetInt("sys.time.valid", 0) == 0) return;
+    for (int g = 0; g < LXMF_MAX_IDENTITIES; ++g) {
+        if (!s_ids[g].used || !idIsGroup(g) || proxyIsClient(g)) continue;
+        for (const auto& m : groupMembers(g))
+            processPrune(s_ids[g], m, std::to_string(LXMF_GROUP_KEEP_S));
+    }
+}
+
 /* ── lxmf.cmd.* — identity-level commands ──
  *
  * The handler is fired by the storage subscription pump. Our own
@@ -7124,13 +8363,15 @@ static void onIdentityLevelCmd(const char* key, const char* val)
              * what an lxmproxy server hands in when it takes an account over:
              * the name the account already advertises, and the role that says
              * this slot is hosted here for somebody else. */
-            std::string raw = val, hex = raw, dn, role;
+            std::string raw = val, hex = raw, dn, role, kind;
             size_t bar = raw.find('|');
             if (bar != std::string::npos) {
                 hex = raw.substr(0, bar);
                 dn  = raw.substr(bar + 1);
                 size_t bar2 = dn.find('|');
                 if (bar2 != std::string::npos) { role = dn.substr(bar2 + 1); dn = dn.substr(0, bar2); }
+                size_t bar3 = role.find('|');
+                if (bar3 != std::string::npos) { kind = role.substr(bar3 + 1); role = role.substr(0, bar3); }
             }
             if (hex.size() != 128) {
                 err("identity_import: expect 128 hex chars");
@@ -7151,6 +8392,13 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                         storageDefault(idPath(n, "default_method").c_str(), "auto");
                         if (!dn.empty())   storageSet(idPath(n, "display_name").c_str(), dn.c_str());
                         if (!role.empty()) storageSet(idPath(n, "proxy_role").c_str(), role.c_str());
+                        if (kind == "group") {
+                            storageSet(idPath(n, "kind").c_str(), "group");
+                            /* Hidden until the owner's CONFIG says otherwise:
+                             * the announce below must not say what it hides. */
+                            storageDefault(idPath(n, "hide_name").c_str(), 1);
+                            storageSet(idPath(n, "default_method").c_str(), "link-if-big");
+                        }
                         storageEnd();
                         connectOurDest(s_ids[n]);
                         sendAnnounce(s_ids[n]);   /* as for identity_new */
@@ -7164,8 +8412,19 @@ static void onIdentityLevelCmd(const char* key, const char* val)
             if (!end || *end != '\0' || n < 0 || n >= LXMF_MAX_IDENTITIES) {
                 warn("identity_destroy: bad slot \"%s\"", val);
             } else {
+                /* An account's groups go with it. */
+                for (int g = 0; g < LXMF_MAX_IDENTITIES; ++g)
+                    if (g != n && s_ids[g].used && idIsGroup(g) &&
+                        storageGetInt(idPath(g, "group_owner").c_str(), -1) == n)
+                        groupDelete(g);
                 destroyIdentity((int)n);
             }
+        }
+        else if (std::strcmp(tail, "group_new") == 0) {
+            groupCreate(val);
+        }
+        else if (std::strcmp(tail, "group_delete") == 0) {
+            groupDelete(std::atoi(val));
         }
         else if (std::strcmp(tail, "pn_sync") == 0) {
             /* "all" → every check-marked node; a 32-hex value → that node
@@ -7250,6 +8509,7 @@ static void handleIdCmd(int n, const char* key, const char* val)
 
     /* send/cancel/delete value is "<peer>/<key>" (per-contact store).
      * delete also accepts "<peer>/" or "<peer>" → whole conversation.
+     * prune is "<peer>/<age seconds>"; age 0 or absent = every message.
      * send accepts an optional third segment "<peer>/<key>/pn:<hash>" —
      * upload to that propagation node instead of the direct paths.
      * link_open/link_close/ping take a bare "<peer>".
@@ -7324,6 +8584,9 @@ static void handleIdCmd(int n, const char* key, const char* val)
         else if (std::strcmp(verb, "delete") == 0) {
             processDelete(id, peer_hex, mid);
         }
+        else if (std::strcmp(verb, "prune") == 0) {
+            processPrune(id, peer_hex, mid);
+        }
         else if (std::strcmp(verb, "link_open") == 0) {
             uint8_t dh[16];
             if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh))
@@ -7354,6 +8617,55 @@ static void handleIdCmd(int n, const char* key, const char* val)
         else if (std::strcmp(verb, "proxy_force_off") == 0) {
             proxyForceOff(id);
         }
+        else if (!idIsGroup(n) && (std::strcmp(verb, "member_add") == 0 ||
+                                   std::strcmp(verb, "member_del") == 0 ||
+                                   std::strcmp(verb, "members_set") == 0 ||
+                                   std::strcmp(verb, "members_init") == 0)) {
+            warn("id %d: cmd.%s on an identity that is not a group", n, verb);
+        }
+        else if (std::strncmp(verb, "member", 6) == 0 && groupEnded(n)) {
+            warn("id %d: cmd.%s on a deleted group", n, verb);
+        }
+        else if (std::strcmp(verb, "member_add") == 0) {
+            /* Names and keys come from the owner account's own address book. */
+            int o = storageGetInt(idPath(n, "group_owner").c_str(), -1);
+            std::vector<GroupMember> want = groupCurrentMembers(n);
+            for (const auto& p : splitComma(raw)) {
+                uint8_t dh[16];
+                if (!hexToDestHash(p, dh) || groupIsMember(n, p)) continue;
+                want.push_back(o >= 0 ? groupMemberFrom(o, p) : GroupMember{ p, "", "" });
+            }
+            groupApplyMembers(id, want);
+        }
+        else if (std::strcmp(verb, "member_del") == 0) {
+            int o = storageGetInt(idPath(n, "group_owner").c_str(), -1);
+            if (o >= 0 && s_ids[o].used &&
+                raw == bytesToHex(s_ids[o].dest_hash, LXMF_DEST_HASH_LEN)) {
+                warn("id %d: the owner stays a member of its group", n);
+            } else {
+                std::vector<GroupMember> want;
+                for (auto& m : groupCurrentMembers(n)) if (m.dest != raw) want.push_back(m);
+                groupApplyMembers(id, want);
+            }
+        }
+        else if (std::strcmp(verb, "members_set") == 0 ||
+                 std::strcmp(verb, "members_init") == 0) {
+            /* A proxy server applying the list its client sent: `init` with the
+             * handover, which is no news to anyone; `set` on every change after. */
+            groupApplyMembers(id, groupParseMembers(raw),
+                              std::strcmp(verb, "members_set") == 0
+                                  ? GROUP_TELL_CHANGES : GROUP_TELL_NONE);
+        }
+        else if (std::strcmp(verb, "group_leave") == 0) {
+            groupLeave(id, raw);
+        }
+        else if (std::strcmp(verb, "group_info") == 0) {
+            if (mid.empty()) warn("id %d: cmd.group_info needs <group>/<key>", n);
+            else             groupAskInfo(n, peer_hex, mid);
+        }
+        else if (std::strcmp(verb, "group_members") == 0) {
+            groupAskMembers(n, raw);
+        }
         else {
             warn("id %d: unknown cmd %s", n, verb);
         }
@@ -7366,14 +8678,13 @@ static void handleIdCmd(int n, const char* key, const char* val)
 
 /* Per-identity static stubs — slot index captured at compile time so the
  * callback signature stays (key, val). */
-static void onIdCmd0(const char* key, const char* val) { handleIdCmd(0, key, val); }
-static void onIdCmd1(const char* key, const char* val) { handleIdCmd(1, key, val); }
-static void onIdCmd2(const char* key, const char* val) { handleIdCmd(2, key, val); }
-static void onIdCmd3(const char* key, const char* val) { handleIdCmd(3, key, val); }
-static_assert(LXMF_MAX_IDENTITIES == 4,
+template <int N>
+static void onIdCmd(const char* key, const char* val) { handleIdCmd(N, key, val); }
+static_assert(LXMF_MAX_IDENTITIES == 10,
               "per-identity cmd stubs must match LXMF_MAX_IDENTITIES");
 static storage_change_cb_t s_id_cmd_stubs[LXMF_MAX_IDENTITIES] = {
-    onIdCmd0, onIdCmd1, onIdCmd2, onIdCmd3,
+    onIdCmd<0>, onIdCmd<1>, onIdCmd<2>, onIdCmd<3>, onIdCmd<4>,
+    onIdCmd<5>, onIdCmd<6>, onIdCmd<7>, onIdCmd<8>, onIdCmd<9>,
 };
 
 static std::string idCmdScope(int n)
@@ -7460,7 +8771,8 @@ static void publishStats(void)
          * is occupied at all (the gate every row of the block hangs on), the
          * name to show, and the traffic counters as one line. Composing them
          * here is what lets a static descriptor describe an identity block. */
-        setIntIfChanged(idEphPath(n, "used"), 1);
+        /* A group is managed from its owner's messenger, not as an identity. */
+        setIntIfChanged(idEphPath(n, "used"), idIsGroup(n) ? 0 : 1);
         std::string label = storageGetStr(idPath(n, "display_name").c_str(), "");
         if (label.empty()) label = storageGetStr(idPath(n, "label").c_str(), "");
         if (label.empty()) label = "(unnamed)";
@@ -7487,7 +8799,7 @@ static void publishStats(void)
  * gate is a key here rather than a call from the straddle that needs it. */
 static void applyAcceptGates(void)
 {
-    static uint8_t s_applied[LXMF_MAX_IDENTITIES] = { 1, 1, 1, 1 };
+    static uint8_t s_applied[LXMF_MAX_IDENTITIES] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
     for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n) {
         lxmf_id_t& id = s_ids[n];
         if (!id.used || id.handle < 0) continue;
@@ -7787,6 +9099,7 @@ static void cliId(const char* rest)
             lxmf_id_t& id = s_ids[n];
             if (!id.used) continue;
             std::string lbl = storageGetStr(idPath(n, "label").c_str(), "");
+            if (idIsGroup(n)) lbl += " (group)";
             uint8_t ih[RNSD_IDENT_HASH_LEN] = {};
             bool have_ih = rnsdIdentityHash(id.identity_key.c_str(), ih);
             cliPrintf("%s %-3d %-12s %-32s %s\n",
@@ -8454,6 +9767,202 @@ static void cliSend(const char* rest)
 
 /* ── dispatch ── */
 
+/* ── `lxmf group …` — the selected account's groups ── */
+
+static int cliOwnedGroup(int sel, const std::string& peer)
+{
+    for (int g = 0; g < LXMF_MAX_IDENTITIES; ++g)
+        if (s_ids[g].used && idIsGroup(g) &&
+            storageGetInt(idPath(g, "group_owner").c_str(), -1) == sel &&
+            bytesToHex(s_ids[g].dest_hash, LXMF_DEST_HASH_LEN) == peer)
+            return g;
+    return -1;
+}
+
+static const char* groupStateName(int st)
+{
+    switch (st) {
+        case LXMF_GROUP_ST_LEAVING: return "leaving";
+        case LXMF_GROUP_ST_LEFT:    return "left";
+        case LXMF_GROUP_ST_REMOVED: return "removed";
+        case LXMF_GROUP_ST_DELETED: return "deleted";
+        default:                    return "member";
+    }
+}
+
+/* Resolve each space-separated argument as a peer; empty on any miss (the
+ * resolver has said why). */
+static std::vector<std::string> cliResolvePeers(const std::string& args)
+{
+    std::vector<std::string> out;
+    size_t at = 0;
+    while (at < args.size()) {
+        size_t sp = args.find(' ', at);
+        std::string t = args.substr(at, sp == std::string::npos ? std::string::npos : sp - at);
+        at = sp == std::string::npos ? args.size() : sp + 1;
+        if (t.empty()) continue;
+        std::string p = cliResolvePeer(t);
+        if (p.empty()) return {};
+        out.push_back(p);
+    }
+    return out;
+}
+
+static void cliGroup(const char* rest)
+{
+    int sel = selectedId();
+    lxmf_id_t* id = idAt(sel);
+    if (!id || !id->used || idIsGroup(sel)) { cliPrintf("select an account first (lxmf id <n>)\n"); return; }
+    std::string a = rest ? rest : "";
+    while (!a.empty() && a.front() == ' ') a.erase(a.begin());
+    size_t sp = a.find(' ');
+    std::string sub = a.substr(0, sp);
+    std::string arg = sp == std::string::npos ? "" : a.substr(sp + 1);
+    while (!arg.empty() && arg.front() == ' ') arg.erase(arg.begin());
+
+    if (sub.empty()) {
+        int shown = 0;
+        for (const auto& peer : collectTokens("s.lxmf.id." + std::to_string(sel) + ".contacts.")) {
+            if (storageGetInt(contactPath(sel, peer, "group").c_str(), 0) != 1) continue;
+            int g = cliOwnedGroup(sel, peer);
+            cliPrintf("%-24s %s  %s%s\n", peerDisplayName(sel, peer).c_str(), peer.c_str(),
+                      groupStateName(storageGetInt(contactPath(sel, peer, "group_state").c_str(), 0)),
+                      g >= 0 ? (std::string(", owner, slot ") + std::to_string(g)).c_str() : "");
+            shown++;
+        }
+        if (!shown) cliPrintf("no groups for id %d\n", sel);
+        return;
+    }
+    if (sub == "create") {
+        /* create [--show-name] <peer>[,<peer>…] <name…> */
+        bool show = arg.rfind("--show-name ", 0) == 0;
+        if (show) { arg = arg.substr(12); arg.erase(0, arg.find_first_not_of(' ')); }
+        size_t s2 = arg.find(' ');
+        std::string name = s2 == std::string::npos ? "" : arg.substr(s2 + 1);
+        std::string list = arg.substr(0, s2);
+        for (auto& c : list) if (c == ',') c = ' ';
+        if (name.empty() || list.empty()) {
+            cliPrintf("usage: lxmf group create [--show-name] <peer>[,<peer>…] <name>\n");
+            return;
+        }
+        std::vector<std::string> peers = cliResolvePeers(list);
+        if (peers.empty()) return;
+        for (auto& c : name) if (c == '|') c = '/';
+        std::string v = std::to_string(sel) + "|" + name + "|";
+        for (size_t i = 0; i < peers.size(); ++i) { if (i) v += ','; v += peers[i]; }
+        v += show ? "|0" : "|1";
+        storageSet("lxmf.cmd.group_new", v.c_str());
+        cliPrintf("creating \"%s\" with %zu member(s)\n", name.c_str(), peers.size());
+        return;
+    }
+    if (sub == "info") {
+        /* info <n>: who has message n of the last `lxmf msgs` listing */
+        int k = std::atoi(arg.c_str());
+        if (k < 1 || (size_t)k > s_msgs_list.size()) {
+            cliPrintf("usage: lxmf group info <n>   (n from the last `lxmf msgs <group>`)\n");
+            return;
+        }
+        const MsgRef& ref = s_msgs_list[(size_t)k - 1];
+        if (storageGetInt(contactPath(sel, ref.peer, "group").c_str(), 0) != 1) {
+            cliPrintf("message %d is not in a group\n", k);
+            return;
+        }
+        std::string r = storageGetStr(msgPath(sel, ref.peer, ref.key, "group_receipts").c_str(), "");
+        std::string members = storageGetStr(contactPath(sel, ref.peer, "members").c_str(), "");
+        size_t at = 0;
+        while (at < r.size()) {
+            size_t c = r.find(',', at);
+            std::string item = r.substr(at, c == std::string::npos ? std::string::npos : c - at);
+            at = c == std::string::npos ? r.size() : c + 1;
+            std::string who = item.substr(0, 6);
+            size_t p = members.find(who);
+            if (p != std::string::npos && (p == 0 || members[p - 1] == '\n')) {
+                size_t bar = members.find('|', p), nl = members.find('\n', p);
+                if (bar != std::string::npos)
+                    who = members.substr(bar + 1, nl == std::string::npos ? std::string::npos
+                                                                          : nl - bar - 1);
+            }
+            cliPrintf("  %-24s %s\n", who.c_str(),
+                      lxmfStatusName((uint8_t)std::atoi(item.c_str() + 7)));
+        }
+        storageSet(idEphPath(sel, "cmd.group_info").c_str(), (ref.peer + "/" + ref.key).c_str());
+        cliPrintf("%s — asked the group again; run this once more for its answer\n",
+                  r.empty() ? "no receipts yet" : "as last answered");
+        return;
+    }
+    /* Every other verb names the group first. */
+    size_t s2 = arg.find(' ');
+    std::string garg = arg.substr(0, s2);
+    std::string more = s2 == std::string::npos ? "" : arg.substr(s2 + 1);
+    if (garg.empty()) {
+        cliPrintf("usage: lxmf group %s <group>%s\n", sub.c_str(),
+                  sub == "add" || sub == "remove" ? " <peer>…" : "");
+        return;
+    }
+    std::string gpeer = cliResolvePeer(garg);
+    if (gpeer.empty()) return;
+    int g = cliOwnedGroup(sel, gpeer);
+    int st = storageGetInt(contactPath(sel, gpeer, "group_state").c_str(), 0);
+
+    if (sub == "members") {
+        /* As this account knows them (contacts.<group>.members). */
+        std::string list = storageGetStr(contactPath(sel, gpeer, "members").c_str(), "");
+        size_t at = 0;
+        while (at < list.size()) {
+            size_t nl = list.find('\n', at);
+            std::string line = list.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+            at = nl == std::string::npos ? list.size() : nl + 1;
+            if (line.size() > 33) cliPrintf("%-24s %s\n", line.c_str() + 33, line.substr(0, 32).c_str());
+        }
+        if (list.empty()) {
+            storageSet(idEphPath(sel, "cmd.group_members").c_str(), gpeer.c_str());
+            cliPrintf("not known yet — asked the group\n");
+        }
+        return;
+    }
+    if (sub == "refresh") {
+        storageSet(idEphPath(sel, "cmd.group_members").c_str(), gpeer.c_str());
+        cliPrintf("asked the group for its members\n");
+        return;
+    }
+    if (sub == "add" || sub == "remove") {
+        if (g < 0) { cliPrintf("only the owner changes the members\n"); return; }
+        std::vector<std::string> peers = cliResolvePeers(more);
+        if (peers.empty()) { cliPrintf("usage: lxmf group %s <group> <peer>…\n", sub.c_str()); return; }
+        if (sub == "add") {
+            std::string v;
+            for (size_t i = 0; i < peers.size(); ++i) { if (i) v += ','; v += peers[i]; }
+            storageSet(idEphPath(g, "cmd.member_add").c_str(), v.c_str());
+        } else {
+            /* One per command: the key is self-clearing. */
+            if (peers.size() > 1) { cliPrintf("remove one member at a time\n"); return; }
+            storageSet(idEphPath(g, "cmd.member_del").c_str(), peers[0].c_str());
+        }
+        cliPrintf("%s requested\n", sub.c_str());
+        return;
+    }
+    if (sub == "leave") {
+        if (g >= 0) { cliPrintf("the owner deletes the group instead: lxmf group delete\n"); return; }
+        if (st != LXMF_GROUP_ST_MEMBER) { cliPrintf("already %s\n", groupStateName(st)); return; }
+        storageSet(idEphPath(sel, "cmd.group_leave").c_str(), gpeer.c_str());
+        cliPrintf("sent /leave — the group will confirm\n");
+        return;
+    }
+    if (sub == "delete") {
+        if (g >= 0 && st < LXMF_GROUP_ST_LEFT) {
+            storageSet("lxmf.cmd.group_delete", std::to_string(g).c_str());
+            cliPrintf("deleting the group for everyone\n");
+        } else if (st >= LXMF_GROUP_ST_LEFT) {
+            storageSet(idEphPath(sel, "cmd.delete").c_str(), gpeer.c_str());
+            cliPrintf("deleted the conversation\n");
+        } else {
+            cliPrintf("leave it first: lxmf group leave\n");
+        }
+        return;
+    }
+    cliPrintf("unknown subcommand `%s`. try `lxmf -h`.\n", sub.c_str());
+}
+
 static void cliLxmf(const char* args)
 {
     if (!args) args = "";
@@ -8481,6 +9990,17 @@ static void cliLxmf(const char* args)
         cliPrintf("lxmf link <act> <peer>  open|close|status a conversation link to <32-hex peer>\n");
         cliPrintf("lxmf p[ing] <peer>      probe peer (32-hex, list-#, name/nick):\n");
         cliPrintf("                      rtt + both ends' txpwr/rssi/snr\n");
+        cliPrintf("lxmf group              the selected id's groups and where it stands\n");
+        cliPrintf("lxmf group create [--show-name] <peer>[,<peer>…] <name>\n");
+        cliPrintf("                      the name stays out of the group's announce\n");
+        cliPrintf("                      unless --show-name\n");
+        cliPrintf("lxmf group members <g>  the members as this id knows them\n");
+        cliPrintf("lxmf group refresh <g>  ask the group for its members again\n");
+        cliPrintf("lxmf group info <n>     who has msg n of the last `lxmf msgs`\n");
+        cliPrintf("lxmf group add <g> <peer>…   /   remove <g> <peer>   (owner)\n");
+        cliPrintf("lxmf group leave <g>    send /leave; the group confirms\n");
+        cliPrintf("lxmf group delete <g>   owner: delete it for everyone;\n");
+        cliPrintf("                      after leaving/removal/deletion: drop the conversation\n");
         cliPrintf("lxmf proxy [<cmd>]      proxy this identity: no arg = state,\n");
         cliPrintf("                      `servers` = the ones we've heard,\n");
         cliPrintf("                      `on <32-hex>` / `off` / `force-off`\n");
@@ -8556,6 +10076,7 @@ static void cliLxmf(const char* args)
     if (cliVerbIs(verb.c_str(), "contacts", 1)) { cliContacts(rest); return; }
     if (verb == "announces") { cliAnnounces(rest); return; }
     if (verb == "send")      { cliSend(rest); return; }
+    if (verb == "group")     { cliGroup(rest); return; }
     if (cliVerbIs(verb.c_str(), "announce", 1)) {
         int sel = selectedId();
         lxmf_id_t* id = idAt(sel);
@@ -8918,6 +10439,7 @@ static void lxmfTaskMain(void*)
 
     while (!s_stop) {
         itsPoll(nextDeadline());
+        groupDrainSends();
 
         TickType_t now = xTaskGetTickCount();
         if (now - s_lastPublishTick >= pdMS_TO_TICKS(lxmfTickIntervalMs())) {
@@ -8927,6 +10449,8 @@ static void lxmfTaskMain(void*)
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             publishLinks();         /* per-peer link state for the header icons */
             proxyClientTick();      /* the proxy Channel, its handshakes, CONFIG */
+            groupPrune();           /* groups keep a day of what they passed on */
+            groupReap();            /* a deleted group goes once its notices are out */
             applyAcceptGates();     /* the per-destination inbound gate */
             pnClientTick();         /* propagation-node uploads + sync machine */
             /* The delivery queue's sweep, when its interval has come round. */
@@ -9408,7 +10932,7 @@ void LxmfService::onInit()
      *  - generate_stamps: pay a peer's advertised cost when sending.
      * Whether we *require* inbound stamps is the enforce_stamps toggle. */
     storageBegin();
-    storageDefault("s.lxmf.stamp_cost",      8);
+    storageDefault("s.lxmf.stamp_cost",      0);
     storageDefault("s.lxmf.generate_stamps", 1);
     /* The delivery queue (§6): how often a queued message gets another attempt,
      * and how long it may keep trying before it is failed DELIVERY_TIMEOUT.
@@ -9498,7 +11022,7 @@ int lxmfCreateIdentity(const char* display_name, bool sync)
 }
 
 int lxmfImportIdentity(const char* privkey_hex, const char* display_name,
-                       const char* role, bool sync)
+                       const char* role, bool sync, const char* kind)
 {
     if (!privkey_hex || std::strlen(privkey_hex) != 128) {
         warn("lxmfImportIdentity: expect 128 hex chars");
@@ -9507,6 +11031,7 @@ int lxmfImportIdentity(const char* privkey_hex, const char* display_name,
     std::string v = privkey_hex;
     v += '|'; if (display_name) v += display_name;
     v += '|'; if (role)         v += role;
+    if (kind && *kind) { v += '|'; v += kind; }
     storageSet("lxmf.cmd.identity_import", v.c_str());
     if (!sync) return 0;
 

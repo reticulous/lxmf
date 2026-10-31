@@ -9,6 +9,7 @@
  * page is showing.
  */
 #include "lxmf_tiny.h"
+#include "lxmf.h"   /* LXMF_MAX_IDENTITIES */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,9 +33,7 @@ static void sumUnread(const char* key, const char* val)
 static bool drawLxmfPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t)
 {
     s_unread = 0;
-    /* Slot bound mirrors lxmf's private LXMF_MAX_IDENTITIES (4), the same way
-     * the LCD app's identity walk does — there is no exported count. */
-    for (int n = 0; n < 4; n++) {
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; n++) {
         char prefix[40];
         snprintf(prefix, sizeof prefix, "s.lxmf.id.%d.contacts", n);
         storageForEach(prefix, sumUnread);

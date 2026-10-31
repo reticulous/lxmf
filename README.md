@@ -2,7 +2,7 @@
 
 **lxmf** is the device's LXMF mailbox: it sends and receives signed
 [LXMF](https://github.com/markqvist/LXMF) messages over [rns](../rns),
-holds up to four independent identities, and advertises each one so other
+holds up to ten independent identities, and advertises each one so other
 nodes can reach it. It interoperates with stock LXMF clients (Sideband,
 NomadNet, MeshChat) wire-for-wire.
 
@@ -29,7 +29,7 @@ format and the per-byte deltas from upstream are in
   de-duplicates, and stores inbound ones. Signatures are checked against the
   sender's Reticulum identity — forged or corrupt messages are dropped
   silently.
-- **Identities.** Up to `LXMF_MAX_IDENTITIES = 4` independent mailboxes
+- **Identities.** Up to `LXMF_MAX_IDENTITIES = 10` independent mailboxes
   (`lxmf.delivery` destinations), each with its own keypair, contacts, and
   message history, fully separate. **No identity is created automatically** — a
   device with none runs as a transport-only node (it relays and tracks the
@@ -52,6 +52,9 @@ format and the per-byte deltas from upstream are in
   `lxmf.propagation` store-and-forward nodes (see below) — a message can
   be resent via a node from its detail page, and a user-ordered node list
   is polled for held messages.
+- **Groups.** A small fan-out group with an address of its own, living on its
+  creator's device or proxy, that any LXMF client can be a member of (see
+  **Groups**).
 - **Message-notification sound.** Plays a short sound on inbound delivery
   via the optional [audio](../audio) engine.
 
@@ -112,7 +115,9 @@ key. Presence = request in flight; absence = done.
 |---|---|---|
 | `lxmf.cmd.identity_new` | optional label | generate a new identity, allocate the next slot, bring its mailbox up |
 | `lxmf.cmd.identity_import` | 128-hex private key | import a key into a new slot |
-| `lxmf.cmd.identity_destroy` | `<n>` | wipe identity `n` — its secret, all its storage, its subscriptions |
+| `lxmf.cmd.identity_destroy` | `<n>` | wipe identity `n` — its secret, all its storage, its subscriptions; an account's groups are deleted with it |
+| `lxmf.cmd.group_new` | `<owner n>\|<name>\|<peer>,<peer>,…[\|<hide name 1\|0>]` | make a group owned by account `n`, with those members and the owner; its name stays out of its announce unless the last field is `0` (see **Groups**) |
+| `lxmf.cmd.group_delete` | `<g>` | the owner deletes group `g`: everyone is told, and the slot goes once that is out |
 | `lxmf.cmd.pn_sync` | `all` or `<32-hex>` | check propagation nodes for held messages now (all check-marked, or one node) |
 | `lxmf.cmd.pn_add` | `<32-hex>[\|<name>]` | append a propagation node at the first free list index |
 
@@ -123,6 +128,7 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.send` | `<peer>/<key>[/pn:<hash>]` | pack, sign, and transmit the draft at `s.lxmf.id.<n>.msgs.<peer>.<key>`; the optional `pn:` segment uploads to that propagation node instead |
 | `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` finishes every outbound of this identity that has not finished. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation (and the contact with it). A proxied outbound is dropped on the proxy too (`DROP`), so a message deleted here is not still being sent by a machine elsewhere. Deleting one message counts it back out of the conversation directory — `count` always, and `unread` when it was an inbound past the read watermark — since those are maintained counters rather than derived, and a deleted message must not go on lighting the badge |
+| `lxmf.id.<n>.cmd.prune` | `<peer>/<seconds>` | delete messages in that conversation but keep the contact: all of them for `0`, else those whose `ts` is more than that many seconds old. Drafts stay. Each goes through the single-message delete (proxy `DROP`, counters); a conversation left empty also has its preview cleared and is marked `kept`, so it stays in the contact list at zero messages. By age needs `sys.time.valid` and is refused without it |
 | `lxmf.id.<n>.cmd.retry` | `<peer>/<key>` | try this one again NOW. Proxied, that is a `RETRY` frame naming the record — the body is already on the server, and putting it back on the air to say "again" would cost the whole message to carry one bit. Unproxied it is an ordinary send, since this device owns the queue |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — a link establishment where there is no link, else one packet on the open one (see **Ping**) |
@@ -130,6 +136,12 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.proxy_on` | `<32-hex>` | ask that `lxmproxy.server` to take this account; this device stays registered until the server confirms |
 | `lxmf.id.<n>.cmd.proxy_off` | any | hand the account back; this device stays proxied and working until the server answers |
 | `lxmf.id.<n>.cmd.proxy_force_off` | any | the dead-server override — read what it costs first |
+| `lxmf.id.<n>.cmd.group_leave` | `<group>` | send that group "/leave"; `group_state` is `leaving` until its answer |
+| `lxmf.id.<n>.cmd.group_info` | `<group>/<key>` | who has that message: "/info_ <id>" to the group, whose answer lands on the record as `group_receipts` (and moves `group_receipts_ts`); read off directly where this account owns the group and it lives here |
+| `lxmf.id.<n>.cmd.group_members` | `<group>` | "/members_" to the group; the answer replaces `contacts.<group>.members` |
+| `lxmf.id.<g>.cmd.member_add` | `<peer>[,<peer>…]` | add members to group `g`; names and keys come from the owner's contacts |
+| `lxmf.id.<g>.cmd.member_del` | `<peer>` | remove a member from group `g` (not the owner) |
+| `lxmf.id.<g>.cmd.members_set` / `members_init` | `dest\|pubkey\|name` lines | a proxy server applying the list its client sent — `set` tells the changes, `init` (the handover) tells nothing |
 
 To make a command key atomic with its data, write the data fields and the
 command key in one `storageBegin()/storageEnd()` transaction — the firmware
@@ -418,6 +430,118 @@ Both frontends work the same way:
 Upstream's clients (Sideband, NomadNet, MeshChat) implement none of the reply
 fields, so a reply reaches them as an ordinary message: nothing breaks, the
 quote is simply not drawn.
+
+## Groups
+
+```
+Ann → group        "see you at 8"
+group → Bob, Cat   "Ann: see you at 8"      FIELD_GROUP [Ann, 3a91f0]
+Bob → group        "/info_ 3a91f0"
+group → Bob        ""                       FIELD_GROUP [group, 3a91f0, INFO, Cat[0..2] DELIVERED]
+Bob → group        "/leave"
+group → Ann, Bob, Cat   "Bob left"          FIELD_GROUP [group, -, LEFT, [Bob]]
+```
+
+A message is named in a group by **3 bytes**: the first three of the writer's own
+`message_id` (`3a91f0` above). It is what the group sends on, what a reply in the
+group names, and what `/info` asks about. That is what keeps a group usable over
+LoRa — `FIELD_GROUP` on a member's message is 25 bytes — and it costs a
+collision now and then, as the LoRa layer's own short ids do.
+
+A group is a small fan-out for a handful of people (three to five is what it is
+made for). It has an LXMF address of its own and lives on its creator's device,
+or on that account's proxy when it has one. Whatever a member sends it, it sends
+on to every other member from its own address, with the writer's announced name
+in front: anybody on any LXMF client can be a member, and sees "Ann: see you at
+8" from the group. Reticulous shows the name above the bubble instead, the way
+Signal does, and drops the prefix.
+
+Everything below can be done from either frontend or from the CLI (`lxmf group
+…`, see **CLI**).
+
+**Making one.** The new-group button — a "+" with the group icon, left of the
+propagation-node envelope in the messenger's tab bar on the LCD, right of the
+search field on the web — or `lxmf group create` asks for a name and the
+contacts to put in it. The group is a
+new identity slot marked `kind = group`, so it takes one of the ten; it never
+appears among the accounts to pick.
+
+**Its name stays private** unless you untick **Hide group name** (ticked by
+default; `--show-name` on the CLI). A hidden group announces with no name at
+all, so nothing on the mesh learns what it is called. Its members learn the name
+from the group itself — it rides on the answer to `/members`, which every
+newcomer asks — and keep it as the group contact's name. A proxy holding the
+group keeps the name with the rest of its settings and announces it only if
+told to. Its owner gets it as a contact with the group
+icon, and its info page lists the members with add and remove.
+
+**What everyone sees.** Every change is a message from the group to every member,
+the one it concerns included: "Ann created Friday and added Bob and Cat", "Ann added
+Dan", "Ann removed Dan", "Bob left", "Ann deleted the group". Reticulous draws
+these as a centred line rather than a bubble.
+
+**Leaving.** For a member, deleting the group's contact is **Leave group**: it
+sends the group "/leave" — which anybody on any client can also just type — and
+waits for the group's "… left". Once that has come, or a "removed" naming you,
+or "deleted the group", the composer is gone and the option becomes **Delete
+group**, which drops the conversation. The owner cannot leave; the owner's
+option is **Delete group**, which tells everyone and takes the group off the air
+once that message is out.
+
+**Commands.** A member talks to the group itself with a message it does not send
+on — anybody on any client can type them, and reticulous sends them for you
+without showing them:
+
+| Command | The group answers, to that member only |
+|---|---|
+| `/leave` | "Bob left", to everyone (see **Leaving**) |
+| `/members` | "Members: Ann, Bob and Cat", with every member's address and name, and the group's own name |
+| `/member <6 hex>` | the same for the one member whose address starts with that |
+| `/info <6 hex>` | "3a91f0: delivered to Cat. On its way to Dan.", with 4 bytes per copy: the first 3 of that member's address, and the status of the group's copy to them |
+
+The three that answer with data also come with a trailing underscore —
+`/members_`, `/member_ <6 hex>`, `/info_ <6 hex>` — and are then answered with
+the data alone and no text. Those are the ones reticulous sends: it reads the
+field, and the sentence would only cost air.
+
+**Members.** Every member keeps the member list as the group last told it
+(`contacts.<group>.members`): a newcomer asks `/members_` when the notice adding
+it arrives, asks `/member_` for each one added after, and drops whoever leaves or
+is removed. A member who never got the list asks for it once a boot. Only the
+owner can add and remove; everyone sees the list, on the group's info page.
+
+**Who got it.** A message's info page in a group asks `/info_` and shows a spinner
+until the answer, then one line per member with how the group's copy to them is
+doing. The group keeps that for the day it keeps what it sent on. The owner, when
+the group lives on its own device, reads it straight off without asking. A
+member's message also offers **Message <name>** there, which opens the direct
+conversation with them.
+
+**Who it takes mail from.** Members only. A group asks no stamp, since nobody
+else gets anything through it. A message from anyone else, from a member who has
+left or was removed, or to a deleted group is dropped.
+
+**Replies** inside a group name their target by its 3-byte id, in
+`FIELD_REPLY_TO` cut to 3 bytes: each member holds a separately signed copy with
+an id of its own, and the writer's is the one id they all know.
+
+**Ticks** on a message you send to a group mean the group has it; who else does
+is on its info page.
+
+**Proxy.** A group goes wherever its owner's account goes: when the owner is
+proxied, the owner's own Channel vouches for the group (`ADOPT`) and the group
+then hands itself over on a Channel of its own, approved already; when the owner
+comes back, or is forced off, so does the group. The group's server does the
+fan-out and says the notices; the owner's device keeps the member list, and every
+edit to it goes over as `CONFIG`. Deleting a proxied group goes over the same
+way: the server says "deleted the group", drops the group's approval at once,
+and drops the group once that message is out.
+
+Command keys: `lxmf.cmd.group_new = <owner n>|<name>|<peer>,<peer>,…[|<hide 1|0>]`,
+`lxmf.cmd.group_delete = <g>`, `lxmf.id.<g>.cmd.member_add = <peer>[,<peer>…]`,
+`lxmf.id.<g>.cmd.member_del = <peer>`, and on the member's own account
+`lxmf.id.<n>.cmd.group_leave = <group>`, `lxmf.id.<n>.cmd.group_info =
+<group>/<key>` and `lxmf.id.<n>.cmd.group_members = <group>`.
 
 ## Propagation nodes
 
@@ -903,7 +1027,7 @@ proof-of-work price (in bits; each bit doubles the work) a sender pays per
 message as spam friction. Three knobs, all surfaced in the Settings panel
 and the on-device settings pane:
 
-- **`s.lxmf.stamp_cost`** (slider 0–18, default 8): the single cost we
+- **`s.lxmf.stamp_cost`** (slider 0–18, default 0): the single cost we
   advertise to everyone. `0` advertises none. The cap of 18 keeps it
   generatable on-device; validation is cheap at any cost. This is *only*
   what we advertise.
@@ -934,7 +1058,7 @@ cost, and it may reject it (`PN_REJECTED`).
 | Key | Default | Meaning |
 |---|---|---|
 | `s.lxmf.max_announces` | `2048` | Heard-peer list entry cap; `0` = no eviction. |
-| `s.lxmf.stamp_cost` | `8` | Advertised PoW cost (bits, 0–18; `0` = none). |
+| `s.lxmf.stamp_cost` | `0` | Advertised PoW cost (bits, 0–18; `0` = none). |
 | `s.lxmf.generate_stamps` | `1` | Pay a peer's advertised stamp cost when sending. |
 | `s.lxmf.enforce_stamps` | `0` | Drop inbound without a valid stamp for our cost. |
 | `s.lxmf.link_timeout` | `0` | Conversation-Link establishment budget, seconds; `0` = let rnsd derive it from the next hop's interface speed. Whichever decides it, rnsd publishes the result as `rnsd.links.<tag>.estab_timeout_s` and the send's own deadline adopts it — a DIRECT send never gives up on a link that is still inside the budget rnsd granted it. |
@@ -967,10 +1091,34 @@ default_method   auto | link-always | link-if-one-exists | link-if-big | opportu
 proxy_role       off (default) | server | client — which device registers and
                  announces this account (see Being proxied)
 proxy_dest       32-hex lxmproxy.server destination, while proxied
+kind             "group" on a group's slot; absent on an account
+hide_name        a group: 1 (default) = its announce carries no name
+group_owner      a group's owning account slot on the device that made it
+ended            a deleted group: wall-clock s it was deleted; 0 = live
 contacts.<peer>.{hash,pubkey,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pubkey = the contact's own key, so verifying a message from them needs no route and no announce; pn = this contact's propagation node, all-zero = none)
+contacts.<peer>.group        1 = this peer is a group
+contacts.<peer>.group_state  that group as this account sees it: 0 member,
+                             1 leaving, 2 left, 3 removed, 4 deleted
+contacts.<peer>.member       in a group's own slot: 1 = a member (a removed
+                             one stays, at 0, for the notice to reach it)
+contacts.<peer>.members      a group's members as this account knows them,
+                             "hex32|name" lines
 msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,reply_quote,method,ts,recv_ts,
                    read,message_id,body_absent,body_size,handed,told,offered,
-                   via_link,proxy_status}
+                   via_link,proxy_status,group_from,orig_id,reply_short,group_event,
+                   group_subjects,group_data,group_name,group_receipts,group_receipts_ts,command}
+                                 group_from/orig_id = FIELD_GROUP's writer and
+                                 the 3-byte id of their message (group_from =
+                                 the group itself on what it says); reply_short
+                                 = a group reply's 3-byte target; group_event
+                                 1 added, 2 removed, 3 left, 4 deleted, 5 info,
+                                 6 members, 7 member; group_subjects = whom,
+                                 comma-separated 32-hex; group_data = an answer,
+                                 kept only on a proxy for its owner;
+                                 group_receipts = "hex6:status,…" from /info,
+                                 group_receipts_ts moves with every answer;
+                                 command = 1 on a command we sent our group,
+                                 never drawn
                                  per-conversation message records
                                  (handed/told are the proxy SERVER's;
                                   proxy_status is the CLIENT's record of
@@ -1070,7 +1218,26 @@ lxmf p[ing] <peer>          probe <peer> (same forms as `send`); holds the promp
 lxmf proxy [<cmd>]          no arg = this identity's proxy state; `servers` =
                             the lxmproxy.server announces heard; `on <32-hex>`,
                             `off`, `force-off` (see **Being proxied**)
+lxmf group                  this identity's groups: name, address, where it
+                            stands (member / leaving / left / removed /
+                            deleted), and the slot of the ones it owns
+lxmf group create [--show-name] <peer>[,<peer>…] <name>
+                            make a group owned by this identity; its name stays
+                            out of its announce unless --show-name
+lxmf group members <g>      the members as this identity knows them (asks the
+                            group when it knows none)
+lxmf group refresh <g>      ask the group for its members again
+lxmf group info <n>         who has message n of the last `lxmf msgs <group>`:
+                            prints the last answer and asks again
+lxmf group add <g> <peer>…  add members (owner only)
+lxmf group remove <g> <peer>  remove one member (owner only)
+lxmf group leave <g>        send "/leave"; the group's "… left" answers it
+lxmf group delete <g>       owner: delete the group for everyone; anyone who
+                            has left, was removed, or whose group was deleted:
+                            drop the conversation
 ```
+
+`<g>` and `<peer>` take the same forms as `send`.
 
 Numbered listings (`chats`, `msgs`, `unfinished`, `contacts`, `announces`) feed
 the index arguments of `read` / `send` / `ping` / `cancel` / `msgs <#>`. One
@@ -1085,7 +1252,7 @@ any of these on-device with `spangap cli "<command>"`.
 
 **Settings** (Settings → Reticulum Mesh → LXMF Messages): described by the
 `settings:` block in `straddle.yaml` and lowered by the build to both surfaces.
-The four identity slots are rows gated on the slot being occupied; the
+The ten identity slots are rows gated on the slot being occupied; the
 propagation nodes are a collection over the `lxmf.pnode.*` command keys; the create
 and import forms submit to `lxmf.identity.*`, where the 128-hex and 32-hex rules
 are stated once instead of as a regex per UI.
@@ -1094,7 +1261,8 @@ are stated once instead of as a regex per UI.
 (`modules/lxmf.ts`), the chat window (`panels/MessagesWindow.vue`), and the chat
 components
 (`components/lxmf/`: `PeerAvatar`, `ConversationList`, `ContactCard`,
-`MessageBubble`, `Composer`, `AnnouncesView`, `ConversationThread`).
+`MessageBubble`, `Composer`, `AnnouncesView`, `ConversationThread`,
+`GroupCreate`).
 
 **On-device LCD app** (`esp-idf/conditional/spangap-lcd/src/lxmf_lcd.cpp`):
 the **LXMF** app, an `LcdApp` installed via `lcdInstall(new LxmfApp())`. The
@@ -1132,15 +1300,59 @@ Both frontends share the contact-info pattern: clicking anywhere on a
 conversation's header (or, on the LCD, a contact row's circled-i — the info
 icon is a cue, not the sole target) opens a per-peer info page showing the
 destination hash grouped in fours for eye comparison (the web copy button
-still yields the bare unspaced hex) and holding the delete-conversation
-flow behind an explicit "Are you sure?" confirm. The page's back chevron
-returns to whichever screen opened it — contact overview or message view.
+still yields the bare unspaced hex) and holding the delete flow. The page's
+back chevron returns to whichever screen opened it — contact overview or
+message view.
 
 The page opens with a row of buttons, each sized to its own text: **Delete**
-(the conversation, behind the confirm) and **Ping**. The web Ping result is a
+and **Ping**. On the web, Delete removes the whole conversation and the contact
+behind an "Are you sure?" confirm. On the LCD it opens a choice with nothing
+preselected: the conversation and contact info, the messages only, or the
+messages older than 1 day, 3 days, 1 week or 1 month (the by-age choices appear
+only once `sys.time.valid` is set). Each choice leads to a second confirm that
+names exactly what goes. The web Ping result is a
 popover under the button, dismissed by a touch anywhere; the LCD's is inline
 under the button row instead, which leaves the button reachable so a re-measure
 is one press.
+
+**Groups** (see **Groups**) look the same on both:
+
+- **The new-group button** — a "+" with the group icon (on the web, the "group
+  add" icon). LCD: in the tab bar, left of the propagation-node envelope, shown
+  while an account is open. Web: right of the search field. It
+  opens a page with a name field, a **Hide group name** box (ticked), and a
+  checklist of the account's contacts (groups and this device's own addresses
+  left out); Create waits for a name and at least one tick.
+- **A group contact** carries the people icon in the list and on its header; on
+  the LCD it leads the row, with as much room after it as before it.
+- **Its info page** has no Ping and no propagation-node choice. For the owner it
+  lists the members — the owner as "You", everyone else with a remove ✕ — and an
+  Add member page drawn from the account's contacts; both go once the group is
+  deleted. Any other member sees the list read-only, from
+  `contacts.<group>.members`, with a **Refresh** that asks the group again, until
+  they are out of it. The one destructive choice is, in order: **Delete group** (drop the
+  conversation) once you have left, were removed, or the group was deleted;
+  **Delete group** for everyone, behind a confirm saying so, for the owner;
+  **Leaving…**, disabled, while a "/leave" waits for its answer; **Leave group**,
+  behind a confirm, otherwise. On the LCD, the by-age and messages-only choices
+  stay alongside it.
+- **In the thread** a member's message shows the writer's name above the bubble
+  in a colour of their own, on the first of a run, with the "Name: " prefix
+  dropped; a notice from the group is a centred grey line. Commands you sent the
+  group (`command`) are not drawn at all — the group's "<you> left" stands for a
+  "/leave". A reply in a group writes `reply_short`: the target's `orig_id`, or
+  for your own message the first 6 hex of its `message_id`; a quote is found by
+  either.
+- **A message's info page** in a group asks `group_info` on opening and shows a
+  spinner ("Asking the group…") until `group_receipts_ts` moves, then a line per
+  member — named from the members list by address prefix, "You" for yourself —
+  with that copy's status as the bubbles draw it. On another member's message a
+  **Message <name>** button opens the direct conversation with them.
+- **The composer** is replaced, once you are out, by "You left this group", "You
+  were removed from this group" or "This group was deleted".
+- **Accounts:** a group's slot is never offered as an account — not in either
+  picker, not in Settings (its `lxmf.id.<g>.used` is 0), not in nomad's identity
+  chooser.
 
 ## What it owns
 
@@ -1153,10 +1365,11 @@ lxmf/
 │   │   └── lxmproxy_wire.h   the LXMF-proxy frames, shared with the server
 │   ├── src/
 │   │   ├── lxmf.cpp          the lxmf task: identities, mailbox, send/recv,
-│   │   │                     announces, and the proxy CLIENT
+│   │   │                     announces, groups, and the proxy CLIENT
 │   │   ├── lxmf_stamp.cpp    LXStamper-compatible PoW (self-contained SHA-256/HMAC/HKDF)
 │   │   └── lxmproxy_wire.cpp the proxy frame codec (own minimal msgpack)
 │   ├── conditional/spangap-lcd/src/lxmf_lcd.cpp   on-device LXMF app (LVGL)
+│   ├── assets/lcd-icons/                           the app's icons (group.svg = groups)
 │   └── data/lxmf/ding.wav                          notification sound → /fixed/lxmf/ding.wav
 └── browser/
     └── src/{modules,panels,components}/…           web UI (see Frontends)

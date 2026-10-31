@@ -67,7 +67,8 @@ architecture and resolves several behaviours the storage model forces.
    from being lost.
 8. **Per-contact message store.** `msgs.<peer>.<key>` rather than a flat
    `msgs.<key>` pile; `cmd.{send,cancel,delete}` value is `<peer>/<key>`
-   (`delete` also takes a bare `<peer>` = whole conversation). The `<peer>`
+   (`delete` also takes a bare `<peer>` = whole conversation; `prune` is
+   `<peer>/<age seconds>` and fans out into single-message deletes). The `<peer>`
    subtree is the seam any future retention/eviction hangs on; this layout
    itself adds no eviction.
 9. **Proof-of-work stamps** (`lxmf_stamp.cpp`) — generate and validate,
@@ -82,6 +83,9 @@ architecture and resolves several behaviours the storage model forces.
     problem is the propagation node, which needs every other client to change.
     This needs nothing of anyone, and pays for it by putting the account key and
     the full cleartext on two devices instead of one.
+12. **Groups** (§8d). A group is an identity slot that re-sends what its
+    members send it. Upstream reserves `FIELD_GROUP` and defines nothing for
+    it; this gives it a shape and needs nothing of a member's client.
 
 ### Not present (upstream features deliberately unbuilt)
 
@@ -98,15 +102,14 @@ State these as absent, not "coming":
   The *client* side of PROPAGATED (`0x03`) — upload to a node and sync
   from a node — IS implemented; see §8b.
 - **PAPER mode** (`0x05`).
-- **Group conversations** (`FIELD_GROUP = 0x0B` reserved), **audio
-  messages** (`FIELD_AUDIO = 0x07`; such messages display
+- **Audio messages** (`FIELD_AUDIO = 0x07`; such messages display
   "[audio — unsupported]"), and **externalised blob attachments**.
 - **Per-attempt give-up.** There is no `MAX_DELIVERY_ATTEMPTS`; the delivery
   queue (§6) bounds a message by wall clock (`s.lxmf.delivery_timeout`), not
   by a count, and a message that timed out is re-issued by the client writing
   `cmd.send` again.
 - **Multi-identity UX.** The schema is an array from day one
-  (`LXMF_MAX_IDENTITIES = 4`); single-identity simply runs at `n = 0`. There
+  (`LXMF_MAX_IDENTITIES = 10`); single-identity simply runs at `n = 0`. There
   is no picker / generate / import flow beyond the settings panes.
 - **Several proxy clients on one account.** That is read state, deletion
   propagation and per-client cursors — actual IMAP, and a different shape from
@@ -182,13 +185,13 @@ is deliberately narrow:
 
 | Subscription | Installed | Fires for | Handler |
 |---|---|---|---|
-| `lxmf.cmd.` | once in `lxmfTaskMain` | `identity_new` / `identity_import` / `identity_destroy` | `onIdentityLevelCmd` |
-| `lxmf.id.<n>.cmd.` | per slot, by `createIdentityForSlot`/`loadIdentityForSlot`; removed by `destroyIdentity` | `send` / `cancel` / `delete` / `announce` | static `onIdCmd<n>` → `handleIdCmd(n,…)` |
+| `lxmf.cmd.` | once in `lxmfTaskMain` | `identity_new` / `identity_import` / `identity_destroy` / `group_new` / `group_delete` / `pn_sync` / `pn_add` | `onIdentityLevelCmd` |
+| `lxmf.id.<n>.cmd.` | per slot, by `createIdentityForSlot`/`loadIdentityForSlot`; removed by `destroyIdentity` | `send` / `cancel` / `delete` / `prune` / `announce` / `group_leave` / `group_info` / `group_members` and the rest of the per-identity verbs; on a group's slot `member_add` / `member_del` / `members_set` / `members_init` | static `onIdCmd<n>` → `handleIdCmd(n,…)` |
 | `lxmf.url_web`, `lxmf.url_lcd` | once | a tapped `lxmf@<hash>` link | `onOpenContactUrl` (path request only) |
 | `s.lxmf.debug.only_local` | once | live debug-verbosity toggle | inline lambda |
 
-The slot index is captured at compile time in four static stubs
-(`onIdCmd0…3`) so the callback stays `(key,val)` with no key parsing. **The
+The slot index is captured at compile time in one static stub per slot
+(`onIdCmd<N>`) so the callback stays `(key,val)` with no key parsing. **The
 firmware never subscribes to `s.lxmf.*` or `lxmf.id.<n>.*` (non-`cmd`).**
 Every firmware write to message records or ephemeral mirrors is silent
 relative to its own subscriptions — the cmd command keys are the only wake
@@ -248,8 +251,9 @@ RENDERER, 0x30 REPLY_TO, 0x31 REPLY_QUOTE, 0x40 REACTION, 0x41 COMMENT,
 `RENDERER ∈ {PLAIN, MICRON, MARKDOWN, BBCODE}`.
 
 Of those, this implementation packs and parses `REPLY_TO` (raw 32 B message
-hash) and `REPLY_QUOTE` (UTF-8 fragment of the quoted message), parses and logs
-`TICKET`, and skips the rest without failing the parse. The quote is optional
+hash; 3 B inside a group), `REPLY_QUOTE` (UTF-8 fragment of the quoted message)
+and `GROUP` (its shapes are in §8d),
+parses and logs `TICKET`, and skips the rest without failing the parse. The quote is optional
 and travels only when the user picked a fragment out of the message they are
 replying to; a plain reply carries `REPLY_TO` alone and each end draws the
 preview from its own copy of the quoted message. **A received quote is drawn
@@ -986,6 +990,123 @@ handle, which is why a server that has run out of room for an account asks
 through a key rather than calling rnsd itself. The key is ephemeral: a fresh
 boot accepts.
 
+## 8d. Groups
+
+```
+member A ─ LXM ──────────────► group g      verify, dedup, A ∈ members?
+                               g ─ LXM ───► B, C, …   "<A's name>: <text>"
+                                            FIELD_GROUP [A, mid[0..2]]
+member B ─ "/info_ 3a91f0" ──► g            scan its copies with orig_id 3a91f0
+                               g ─ LXM ───► B   ""
+                                            FIELD_GROUP [g, 3a91f0, INFO, C[0..2] st …]
+member B ─ "/leave" ─────────► g
+                               g ─ LXM ───► every member, B included   "B left"
+                                            FIELD_GROUP [g, random, LEFT, [B]]
+                               member := 0
+```
+
+In the "groups" section of `lxmf.cpp`. A group is a slot with
+`s.lxmf.id.<g>.kind = group`; its members are its own contacts with
+`member = 1`. `onInboundLxm` hands a group slot's verified, de-duplicated mail to
+`groupFanOut` instead of storing it. What stays in the group's store is a body-
+less dedup marker per inbound and one outbound record per copy sent on, each an
+ordinary message the delivery queue owns; `groupPrune` drops anything older than
+a day, hourly.
+
+**Ids are 3 bytes.** A message is named in a group by the first 3 bytes of its
+writer's `message_id` — `orig_id` on every copy, `reply_short` on a reply,
+the argument of `/info`. Every member's copy is signed separately and has a
+`message_id` of its own, so the writer's is the one name they share; 3 bytes of
+it, not 32, is what keeps a group message inside one LoRa packet. A collision
+costs a wrong quote or a merged receipt, which is accepted.
+
+**`FIELD_GROUP` (`0x0B`).** On a member's message sent on: `[from b16, orig b3]`.
+On what the group itself says: `[g b16, id b3, event, data]`, with
+`LXMF_GROUP_EV_*`:
+
+| event | id | data | to |
+|---|---|---|---|
+| 1 added / 2 removed / 3 left | random | `[dest b16…]` whom | every member, and whoever just left or was removed |
+| 4 deleted | random | `[]` | every member |
+| 5 info | the asked id | bin, 4 B per copy: dest[0..2], LxmfStatus | the asker |
+| 6 members / 7 member | random | `[[dest b16, name]…]`, then the group's name as a 5th element | the asker |
+
+**A hidden name** (`hide_name`, the default): the group announces `[nil, 0]`, and
+the members answer is how a member learns what it is called — `groupHear` puts
+it in the group contact's `display_name`, which an announce without a name never
+overwrites. An imported group starts hidden, so a proxy's first announce of a
+group says nothing before the owner's `CONFIG` has said whether it may.
+
+`FIELD_REPLY_TO` inside a group is a 3-byte bin (`reply_short`). The text of
+every one of these is what any client shows; the field is what reticulous acts
+on.
+
+**The commands** (`groupCommandOf`) are plain text a member sends the group —
+"/leave", "/members", "/member <6 hex>", "/info <6 hex>" — so any client can use
+them. The group answers and does not send them on. The three that answer with
+data take a trailing "_" ("/info_ 3a91f0") for an answer with empty text and
+the field alone; reticulous sends only those, since it reads the field and the
+sentence is air it would not show. `/info` reads the group's own
+outbound records for that `orig_id` (`groupReceipts`): one per member it sent
+the message to, while `groupPrune` keeps them. Reticulous writes its commands
+with `command = 1` (`groupSendCommand`): never drawn, never the conversation's
+preview, and queued like a group copy.
+
+**A member's device** (`groupHear`, for anything whose `group_from` is set):
+
+- stores `group_from` / `orig_id` / `reply_short` / `group_event` /
+  `group_subjects` on the record and marks the contact `group`;
+- on a notice naming it, or on `deleted`, moves `contacts.<g>.group_state` —
+  `processReady` refuses to send to a group at left, removed or deleted;
+- keeps `contacts.<g>.members`: asks `/members_` when added itself, `/member_`
+  for each one added after, drops whoever leaves or is removed, and asks `/members_`
+  once a boot when it knows none;
+- takes an answer (5–7) without storing it as a message: `info` lands on the
+  asking record as `group_receipts` and moves `group_receipts_ts`, so a page
+  waiting on it sees it arrive; `members` / `member` replace or merge the list.
+  An account hosted on a proxy (`proxy_role = server`) does none of this and
+  stores everything, `group_data` included, for its owner's device to take from
+  `MSG`.
+
+The owner, where the group lives on its own device (`groupHeldHere`), asks
+nothing: `group_info` reads the receipts straight off the slot, and
+`groupApplyMembers` keeps its `members` current.
+
+**Group copies are sent from the task loop, never where they are written.**
+`groupPost` writes the record and queues it; `groupDrainSends` sends the queue
+right after `itsPoll` returns. Where a copy is written is usually deep already —
+a member's message delivered on this same device arrives inside its sender's
+`processReady`, and a copy to another identity here is delivered inline in turn
+— and sending from there overflows the lxmf task's 8 KB stack.
+
+A message that already carries `FIELD_GROUP` is never sent on — no group feeds
+another. "/leave" is told before the leaver's `member` goes to 0: the notice
+goes to the members, and only while the leaver still is one does that include
+the one device waiting on it. A removed member keeps its contact at `member = 0`, so the notice that
+says so is addressed to it like any other message; dropping the contact would
+have dropped that message with it.
+
+**Notices are said where the group is registered** (`groupApplyMembers`,
+`GroupTell`). On the owner's device when the group is its own; on the proxy when
+it has been handed over, where `members_set` arrives as the owner edits and is
+told, and `members_init` (the handover's list, no news to anyone) is not. The
+owner's name in a notice is the `group_owner` slot's, or on a proxy the member
+hosted beside the group.
+
+**Deleting.** `group_delete` sets `ended` and says "deleted the group"; a group
+at `ended` takes nothing. `groupReap` drops the slot once none of its outbound is
+still in progress, or once `delivery_timeout` says none of it ever will be. A
+proxied group puts `ended` in its `CONFIG`; its server says the notice and reaps
+its own copy, and the owner's device drops its slot once that `CONFIG` has gone.
+
+**Proxy.** `groupFollowOwner` (in the 1 Hz proxy tick) keeps a group where its
+owner is: owner proxied and ready, group not → `ADOPT` on the owner's Channel,
+then `proxy_on` to the same server; owner back to `off` → `proxy_off`. Owner
+forced off → the group is forced off with it. A group's `HANDOVER` carries the
+member list (non-empty is what makes the server import it `kind = group`), and
+its `CONFIG` carries `display_name`, `enabled`, `members`, `ended` and `hide_name` — never the
+device-wide stamp and propagation-node knobs, which are the owner account's.
+
 ## 9. Announces
 
 `sendAnnounce(id)` builds msgpack `[display_name_or_nil, stamp_cost]` and
@@ -1056,7 +1177,7 @@ path, so announce traffic cannot overflow rnsd's recv queue.
 
 ## 10. Identity model
 
-The schema is an array (`…id.<n>.*`, `n ∈ [0, LXMF_MAX_IDENTITIES = 4)`);
+The schema is an array (`…id.<n>.*`, `n ∈ [0, LXMF_MAX_IDENTITIES = 10)`);
 single-identity runs at `n = 0`. Each slot is fully compartmentalised —
 contacts, messages, drafts kept separate by path; `destroyIdentity(n)` wipes
 `secrets.lxmf.id.<n>.privkey`, `s.lxmf.id.<n>.*`, and `lxmf.id.<n>.*`, and
@@ -1129,7 +1250,15 @@ size gate), documented in [rns](../rns), not here.
 label · enabled (1) · display_name · default_method (auto or empty ⇒ global s.lxmf.default_method, default link-if-big)
 proxy_role               off (default) | server | client — which device registers and announces this account (§8c)
 proxy_dest               32-hex lxmproxy.server destination, while proxied
-contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none; count/unread are maintained counters — bumpConvDirectory adds on write and processDelete subtracts on a single-message delete, so neither is ever re-derived from the store)
+kind                     "group" on a group's slot (§8d); absent on an account
+group_owner              a group's owning account slot, on the device that made it
+ended                    a deleted group: wall-clock s it was deleted; 0 = live
+hide_name                a group: 1 (default) = its announce carries no name
+contacts.<m>.group       u8 1 = this peer is a group
+contacts.<m>.group_state u8 that group as this account sees it: 0 member, 1 leaving, 2 left, 3 removed, 4 deleted
+contacts.<m>.member      u8 in a group's own slot: 1 = a member; a removed one stays at 0
+contacts.<m>.members     a group: its members as this account knows them, "hex32|name" lines
+contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn,kept}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none; kept = 1 once cmd.prune has emptied the conversation, so the peer stays a contact at count 0 (both frontends list `count > 0 || kept`); count/unread are maintained counters — bumpConvDirectory adds on write and processDelete subtracts on a single-message delete, so neither is ever re-derived from the store)
 
 msgs.<id>.dir            in | out
 msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)
@@ -1151,6 +1280,17 @@ msgs.<id>.ts             unix s (sender clock; can be wrong — recv_ts is the d
 msgs.<id>.delivered_ts   u32 unix s the delivery proof finished DELIVERED; 0 = not delivered
 msgs.<id>.read           inbound only, 0 | 1
 msgs.<id>.message_id     raw 32 B SHA-256 (firmware)
+msgs.<id>.group_from     raw 16 B FIELD_GROUP writer (the group itself on a notice); all-zero = not a group message
+msgs.<id>.orig_id        raw 3 B the first 3 bytes of the writer's own message_id — a group's name for it
+msgs.<id>.reply_short    raw 3 B a group reply's target (FIELD_REPLY_TO cut to 3 bytes); exclusive with reply_to
+msgs.<id>.command        u8 1 = a command we sent our group; never drawn, never the preview
+msgs.<id>.group_data     an answer's data (/info, /members), kept only on a proxy for its owner
+msgs.<id>.group_name     a members answer's group name, kept likewise
+msgs.<id>.group_receipts "hex6:status,…" — who has this message, from /info
+msgs.<id>.group_receipts_ts u32 moves with every /info answer
+msgs.<id>.group_event    u8 a group notice: 1 added, 2 removed, 3 left, 4 deleted; 0 = none
+msgs.<id>.group_subjects whom a notice names, comma-separated 32-hex
+                         (group_event: 1 added, 2 removed, 3 left, 4 deleted, 5 info, 6 members, 7 member)
 ```
 
 `body_absent` is a FIELD and not an inference: empty content is a legitimate
@@ -1241,7 +1381,7 @@ rows render — `lxmf.id.<n>.used` as the slot gate, `label_text`, `state_text`,
 **Browser** (`browser/`, `registerLxmf`): `modules/lxmf.ts` (Pinia + RPC),
 `panels/MessagesWindow.vue` (chat window), and `components/lxmf/` (`PeerAvatar`, `ConversationList`,
 `ContactCard`, `MessageBubble`, `Composer`, `AnnouncesView`,
-`ConversationThread`). `MessageBubble.vue` renders the stage glyph and shows
+`ConversationThread`, `GroupCreate`). `MessageBubble.vue` renders the stage glyph and shows
 `last_error` as its tooltip.
 
 The frontend write contract (`modules/lxmf.ts`, `CmdQueue`): a record write
@@ -1275,7 +1415,7 @@ compiled only when the lcd straddle is staged, so **no `#if` guards anything**.
 
 The settings pane is NOT here — it is described in `straddle.yaml`. The identity
 blocks that used to be rebuilt in place by a `s.lxmf.id` subscription are now
-four static row blocks each gated on `when_key: lxmf.id.<n>.used`, which the
+ten static row blocks each gated on `when_key: lxmf.id.<n>.used`, which the
 runtime shows and hides from the same subscription without anything being
 destroyed under a live event. That is what removed the 150 ms deferred rebuild
 (one create writes several keys in a bracket, and Destroy's own event would
@@ -1285,6 +1425,24 @@ to its `s.lxmf.id` / `lxmf.id` / `lxmf.announces` storage subscriptions and rend
 outbound bubble glyphs with `LV_SYMBOL_OK` / `LV_SYMBOL_CLOSE`. The
 `lxmf.url_lcd` handler calls `lcdShowProgram("LXMF")` then opens the thread,
 both on the lcd task.
+
+**Groups in the frontends.** Every account list in both (and nomad's identity
+chooser) skips a slot whose `kind` is `group`; the settings blocks hide it
+because the firmware publishes its `lxmf.id.<g>.used` as 0. "The open account
+owns this group" is computed, not stored: a slot with `kind = group`,
+`lxmf.id.<g>.dest_hash` equal to the contact and `group_owner` equal to the open
+account. The owner's member list is that slot's own contacts directory with
+`member = 1` — the browser fetches `s.lxmf.id.<g>.contacts` while the owner's
+card is open, since the mirror otherwise carries only the open account's. A
+message is a group member's when `group_from` is set and is not the peer, and a
+notice when `group_from` is the peer. Neither frontend parses the "Name: "
+prefix for anything but display: the name it shows is the open account's own
+contact name for `group_from` when it has one, the prefix otherwise. Every
+other member's view of the list is `contacts.<group>.members`, already in the
+mirror. A record with `command` set is filtered out with the drafts. The
+message page's receipts wait on `group_receipts_ts` changing from what it was
+when the page asked — not on `group_receipts` itself, which an answer may leave
+exactly as it was.
 
 ## 13. Maintainer pitfalls
 

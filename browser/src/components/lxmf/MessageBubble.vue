@@ -35,6 +35,10 @@
          @click="acts = true"
          @mouseup="onSelect"
          @contextmenu.prevent="emit('menu', m)">
+      <!-- The member of a group who wrote this, above the text, on a colour
+           of their own — once per run of their messages. -->
+      <div v-if="sender && showSender" class="sender"
+           :style="{ color: `hsl(${sender.hue} 70% 72%)` }">{{ sender.name }}</div>
       <!-- What this message replies to: the quoted line, drawn from OUR copy of
            that message, with a tap back to it. A reply to a message this device
            does not hold says only that much. -->
@@ -109,8 +113,8 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { matClose, matReply, matInfo, matDelete, matDownload, matLink }
   from '@quasar/extras/material-icons'
 import DeliveryTicks from './DeliveryTicks.vue'
-import { type Message, type QuoteView, segmentMessage, openNomad, formatMsgTime,
-         lxmfStatusName, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
+import { type GroupSender, type Message, type QuoteView, segmentMessage, openNomad,
+         formatMsgTime, lxmfStatusName, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 
 const props = defineProps<{
   m: Message
@@ -121,10 +125,15 @@ const props = defineProps<{
   /* This identity's mail belongs to a proxy server — what makes a direct
    * message worth marking as one. */
   proxied?: boolean
+  /* The group member who wrote this, when it is a group message from someone
+   * else; its text is then the body without the name the group put in front. */
+  sender?: GroupSender | null
+  /* Draw the sender's name — the first bubble of a run from that member. */
+  showSender?: boolean
 }>()
 
 /* Split the body into text + tappable Nomad-page-link runs. */
-const segments = computed(() => segmentMessage(props.m.content))
+const segments = computed(() => segmentMessage(props.sender ? props.sender.body : props.m.content))
 const emit = defineEmits<{
   resend: [m: Message]
   menu: [m: Message]
@@ -225,6 +234,11 @@ const delivered = computed(() =>
 }
 .download:hover { background: rgba(255,255,255,0.14); }
 
+.sender {
+  font-size: calc(12px * var(--rfs, 1)); font-weight: 700;
+  line-height: 1.3; margin-bottom: 1px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
 /* Quote block at the head of a reply: an accent bar, who wrote the quoted
  * message, and its line. Sits inside the balloon, dimmer than the reply
  * itself — it is context, not the message. */

@@ -318,6 +318,367 @@ settings:
                   color: red
                   do: { set: { key: "lxmf.cmd.identity_destroy", value: "3", edge: true } }
         when_key: "lxmf.id.3.used"
+      # Identity slot 4. lxmf.cpp publishes `used` as the gate and the rest as
+      # finished text, so the block is present only while the slot is.
+      - section: "Identity 4"
+        when_key: "lxmf.id.4.used"
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.4.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.4.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.4.identity_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.4.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.4.traffic" }
+        when_key: "lxmf.id.4.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.4.enabled" }
+        when_key: "lxmf.id.4.used"
+      - value: { label: "Proxy", key: "lxmf.id.4.proxy_text" }
+        when_key: "lxmf.id.4.used"
+      - buttons:
+          items:
+            - label: "Use a proxy"
+              when_key: "lxmf.id.4.proxy_offer"
+              do:
+                form:
+                  title: "Proxy identity 4"
+                  submit: "Ask"
+                  cmd: lxmf.id.4.setproxy
+                  fields:
+                    - text: { label: "Server address", field: dest, placeholder: "32 hex characters" }
+                    - value: { label: "Heard", key: "lxmf.proxies_text" }
+            - label: "Stop asking"
+              when_key: "lxmf.id.4.proxy_asking"
+              do: { set: { key: "lxmf.id.4.cmd.proxy_off", value: "1", edge: true } }
+            - label: "Stop proxying"
+              when_key: "lxmf.id.4.proxy_held"
+              do:
+                dialog:
+                  text: "Take this account back? It keeps working — the server goes on delivering — until the server hands its keys back and this device starts answering again."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Take it back", do: { set: { key: "lxmf.id.4.cmd.proxy_off", value: "1", edge: true } } }
+            - label: "Force off"
+              color: red
+              when_key: "lxmf.id.4.proxy_held"
+              do:
+                dialog:
+                  text: "Only for a server that is gone for good. It keeps the account key, the ratchet state and anything it still holds — undelivered mail, and mail it accepted but never handed over. If it ever comes back it will announce this same address, and nothing on the network can tell you apart."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Force off", color: red, do: { set: { key: "lxmf.id.4.cmd.proxy_force_off", value: "1", edge: true } } }
+        when_key: "lxmf.id.4.used"
+      - button:
+          label: "Destroy identity 4"
+          color: red
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  color: red
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "4", edge: true } }
+        when_key: "lxmf.id.4.used"
+      # Identity slot 5.
+      - section: "Identity 5"
+        when_key: "lxmf.id.5.used"
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.5.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.5.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.5.identity_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.5.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.5.traffic" }
+        when_key: "lxmf.id.5.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.5.enabled" }
+        when_key: "lxmf.id.5.used"
+      - value: { label: "Proxy", key: "lxmf.id.5.proxy_text" }
+        when_key: "lxmf.id.5.used"
+      - buttons:
+          items:
+            - label: "Use a proxy"
+              when_key: "lxmf.id.5.proxy_offer"
+              do:
+                form:
+                  title: "Proxy identity 5"
+                  submit: "Ask"
+                  cmd: lxmf.id.5.setproxy
+                  fields:
+                    - text: { label: "Server address", field: dest, placeholder: "32 hex characters" }
+                    - value: { label: "Heard", key: "lxmf.proxies_text" }
+            - label: "Stop asking"
+              when_key: "lxmf.id.5.proxy_asking"
+              do: { set: { key: "lxmf.id.5.cmd.proxy_off", value: "1", edge: true } }
+            - label: "Stop proxying"
+              when_key: "lxmf.id.5.proxy_held"
+              do:
+                dialog:
+                  text: "Take this account back? It keeps working — the server goes on delivering — until the server hands its keys back and this device starts answering again."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Take it back", do: { set: { key: "lxmf.id.5.cmd.proxy_off", value: "1", edge: true } } }
+            - label: "Force off"
+              color: red
+              when_key: "lxmf.id.5.proxy_held"
+              do:
+                dialog:
+                  text: "Only for a server that is gone for good. It keeps the account key, the ratchet state and anything it still holds — undelivered mail, and mail it accepted but never handed over. If it ever comes back it will announce this same address, and nothing on the network can tell you apart."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Force off", color: red, do: { set: { key: "lxmf.id.5.cmd.proxy_force_off", value: "1", edge: true } } }
+        when_key: "lxmf.id.5.used"
+      - button:
+          label: "Destroy identity 5"
+          color: red
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  color: red
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "5", edge: true } }
+        when_key: "lxmf.id.5.used"
+      # Identity slot 6.
+      - section: "Identity 6"
+        when_key: "lxmf.id.6.used"
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.6.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.6.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.6.identity_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.6.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.6.traffic" }
+        when_key: "lxmf.id.6.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.6.enabled" }
+        when_key: "lxmf.id.6.used"
+      - value: { label: "Proxy", key: "lxmf.id.6.proxy_text" }
+        when_key: "lxmf.id.6.used"
+      - buttons:
+          items:
+            - label: "Use a proxy"
+              when_key: "lxmf.id.6.proxy_offer"
+              do:
+                form:
+                  title: "Proxy identity 6"
+                  submit: "Ask"
+                  cmd: lxmf.id.6.setproxy
+                  fields:
+                    - text: { label: "Server address", field: dest, placeholder: "32 hex characters" }
+                    - value: { label: "Heard", key: "lxmf.proxies_text" }
+            - label: "Stop asking"
+              when_key: "lxmf.id.6.proxy_asking"
+              do: { set: { key: "lxmf.id.6.cmd.proxy_off", value: "1", edge: true } }
+            - label: "Stop proxying"
+              when_key: "lxmf.id.6.proxy_held"
+              do:
+                dialog:
+                  text: "Take this account back? It keeps working — the server goes on delivering — until the server hands its keys back and this device starts answering again."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Take it back", do: { set: { key: "lxmf.id.6.cmd.proxy_off", value: "1", edge: true } } }
+            - label: "Force off"
+              color: red
+              when_key: "lxmf.id.6.proxy_held"
+              do:
+                dialog:
+                  text: "Only for a server that is gone for good. It keeps the account key, the ratchet state and anything it still holds — undelivered mail, and mail it accepted but never handed over. If it ever comes back it will announce this same address, and nothing on the network can tell you apart."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Force off", color: red, do: { set: { key: "lxmf.id.6.cmd.proxy_force_off", value: "1", edge: true } } }
+        when_key: "lxmf.id.6.used"
+      - button:
+          label: "Destroy identity 6"
+          color: red
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  color: red
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "6", edge: true } }
+        when_key: "lxmf.id.6.used"
+      # Identity slot 7.
+      - section: "Identity 7"
+        when_key: "lxmf.id.7.used"
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.7.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.7.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.7.identity_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.7.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.7.traffic" }
+        when_key: "lxmf.id.7.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.7.enabled" }
+        when_key: "lxmf.id.7.used"
+      - value: { label: "Proxy", key: "lxmf.id.7.proxy_text" }
+        when_key: "lxmf.id.7.used"
+      - buttons:
+          items:
+            - label: "Use a proxy"
+              when_key: "lxmf.id.7.proxy_offer"
+              do:
+                form:
+                  title: "Proxy identity 7"
+                  submit: "Ask"
+                  cmd: lxmf.id.7.setproxy
+                  fields:
+                    - text: { label: "Server address", field: dest, placeholder: "32 hex characters" }
+                    - value: { label: "Heard", key: "lxmf.proxies_text" }
+            - label: "Stop asking"
+              when_key: "lxmf.id.7.proxy_asking"
+              do: { set: { key: "lxmf.id.7.cmd.proxy_off", value: "1", edge: true } }
+            - label: "Stop proxying"
+              when_key: "lxmf.id.7.proxy_held"
+              do:
+                dialog:
+                  text: "Take this account back? It keeps working — the server goes on delivering — until the server hands its keys back and this device starts answering again."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Take it back", do: { set: { key: "lxmf.id.7.cmd.proxy_off", value: "1", edge: true } } }
+            - label: "Force off"
+              color: red
+              when_key: "lxmf.id.7.proxy_held"
+              do:
+                dialog:
+                  text: "Only for a server that is gone for good. It keeps the account key, the ratchet state and anything it still holds — undelivered mail, and mail it accepted but never handed over. If it ever comes back it will announce this same address, and nothing on the network can tell you apart."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Force off", color: red, do: { set: { key: "lxmf.id.7.cmd.proxy_force_off", value: "1", edge: true } } }
+        when_key: "lxmf.id.7.used"
+      - button:
+          label: "Destroy identity 7"
+          color: red
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  color: red
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "7", edge: true } }
+        when_key: "lxmf.id.7.used"
+      # Identity slot 8.
+      - section: "Identity 8"
+        when_key: "lxmf.id.8.used"
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.8.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.8.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.8.identity_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.8.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.8.traffic" }
+        when_key: "lxmf.id.8.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.8.enabled" }
+        when_key: "lxmf.id.8.used"
+      - value: { label: "Proxy", key: "lxmf.id.8.proxy_text" }
+        when_key: "lxmf.id.8.used"
+      - buttons:
+          items:
+            - label: "Use a proxy"
+              when_key: "lxmf.id.8.proxy_offer"
+              do:
+                form:
+                  title: "Proxy identity 8"
+                  submit: "Ask"
+                  cmd: lxmf.id.8.setproxy
+                  fields:
+                    - text: { label: "Server address", field: dest, placeholder: "32 hex characters" }
+                    - value: { label: "Heard", key: "lxmf.proxies_text" }
+            - label: "Stop asking"
+              when_key: "lxmf.id.8.proxy_asking"
+              do: { set: { key: "lxmf.id.8.cmd.proxy_off", value: "1", edge: true } }
+            - label: "Stop proxying"
+              when_key: "lxmf.id.8.proxy_held"
+              do:
+                dialog:
+                  text: "Take this account back? It keeps working — the server goes on delivering — until the server hands its keys back and this device starts answering again."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Take it back", do: { set: { key: "lxmf.id.8.cmd.proxy_off", value: "1", edge: true } } }
+            - label: "Force off"
+              color: red
+              when_key: "lxmf.id.8.proxy_held"
+              do:
+                dialog:
+                  text: "Only for a server that is gone for good. It keeps the account key, the ratchet state and anything it still holds — undelivered mail, and mail it accepted but never handed over. If it ever comes back it will announce this same address, and nothing on the network can tell you apart."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Force off", color: red, do: { set: { key: "lxmf.id.8.cmd.proxy_force_off", value: "1", edge: true } } }
+        when_key: "lxmf.id.8.used"
+      - button:
+          label: "Destroy identity 8"
+          color: red
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  color: red
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "8", edge: true } }
+        when_key: "lxmf.id.8.used"
+      # Identity slot 9.
+      - section: "Identity 9"
+        when_key: "lxmf.id.9.used"
+      - info:
+          rows:
+            - value:  { label: "Name", key: "lxmf.id.9.label_text" }
+            - value:  { label: "Address", key: "lxmf.id.9.dest_hash", copyable: true }
+            - value:  { label: "Identity", key: "lxmf.id.9.identity_hash", copyable: true }
+            - value:  { label: "State", key: "lxmf.id.9.state_text" }
+            - value:  { label: "Messages", key: "lxmf.id.9.traffic" }
+        when_key: "lxmf.id.9.used"
+      - switch: { label: "Enabled", key: "s.lxmf.id.9.enabled" }
+        when_key: "lxmf.id.9.used"
+      - value: { label: "Proxy", key: "lxmf.id.9.proxy_text" }
+        when_key: "lxmf.id.9.used"
+      - buttons:
+          items:
+            - label: "Use a proxy"
+              when_key: "lxmf.id.9.proxy_offer"
+              do:
+                form:
+                  title: "Proxy identity 9"
+                  submit: "Ask"
+                  cmd: lxmf.id.9.setproxy
+                  fields:
+                    - text: { label: "Server address", field: dest, placeholder: "32 hex characters" }
+                    - value: { label: "Heard", key: "lxmf.proxies_text" }
+            - label: "Stop asking"
+              when_key: "lxmf.id.9.proxy_asking"
+              do: { set: { key: "lxmf.id.9.cmd.proxy_off", value: "1", edge: true } }
+            - label: "Stop proxying"
+              when_key: "lxmf.id.9.proxy_held"
+              do:
+                dialog:
+                  text: "Take this account back? It keeps working — the server goes on delivering — until the server hands its keys back and this device starts answering again."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Take it back", do: { set: { key: "lxmf.id.9.cmd.proxy_off", value: "1", edge: true } } }
+            - label: "Force off"
+              color: red
+              when_key: "lxmf.id.9.proxy_held"
+              do:
+                dialog:
+                  text: "Only for a server that is gone for good. It keeps the account key, the ratchet state and anything it still holds — undelivered mail, and mail it accepted but never handed over. If it ever comes back it will announce this same address, and nothing on the network can tell you apart."
+                  buttons:
+                    - { label: "Cancel" }
+                    - { label: "Force off", color: red, do: { set: { key: "lxmf.id.9.cmd.proxy_force_off", value: "1", edge: true } } }
+        when_key: "lxmf.id.9.used"
+      - button:
+          label: "Destroy identity 9"
+          color: red
+          do:
+            dialog:
+              text: "Destroy this identity? Its private key and everything it has sent or received are erased. Nobody can reach this address again, and there is no way back."
+              buttons:
+                - { label: "Cancel" }
+                - label: "Destroy"
+                  color: red
+                  do: { set: { key: "lxmf.cmd.identity_destroy", value: "9", edge: true } }
+        when_key: "lxmf.id.9.used"
       # The two ways to get an identity are one choice, so they share a line
       # rather than stacking as two full-width buttons.
       - buttons:

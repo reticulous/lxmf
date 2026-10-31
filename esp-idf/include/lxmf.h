@@ -26,6 +26,10 @@
 #include <cstdint>
 #include <string>
 
+/* Identity slots (`s.lxmf.id.<n>`, n ∈ [0, LXMF_MAX_IDENTITIES)). A group
+ * (`s.lxmf.id.<n>.kind = group`) takes a slot like an account does. */
+#define LXMF_MAX_IDENTITIES 10
+
 /* ── Message status (stored as the u8 `status` record field) ────────────────
  * A single unified state: lifecycle progress, terminal outcome, or gave-up
  * reason all live here. Companion field `tries` (u8) is the try count for the
@@ -232,14 +236,15 @@ int lxmfCreateIdentity(const char* display_name, bool sync = false);
  *  Ed25519+X25519 private key, `display_name` the name it already advertises
  *  (may be null/empty), `role` the value for `s.lxmf.id.<n>.proxy_role` — null
  *  or "" leaves it `off`, "server" marks a slot this device hosts on somebody
- *  else's behalf. The slot registers and announces `lxmf.delivery` at once,
- *  because nothing else would ever say the destination is here now.
+ *  else's behalf. `kind` "group" makes the slot a group. The slot registers
+ *  and announces `lxmf.delivery` at once, because nothing else would ever say
+ *  the destination is here now.
  *
  *  Both modes write the `lxmf.cmd.identity_import` sentinel. Sync mode waits
  *  (≤ 5 s) and returns the allocated slot, or -1; async returns 0 on a
  *  well-formed request. */
 int lxmfImportIdentity(const char* privkey_hex, const char* display_name,
-                       const char* role, bool sync);
+                       const char* role, bool sync, const char* kind = nullptr);
 
 /** Which slot holds the identity behind `dest_hash` (its `lxmf.delivery`
  *  destination), or -1 when none does. Reads the published addresses, so it is

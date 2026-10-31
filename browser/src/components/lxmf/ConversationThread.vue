@@ -10,7 +10,7 @@
       <button class="back" :class="{ 'back--shown': showBack }" title="Back" @click.stop="emit('back')">
         <q-icon :name="matArrowBack" size="20px" />
       </button>
-      <PeerAvatar :peer="peer" :name="name" :size="30" />
+      <PeerAvatar :peer="peer" :name="name" :size="30" :group="group" />
       <div class="who">
         <div class="name">{{ name }}</div>
         <div class="sub">{{ reachLine }}</div>
@@ -40,9 +40,18 @@
       </div>
       <template v-for="b in buckets" :key="b.day">
         <div class="daysep"><span>{{ b.day }}</span></div>
+        <template v-for="m in b.messages" :key="m.key">
+        <!-- A notice from the group itself — who joined, left, was removed,
+             or that it is gone: a line of the conversation, not a message
+             anybody wrote. -->
+        <div v-if="isGroupNotice(m)" :id="`msg-${m.key}`" class="notice">
+          <span>{{ m.content }}</span>
+        </div>
         <MessageBubble
-          v-for="m in b.messages" :key="m.key" :m="m" :proxied="proxied"
+          v-else :m="m" :proxied="proxied"
           :quote="quoteFor(m)"
+          :sender="senders.get(m.key)?.g ?? null"
+          :show-sender="senders.get(m.key)?.first ?? false"
           @resend="m2 => emit('resend', m2)"
           @menu="m2 => emit('msg-menu', m2)"
           @delete="m2 => emit('msg-delete', m2)"
@@ -51,6 +60,7 @@
           @reply="(m2, frag) => emit('msg-reply', m2, frag)"
           @quote-open="jumpTo"
         />
+        </template>
       </template>
     </div>
   </div>
@@ -73,7 +83,8 @@ import { matArrowBack, matInfo, matLink, matLinkOff } from '@quasar/extras/mater
 import PeerAvatar from './PeerAvatar.vue'
 import MessageBubble from './MessageBubble.vue'
 import ContactSignal from './ContactSignal.vue'
-import { quoteView, type Message, type Reachability } from '../../modules/lxmf'
+import { quoteView, replyTarget, groupSender, isGroupNotice,
+         type GroupSender, type Message, type Reachability } from '../../modules/lxmf'
 
 const props = defineProps<{
   /* Identity slot this pane views. Only to scope the per-conversation scroll
@@ -88,6 +99,11 @@ const props = defineProps<{
   /* This identity's mail belongs to a proxy server, which is what makes "this
    * one went direct" worth marking on a bubble at all. */
   proxied?: boolean
+  /* The peer is an LXMF group: its header draws the group glyph. */
+  group?: boolean
+  /* The name this account knows a peer by, '' when none — what names the
+   * member behind a group message ahead of the prefix the group wrote. */
+  knownName?: (peer: string) => string
   /* Reveal the Back button (single-column / compact layouts). Hidden by
    * default — desktop master/detail keeps the rail permanently visible. */
   showBack?: boolean
@@ -120,16 +136,30 @@ const reachLine = computed(() => {
   return `heard ${age}${hops}`
 })
 
-/* message_id → the message it names, over this conversation. What a reply's
- * quote block is resolved against: the reply carries an id, and the line it
- * shows comes from our own copy of the message that id names. */
-const byId = computed(() => {
-  const m = new Map<string, Message>()
-  for (const b of props.buckets)
-    for (const msg of b.messages) if (msg.messageId) m.set(msg.messageId, msg)
-  return m
+/* Every message of this conversation, in order. What a reply's quote block is
+ * resolved against (replyTarget): the reply carries a reference, and the line
+ * it shows comes from our own copy of the message that reference names. */
+const allMsgs = computed(() => props.buckets.flatMap(b => b.messages))
+
+/* The member behind each group message, and whether its bubble opens a run
+ * from that member — the name is drawn once per run, as Signal does. A date
+ * separator, an outgoing message or another member ends a run. */
+const senders = computed(() => {
+  const out = new Map<string, { g: GroupSender; first: boolean }>()
+  const known = props.knownName ?? (() => '')
+  for (const b of props.buckets) {
+    let prev = ''
+    for (const msg of b.messages) {
+      const g = msg.dir === 'in' ? groupSender(msg, known) : null
+      if (g) out.set(msg.key, { g, first: g.from !== prev })
+      prev = g ? g.from : ''
+    }
+  }
+  return out
 })
-const quoteFor = (m: Message) => quoteView(m, byId.value, () => props.name)
+const quoteFor = (m: Message) =>
+  quoteView(m, x => replyTarget(x, allMsgs.value), () => props.name,
+            t => senders.value.get(t.key)?.g ?? null)
 
 const scroller = ref<HTMLElement | null>(null)
 
@@ -290,5 +320,10 @@ onBeforeUnmount(() => {
 .daysep span {
   background: #ffffcc; color: #000;
   font-size: calc(11px * var(--rfs, 1)); padding: 2px 10px; border-radius: 6px;
+}
+.notice { text-align: center; margin: 6px 0; }
+.notice span {
+  color: #9a9a9a; font-size: calc(11px * var(--rfs, 1)); font-style: italic;
+  white-space: pre-wrap; word-break: break-word;
 }
 </style>
