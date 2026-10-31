@@ -620,8 +620,13 @@ from `lora.<n>.meas.*` by `lxmfPingLink` at render time. iface-lora republishes
 those on its own 15 s beat, so a snapshot taken at settle was stale as soon as
 the radio heard the peer again — and on a first probe it was empty, the link
 having come up seconds earlier. The LCD's contact-info label therefore watches
-`lora.` as well as `lxmf.ping`, guarded on the page being open, so the line
-appears when the beat publishes rather than only on the next probe.
+`lora.<n>.meas_gen` as well as `lxmf.ping`, guarded on the page being open, so
+the line appears when the beat publishes rather than only on the next probe.
+The LCD subscribes to that counter rather than to the `lora.<n>.meas` prefix,
+here and for the signal bars, because the prefix sends one notification for
+every changed field. A fresh neighbour table changes every field of every slot
+at once, which is more than the lcd task's inbox drains inside the storage
+notify bound, and the excess is dropped.
 
 ## 7. Inbound lifecycle
 

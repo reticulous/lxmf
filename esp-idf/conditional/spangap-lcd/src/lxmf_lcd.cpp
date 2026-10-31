@@ -4675,12 +4675,14 @@ void lxmfApp(void* arg) {
         storageSubscribeChanges("lxmf.ping",      onPingChange);      /* contact info page's Ping result */
         /* The radio's own measurements, which the same label prints. They are
          * published on iface-lora's beat, not the probe's, so without this the
-         * line a first probe was too early to see never appears. One prefix
-         * per radio slot: "lora." would fire on every stat. */
-        storageSubscribeChanges("lora.0.meas",    onPingChange);
-        storageSubscribeChanges("lora.1.meas",    onPingChange);
-        storageSubscribeChanges("lora.2.meas",    onPingChange);
-        storageSubscribeChanges("lora.3.meas",    onPingChange);
+         * line a first probe was too early to see never appears. Watched via
+         * each radio slot's meas_gen counter, which moves once per
+         * publication: the lora.<n>.meas prefix fires once per changed field
+         * and floods the lcd inbox. */
+        storageSubscribeChanges("lora.0.meas_gen", onPingChange);
+        storageSubscribeChanges("lora.1.meas_gen", onPingChange);
+        storageSubscribeChanges("lora.2.meas_gen", onPingChange);
+        storageSubscribeChanges("lora.3.meas_gen", onPingChange);
         storageSubscribeChanges("sys.standby",    onStandbyChange);   /* wake → clear unread if reading */
         g_subscribed = true;
     }
@@ -4727,12 +4729,13 @@ void LxmfApp::appInit() {
         s_gwBars = slot ? makeSignalBars(slot) : nullptr;
         setSignalBars(s_gwBars, 0);                       /* hidden until a sample lands */
         storageSubscribeChanges("rnsd.gw",     onSignalChange);
-        /* The radios' per-peer measurements, one prefix per slot (the
-         * subscription is a prefix, and "lora." would fire on every stat). */
-        storageSubscribeChanges("lora.0.meas", onSignalChange);
-        storageSubscribeChanges("lora.1.meas", onSignalChange);
-        storageSubscribeChanges("lora.2.meas", onSignalChange);
-        storageSubscribeChanges("lora.3.meas", onSignalChange);
+        /* The radios' per-peer measurements, through each radio slot's
+         * meas_gen counter: one notify per publication, where the
+         * lora.<n>.meas prefix would send one per changed field. */
+        storageSubscribeChanges("lora.0.meas_gen", onSignalChange);
+        storageSubscribeChanges("lora.1.meas_gen", onSignalChange);
+        storageSubscribeChanges("lora.2.meas_gen", onSignalChange);
+        storageSubscribeChanges("lora.3.meas_gen", onSignalChange);
         gwSignalUpdate();
         /* Proxy arrow: the Channel to the server holding this identity's
          * account, hidden while this device answers on its own address. Rides
