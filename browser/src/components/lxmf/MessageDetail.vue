@@ -40,7 +40,7 @@
           <span class="spin"></span> Asking the group…
         </div>
         <div v-else class="receipts">
-          <div v-if="!receipts.length" class="rempty">No recipients.</div>
+          <div v-if="!receipts.length" class="rempty">The group has no record of anyone it sent this to.</div>
           <div v-for="r in receipts" :key="r.prefix" class="rrow">
             <span class="rname">{{ r.name }}</span>
             <span v-if="r.delivered" class="rtick"><DeliveryTicks variant="delivered" /></span>

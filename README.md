@@ -596,7 +596,7 @@ group → Cat   "Bob: me too"    0x30: hash of the group's copy to Cat
 
 Each member holds a separately signed copy with an id of its own, so the group
 writes into each member's copy the id of that member's own copy of the message
-quoted. It can do that for as long as it keeps what it sent on, a day. A reply
+quoted. It can do that for as long as it keeps what it sent on, three days. A reply
 to anything older goes on without `0x30` but with its quote `0x31`, if it has
 one, and that quote is shown unchecked.
 

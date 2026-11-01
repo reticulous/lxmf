@@ -3873,7 +3873,9 @@ static std::string groupCommandOf(const std::string& content, std::string& id6, 
 }
 
 /* Who group g sent the message with 3-byte id `id6` to, and how each copy is
- * doing: "hex6:status,…", the first 3 bytes of each member's dest. */
+ * doing: "hex6:status,…", the first 3 bytes of each member's dest. An answer
+ * to /info carries the id it answers as its own `orig_id`, so the group's own
+ * words (those with a `group_event`) are no copy of anything. */
 static std::string groupReceipts(int g, const std::string& id6)
 {
     std::string out;
@@ -3882,6 +3884,7 @@ static std::string groupReceipts(int g, const std::string& id6)
         for (const auto& key : collectTokens(msgPrefix(g, peer))) {
             if (storageGetStr(msgPath(g, peer, key, "dir").c_str(), "") != "out") continue;
             if (storageGetStr(msgPath(g, peer, key, "orig_id").c_str(), "") != id6) continue;
+            if (storageGetInt(msgPath(g, peer, key, "group_event").c_str(), 0) != 0) continue;
             st = storageGetInt(msgPath(g, peer, key, "status").c_str(), 0);
         }
         if (st < 0) continue;
@@ -8667,8 +8670,8 @@ static void groupReap(void)
 }
 
 /* Lines a group slot keeps: what it sent and the markers of what it received
- * age out after a day. */
-#define LXMF_GROUP_KEEP_S   86400
+ * age out after three days. */
+#define LXMF_GROUP_KEEP_S   (3 * 86400)
 #define LXMF_GROUP_PRUNE_S  3600
 static void groupPrune(void)
 {
@@ -10839,7 +10842,7 @@ static void lxmfTaskMain(void*)
             convReap();             /* close conversation links idle past s.lxmf.link.idle_s */
             publishLinks();         /* per-peer link state for the header icons */
             proxyClientTick();      /* the proxy Channel, its handshakes, CONFIG */
-            groupPrune();           /* groups keep a day of what they passed on */
+            groupPrune();           /* groups keep three days of what they passed on */
             groupReap();            /* a deleted group goes once its notices are out */
             applyAcceptGates();     /* the per-destination inbound gate */
             pnClientTick();         /* propagation-node uploads + sync machine */

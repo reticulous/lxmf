@@ -4668,7 +4668,7 @@ void fillReceipts() {
         fillMeta(meta, fake);
         rows++;
     }
-    if (!rows) mkLabel(s_rcptBox, "The group named nobody.", lv_color_hex(0x8a93a0));
+    if (!rows) mkLabel(s_rcptBox, "The group has no record of anyone it sent this to.", lv_color_hex(0x8a93a0));
 }
 
 void closeMsgDetail() {

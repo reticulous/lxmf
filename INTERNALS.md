@@ -1029,7 +1029,7 @@ In the "groups" section of `lxmf.cpp`. A group is a slot with
 `groupFanOut` instead of storing it. What stays in the group's store is a body-
 less dedup marker per inbound and one outbound record per copy sent on, each an
 ordinary message the delivery queue owns; `groupPrune` drops anything older than
-a day, hourly.
+three days, hourly.
 
 **Ids are 3 bytes.** A message is named in a group by the first 3 bytes of its
 writer's `message_id` — `orig_id` on every copy, the argument of `/info`. Every
