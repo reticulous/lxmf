@@ -191,7 +191,7 @@ const props = withDefaults(defineProps<{
   /* The group's member list as the group last sent it — a member's view. */
   roster?: GroupMember[]
 }>(), { group: false, ownedGroup: null, members: () => [], addable: () => [], selfDest: '',
-        groupState: GroupState.Member, roster: () => [] })
+        groupState: () => GroupState.Member, roster: () => [] })
 const emit = defineEmits<{
   close: []
   'delete-conversation': [peer: string]
