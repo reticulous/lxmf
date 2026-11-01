@@ -149,7 +149,8 @@ export interface Message {
   // sent only when the user picked one by selecting it. Empty means the reply
   // quotes the whole message and the preview comes from our own copy of it.
   // Never rendered unless it really occurs in the message `replyTo` names — see
-  // quoteOf() — so a sender cannot put words in the other party's bubble.
+  // quoteView() — so a sender cannot put words in the other party's bubble;
+  // only a quote with no `replyTo` at all is drawn as it came.
   replyQuote?: string
   method?: string      // delivery method override
   read?: number        // inbound read flag
@@ -170,19 +171,17 @@ export interface Message {
   // unproxied every message is direct and the mark would say nothing.
   viaLink: boolean
   // A group message relayed to us: the destination of the member who wrote it
-  // and the message_id of their original. A group signs a separate copy for
-  // every member, so the original's id is the one every member shares — what a
-  // reply in the group names. '' / all-zero on an ordinary message.
+  // and the first 3 bytes of the message_id of their original. A group signs a
+  // separate copy for every member, so the original's id is the one every
+  // member shares — what /info names. `groupFrom` is the 3 bytes the group
+  // named the writer by, followed by zeros, while this account knows no member
+  // by them (groupFromKnown). '' / all-zero on an ordinary message.
   groupFrom?: string
   origId?: string
   // A notice from the group itself (groupFrom === peer): what happened —
   // GroupEvent — and the 32-hex destinations it happened to.
   groupEvent?: GroupEvent
   groupSubjects?: string[]
-  // In a group, a reply names its target by 3 bytes (6 hex) — the target's
-  // `origId` when it has one, else the head of its message_id — in place of
-  // the 32-byte `replyTo`. '' / all-zero when not a group reply.
-  replyShort?: string
   // A command this device sent the group (/leave, /info, /members, /member):
   // traffic for the group, never drawn as something said.
   command?: boolean
@@ -202,6 +201,12 @@ export enum GroupState { Member = 0, Leaving = 1, Left = 2, Removed = 3, Deleted
  *  bubble from a member. */
 export function isGroupNotice(m: Message): boolean {
   return hasDest(m.groupFrom ?? '') && (m.groupFrom ?? '').toLowerCase() === m.peer
+}
+
+/** True when `groupFrom` names a member this account knows, not only the 3
+ *  bytes the group named them by. */
+export function groupFromKnown(from: string): boolean {
+  return /^[0-9a-f]{32}$/i.test(from) && /[^0]/.test(from.slice(6))
 }
 
 /** One recipient of a group message as the group reports it: the first 3
@@ -730,7 +735,9 @@ export function segmentMessage(content: string): MsgSegment[] {
  * message: a carried fragment is drawn only where it really occurs there, so a
  * quote can never say something the quoted message does not. With no copy of
  * the quoted message there is nothing to check against, and the block says only
- * that this is a reply. */
+ * that this is a reply. A fragment that names no message at all — a group
+ * passes a quote on without its FIELD_REPLY_TO once it no longer knows the copy
+ * it names — is drawn as it came, under no author. */
 
 /** Longest quote a bubble or the composer strip draws. */
 export const QUOTE_PREVIEW_MAX = 120
@@ -750,25 +757,16 @@ export interface QuoteView {
   text: string
 }
 
-/** Whether `m` is a reply at all — by the group's 3-byte reference or by the
- *  full message hash. */
+/** Whether `m` is a reply at all — naming its message, or carrying a quote
+ *  that names none. */
 export function isReply(m: Message): boolean {
-  return hasDest(m.replyShort ?? '') || hasDest(m.replyTo ?? '')
+  return hasDest(m.replyTo ?? '') || !!m.replyQuote
 }
 
 /** The message `m` replies to, over `msgs` (the conversation it lives in), or
- *  null when this device does not hold it. A group reply names its target by 6
- *  hex — the target's `origId`, or the head of its message_id when it has
- *  none; any other reply by the whole message_id. */
+ *  null when this device does not hold it. */
 export function replyTarget(m: Message, msgs: Iterable<Message>): Message | null {
-  const short = (m.replyShort ?? '').toLowerCase()
   const full = (m.replyTo ?? '').toLowerCase()
-  if (hasDest(short)) {
-    for (const t of msgs)
-      if ((t.origId ?? '').toLowerCase() === short ||
-          t.messageId.toLowerCase().startsWith(short)) return t
-    return null
-  }
   if (!hasDest(full)) return null
   for (const t of msgs) if (t.messageId.toLowerCase() === full) return t
   return null
@@ -783,6 +781,7 @@ export function quoteView(m: Message, targetOf: (m: Message) => Message | null,
                           nameOf: (peer: string) => string,
                           senderOf?: (t: Message) => GroupSender | null): QuoteView | null {
   if (!isReply(m)) return null
+  if (!hasDest(m.replyTo ?? '')) return { key: '', label: '', text: quoteLine(m.replyQuote ?? '') }
   const t = targetOf(m)
   if (!t) return { key: '', label: '', text: '' }
   const g = senderOf?.(t) ?? null
@@ -794,15 +793,6 @@ export function quoteView(m: Message, targetOf: (m: Message) => Message | null,
     label: t.dir === 'out' ? 'You' : g ? g.name : nameOf(t.peer),
     text: quoteLine(text),
   }
-}
-
-/** How a reply to `m` names it. In a group, by 3 bytes every member holds it
- *  under: the member's original (`origId`) when `m` is relayed, else the head
- *  of its own message_id — and never the 32-byte hash, which differs between
- *  members' copies. Elsewhere by the message_id itself. */
-export function replyRefOf(m: Message, inGroup: boolean): { replyTo?: string; replyShort?: string } {
-  if (!inGroup) return { replyTo: m.messageId }
-  return { replyShort: hasDest(m.origId ?? '') ? m.origId! : m.messageId.slice(0, 6) }
 }
 
 /** Open a Nomad page URL tapped in a message (writes the shared sentinel). */
@@ -856,7 +846,7 @@ export interface UseLxmf {
   setDraft: (peer: string, text: string) => void
   openPeer: (peer: string) => void
   send: (peer: string, content: string,
-         opts?: { method?: string; replyTo?: string; replyShort?: string; replyQuote?: string }) => Promise<void>
+         opts?: { method?: string; replyTo?: string; replyQuote?: string }) => Promise<void>
   resend: (peer: string, key: string) => Promise<void>
   /** Resend through a propagation node (via = 32-hex node); '' = direct. */
   resendVia: (peer: string, key: string, via: string) => Promise<void>
@@ -1198,7 +1188,6 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       origId: str(r.orig_id),
       groupEvent: num(r.group_event) as GroupEvent,
       groupSubjects: str(r.group_subjects).split(',').filter(s => s.length === 32),
-      replyShort: str(r.reply_short),
       command: num(r.command) === 1,
       groupReceipts: str(r.group_receipts),
       groupReceiptsTs: num(r.group_receipts_ts),
@@ -1296,7 +1285,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   }
 
   async function send(peer: string, content: string,
-                      opts?: { method?: string; replyTo?: string; replyShort?: string; replyQuote?: string }) {
+                      opts?: { method?: string; replyTo?: string; replyQuote?: string }) {
     const n = activeId.value
     // Fail fast on a down/keyless identity rather than writing a
     // sentinel nothing will ever process (6 s CmdQueue timeout).
@@ -1309,14 +1298,13 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       ts: Math.floor(Date.now() / 1000),
     }
     if (opts?.method) rec.method = opts.method
-    /* A reply names the message it answers — by its id, or in a group by the
-     * 3 bytes every member holds it under (replyRefOf); the quote is the
+    /* A reply names the message it answers by its id; the quote is the
      * fragment of it the user picked out, and rides only with the reference it
      * belongs to. */
-    if (opts?.replyShort) rec.reply_short = opts.replyShort
-    else if (opts?.replyTo) rec.reply_to = opts.replyTo
-    if ((opts?.replyShort || opts?.replyTo) && opts.replyQuote)
-      rec.reply_quote = opts.replyQuote
+    if (opts?.replyTo) {
+      rec.reply_to = opts.replyTo
+      if (opts.replyQuote) rec.reply_quote = opts.replyQuote
+    }
     const data = nest(`s.lxmf.id.${n}.msgs.${peer}.${key}`, rec)
     if (_draftsById[n]) delete _draftsById[n]![peer]
     // The record is written optimistically as `queued` so the bubble

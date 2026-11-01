@@ -135,15 +135,13 @@ static bool mpInBinN(MpIn& s, uint8_t* out, size_t want, bool* have)
     return true;
 }
 
-/* A reply reference: the full 32-byte message id, or a group's 3-byte one. */
+/* A reply reference: the 32-byte message id. */
 static bool mpInReply(MpIn& s, LxmproxyFrame& out)
 {
     const uint8_t* p; size_t l; bool nil = false;
     if (!mpInBin(s, p, l, &nil)) return false;
     if (nil) return true;
     if (l == LXMPROXY_MID_LEN) { std::memcpy(out.reply_to, p, l); out.have_reply_to = true; }
-    else if (l == LXMPROXY_SHORT_ID_LEN) { std::memcpy(out.reply_short, p, l);
-                                           out.have_reply_short = true; }
     return true;
 }
 

@@ -406,7 +406,10 @@ if it really occurs in the message `reply_to` names; otherwise the block falls
 back to that message's own opening line, and a reply to a message this device
 does not hold says just "replying to a message". So a quote block can never put
 words in the other party's bubble. The fragment as it arrived is still on the
-message's detail page, verified or not.
+message's detail page, verified or not. The one quote drawn unchecked is a `0x31`
+that comes with no `0x30` at all, which is what a group sends on once it has
+lost track of the message quoted (see **Groups**): it is shown as it came, with
+no author over it.
 
 Both frontends work the same way:
 
@@ -427,26 +430,29 @@ Both frontends work the same way:
   `message_id` until the firmware has packed it, and there is nothing to name
   until then, so the action is disabled for exactly that window.
 
-Upstream's clients (Sideband, NomadNet, MeshChat) implement none of the reply
-fields, so a reply reaches them as an ordinary message: nothing breaks, the
-quote is simply not drawn.
+MeshChatX and Columba use the same two fields and draw our replies as replies.
+Upstream's clients (Sideband, NomadNet, MeshChat) implement neither, so a reply
+reaches them as an ordinary message: nothing breaks, the quote is simply not
+drawn.
 
 ## Groups
 
 ```
 Ann → group        "see you at 8"
-group → Bob, Cat   "Ann: see you at 8"      FIELD_GROUP [Ann, 3a91f0]
+group → Bob, Cat   "Ann: see you at 8"      FIELD_GROUP [Ann[0..2], 3a91f0]
 Bob → group        "/info_ 3a91f0"
-group → Bob        ""                       FIELD_GROUP [group, 3a91f0, INFO, Cat[0..2] DELIVERED]
+group → Bob        ""                       FIELD_GROUP [group[0..2], 3a91f0, INFO, Cat[0..2] DELIVERED]
 Bob → group        "/leave"
-group → Ann, Bob, Cat   "Bob left"          FIELD_GROUP [group, -, LEFT, [Bob]]
+group → Ann, Bob, Cat   "Bob left"          FIELD_GROUP [group[0..2], -, LEFT, [Bob]]
 ```
 
 A message is named in a group by **3 bytes**: the first three of the writer's own
-`message_id` (`3a91f0` above). It is what the group sends on, what a reply in the
-group names, and what `/info` asks about. That is what keeps a group usable over
-LoRa — `FIELD_GROUP` on a member's message is 25 bytes — and it costs a
-collision now and then, as the LoRa layer's own short ids do.
+`message_id` (`3a91f0` above), and its writer by the first three of their
+address. That is what the group sends on and what `/info` asks about, and it is
+what keeps a group usable over LoRa — `FIELD_GROUP` on a member's message is 12
+bytes. A message id costs a collision now and then, as the LoRa layer's own short
+ids do; a writer's never does, because the group refuses a member whose first
+three bytes another member's, or its own, already are.
 
 A group is a small fan-out for a handful of people (three to five is what it is
 made for). It has an LXMF address of its own and lives on its creator's device,
@@ -507,7 +513,8 @@ field, and the sentence would only cost air.
 **Members.** Every member keeps the member list as the group last told it
 (`contacts.<group>.members`): a newcomer asks `/members_` when the notice adding
 it arrives, asks `/member_` for each one added after, and drops whoever leaves or
-is removed. A member who never got the list asks for it once a boot. Only the
+is removed. A member who never got the list asks for it once a boot, and one
+who gets a message from a writer it knows no member by asks `/member_` for them. Only the
 owner can add and remove; everyone sees the list, on the group's info page.
 
 **Who got it.** A message's info page in a group asks `/info_` and shows a spinner
@@ -521,9 +528,20 @@ conversation with them.
 else gets anything through it. A message from anyone else, from a member who has
 left or was removed, or to a deleted group is dropped.
 
-**Replies** inside a group name their target by its 3-byte id, in
-`FIELD_REPLY_TO` cut to 3 bytes: each member holds a separately signed copy with
-an id of its own, and the writer's is the one id they all know.
+**Replies** inside a group are ordinary replies, so every LXMF client that
+draws replies draws them:
+
+```
+Bob → group   "me too"         0x30: hash of Bob's copy of Ann's message
+group → Ann   "Bob: me too"    0x30: hash of Ann's own message
+group → Cat   "Bob: me too"    0x30: hash of the group's copy to Cat
+```
+
+Each member holds a separately signed copy with an id of its own, so the group
+writes into each member's copy the id of that member's own copy of the message
+quoted. It can do that for as long as it keeps what it sent on, a day. A reply
+to anything older goes on without `0x30` but with its quote `0x31`, if it has
+one, and that quote is shown unchecked.
 
 **Ticks** on a message you send to a group mean the group has it; who else does
 is on its info page.
@@ -1105,12 +1123,13 @@ contacts.<peer>.members      a group's members as this account knows them,
                              "hex32|name" lines
 msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,reply_quote,method,ts,recv_ts,
                    read,message_id,body_absent,body_size,handed,told,offered,
-                   via_link,proxy_status,group_from,orig_id,reply_short,group_event,
+                   via_link,proxy_status,group_from,orig_id,group_event,
                    group_subjects,group_data,group_name,group_receipts,group_receipts_ts,command}
                                  group_from/orig_id = FIELD_GROUP's writer and
                                  the 3-byte id of their message (group_from =
-                                 the group itself on what it says); reply_short
-                                 = a group reply's 3-byte target; group_event
+                                 the group itself on what it says; the 3 bytes
+                                 the group named the writer by, then zeros,
+                                 until this account knows that member); group_event
                                  1 added, 2 removed, 3 left, 4 deleted, 5 info,
                                  6 members, 7 member; group_subjects = whom,
                                  comma-separated 32-hex; group_data = an answer,
@@ -1340,14 +1359,15 @@ is one press.
   in a colour of their own, on the first of a run, with the "Name: " prefix
   dropped; a notice from the group is a centred grey line. Commands you sent the
   group (`command`) are not drawn at all — the group's "<you> left" stands for a
-  "/leave". A reply in a group writes `reply_short`: the target's `orig_id`, or
-  for your own message the first 6 hex of its `message_id`; a quote is found by
-  either.
+  "/leave". A reply in a group writes `reply_to` like any other, naming this
+  device's own copy of the message quoted. A writer this account knows no member
+  by yet is named from the "Name: " prefix until the `/member_` answer comes.
 - **A message's info page** in a group asks `group_info` on opening and shows a
   spinner ("Asking the group…") until `group_receipts_ts` moves, then a line per
   member — named from the members list by address prefix, "You" for yourself —
   with that copy's status as the bubbles draw it. On another member's message a
-  **Message <name>** button opens the direct conversation with them.
+  **Message <name>** button opens the direct conversation with them, once this
+  account knows which member wrote it.
 - **The composer** is replaced, once you are out, by "You left this group", "You
   were removed from this group" or "This group was deleted".
 - **Accounts:** a group's slot is never offered as an account — not in either

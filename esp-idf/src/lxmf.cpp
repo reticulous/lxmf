@@ -553,12 +553,12 @@ static const sdb_schema& lxmfMsgSchema()
                                * 0 = not delivered */
          .data("message_id", 32).data("reply_to", 32)
          .data("group_from", 16)  /* FIELD_GROUP: who wrote it; all-zero = not a
-                                   * group message */
+                                   * group message. The 3 bytes the group named
+                                   * them by, then zeros, while this account
+                                   * knows no member by those (groupFromResolve) */
          .data("orig_id", 3)      /* FIELD_GROUP: the first 3 bytes of the
-                                   * writer's own message_id — what replies,
-                                   * /info and receipts in a group name */
-         .data("reply_short", 3)  /* FIELD_REPLY_TO as a group sends it: the
-                                   * replied-to message's 3-byte id */
+                                   * writer's own message_id — what /info and
+                                   * receipts in a group name */
          .u8("command")           /* 1 = a command this device sent its group
                                    * (/leave, /info, /members, /member): never
                                    * drawn, never the conversation's preview */
@@ -1262,17 +1262,18 @@ struct LxmFields {
      * selecting it — a plain reply carries reply_to alone and each end draws the
      * quote from the message it already holds. A receiver shows this text only
      * where it really occurs in the message reply_to names, so a quote cannot
-     * put words in anyone's mouth. */
+     * put words in anyone's mouth. A group passes a quote on without reply_to
+     * when it no longer knows the recipient's copy of the message it names, and
+     * that quote is shown as it came. */
     std::string reply_quote;
     std::string ticket;        /* raw msgpack value of FIELD_TICKET, empty if none */
-    /* FIELD_REPLY_TO cut to 3 bytes: how a reply inside a group names its
-     * target (hex6). Exclusive with reply_to. */
-    std::string reply_short;
-    /* FIELD_GROUP: [sender dest (16 B), the first 3 bytes of the sender's own
-     * message_id], and on what the group itself says two more: [event, data].
-     * Held as hex32 / hex6; empty when absent. `group_subjects` (events 1–4,
-     * comma-separated hex32) and `group_data` (events 5–7, see groupDataOf)
-     * are the decoded data element. */
+    /* FIELD_GROUP: [the first 3 bytes of the writer's dest, the first 3 bytes
+     * of the writer's own message_id], and on what the group itself says two
+     * more: [event, data]. The writer is held as hex32 — as parsed, the 3 bytes
+     * then zeros, until groupFromResolve names the member — and the id as hex6;
+     * empty when absent. `group_subjects` (events 1–4, comma-separated hex32)
+     * and `group_data` (events 5–7, see groupDataOf) are the decoded data
+     * element. */
     std::string group_from;
     std::string orig_id;
     int         group_event = 0;      /* LXMF_GROUP_EV_*, 0 = a member's message */
@@ -1337,25 +1338,21 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
     /* [3] fields — map of int → value. Only emit non-empty entries, so a
      * normal (non-reply) message carries no reply field at all. */
     size_t field_count = 0;
-    bool reply_short = fields.reply_short.size() == 6;
-    bool reply = reply_short || !fields.reply_to.empty();
+    bool reply = fields.reply_to.size() == 64;
     if (reply)                         field_count++;
-    /* A quote without the hash it belongs to is not addressable, so the pair
-     * travels together or not at all. */
-    bool quote = reply && !fields.reply_quote.empty();
+    /* A quote travels beside the hash it belongs to, except where a group
+     * passes one on that it can no longer name for this recipient. */
+    bool quote = !fields.reply_quote.empty();
     if (quote)                         field_count++;
-    bool group = fields.group_from.size() == 32 && fields.orig_id.size() == 6;
+    bool group = fields.group_from.size() >= 6 && fields.orig_id.size() == 6;
     if (group)                         field_count++;
     mpPackMapHeader(out, field_count);
     if (reply) {
         mpPackInt(out, LXMF_FIELD_REPLY_TO);
-        /* FIELD_REPLY_TO is the raw 32-byte replied-to message hash — or,
-         * inside a group, its first 3 bytes (see LxmFields::reply_short). */
+        /* FIELD_REPLY_TO is the raw 32-byte replied-to message hash. */
         uint8_t raw[32] = {};
-        size_t len = reply_short ? 3 : 32;
-        hexToBytes(reply_short ? fields.reply_short.c_str() : fields.reply_to.c_str(),
-                   len * 2, raw, len);
-        mpPackBin(out, raw, len);
+        hexToBytes(fields.reply_to.c_str(), 64, raw, 32);
+        mpPackBin(out, raw, 32);
     }
     if (quote) {
         mpPackInt(out, LXMF_FIELD_REPLY_QUOTE);
@@ -1366,8 +1363,11 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
                   fields.reply_quote.size());
     }
     if (group) {
-        uint8_t from[16], orig[3];
-        hexToBytes(fields.group_from.c_str(), 32, from, 16);
+        /* The writer by the first 3 bytes of their dest: unique within the
+         * group, which never takes a member whose 3 bytes another member's or
+         * its own already are (groupApplyMembers). */
+        uint8_t from[3], orig[3];
+        hexToBytes(fields.group_from.c_str(), 6, from, 3);
         hexToBytes(fields.orig_id.c_str(), 6, orig, 3);
         mpPackInt(out, LXMF_FIELD_GROUP);
         bool members_ev = fields.group_event == LXMF_GROUP_EV_MEMBERS ||
@@ -1505,8 +1505,6 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
             if (!mpReadStrOrBin(s, raw)) { if (!mpScanNext(s)) return false; continue; }
             if (raw.size() == 32 && fields_out)
                 fields_out->reply_to = bytesToHex((const uint8_t*)raw.data(), 32);
-            else if (raw.size() == 3 && fields_out)
-                fields_out->reply_short = bytesToHex((const uint8_t*)raw.data(), 3);
         } else if (key == LXMF_FIELD_REPLY_QUOTE) {
             std::string q;
             if (!mpReadStrOrBin(s, q)) { if (!mpScanNext(s)) return false; continue; }
@@ -1580,9 +1578,10 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
                     for (auto& c : gname) if (c == '\n' || c == '|') c = ' ';
                 }
             }
-            if (ok && from.size() == 16 && orig.size() == 3) {
+            if (ok && from.size() == 3 && orig.size() == 3) {
                 if (fields_out) {
-                    fields_out->group_from     = bytesToHex((const uint8_t*)from.data(), 16);
+                    fields_out->group_from     = bytesToHex((const uint8_t*)from.data(), 3) +
+                                                 std::string(26, '0');
                     fields_out->orig_id        = bytesToHex((const uint8_t*)orig.data(), 3);
                     fields_out->group_event    = (int)ev;
                     fields_out->group_subjects = subjects;
@@ -3047,7 +3046,6 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
         storageGetStr(msgPath(id.index, peer_hex, mid, "group_subjects").c_str(), "");
     fields.group_data  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_data").c_str(), "");
     fields.group_name  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_name").c_str(), "");
-    fields.reply_short = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_short").c_str(), "");
 
     /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
      * but only when generation is enabled and they actually advertise a
@@ -3598,14 +3596,10 @@ static void groupPost(lxmf_id_t& g, const std::string& peer, const std::string& 
     storageSet(msgPath(g.index, peer, k, "peer").c_str(),    peer.c_str());
     storageSet(msgPath(g.index, peer, k, "title").c_str(),   title.c_str());
     storageSet(msgPath(g.index, peer, k, "content").c_str(), content.c_str());
-    if (!f.reply_to.empty() || !f.reply_short.empty()) {
-        if (!f.reply_to.empty())
-            storageSet(msgPath(g.index, peer, k, "reply_to").c_str(), f.reply_to.c_str());
-        else
-            storageSet(msgPath(g.index, peer, k, "reply_short").c_str(), f.reply_short.c_str());
-        if (!f.reply_quote.empty())
-            storageSet(msgPath(g.index, peer, k, "reply_quote").c_str(), f.reply_quote.c_str());
-    }
+    if (!f.reply_to.empty())
+        storageSet(msgPath(g.index, peer, k, "reply_to").c_str(), f.reply_to.c_str());
+    if (!f.reply_quote.empty())
+        storageSet(msgPath(g.index, peer, k, "reply_quote").c_str(), f.reply_quote.c_str());
     storageSet(msgPath(g.index, peer, k, "group_from").c_str(), f.group_from.c_str());
     storageSet(msgPath(g.index, peer, k, "orig_id").c_str(),    f.orig_id.c_str());
     if (f.group_event) {
@@ -3817,6 +3811,45 @@ static void groupAnswer(lxmf_id_t& g, const std::string& to, int event,
     groupPost(g, to, "", text, f);
 }
 
+/* The message a reply from member `from` names by `mid` — the copy group g sent
+ * them, or their own message to it — as the group knows it: who wrote it and
+ * its 3-byte id. False once the group keeps neither. */
+static bool groupReplyTarget(int g, const std::string& from, const std::string& mid,
+                             std::string& writer, std::string& orig)
+{
+    if (storageGetStr(msgPath(g, from, mid, "dir").c_str(), "") == "in") {
+        writer = from;
+        orig   = mid.substr(0, 6);
+        return true;
+    }
+    for (const auto& key : collectTokens(msgPrefix(g, from))) {
+        if (storageGetStr(msgPath(g, from, key, "message_id").c_str(), "") != mid) continue;
+        writer = storageGetStr(msgPath(g, from, key, "group_from").c_str(), "");
+        orig   = storageGetStr(msgPath(g, from, key, "orig_id").c_str(), "");
+        return writer.size() == 32 && orig.size() == 6;
+    }
+    return false;
+}
+
+/* Member `to`'s own copy of what `writer` wrote with 3-byte id `orig`: the
+ * original when `to` wrote it, else the copy group g sent them. "" when the
+ * group keeps no such copy, or has not packed it yet. */
+static std::string groupCopyFor(int g, const std::string& to, const std::string& writer,
+                                const std::string& orig)
+{
+    for (const auto& key : collectTokens(msgPrefix(g, to))) {
+        std::string mid = storageGetStr(msgPath(g, to, key, "message_id").c_str(), "");
+        if (mid.size() != 64) continue;
+        bool in = storageGetStr(msgPath(g, to, key, "dir").c_str(), "") == "in";
+        if (to == writer ? in && mid.compare(0, 6, orig) == 0
+                         : !in &&
+                           storageGetStr(msgPath(g, to, key, "orig_id").c_str(), "") == orig &&
+                           storageGetStr(msgPath(g, to, key, "group_from").c_str(), "") == writer)
+            return mid;
+    }
+    return "";
+}
+
 /* A verified, de-duplicated message to group g from `from`: send it on to every
  * other member — or, when it is a command, carry it out. The record kept here
  * is the dedup marker and carries no body. */
@@ -3881,9 +3914,16 @@ static void groupFanOut(lxmf_id_t& g, const std::string& from, const std::string
         return;
     }
 
+    /* A reply names the replier's own copy of its message, which nobody else
+     * holds: each member is sent the id of theirs instead. */
+    std::string r_writer, r_orig;
+    bool reply = !in.reply_to.empty() &&
+                 groupReplyTarget(g.index, from, in.reply_to, r_writer, r_orig);
+    if (!in.reply_to.empty() && !reply)
+        info("id %d: group no longer knows %s — the reply goes on without it",
+             g.index, in.reply_to.c_str());
+
     LxmFields out;
-    out.reply_to    = in.reply_to;
-    out.reply_short = in.reply_short;
     out.reply_quote = in.reply_quote;
     out.group_from  = from;
     out.orig_id     = mid_hex.substr(0, 6);
@@ -3891,6 +3931,7 @@ static void groupFanOut(lxmf_id_t& g, const std::string& from, const std::string
     int sent = 0;
     for (const auto& m : groupMembers(g.index)) {
         if (m == from) continue;
+        out.reply_to = reply ? groupCopyFor(g.index, m, r_writer, r_orig) : std::string();
         groupPost(g, m, title, body, out);
         sent++;
     }
@@ -3991,6 +4032,42 @@ static void groupAskMembers(int n, const std::string& peer)
     else        groupSendCommand(n, peer, "/members_");
 }
 
+/* Whether a group message's writer is a member this account has named, not
+ * only the 3 bytes the group named them by. */
+static bool groupFromKnown(const std::string& from)
+{
+    return from.size() == 32 && from.find_first_not_of('0', 6) != std::string::npos;
+}
+
+/* FIELD_GROUP names its writer by the first 3 bytes of their dest. Who that is
+ * to account n, in group `peer`: the group itself, else the member n knows by
+ * those bytes — else the 3 bytes followed by zeros, as they came. */
+static std::string groupFromResolve(int n, const std::string& peer, const std::string& from)
+{
+    if (from.size() != 32 || groupFromKnown(from)) return from;
+    if (peer.compare(0, 6, from, 0, 6) == 0) return peer;
+    std::string members = storageGetStr(contactPath(n, peer, "members").c_str(), "");
+    for (size_t at = 0; at + 32 <= members.size(); ) {
+        if (members.compare(at, 6, from, 0, 6) == 0) return members.substr(at, 32);
+        size_t nl = members.find('\n', at);
+        if (nl == std::string::npos) break;
+        at = nl + 1;
+    }
+    return from;
+}
+
+/* Name the writers in account n's conversation with group `peer` that were
+ * only 3 bytes when their messages arrived, now that n knows more members. */
+static void groupFromBackfill(int n, const std::string& peer)
+{
+    for (const auto& key : collectTokens(msgPrefix(n, peer))) {
+        std::string from = storageGetStr(msgPath(n, peer, key, "group_from").c_str(), "");
+        if (from.empty() || groupFromKnown(from)) continue;
+        std::string who = groupFromResolve(n, peer, from);
+        if (who != from) storageSet(msgPath(n, peer, key, "group_from").c_str(), who.c_str());
+    }
+}
+
 /* Something group `peer` itself sent account n (its FIELD_GROUP names the
  * group as writer), or any message from it. Keeps where n stands in the group
  * and what n knows of its members. Returns true for an answer to one of n's
@@ -4020,6 +4097,7 @@ static bool groupHear(int n, const std::string& peer, const LxmFields& f)
              * it out of its announce. */
             if (!f.group_name.empty())
                 setStrIfChanged(contactPath(n, peer, "display_name"), f.group_name.c_str());
+            groupFromBackfill(n, peer);
             return true;
         case LXMF_GROUP_EV_ADDED:
             if (about_me) {
@@ -4046,6 +4124,13 @@ static bool groupHear(int n, const std::string& peer, const LxmFields& f)
         }
         if (st >= 0) setIntIfChanged(contactPath(n, peer, "group_state"), st);
         if (f.group_event == LXMF_GROUP_EV_ADDED && about_me) return false;
+    } else if (!held && !groupFromKnown(f.group_from)) {
+        /* A writer this account knows no member by — one whose arrival in the
+         * group it has not heard about yet. Asked after once a boot. */
+        static std::set<std::string> s_askedWho;
+        std::string id6 = f.group_from.substr(0, 6);
+        if (s_askedWho.insert(std::to_string(n) + "/" + peer + "/" + id6).second)
+            groupSendCommand(n, peer, "/member_ " + id6);
     }
 
     /* A group whose members this account has never been told — one it was in
@@ -4230,6 +4315,8 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
         stampYield();
         return;
     }
+    if (!fields.group_from.empty())
+        fields.group_from = groupFromResolve(id.index, sh_hex, fields.group_from);
     if (!fields.group_from.empty() && groupHear(id.index, sh_hex, fields)) {
         info("id %d: group %s answered (event %d)", id.index, sh_hex.c_str(),
              fields.group_event);
@@ -4257,9 +4344,6 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
                        fields.group_name.c_str());
         }
     }
-    if (!fields.reply_short.empty())
-        storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_short").c_str(),
-                   fields.reply_short.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "dir").c_str(),        "in");
     storageSet(msgPath(id.index, sh_hex, mid_hex, "peer").c_str(),       sh_hex.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "title").c_str(),      title.c_str());
@@ -4270,7 +4354,7 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
     storageSet(msgPath(id.index, sh_hex, mid_hex, "body_size").c_str(), (int)content.size());
     if (!fields.reply_to.empty())
         storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_to").c_str(), fields.reply_to.c_str());
-    if ((!fields.reply_to.empty() || !fields.reply_short.empty()) && !fields.reply_quote.empty())
+    if (!fields.reply_quote.empty())
         storageSet(msgPath(id.index, sh_hex, mid_hex, "reply_quote").c_str(),
                    fields.reply_quote.c_str());
     storageSet(msgPath(id.index, sh_hex, mid_hex, "ts").c_str(),         (int)(ts / 1000));
@@ -5662,9 +5746,11 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
 
     /* From a group: where this account stands in it, and an answer to one of its
      * commands is taken here and not kept as a message. */
+    std::string gfrom = fr.have_group
+        ? groupFromResolve(id.index, peer_hex, bytesToHex(fr.group_from, 16)) : std::string();
     if (!exists && fr.have_group) {
         LxmFields gf;
-        gf.group_from     = bytesToHex(fr.group_from, 16);
+        gf.group_from     = gfrom;
         gf.orig_id        = bytesToHex(fr.orig_id, LXMPROXY_SHORT_ID_LEN);
         gf.group_event    = (int)fr.group_event;
         gf.group_subjects = fr.group_subjects;
@@ -5686,20 +5772,15 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
         /* What this message replies to travels with the offer and not only with
          * the body, so a reply whose body fits inline — never fetched, so no
          * BODY frame ever follows — still lands here as a reply. */
-        if (fr.have_reply_to || fr.have_reply_short) {
-            if (fr.have_reply_to)
-                storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_to").c_str(),
-                           bytesToHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
-            else
-                storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_short").c_str(),
-                           bytesToHex(fr.reply_short, LXMPROXY_SHORT_ID_LEN).c_str());
-            if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
-                storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_quote").c_str(),
-                           fr.reply_quote.c_str());
-        }
+        if (fr.have_reply_to)
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_to").c_str(),
+                       bytesToHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+        if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "reply_quote").c_str(),
+                       fr.reply_quote.c_str());
         if (fr.have_group) {
             storageSet(msgPath(id.index, peer_hex, mid_hex, "group_from").c_str(),
-                       bytesToHex(fr.group_from, 16).c_str());
+                       gfrom.c_str());
             storageSet(msgPath(id.index, peer_hex, mid_hex, "orig_id").c_str(),
                        bytesToHex(fr.orig_id, LXMPROXY_SHORT_ID_LEN).c_str());
             if (fr.group_event) {
@@ -5773,10 +5854,6 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
 
     uint8_t rt[32]; size_t rt_len = 0;
     if (hexToBytes(reply_to.c_str(), reply_to.size(), rt, 32)) rt_len = 32;
-    else {
-        std::string rs = storageGetStr(msgPath(id.index, peer_hex, mid, "reply_short").c_str(), "");
-        if (hexToBytes(rs.c_str(), rs.size(), rt, 3)) rt_len = 3;
-    }
     uint8_t pnh[16]; bool have_pn = hexToBytes(pn.c_str(), pn.size(), pnh, 16);
     /* An all-zero `pn` is "none set", not a node. */
     if (have_pn) {
@@ -5991,17 +6068,12 @@ static void proxyHandleFrame(int n, const LxmproxyFrame& fr)
         storageSet(msgPath(n, peer_hex, mid_hex, "body_absent").c_str(), 0);
         storageSet(msgPath(n, peer_hex, mid_hex, "body_size").c_str(),
                    (int)fr.content.size());
-        if (fr.have_reply_to || fr.have_reply_short) {
-            if (fr.have_reply_to)
-                storageSet(msgPath(n, peer_hex, mid_hex, "reply_to").c_str(),
-                           bytesToHex(fr.reply_to, 32).c_str());
-            else
-                storageSet(msgPath(n, peer_hex, mid_hex, "reply_short").c_str(),
-                           bytesToHex(fr.reply_short, LXMPROXY_SHORT_ID_LEN).c_str());
-            if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
-                storageSet(msgPath(n, peer_hex, mid_hex, "reply_quote").c_str(),
-                           fr.reply_quote.c_str());
-        }
+        if (fr.have_reply_to)
+            storageSet(msgPath(n, peer_hex, mid_hex, "reply_to").c_str(),
+                       bytesToHex(fr.reply_to, 32).c_str());
+        if (!fr.reply_quote.empty() && fr.reply_quote.size() <= LXMF_REPLY_QUOTE_MAX)
+            storageSet(msgPath(n, peer_hex, mid_hex, "reply_quote").c_str(),
+                       fr.reply_quote.c_str());
         storageEnd();
         info("id %d: proxy body %s (%zuB)", n, mid_hex.c_str(), fr.content.size());
         proxySendFrame(n, lxmproxyBuildHanded(fr.msg_id, fr.peer));
@@ -8101,10 +8173,29 @@ enum GroupTell { GROUP_TELL_NONE, GROUP_TELL_CREATED, GROUP_TELL_CHANGES };
  * with `member` 0, so the notice saying so still reaches it. Changes are told
  * only where the group is registered: a proxied group's server tells them when
  * the list reaches it. */
-static void groupApplyMembers(lxmf_id_t& g, const std::vector<GroupMember>& want,
+static void groupApplyMembers(lxmf_id_t& g, const std::vector<GroupMember>& asked,
                               GroupTell tell = GROUP_TELL_CHANGES)
 {
     std::vector<std::string> cur = groupMembers(g.index), added;
+    /* FIELD_GROUP names a writer by the first 3 bytes of their dest, so no two
+     * members, and no member and the group, may share those. A newcomer who
+     * would is refused. */
+    std::vector<std::string> taken = { bytesToHex(g.dest_hash, LXMF_DEST_HASH_LEN).substr(0, 6) };
+    for (const auto& m : asked)
+        if (std::find(cur.begin(), cur.end(), m.dest) != cur.end())
+            taken.push_back(m.dest.substr(0, 6));
+    std::vector<GroupMember> want;
+    for (const auto& m : asked) {
+        bool known = std::find(cur.begin(), cur.end(), m.dest) != cur.end();
+        std::string id6 = m.dest.substr(0, 6);
+        if (!known && std::find(taken.begin(), taken.end(), id6) != taken.end()) {
+            warn("id %d: group cannot take %s — another member or the group starts %s",
+                 g.index, m.dest.c_str(), id6.c_str());
+            continue;
+        }
+        if (!known) taken.push_back(id6);
+        want.push_back(m);
+    }
     for (const auto& m : want) {
         if (std::find(cur.begin(), cur.end(), m.dest) == cur.end()) added.push_back(m.dest);
         storageBegin();

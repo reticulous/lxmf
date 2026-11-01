@@ -195,8 +195,8 @@ struct Msg {
     bool body_absent = false;
     long body_size = 0;
     /* A group's copy of a member's message: who wrote it (32-hex) and the
-     * message_id of their original, which is what a reply names so the quote
-     * resolves on every member's device. All-zero / empty = not a group copy. */
+     * first 3 bytes of the message_id of their original. All-zero / empty = not
+     * a group copy. */
     std::string group_from;
     std::string orig_id;
     /* A notice from the group itself: what happened (1 added, 2 removed, 3 left,
@@ -204,9 +204,6 @@ struct Msg {
      * 32-hex). */
     uint8_t group_event = 0;
     std::string group_subjects;
-    /* In a group a reply names its target by this 6-hex short id (the target's
-     * orig_id, or the head of its message_id) instead of reply_to. */
-    std::string reply_short;
     bool command = false;     /* a command this device sent a group — never drawn */
 };
 
@@ -662,7 +659,6 @@ void msgCb(const char* key, const char* val) {
     else if (!strcmp(field, "orig_id"))     m->orig_id     = val ? val : "";
     else if (!strcmp(field, "group_event")) m->group_event = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "group_subjects")) m->group_subjects = val ? val : "";
-    else if (!strcmp(field, "reply_short")) m->reply_short = val ? val : "";
     else if (!strcmp(field, "command"))     m->command = val && atoi(val) != 0;
 }
 
@@ -677,20 +673,16 @@ bool hexSet(const std::string& h) {
     return !h.empty() && h.find_first_not_of('0') != std::string::npos;
 }
 
-/* What a reply to `m` names. In a group it is the 6-hex short id — the
- * sender's original (orig_id) when `m` is a group's copy, else the head of its
- * own message_id — so every member's quote resolves to the same message.
- * Elsewhere it is the full message_id. Empty until there is an id to name. */
-std::string replyIdOf(const Msg& m, bool inGroup) {
-    if (!inGroup) return m.message_id;
-    if (hexSet(m.orig_id)) return m.orig_id;
-    return m.message_id.size() >= 6 ? m.message_id.substr(0, 6) : std::string();
-}
-
 /* A group copy of somebody else's message: its sender is not the conversation
  * peer (a notice from the group itself names the group). */
 bool fromGroupMember(const Msg& m) {
     return m.in && hexSet(m.group_from) && m.group_from != m.peer;
+}
+
+/* A group names its writer by 3 bytes; until this account knows the member they
+ * belong to, `group_from` is those 3 bytes followed by zeros. */
+bool groupFromKnown(const std::string& from) {
+    return from.size() == 32 && from.find_first_not_of('0', 6) != std::string::npos;
 }
 
 /* The "<name>: " a group puts in front of a member's text, for clients that know
@@ -802,11 +794,8 @@ void sendMessage(const std::string& peer, const std::string& text,
     setf("peer", peer.c_str());
     setf("title", "");
     setf("content", text.c_str());
-    /* In a group the reply rides as the 6-hex short id (startReply chose it)
-     * and reply_to stays unwritten. */
-    const bool inGroup = peerIsGroup(peer);
     if (!reply_to.empty()) {
-        setf(inGroup ? "reply_short" : "reply_to", reply_to.c_str());
+        setf("reply_to", reply_to.c_str());
         if (!quote.empty()) setf("reply_quote", quote.c_str());
     }
     /* Optimistic status: QUEUED (not draft) so the bubble appears the instant we
@@ -831,7 +820,7 @@ void sendMessage(const std::string& peer, const std::string& text,
     Msg m;
     m.peer = peer; m.key = key; m.content = text; m.status = LXMF_ST_QUEUED;
     m.ts = ts; m.in = false;
-    (inGroup ? m.reply_short : m.reply_to) = reply_to;
+    m.reply_to = reply_to;
     m.reply_quote = quote;
     g_msgs.push_back(std::move(m));
 }
@@ -2348,10 +2337,13 @@ void layoutMeta(lv_obj_t* bub, lv_obj_t* meta, uint8_t /*status*/) {
  * typing area until the message goes, and in the balloon afterwards, at both
  * ends.
  *
- * What a quote block SHOWS is always read out of this device's own copy of the
- * quoted message: a fragment that arrived on the wire is drawn only where it
- * really occurs there. So a quote cannot say something its message does not,
- * and a reply to a message this device never saw says only that it is one. */
+ * What a quote block SHOWS is read out of this device's own copy of the quoted
+ * message: a fragment that arrived on the wire is drawn only where it really
+ * occurs there. So a quote cannot say something its message does not, and a
+ * reply to a message this device never saw says only that it is one. The one
+ * exception is a fragment that names no message — a group passes a quote on
+ * without its reply_to once it no longer knows the copy it names — which is
+ * drawn as it came, under no author. */
 
 lv_obj_t*   s_msgActs  = nullptr;       /* the three-icon popup, floating over the thread */
 std::string g_actsKey;                  /* the message it acts on */
@@ -2416,20 +2408,11 @@ const Msg* msgByMid(const std::string& mid) {
     return nullptr;
 }
 
-/* The message `m` replies to, if this device holds it. In a group a reply names
- * its target by a 6-hex short id: a group copy's orig_id, or the head of the
- * message_id of one this device wrote or received unrelayed. Elsewhere it is the
- * full reply_to. */
-bool isReply(const Msg& m) { return hexSet(m.reply_short) || hexSet(m.reply_to); }
+/* The message `m` replies to, if this device holds it. A reply that carries a
+ * quote and no reply_to is one a group passed on after it had lost track of
+ * the message quoted. */
+bool isReply(const Msg& m) { return hexSet(m.reply_to) || !m.reply_quote.empty(); }
 const Msg* replyTarget(const Msg& m) {
-    if (hexSet(m.reply_short)) {
-        for (auto& t : g_msgs)
-            if (t.peer == g_curPeer && (t.orig_id == m.reply_short ||
-                                        t.message_id.compare(0, m.reply_short.size(),
-                                                             m.reply_short) == 0))
-                return &t;
-        return nullptr;
-    }
     return hexSet(m.reply_to) ? msgByMid(m.reply_to) : nullptr;
 }
 
@@ -2459,6 +2442,8 @@ QuoteView quoteFor(const Msg& m) {
     QuoteView q;
     if (!isReply(m)) return q;
     q.have = true;
+    /* Nothing named to check the quote against: it is drawn as it came. */
+    if (!hexSet(m.reply_to)) { q.text = quoteLine(m.reply_quote); return q; }
     const Msg* t = replyTarget(m);
     if (!t) return q;
     q.key  = t->key;
@@ -2649,10 +2634,10 @@ void cancelReply() {
  * there is nothing to name until then. */
 void startReply(const std::string& key, const std::string& fragment) {
     const Msg* m = msgByKey(key);
-    std::string rid = m ? replyIdOf(*m, peerIsGroup(g_curPeer)) : std::string();
+    std::string rid = m ? m->message_id : std::string();
     if (rid.empty()) return;
     g_replyKey   = key;
-    g_replyMid   = rid;   /* in a group, the short id every member resolves alike */
+    g_replyMid   = rid;
     /* A fragment comes off the rendered lines, which have had unrenderable
      * bytes dropped out of them. Only send one that is still found in the
      * message itself — the far end looks for it there, and so does this one. */
@@ -2844,7 +2829,7 @@ void addQuoteBlock(lv_obj_t* bub, const Msg& m) {
     lv_obj_set_style_text_color(line, lv_color_hex(0xc8c8c8), 0);
     lv_label_set_long_mode(line, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_max_width(line, 220, 0);
-    lv_label_set_text(line, q.key.empty() ? "Replying to a message" : q.text.c_str());
+    lv_label_set_text(line, q.text.empty() ? "Replying to a message" : q.text.c_str());
 
     /* Only a quote we can reach leads anywhere. */
     if (!q.key.empty()) {
@@ -4334,9 +4319,7 @@ void showMsgDetail(const std::string& mkey) {
     std::string method  = rd("method");
     bool        readf   = storageGetInt((base + ".read").c_str(), 0) != 0;
     std::string reply   = rd("reply_to");
-    std::string rshort  = rd("reply_short");
-    if (!hexSet(reply) && hexSet(rshort)) reply = rshort;   /* a group reply's short id */
-    std::string quote   = rd("reply_quote");
+    std::string quote  = rd("reply_quote");
     std::string mid     = rd("message_id");
     std::string gfrom   = rd("group_from");
     const bool inGroup  = peerIsGroup(g_curPeer);
@@ -4386,13 +4369,11 @@ void showMsgDetail(const std::string& mkey) {
         detailRow(body, "Read", readf ? "yes" : "no");
     }
     detailRow(body, "Message ID", mid.empty() ? "" : groupHash(mid));
-    if (!reply.empty() && reply.find_first_not_of('0') != std::string::npos) {
-        detailRow(body, "In reply to", groupHash(reply));
-        /* The fragment as it arrived, whether or not it is one this device can
-         * find in the message it names — the detail page is where a quote that
-         * the conversation refuses to draw can still be looked at. */
-        if (!quote.empty()) detailRow(body, "Quoting", quote);
-    }
+    if (hexSet(reply)) detailRow(body, "In reply to", groupHash(reply));
+    /* The fragment as it arrived, whether or not it is one this device can find
+     * in the message it names — the detail page is where a quote that the
+     * conversation refuses to draw can still be looked at. */
+    if (!quote.empty()) detailRow(body, "Quoting", quote);
     if (!title.empty()) detailRow(body, "Title", title);
     detailRow(body, "Content", content);
 
@@ -4415,7 +4396,7 @@ void showMsgDetail(const std::string& mkey) {
         fillReceipts();
 
         /* Another member wrote it: talking to them directly is one press. */
-        if (in && hexSet(gfrom) && gfrom != g_curPeer) {
+        if (in && groupFromKnown(gfrom) && gfrom != g_curPeer) {
             Msg probe; probe.in = true; probe.peer = g_curPeer;
             probe.group_from = gfrom; probe.content = content;
             std::string body2;

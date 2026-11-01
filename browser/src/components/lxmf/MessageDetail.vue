@@ -72,8 +72,10 @@
       </div>
 
       <template v-if="isReply">
-        <div class="sect">In reply to</div>
-        <div class="sn small">{{ grouped(hasDest(m.replyShort ?? '') ? m.replyShort! : m.replyTo!) }}</div>
+        <template v-if="hasDest(m.replyTo ?? '')">
+          <div class="sect">In reply to</div>
+          <div class="sn small">{{ grouped(m.replyTo!) }}</div>
+        </template>
         <!-- The fragment as it arrived, whether or not it is one the
              conversation will draw — that needs it to occur in the message
              above, and this is where an unverifiable quote can still be read. -->
@@ -127,7 +129,7 @@ import { computed, onMounted, ref } from 'vue'
 import { matArrowBack, matContentCopy, matCheck } from '@quasar/extras/material-icons'
 import DeliveryTicks from './DeliveryTicks.vue'
 import { type GroupMember, type Message, type PnNode, lxmfStatusName, LxmfStatus,
-         hasDest, isGroupNotice, parseGroupReceipts, LXMF_TRIES_GAVEUP, RESEND_RETRY }
+         hasDest, groupFromKnown, isGroupNotice, parseGroupReceipts, LXMF_TRIES_GAVEUP, RESEND_RETRY }
   from '../../modules/lxmf'
 
 const props = withDefaults(defineProps<{
@@ -190,7 +192,7 @@ const receipts = computed(() => {
 /* The member who wrote this, for a group message relayed from somebody else. */
 const memberFrom = computed(() => {
   const f = (props.m.groupFrom ?? '').toLowerCase()
-  return props.group && hasDest(f) && f !== props.m.peer ? f : ''
+  return props.group && groupFromKnown(f) && f !== props.m.peer ? f : ''
 })
 const memberName = computed(() => {
   const f = memberFrom.value
@@ -270,8 +272,7 @@ const proxyGaveUpWith = computed(() =>
 
 const grouped = (hex: string) => (hex.match(/.{1,4}/g) ?? []).join(' ')
 
-const isReply = computed(() =>
-  hasDest(props.m.replyShort ?? '') || hasDest(props.m.replyTo ?? ''))
+const isReply = computed(() => hasDest(props.m.replyTo ?? '') || !!props.m.replyQuote)
 
 const sentTime = computed(() =>
   props.m.ts ? new Date(props.m.ts * 1000).toLocaleString() : '—')

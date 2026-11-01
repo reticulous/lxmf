@@ -100,7 +100,7 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_SERVING  = 3,
 
     /* S→C  [4, msg_id b32, peer b16, peer_name str, ts u32, title str,
-     *          size u32, body str|nil, reply_to b32|b3|nil, quote str,
+     *          size u32, body str|nil, reply_to b32|nil, quote str,
      *          group_from b16|nil, orig_id b3|nil, group_event u32,
      *          group_subjects str, group_data str, group_name str]
      * One inbound message the server holds and the client does not. `size` is
@@ -119,7 +119,7 @@ enum LxmproxyFrameType : uint8_t {
     /* C→S  [5, msg_id b32, peer b16] — send me the body you withheld. */
     LXMPROXY_FR_FETCH    = 5,
 
-    /* S→C  [6, msg_id b32, peer b16, content str, reply_to b32|b3|nil, quote str]
+    /* S→C  [6, msg_id b32, peer b16, content str, reply_to b32|nil, quote str]
      * The withheld body. Rides a Resource on the Channel's Link when it does
      * not fit one Channel message. */
     LXMPROXY_FR_BODY     = 6,
@@ -131,7 +131,7 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_HANDED   = 7,
 
     /* C→S  [8, local_key str, peer b16, ts u32, title str, content str,
-     *          reply_to b32|b3|nil, quote str, method str, pn b16|nil]
+     *          reply_to b32|nil, quote str, method str, pn b16|nil]
      * Reproduce this draft on the server and send it. `local_key` is the
      * client's own `o_<unix_ms>_<rand4>`, and it is the idempotency key: a SEND
      * repeated after a reconnect meets the same record and gets the same
@@ -238,12 +238,12 @@ struct LxmproxyFrame {
     bool        have_body = false;      /* MSG carried its body inline */
     uint8_t     reply_to[LXMPROXY_MID_LEN] = {};
     bool        have_reply_to = false;
-    uint8_t     reply_short[LXMPROXY_SHORT_ID_LEN] = {};   /* a group's reply */
-    bool        have_reply_short = false;
     std::string reply_quote;            /* the fragment of the replied-to message
                                          * this one quotes (FIELD_REPLY_QUOTE);
                                          * empty on a reply that quotes the whole
-                                         * message */
+                                         * message. Alone, without reply_to, on a
+                                         * quote a group passed on without
+                                         * knowing the copy it names */
     uint8_t     group_from[LXMPROXY_DEST_LEN] = {};
     uint8_t     orig_id[LXMPROXY_SHORT_ID_LEN] = {};
     bool        have_group = false;     /* MSG: both of the above are set */

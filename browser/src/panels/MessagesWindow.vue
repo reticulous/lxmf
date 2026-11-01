@@ -196,7 +196,7 @@ import Composer from '../components/lxmf/Composer.vue'
 import ContactCard from '../components/lxmf/ContactCard.vue'
 import MessageDetail from '../components/lxmf/MessageDetail.vue'
 import GroupCreate from '../components/lxmf/GroupCreate.vue'
-import { useLxmf, quoteLine, groupSender, replyRefOf, type Message, LxmfStatus,
+import { useLxmf, quoteLine, groupSender, type Message, LxmfStatus,
          GroupState, RESEND_RETRY } from '../modules/lxmf'
 import { useWinZoom } from 'rns/lib/winZoom'
 import { useCompact } from 'spangap-browser/lib/viewport'
@@ -356,7 +356,7 @@ async function onSend(content: string) {
   replyTo.value = null
   try {
     await lxmf.send(peer, content, r ? {
-      ...replyRefOf(r.m, !!lxmf.contactOf(peer)?.group),
+      replyTo: r.m.messageId,
       /* Only a fragment the user picked out travels; a reply to the whole
        * message needs no quote on the wire, because the other end has that
        * message and draws the line from its own copy. */

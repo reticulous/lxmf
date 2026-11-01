@@ -251,7 +251,7 @@ RENDERER, 0x30 REPLY_TO, 0x31 REPLY_QUOTE, 0x40 REACTION, 0x41 COMMENT,
 `RENDERER ∈ {PLAIN, MICRON, MARKDOWN, BBCODE}`.
 
 Of those, this implementation packs and parses `REPLY_TO` (raw 32 B message
-hash; 3 B inside a group), `REPLY_QUOTE` (UTF-8 fragment of the quoted message)
+hash), `REPLY_QUOTE` (UTF-8 fragment of the quoted message)
 and `GROUP` (its shapes are in §8d),
 parses and logs `TICKET`, and skips the rest without failing the parse. The quote is optional
 and travels only when the user picked a fragment out of the message they are
@@ -260,9 +260,13 @@ preview from its own copy of the quoted message. **A received quote is drawn
 only where it really occurs in the message `REPLY_TO` names** — a fragment that
 is not a substring of that message is dropped at display, so a sender cannot put
 words in the other party's bubble, and a quote of a message this device does not
-hold is not shown at all. Upstream's reference clients (Sideband, NomadNet,
-MeshChat) implement none of the reply fields yet, so a reply reaches them as an
-ordinary message and loses only the quote.
+hold is not shown at all. A `REPLY_QUOTE` with no `REPLY_TO` is drawn as it came:
+it is what a group sends on when it can no longer name the recipient's copy of
+the message quoted (§8d), and is stored and drawn rather than dropped.
+MeshChatX and Columba pack and parse both fields the same way (raw 32 B hash,
+UTF-8 quote). Upstream's reference clients (Sideband, NomadNet, MeshChat)
+implement neither, so a reply reaches them as an ordinary message and loses only
+the quote.
 
 ### Identity & destinations
 
@@ -995,13 +999,16 @@ boot accepts.
 ```
 member A ─ LXM ──────────────► group g      verify, dedup, A ∈ members?
                                g ─ LXM ───► B, C, …   "<A's name>: <text>"
-                                            FIELD_GROUP [A, mid[0..2]]
+                                            FIELD_GROUP [A[0..2], mid[0..2]]
+member B ─ LXM, REPLY_TO B's copy ──► g     which message is that? (A, mid[0..2])
+                               g ─ LXM ───► A   REPLY_TO mid
+                               g ─ LXM ───► C   REPLY_TO the id of g's copy to C
 member B ─ "/info_ 3a91f0" ──► g            scan its copies with orig_id 3a91f0
                                g ─ LXM ───► B   ""
-                                            FIELD_GROUP [g, 3a91f0, INFO, C[0..2] st …]
+                                            FIELD_GROUP [g[0..2], 3a91f0, INFO, C[0..2] st …]
 member B ─ "/leave" ─────────► g
                                g ─ LXM ───► every member, B included   "B left"
-                                            FIELD_GROUP [g, random, LEFT, [B]]
+                                            FIELD_GROUP [g[0..2], random, LEFT, [B]]
                                member := 0
 ```
 
@@ -1014,14 +1021,16 @@ ordinary message the delivery queue owns; `groupPrune` drops anything older than
 a day, hourly.
 
 **Ids are 3 bytes.** A message is named in a group by the first 3 bytes of its
-writer's `message_id` — `orig_id` on every copy, `reply_short` on a reply,
-the argument of `/info`. Every member's copy is signed separately and has a
-`message_id` of its own, so the writer's is the one name they share; 3 bytes of
-it, not 32, is what keeps a group message inside one LoRa packet. A collision
-costs a wrong quote or a merged receipt, which is accepted.
+writer's `message_id` — `orig_id` on every copy, the argument of `/info`. Every
+member's copy is signed separately and has a `message_id` of its own, so the
+writer's is the one name they share; 3 bytes of it, not 32, is what keeps a
+group message inside one LoRa packet. A collision costs a merged receipt, which
+is accepted. The writer is named by the first 3 bytes of their dest, and those
+never collide: `groupApplyMembers` refuses a newcomer whose 3 bytes are another
+member's or the group's own.
 
-**`FIELD_GROUP` (`0x0B`).** On a member's message sent on: `[from b16, orig b3]`.
-On what the group itself says: `[g b16, id b3, event, data]`, with
+**`FIELD_GROUP` (`0x0B`).** On a member's message sent on: `[from b3, orig b3]`.
+On what the group itself says: `[g b3, id b3, event, data]`, with
 `LXMF_GROUP_EV_*`:
 
 | event | id | data | to |
@@ -1037,9 +1046,21 @@ it in the group contact's `display_name`, which an announce without a name never
 overwrites. An imported group starts hidden, so a proxy's first announce of a
 group says nothing before the owner's `CONFIG` has said whether it may.
 
-`FIELD_REPLY_TO` inside a group is a 3-byte bin (`reply_short`). The text of
-every one of these is what any client shows; the field is what reticulous acts
-on.
+The text of every one of these is what any client shows; the field is what
+reticulous acts on.
+
+**Replies are rewritten per recipient.** `FIELD_REPLY_TO` is the full 32 bytes
+inside a group as anywhere, so other clients draw a group reply as a reply. What
+a member's reply names is that member's own copy, which nobody else holds, so
+`groupFanOut` asks `groupReplyTarget` which message that is — the copy the group
+sent the replier (its stored `group_from` and `orig_id`), or the replier's own
+message to the group (its dedup marker, keyed by that very id) — and then
+`groupCopyFor` gives each recipient the `message_id` of theirs: the writer's
+original for the writer, the group's copy to them for everyone else. Either
+lookup fails once `groupPrune` has dropped the records, or for a copy not yet
+packed; that recipient then gets the reply without `REPLY_TO` and with its
+`REPLY_QUOTE`, if it has one, which every reticulous frontend draws unchecked
+(§4).
 
 **The commands** (`groupCommandOf`) are plain text a member sends the group —
 "/leave", "/members", "/member <6 hex>", "/info <6 hex>" — so any client can use
@@ -1054,8 +1075,14 @@ preview, and queued like a group copy.
 
 **A member's device** (`groupHear`, for anything whose `group_from` is set):
 
-- stores `group_from` / `orig_id` / `reply_short` / `group_event` /
-  `group_subjects` on the record and marks the contact `group`;
+- names the writer (`groupFromResolve`): the group itself when the 3 bytes are
+  its own, else the member in `contacts.<g>.members` whose dest starts with
+  them, else the 3 bytes followed by zeros — and then asks `/member_` for them,
+  once a boot, and `groupFromBackfill` names every such record when a members
+  answer lands. A proxied account does this on the owner's device, from `MSG`:
+  the hosted account keeps no list and passes the 3 bytes on as they came;
+- stores `group_from` / `orig_id` / `group_event` / `group_subjects` on the
+  record and marks the contact `group`;
 - on a notice naming it, or on `deleted`, moves `contacts.<g>.group_state` —
   `processReady` refuses to send to a group at left, removed or deleted;
 - keeps `contacts.<g>.members`: asks `/members_` when added itself, `/member_`
@@ -1274,15 +1301,14 @@ msgs.<id>.recv_ts        u32 monotonic received-time (never decreases); anchors 
 msgs.<id>.peer           hex16 (redundant with the path segment, kept for indexed query)
 msgs.<id>.title / content
 msgs.<id>.reply_to       raw 32 B replied-to message hash (FIELD_REPLY_TO); all-zero = not a reply
-msgs.<id>.reply_quote    the fragment of that message this one quotes (FIELD_REPLY_QUOTE), UTF-8; empty = quotes the whole message, and each end draws the preview from its own copy. Dropped on receipt above LXMF_REPLY_QUOTE_MAX (512 B), and shown only where it really occurs in the message `reply_to` names
+msgs.<id>.reply_quote    the fragment of that message this one quotes (FIELD_REPLY_QUOTE), UTF-8; empty = quotes the whole message, and each end draws the preview from its own copy. Dropped on receipt above LXMF_REPLY_QUOTE_MAX (512 B), and shown only where it really occurs in the message `reply_to` names — or, with no `reply_to`, as it came
 msgs.<id>.method         link-always | link-if-one-exists | link-if-big | opportunistic-or-fail (per-message override; auto/empty = none; legacy direct/opportunistic still parse)
 msgs.<id>.ts             unix s (sender clock; can be wrong — recv_ts is the display anchor)
 msgs.<id>.delivered_ts   u32 unix s the delivery proof finished DELIVERED; 0 = not delivered
 msgs.<id>.read           inbound only, 0 | 1
 msgs.<id>.message_id     raw 32 B SHA-256 (firmware)
-msgs.<id>.group_from     raw 16 B FIELD_GROUP writer (the group itself on a notice); all-zero = not a group message
+msgs.<id>.group_from     raw 16 B FIELD_GROUP writer (the group itself on a notice); the 3 bytes the group named them by then zeros while this account knows no such member; all-zero = not a group message
 msgs.<id>.orig_id        raw 3 B the first 3 bytes of the writer's own message_id — a group's name for it
-msgs.<id>.reply_short    raw 3 B a group reply's target (FIELD_REPLY_TO cut to 3 bytes); exclusive with reply_to
 msgs.<id>.command        u8 1 = a command we sent our group; never drawn, never the preview
 msgs.<id>.group_data     an answer's data (/info, /members), kept only on a proxy for its owner
 msgs.<id>.group_name     a members answer's group name, kept likewise
