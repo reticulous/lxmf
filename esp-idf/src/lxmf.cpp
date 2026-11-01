@@ -1007,6 +1007,25 @@ static std::string bytesToHex(const uint8_t* data, size_t n)
     return out;
 }
 
+/* Hex a person typed or pasted may be grouped with spaces ("1303 a636 ...");
+ * every human-entered hex string goes through this before it is checked. */
+static std::string stripSpaces(std::string_view s)
+{
+    std::string out;
+    for (char c : s) if (!std::isspace((unsigned char)c)) out += c;
+    return out;
+}
+
+/* A destination or identity hash a person entered: spaces stripped, and a full
+ * 64-hex hash cut to its leading 32 hex (the truncated hash Reticulum uses). */
+static std::string hexAddr(std::string_view s)
+{
+    std::string out = stripSpaces(s);
+    if (out.size() == 64 && out.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+        out.resize(32);
+    return out;
+}
+
 [[maybe_unused]] static bool hexToBytes(const char* hex, size_t hex_len,
                        uint8_t* out, size_t out_len)
 {
@@ -4849,6 +4868,32 @@ static void pingAbandon(lxmf_id_t& id)
     id.ping.started_ms = 0;
 }
 
+static void contactAdd(lxmf_id_t& id, std::string peer_hex)
+{
+    peer_hex = hexAddr(peer_hex);
+    for (char& c : peer_hex) c = (char)std::tolower((unsigned char)c);
+    uint8_t dh[16];
+    if (peer_hex.size() != 32 ||
+        peer_hex.find_first_not_of("0123456789abcdef") != std::string::npos ||
+        !hexToDestHash(peer_hex, dh)) {
+        warn("id %d: contact_add bad peer \"%s\"", id.index, peer_hex.c_str());
+        return;
+    }
+    if (!storageExists(contactPath(id.index, peer_hex, "hash").c_str())) {
+        std::string nm = bestHeardName(peer_hex);
+        storageBegin();
+        storageSet(contactPath(id.index, peer_hex, "hash").c_str(),  peer_hex.c_str());
+        storageSet(contactPath(id.index, peer_hex, "trust").c_str(), 0);
+        if (!nm.empty())
+            storageSet(contactPath(id.index, peer_hex, "display_name").c_str(), nm.c_str());
+        storageEnd();
+    }
+    setIntIfChanged(contactPath(id.index, peer_hex, "kept"), 1);
+    lxmfSyncContactKey(id.index, peer_hex);
+    rnsdRequestPath(dh);
+    info("id %d: contact %s added, path requested", id.index, peer_hex.c_str());
+}
+
 /* Start a probe to `peer_hex`, superseding any ping already in flight for this
  * identity (its result is abandoned, not settled — the user asked for a newer
  * measurement and a stale OUT_RESULT would overwrite it). */
@@ -6771,7 +6816,7 @@ static void onPnodeAdd(const char* key, const char* val)
     cJSON* o = cJSON_Parse(payload.c_str());
     cJSON* h = o ? cJSON_GetObjectItem(o, "hash") : nullptr;
     cJSON* nm = o ? cJSON_GetObjectItem(o, "name") : nullptr;
-    std::string hex  = cJSON_IsString(h)  ? h->valuestring  : "";
+    std::string hex  = cJSON_IsString(h)  ? hexAddr(h->valuestring) : "";
     std::string name = cJSON_IsString(nm) ? nm->valuestring : "";
     if (o) cJSON_Delete(o);
     for (char& c : hex) c = (char)std::tolower((unsigned char)c);
@@ -6911,7 +6956,7 @@ static void onIdentityImport(const char* key, const char* val)
     storageUnset(key);
     cJSON* o = cJSON_Parse(payload.c_str());
     cJSON* k = o ? cJSON_GetObjectItem(o, "privkey") : nullptr;
-    std::string hex = cJSON_IsString(k) ? k->valuestring : "";
+    std::string hex = cJSON_IsString(k) ? stripSpaces(k->valuestring) : "";
     if (o) cJSON_Delete(o);
     for (char& c : hex) c = (char)std::tolower((unsigned char)c);
     if (hex.size() != 128) {
@@ -6944,7 +6989,7 @@ static void onSetProxy(int n, const char* key, const char* val)
     storageUnset(key);
     cJSON* o = cJSON_Parse(payload.c_str());
     cJSON* d = o ? cJSON_GetObjectItem(o, "dest") : nullptr;
-    std::string dest = cJSON_IsString(d) ? d->valuestring : "";
+    std::string dest = cJSON_IsString(d) ? hexAddr(d->valuestring) : "";
     if (o) cJSON_Delete(o);
     for (char& c : dest) c = (char)std::tolower((unsigned char)c);
 
@@ -8687,6 +8732,7 @@ static void onIdentityLevelCmd(const char* key, const char* val)
                 size_t bar3 = role.find('|');
                 if (bar3 != std::string::npos) { kind = role.substr(bar3 + 1); role = role.substr(0, bar3); }
             }
+            hex = stripSpaces(hex);
             if (hex.size() != 128) {
                 err("identity_import: expect 128 hex chars");
             } else {
@@ -8801,6 +8847,14 @@ static void onIdentityLevelCmd(const char* key, const char* val)
     }
 
     storageUnset(key);   /* last step — sync waiter sees "processed" now */
+}
+
+static void onIdentityPending(const char* key, const char* val)
+{
+    if (!val || !*val) return;
+    std::string name = val;
+    onIdentityLevelCmd("lxmf.cmd.identity_new", name.c_str());
+    storageUnset("s.lxmf.identity_pending");
 }
 
 /* ── lxmf.id.<n>.cmd.* — per-identity commands ──
@@ -8921,6 +8975,9 @@ static void handleIdCmd(int n, const char* key, const char* val)
         }
         else if (std::strcmp(verb, "ping") == 0) {
             pingStart(id, peer_hex);
+        }
+        else if (std::strcmp(verb, "contact_add") == 0) {
+            contactAdd(id, peer_hex);
         }
         else if (std::strcmp(verb, "fetch") == 0) {
             if (mid.empty())
@@ -9348,9 +9405,10 @@ static void peerNameLookupContacts(int sel, PeerNameLookupCtx& ctx)
 
 static std::string cliResolvePeer(const std::string& arg)
 {
-    if (arg.size() == 32) {
+    std::string hex = hexAddr(arg);
+    if (hex.size() == 32) {
         uint8_t dh[16];
-        if (hexToDestHash(arg, dh)) return arg;
+        if (hexToDestHash(hex, dh)) return hex;
     }
     char* end = nullptr;
     long n = std::strtol(arg.c_str(), &end, 10);
@@ -10006,10 +10064,11 @@ static void cliAnnounces(const char* rest)
     while (rest && *rest == ' ') rest++;
     std::string arg = (rest && *rest) ? std::string(rest) : "";
 
-    /* 32-hex → direct lookup. */
-    if (arg.size() == 32) {
+    /* 32- or 64-hex (spaces ignored) → direct lookup. */
+    std::string hex = hexAddr(arg);
+    if (hex.size() == 32) {
         uint8_t dh[16];
-        if (hexToDestHash(arg, dh)) { cliAnnouncesByHash(arg); return; }
+        if (hexToDestHash(hex, dh)) { cliAnnouncesByHash(hex); return; }
         /* not valid hex despite the length — fall through to substring */
     }
 
@@ -10415,8 +10474,7 @@ static void cliLxmf(const char* args)
         while (*rest == ' ') rest++;
         const char* sp2 = std::strchr(rest, ' ');
         std::string act = sp2 ? std::string(rest, sp2 - rest) : std::string(rest);
-        std::string peer = sp2 ? std::string(sp2 + 1) : std::string();
-        while (!peer.empty() && peer.front() == ' ') peer.erase(peer.begin());
+        std::string peer = sp2 ? hexAddr(sp2 + 1) : std::string();
         if (peer.size() != 32) { cliPrintf("usage: lxmf link open|close|status <32-hex peer>\n"); return; }
         if (act == "status") {
             std::string st = storageGetStr(idEphPath(sel, ("link." + peer).c_str()).c_str(), "");
@@ -10555,8 +10613,7 @@ static void cliLxmf(const char* args)
             return;
         }
         if (arg.rfind("on ", 0) == 0) {
-            std::string d = arg.substr(3);
-            while (!d.empty() && d.front() == ' ') d.erase(d.begin());
+            std::string d = hexAddr(std::string_view(arg).substr(3));
             if (d.size() != 32) { cliPrintf("usage: lxmf proxy on <32-hex server dest>\n"); return; }
             proxyOn(*id, d);
             cliPrintf("provisioning with %s — this device stays registered "
@@ -10693,17 +10750,23 @@ static void lxmfTaskMain(void*)
      * loadIdentityForSlot via subscribePerIdCmds. */
     storageSubscribeChanges("lxmf.cmd.", onIdentityLevelCmd);
 
-    /* Catch up on a sentinel written before this subscription existed. Storage
+    /* Catch up on requests written before these subscriptions existed. Storage
      * delivers CHANGES, not state, so a write that lands before the subscriber
-     * is registered is heard by nobody — and the LCD onboarding wizard writes
-     * lxmf.cmd.identity_new from the boot screen, while this task is still
-     * waiting for the RNS orchestrator to start it. That is a device the
-     * operator named during setup and which then has no identity at all, with
-     * nothing on any surface to say why.
+     * is registered is heard by nobody, and this task only starts once the RNS
+     * orchestrator does — up to a minute after boot.
      *
-     * Only the two creation commands: every other lxmf.cmd.* addresses an
-     * identity that must already exist, so an unconsumed one is stale rather
-     * than pending. The handler unsets the key, so this runs at most once. */
+     * The LCD onboarding wizard asks for its identity through the persisted
+     * s.lxmf.identity_pending (the name), so the request survives a reset in
+     * that window; it is consumed once the identity exists. Of the lxmf.cmd.*
+     * sentinels only the two creation commands are caught up: every other one
+     * addresses an identity that must already exist, so an unconsumed one is
+     * stale rather than pending. The settings forms' identity requests are
+     * caught up too. Every handler unsets its key, so each runs at most once. */
+    storageSubscribeChanges("s.lxmf.identity_pending", onIdentityPending);
+    {
+        std::string v = storageGetStr("s.lxmf.identity_pending", "");
+        if (!v.empty()) onIdentityPending("s.lxmf.identity_pending", v.c_str());
+    }
     for (const char* pend : { "lxmf.cmd.identity_new", "lxmf.cmd.identity_import" }) {
         std::string v = storageGetStr(pend, "");
         if (v.empty()) continue;
@@ -10720,6 +10783,13 @@ static void lxmfTaskMain(void*)
     storageSubscribeChanges("lxmf.pnode.order",     onPnodeOrder);
     storageSubscribeChanges("lxmf.identity.new",    onIdentityNew);
     storageSubscribeChanges("lxmf.identity.import", onIdentityImport);
+    for (const char* pend : { "lxmf.identity.new", "lxmf.identity.import" }) {
+        std::string v = storageGetStr(pend, "");
+        if (v.empty()) continue;
+        info("%s was written before we were listening — running it now", pend);
+        if (std::strcmp(pend, "lxmf.identity.new") == 0) onIdentityNew(pend, v.c_str());
+        else                                              onIdentityImport(pend, v.c_str());
+    }
 
     /* No iface-event announce subscription: rnsd's per-interface announce
      * replay hands a new interface our last announce, pinned to it. */

@@ -501,16 +501,30 @@ std::string trim(const std::string& s) {
     size_t b = s.find_last_not_of(' ');
     return s.substr(a, b - a + 1);
 }
+/* Typed hex may be grouped with spaces ("1303 a636 ..."); drop all whitespace. */
+std::string nospace(const std::string& s) {
+    std::string o;
+    for (char c : s) if (!isspace((unsigned char)c)) o += c;
+    return o;
+}
 bool isHex32(const std::string& s) {
     if (s.size() != 32) return false;
     for (char c : s) if (!isxdigit((unsigned char)c)) return false;
     return true;
 }
-/* needle is already lowercased + trimmed; hash is lowercase hex. */
+/* A typed address: whitespace dropped, and a full 64-hex hash cut to the
+ * leading 32 hex that address a destination. */
+std::string hexAddr(const std::string& s) {
+    std::string h = nospace(s);
+    if (h.size() == 64 && isHex32(h.substr(0, 32)) && isHex32(h.substr(32))) h.resize(32);
+    return h;
+}
+/* needle is already lowercased + trimmed; hash is lowercase hex and is matched
+ * against the needle as a typed address (see hexAddr). */
 bool qmatch(const std::string& needle, const std::string& name, const std::string& hash) {
     if (needle.empty()) return true;
     return lower(name).find(needle) != std::string::npos ||
-           hash.find(needle) != std::string::npos;
+           hash.find(hexAddr(needle)) != std::string::npos;
 }
 
 /* ---- identity ---- */
@@ -1855,6 +1869,19 @@ void openThread(const std::string& peer) {
 
 void onContactClick(lv_event_t* e) {
     openThread(*static_cast<std::string*>(lv_event_get_user_data(e)));
+}
+
+/* A typed address becomes a contact, and lxmf asks the mesh for a path. */
+void addAndOpen(const std::string& peer) {
+    if (g_id < 0) return;
+    char k[48];
+    snprintf(k, sizeof k, "lxmf.id.%d.cmd.contact_add", g_id);
+    storageSet(k, peer.c_str());
+    openThread(peer);
+}
+
+void onNewAddressClick(lv_event_t* e) {
+    addAndOpen(*static_cast<std::string*>(lv_event_get_user_data(e)));
 }
 
 /* A contact tapped in the nomad browser (lxmf.url_lcd) waits here until an
@@ -4817,7 +4844,7 @@ lv_obj_t* buildPeerRow(lv_obj_t* list, const RowSpec& s) {
     lv_obj_set_style_pad_ver(row, 1, 0);
     lv_obj_set_style_pad_hor(row, 6, 0);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    bindPeer(row, onContactClick, s.peer);
+    bindPeer(row, s.key == "\x01.new" ? onNewAddressClick : onContactClick, s.peer);
     if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), row);
 
     fillPeerContent(row, s.title, s.sub, s.age, s.titleColor);
@@ -5050,7 +5077,8 @@ void rebuildList(bool keepScroll) {
         std::vector<int> en, dis;
         configuredIds(en, dis);
         const char* msg =
-            !en.empty()  ? "Waiting for initialization…"                :
+            !en.empty() || storageExists("s.lxmf.identity_pending")
+                         ? "Waiting for initialization…"                :
             !dis.empty() ? "Identity disabled.\nEnable it in Settings." :
                            "No active identity.\nCreate one in Settings.";
         tC.push_back(emptySpec(msg));
@@ -5078,15 +5106,16 @@ void rebuildList(bool keepScroll) {
 
     int cRows = 0;
 
-    /* "New": a bare 32-hex query for a peer we don't already have a thread with. */
-    if (isHex32(nC)) {
+    /* "New": a bare 32- or 64-hex query for a peer we don't already have a thread with. */
+    std::string nCh = hexAddr(nC);
+    if (isHex32(nCh)) {
         bool known = false;
-        for (auto& c : convs) if (c.peer == nC) { known = true; break; }
+        for (auto& c : convs) if (c.peer == nCh) { known = true; break; }
         if (!known) {
             tC.push_back(groupSpec("New"));
-            RowSpec s; s.kind = RK_PEER; s.key = "\x01.new"; s.peer = nC;
-            s.title = "Message this address"; s.sub = nC; s.titleColor = lv_color_white();
-            s.sig = "N|" + nC;
+            RowSpec s; s.kind = RK_PEER; s.key = "\x01.new"; s.peer = nCh;
+            s.title = "Message this address"; s.sub = nCh; s.titleColor = lv_color_white();
+            s.sig = "N|" + nCh;
             tC.push_back(std::move(s));
             cRows++;
         }
@@ -5117,12 +5146,15 @@ void rebuildList(bool keepScroll) {
     std::string nM = lower(trim(g_qMesh));
     int expire = storageGetInt("s.lxmf.on_mesh_expire", 3600);   /* 0 = show all */
     int shown = 0, total = 0;
+    std::string nMh = hexAddr(nM);
+    bool exactShown = false;
     for (auto& an : g_anns) {
         if (expire > 0 && an.last > 0 && (now - an.last) > expire) continue;   /* too old */
         std::string nm = an.name.empty() ? peerName(an.hash) : an.name;
         if (!qmatch(nM, nm, an.hash)) continue;
         total++;
         if (shown >= MESH_ROW_CAP) continue;
+        if (an.hash == nMh) exactShown = true;
         RowSpec s; s.kind = RK_PEER; s.key = an.hash; s.peer = an.hash;
         s.title = nm; s.sub = an.hash;
         s.age = an.last > 0 ? relAge(now - an.last) : std::string();
@@ -5135,6 +5167,14 @@ void rebuildList(bool keepScroll) {
         char foot[48];
         snprintf(foot, sizeof foot, "+%d more — search to narrow", total - shown);
         tM.push_back(groupSpec(foot));
+    }
+    if (isHex32(nMh) && !exactShown) {
+        RowSpec s; s.kind = RK_PEER; s.key = "\x01.new"; s.peer = nMh;
+        s.title = "Message this address"; s.sub = nMh; s.titleColor = lv_color_white();
+        s.sig = "N|" + nMh;
+        tM.insert(tM.begin(), std::move(s));
+        tM.insert(tM.begin(), groupSpec("New"));
+        shown++;
     }
     if (shown == 0)
         tM.push_back(emptySpec(nM.empty() ? "Nothing heard recently." : "No matches."));
@@ -5204,15 +5244,15 @@ void onSearchChanged(lv_event_t* e) {
 
 void onSearchEnter(lv_event_t* e) {
     /* Enter flushes any pending debounce, then opens the thread if the query is
-     * a bare 32-hex address (start a conversation with an exact dest). */
+     * a bare 32- or 64-hex address (start a conversation with an exact dest). */
     if (g_searchTimer) {
         lv_timer_delete(g_searchTimer);
         g_searchTimer = nullptr;
         rebuildList();
     }
     lv_obj_t* ta = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
-    std::string needle = lower(trim(ta == s_searchM ? g_qMesh : g_qContacts));
-    if (isHex32(needle)) openThread(needle);
+    std::string needle = hexAddr(lower(ta == s_searchM ? g_qMesh : g_qContacts));
+    if (isHex32(needle)) addAndOpen(needle);
 }
 
 /* One tab page: a single vertical scroll list whose first child is the search

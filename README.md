@@ -114,6 +114,7 @@ key. Presence = request in flight; absence = done.
 | Key | Value | Effect |
 |---|---|---|
 | `lxmf.cmd.identity_new` | optional label | generate a new identity, allocate the next slot, bring its mailbox up |
+| `s.lxmf.identity_pending` | label | as `identity_new`, but persisted so the request survives a reset before lxmf starts; unset once the identity exists |
 | `lxmf.cmd.identity_import` | 128-hex private key | import a key into a new slot |
 | `lxmf.cmd.identity_destroy` | `<n>` | wipe identity `n` — its secret, all its storage, its subscriptions; an account's groups are deleted with it |
 | `lxmf.cmd.group_new` | `<owner n>\|<name>\|<peer>,<peer>,…[\|<hide name 1\|0>]` | make a group owned by account `n`, with those members and the owner; its name stays out of its announce unless the last field is `0` (see **Groups**) |
@@ -134,6 +135,7 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.retry` | `<peer>/<key>` | try this one again NOW. Proxied, that is a `RETRY` frame naming the record — the body is already on the server, and putting it back on the air to say "again" would cost the whole message to carry one bit. Unproxied it is an ordinary send, since this device owns the queue |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — a link establishment where there is no link, else one packet on the open one (see **Ping**) |
+| `lxmf.id.<n>.cmd.contact_add` | `<peer>` | make `<peer>` a contact (kept, so it lists with no messages), take its key from rnsd if known, and request a path to it. The web and LCD search fields write it when a typed address is opened |
 | `lxmf.id.<n>.cmd.fetch` | `<peer>/<message_id>` | ask the proxy server for a body it withheld (see **Being proxied**) |
 | `lxmf.id.<n>.cmd.proxy_on` | `<32-hex>` | ask that `lxmproxy.server` to take this account; this device stays registered until the server confirms |
 | `lxmf.id.<n>.cmd.proxy_off` | any | hand the account back; this device stays proxied and working until the server answers |
@@ -1345,6 +1347,13 @@ whole file lives
 under `conditional/spangap-lcd/` and is compiled and registered only when
 the [spangap-lcd](../spangap-lcd) straddle is in the build (the
 `lxmfLcdRegister` init hook is `when:`-gated) — no `#if` anywhere.
+
+**Typing an address.** Both surfaces' search fields take a destination hash as
+32 hex or as the full 64 (whose leading 32 are the address), with spaces
+anywhere; so do the settings forms and the `lxmf`/`lxmproxy` commands that take
+a hash. A full address that is not yet a contact is offered as "Message this
+address" in either list; opening it (that row, or Enter) writes
+`cmd.contact_add` and opens the conversation.
 
 **Picking an account.** With one identity neither surface asks. With more than
 one, both ask on the way in and nowhere else — there is no in-window identity

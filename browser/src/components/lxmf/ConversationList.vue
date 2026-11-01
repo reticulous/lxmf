@@ -4,7 +4,8 @@
      search box on top filters two sections: "Contacts" (peers you've
      messaged — shown with rich conversation preview / unread / time) and
      "On the Mesh" (announced peers you haven't talked to yet). A bare
-     32-hex query offers "message this address". The button right of the
+     32-hex query that isn't a contact yet offers "message this address",
+     which adds it as a contact and opens it. The button right of the
      search box starts a new group. Presentational: props in,
      intent out — no device-store access, no pane/screen knowledge. -->
 <template>
@@ -22,7 +23,7 @@
 
     <div class="conv-scroll">
       <div v-if="rawHexReady" class="grp">New</div>
-      <div v-if="rawHexReady" class="conv" @click="emit('open-peer', hexQuery)">
+      <div v-if="rawHexReady" class="conv" @click="addHex">
         <PeerAvatar :peer="hexQuery" name="" :size="40" />
         <div class="mid">
           <div class="line1"><span class="name">Message this address</span></div>
@@ -81,21 +82,22 @@ import { computed, ref } from 'vue'
 import { matGroupAdd } from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import ContactSignal from './ContactSignal.vue'
-import type { Conversation } from '../../modules/lxmf'
+import { hexAddr, type Conversation } from '../../modules/lxmf'
 
 const props = defineProps<{
   conversations: Conversation[]
   directory: { peer: string; name: string; known: boolean; group: boolean }[]
   activePeer: string
 }>()
-const emit = defineEmits<{ 'open-peer': [peer: string]; 'new-group': [] }>()
+const emit = defineEmits<{ 'open-peer': [peer: string]; 'add-peer': [peer: string]; 'new-group': [] }>()
 
 const q = ref('')
 
 const isHex64 = (s: string) => /^[0-9a-f]{32}$/i.test(s)
-const hexQuery = computed(() => q.value.trim().toLowerCase())
+/* The query read as an address: spaces dropped, a 64-hex hash cut to 32. */
+const hexQuery = computed(() => hexAddr(q.value))
 const rawHexReady = computed(() =>
-  isHex64(hexQuery.value) && !props.directory.some(d => d.peer === hexQuery.value))
+  isHex64(hexQuery.value) && !props.directory.some(d => d.peer === hexQuery.value && d.known))
 
 /* Conversation metadata (preview / unread / time) keyed by peer, so a
  * Contacts row can render its thread state without the rail knowing how
@@ -109,8 +111,9 @@ const convByPeer = computed(() => {
 const filtered = computed(() => {
   const needle = q.value.trim().toLowerCase()
   if (!needle) return props.directory
+  const hexNeedle = hexQuery.value
   return props.directory.filter(d =>
-    d.name.toLowerCase().includes(needle) || d.peer.toLowerCase().includes(needle))
+    d.name.toLowerCase().includes(needle) || d.peer.toLowerCase().includes(hexNeedle))
 })
 
 /* Contacts carry their conversation (if any) and sort by recency —
@@ -129,8 +132,14 @@ const contacts = computed(() =>
  * first). */
 const heard = computed(() => filtered.value.filter(d => !d.known))
 
+function addHex() {
+  const peer = hexQuery.value
+  q.value = ''
+  emit('add-peer', peer)
+}
+
 function onEnter() {
-  if (rawHexReady.value) return emit('open-peer', hexQuery.value)
+  if (rawHexReady.value) return addHex()
   const only = [...contacts.value, ...heard.value]
   if (only.length === 1) emit('open-peer', only[0]!.peer)
 }

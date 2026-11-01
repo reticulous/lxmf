@@ -195,6 +195,7 @@ is deliberately narrow:
 |---|---|---|---|
 | `lxmf.cmd.` | once in `lxmfTaskMain` | `identity_new` / `identity_import` / `identity_destroy` / `group_new` / `group_delete` / `pn_sync` / `pn_add` | `onIdentityLevelCmd` |
 | `lxmf.id.<n>.cmd.` | per slot, by `createIdentityForSlot`/`loadIdentityForSlot`; removed by `destroyIdentity` | `send` / `cancel` / `delete` / `prune` / `announce` / `group_leave` / `group_info` / `group_members` and the rest of the per-identity verbs; on a group's slot `member_add` / `member_del` / `members_set` / `members_init` | static `onIdCmd<n>` → `handleIdCmd(n,…)` |
+| `s.lxmf.identity_pending` | once in `lxmfTaskMain`, which first runs any value already stored | a display name persisted by the LCD onboarding wizard, which runs before lxmf starts | `onIdentityPending` (runs `identity_new`, then unsets the key) |
 | `lxmf.url_web`, `lxmf.url_lcd` | once | a tapped `lxmf@<hash>` link | `onOpenContactUrl` (path request only) |
 | `s.lxmf.debug.only_local` | once | live debug-verbosity toggle | inline lambda |
 

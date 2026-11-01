@@ -171,7 +171,7 @@ import { computed, ref } from 'vue'
 import { matArrowBack, matVerifiedUser, matContentCopy, matCheck, matPersonRemove }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
-import { hasDest, pingLinkLines, peerMeasOf, GroupState, SELF_DESTRUCT_CHOICES, selfDestructLabel,
+import { hasDest, hexAddr, pingLinkLines, peerMeasOf, GroupState, SELF_DESTRUCT_CHOICES, selfDestructLabel,
          type Contact, type GroupMember, type GroupSlot, type PingResult, type PnNode,
          type Reachability }
   from '../../modules/lxmf'
@@ -270,7 +270,9 @@ const pnIsForeign = computed(() =>
   !!contactPn.value && !props.pnNodes.some(n => n.hash === contactPn.value))
 const pnCustom = ref(false)
 const pnCustomHash = ref('')
-const validCustomPn = computed(() => /^[0-9a-f]{32}$/i.test(pnCustomHash.value.trim()))
+/* Spaces dropped and a 64-hex hash cut to 32 (hexAddr). */
+const pnCustomHex = computed(() => hexAddr(pnCustomHash.value))
+const validCustomPn = computed(() => /^[0-9a-f]{32}$/.test(pnCustomHex.value))
 const pnSelValue = computed(() => (pnCustom.value ? '~custom' : contactPn.value))
 function onPnSelect(e: Event) {
   const v = (e.target as HTMLSelectElement).value
@@ -279,7 +281,7 @@ function onPnSelect(e: Event) {
   emit('set-pn', props.peer, v)
 }
 function applyCustomPn() {
-  emit('set-pn', props.peer, pnCustomHash.value.trim().toLowerCase())
+  emit('set-pn', props.peer, pnCustomHex.value)
   pnCustom.value = false
   pnCustomHash.value = ''
 }

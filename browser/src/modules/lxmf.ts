@@ -483,6 +483,14 @@ export function peerAvatar(peer: string, name: string): { hue: number; glyph: st
 
 function num(v: unknown, d = 0): number { const n = Number(v); return Number.isFinite(n) ? n : d }
 function str(v: unknown): string { return v == null ? '' : String(v) }
+/** Hex a person typed or pasted may be grouped with spaces ("1303 a636 …"). */
+function stripSpaces(s: string): string { return s.replace(/\s+/g, '') }
+/** A destination/identity hash a person entered: spaces stripped, lowercased,
+ *  and a full 64-hex hash cut to its leading 32 hex (Reticulum's truncated hash). */
+export function hexAddr(s: string): string {
+  const h = stripSpaces(s).toLowerCase()
+  return /^[0-9a-f]{64}$/.test(h) ? h.slice(0, 32) : h
+}
 
 /** True when a stored destination field (e.g. a contact's `pn`) names a real
  *  dest — non-empty and not the all-zero placeholder. */
@@ -1484,6 +1492,10 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const ping = (peer: string): Promise<void> =>
     queue(`lxmf.id.${activeId.value}.cmd.ping`).enqueue(peer)
 
+  /* A typed address becomes a contact, and the firmware asks the mesh for a path. */
+  const addContact = (peer: string): Promise<void> =>
+    queue(`lxmf.id.${activeId.value}.cmd.contact_add`).enqueue(peer)
+
   /* Ask the proxy server for a body it withheld. Settles on the record's own
    * effect — the body arriving — never on the sentinel, since ephemeral
    * deletions are not propagated back over the storage channel. */
@@ -1561,7 +1573,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     device.sendJson(patch)
   }
   const pnAdd = (hash: string, name = '') => {
-    const h = hash.trim().toLowerCase()
+    const h = hexAddr(hash)
     if (!/^[0-9a-f]{32}$/.test(h)) throw new Error('node hash must be 32 hex chars')
     const list = pnNodes.value.slice()
     if (list.some(e => e.hash === h)) return
@@ -1606,7 +1618,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   /** Per-contact propagation node ('' clears). Plain config write — the
    *  firmware reads it only through the resend dialog's via option. */
   const setContactPn = (peer: string, hash: string) => {
-    const h = hash.trim().toLowerCase()
+    const h = hexAddr(hash)
     if (h && !/^[0-9a-f]{32}$/.test(h)) throw new Error('node hash must be 32 hex chars')
     device.set(`s.lxmf.id.${activeId.value}.contacts.${peer}.pn`,
                h || '00000000000000000000000000000000')
@@ -1630,7 +1642,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
   const createIdentity = (label: string) =>
     queue('lxmf.cmd.identity_new').enqueue(label || 'main')
   const importIdentity = (privHex: string) =>
-    queue('lxmf.cmd.identity_import').enqueue(privHex.trim())
+    queue('lxmf.cmd.identity_import').enqueue(stripSpaces(privHex))
   const destroyIdentity = (n: number) =>
     queue('lxmf.cmd.identity_destroy').enqueue(String(n))
   /* Plain config write — no sentinel. The firmware reads
@@ -1666,7 +1678,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
     pnStatus, setContactPn, setSelfDestruct, markOpened, expire,
     markConversationRead, announceNow, linkState, toggleLink, proxied,
-    ping, pingResult, fetchBody, peerMeas,
+    ping, addContact, pingResult, fetchBody, peerMeas,
     createIdentity, importIdentity, destroyIdentity, setEnabled,
   }
 }

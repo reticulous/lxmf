@@ -63,6 +63,7 @@
               :directory="lxmf.peerDirectory.value"
               :active-peer="lxmf.activePeer.value"
               @open-peer="openPeer"
+              @add-peer="addPeer"
               @new-group="showGroupCreate = true"
             />
           </div>
@@ -350,6 +351,11 @@ function openPeer(peer: string) {
   showContact.value = false
   replyTo.value = null
   lxmf.markConversationRead(peer)
+}
+
+function addPeer(peer: string) {
+  lxmf.addContact(peer).catch(() => {})
+  openPeer(peer)
 }
 
 async function onSend(content: string) {
