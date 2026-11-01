@@ -269,7 +269,10 @@ struct ChunkJob {
 };
 ChunkJob* g_chunkC = nullptr;
 ChunkJob* g_chunkM = nullptr;
-std::vector<std::string> g_nomadTargets;/* "<hash>:<path>" per tappable Nomad link in the open thread */
+/* A tappable link in the open thread: the shared sentinel a tap writes, and
+ * its value before the "|<nonce>". */
+struct LinkTarget { const char* key; std::string value; };
+std::vector<LinkTarget> g_linkTargets;  /* per tappable message link in the open thread */
 std::string       g_curPeer;            /* peer of the open thread */
 std::string       g_pendingOpenPeer;    /* contact tapped in nomad, awaiting an identity pick */
 std::string       g_qContacts;          /* Contacts-tab search-box text */
@@ -1314,7 +1317,7 @@ void beginThreadLoad() {
     if (!s_bubbles) return;
     lv_obj_clean(s_bubbles);
     g_bubbles.clear();
-    g_nomadTargets.clear();
+    g_linkTargets.clear();
     g_dateSeps.clear();
     if (s_stickyDate) lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
     if (s_sdWarn)     lv_obj_add_flag(s_sdWarn, LV_OBJ_FLAG_HIDDEN);
@@ -1915,11 +1918,13 @@ void onLcdOpenUrl(const char* /*key*/, const char* val) {
 
 /* ---- thread rendering ---- */
 
-/* ---- Nomad page links in message text ----
+/* ---- Nomad page and RRC room links in message text ----
  * A message may quote a Nomad page URL "<32hex>:/path". We render those as
  * tappable links; a tap hands the URL to the Nomad browser via nomad.url_lcd
  * (nomad_lcd subscribes, brings itself forward, and navigates). This is the
- * exact reverse of nomad_lcd's lxmf@<hash> links → lxmf.url_lcd. */
+ * exact reverse of nomad_lcd's lxmf@<hash> links → lxmf.url_lcd.
+ * RRC links work the same way towards the RRC app: a tap writes rrc.url_lcd =
+ * "<hub>[/<room>]|<nonce>" and the RRC app joins the room on that hub. */
 
 /* Match a Nomad page link at line[pos]: 32 hex + ':' + '/' + a run of
  * non-space path chars, not part of a longer hex token. Fills `url` with
@@ -1939,23 +1944,96 @@ bool matchNomadAt(const std::string& s, size_t pos, std::string& url, size_t& le
     return true;
 }
 
-void onNomadLinkClick(lv_event_t* e) {
-    size_t idx = (size_t)(intptr_t)lv_event_get_user_data(e);
-    if (idx >= g_nomadTargets.size()) return;
-    /* "<hash>:<path>|<nonce>" — nonce makes repeat taps re-fire (nomad_lcd
-     * strips it). Path fits comfortably; guard the buffer regardless. */
-    char v[160];
-    snprintf(v, sizeof v, "%s|%u", g_nomadTargets[idx].c_str(), (unsigned)millis());
-    storageSet("nomad.url_lcd", v);
+/* Match an RRC link at s[pos], one of
+ *   rrc://[#]<room>@<hub>      rrc://<hub>[:<dest>][/[#]<room>]
+ *   rrc@<hub>                  #<room>@<hub>
+ * Room = [A-Za-z0-9][A-Za-z0-9_.-]*, minus trailing '.'/'-'; hub/dest = 32 hex,
+ * any case, and a hub written after '@' may be 64 hex, cut to its first 32. The
+ * rrc forms must not follow a word character; the bare '#' form must start the
+ * text or follow whitespace, '(' or ','. Nothing word-like may follow the link.
+ * Fills `target` with "<hub>[/<room>]" (hub lowercased, room as typed); `len`
+ * is the link's byte length. */
+bool matchRrcAt(const std::string& s, size_t pos, std::string& target, size_t& len) {
+    auto hex  = [](char c){ return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'); };
+    auto word = [](char c){ return isalnum((unsigned char)c) || c == '_'; };
+    auto hex32 = [&](size_t q) {
+        if (q + 32 > s.size()) return false;
+        for (size_t k = 0; k < 32; k++) if (!hex(s[q + k])) return false;
+        return true;
+    };
+    auto endsHere = [&](size_t e) { return e >= s.size() || !word(s[e]); };
+    /* A room starting at q; returns its end (q when there is none). */
+    auto roomEnd = [&](size_t q) {
+        if (q >= s.size() || !isalnum((unsigned char)s[q])) return q;
+        size_t e = q + 1;
+        while (e < s.size() && (word(s[e]) || s[e] == '.' || s[e] == '-')) e++;
+        return e;
+    };
+    /* "<room>@<hub>" from q (after any '#'): fills the outputs and returns true. */
+    auto roomAtHub = [&](size_t q) {
+        size_t r = roomEnd(q);
+        if (r == q || r >= s.size() || s[r] != '@' || !hex32(r + 1)) return false;
+        size_t e = r + 33;
+        if (hex32(e)) e += 32;
+        if (!endsHere(e)) return false;
+        size_t rl = r;
+        while (rl > q && (s[rl - 1] == '.' || s[rl - 1] == '-')) rl--;
+        target = s.substr(r + 1, 32) + "/" + s.substr(q, rl - q);
+        len = e - pos;
+        return true;
+    };
+    char prev = pos > 0 ? s[pos - 1] : ' ';
+    bool ok = false;
+    if (s.compare(pos, 4, "rrc@") == 0) {
+        if (word(prev) || !hex32(pos + 4)) return false;
+        size_t e = pos + 36;
+        if (hex32(e)) e += 32;
+        if (!endsHere(e)) return false;
+        target = s.substr(pos + 4, 32);
+        len = e - pos;
+        ok = true;
+    } else if (s.compare(pos, 6, "rrc://") == 0) {
+        if (word(prev)) return false;
+        size_t p = pos + 6;
+        ok = roomAtHub(s[p] == '#' ? p + 1 : p);
+        if (!ok && hex32(p)) {
+            size_t e = p + 32;
+            target = s.substr(p, 32);
+            if (e < s.size() && s[e] == ':' && hex32(e + 1)) e += 33;
+            if (e < s.size() && s[e] == '/') {
+                size_t q = e + 1;
+                if (q < s.size() && s[q] == '#') q++;
+                size_t r = roomEnd(q);
+                while (r > q && (s[r - 1] == '.' || s[r - 1] == '-')) r--;
+                if (r > q) { target += "/" + s.substr(q, r - q); e = r; }
+            }
+            if (endsHere(e)) { len = e - pos; ok = true; }
+        }
+    } else if (s[pos] == '#') {
+        if (!(isspace((unsigned char)prev) || prev == '(' || prev == ',')) return false;
+        ok = roomAtHub(pos + 1);
+    }
+    if (ok) for (size_t k = 0; k < 32; k++) target[k] = (char)tolower((unsigned char)target[k]);
+    return ok;
 }
 
-/* Render a message body into the bubble. No link → one wrapping label, exactly
- * as before. With link(s) → the body is split at link boundaries into plain
- * labels and clickable blue link labels, each wrapping within the bubble; they
- * stack in the bubble's column. (A label can't make a substring clickable, so
- * a link becomes its own widget — the same constraint nomad_lcd handles for
- * lxmf@ links.) */
-/* Returns the last plain text label when the message has no Nomad links (so the
+void onLinkClick(lv_event_t* e) {
+    size_t idx = (size_t)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= g_linkTargets.size()) return;
+    /* "<value>|<nonce>" — nonce makes repeat taps re-fire (the reader strips
+     * it). Values fit comfortably; guard the buffer regardless. */
+    char v[160];
+    snprintf(v, sizeof v, "%s|%u", g_linkTargets[idx].value.c_str(), (unsigned)millis());
+    storageSet(g_linkTargets[idx].key, v);
+}
+
+/* Render a message body into the bubble. No link → one wrapping label. With
+ * link(s) → the body is split at link boundaries into plain labels and
+ * clickable blue link labels, each wrapping within the bubble; they stack in
+ * the bubble's column. (A label can't make a substring clickable, so a link
+ * becomes its own widget — the same constraint nomad_lcd handles for lxmf@
+ * links.) */
+/* Returns the last plain text label when the message has no links (so the
  * inline-timestamp path can measure its last line); nullptr when it also holds
  * link widgets. */
 lv_obj_t* addBubbleText(lv_obj_t* bub, const std::string& content) {
@@ -1985,17 +2063,19 @@ lv_obj_t* addBubbleText(lv_obj_t* bub, const std::string& content) {
     bool any = false;
     while (i < body.size()) {
         std::string url; size_t len;
-        if (matchNomadAt(body, i, url, len)) {
+        const char* key = matchNomadAt(body, i, url, len) ? "nomad.url_lcd"
+                        : matchRrcAt(body, i, url, len)   ? "rrc.url_lcd" : nullptr;
+        if (key) {
             addText(textStart, i);
-            lv_obj_t* l = mkLabel(bub, url, lv_color_hex(0x6db3ff));
+            lv_obj_t* l = mkLabel(bub, body.substr(i, len), lv_color_hex(0x6db3ff));
             lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
             lv_obj_set_style_max_width(l, 228, 0);
             lv_obj_set_style_text_decor(l, LV_TEXT_DECOR_UNDERLINE, 0);
             lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_ext_click_area(l, 4);
-            size_t idx = g_nomadTargets.size();
-            g_nomadTargets.push_back(url);
-            lv_obj_add_event_cb(l, onNomadLinkClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+            size_t idx = g_linkTargets.size();
+            g_linkTargets.push_back({key, url});
+            lv_obj_add_event_cb(l, onLinkClick, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
             if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), l);
             i += len;
             textStart = i;
@@ -3407,7 +3487,7 @@ void rebuildThread() {
      * Every bubble goes, so anything anchored to one goes with it. */
     dismissMsgActions();
     lv_obj_clean(s_bubbles);
-    g_nomadTargets.clear();          /* link widgets are gone with the cleaned bubbles */
+    g_linkTargets.clear();           /* link widgets are gone with the cleaned bubbles */
     g_dateSeps.clear();              /* separator widgets went with the clean */
     g_bubbles.clear();
     for (size_t i = 0; i < ms.size(); i++) {

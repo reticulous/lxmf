@@ -749,23 +749,45 @@ function rand4(): string {
  * the shared `nomad.url_web` sentinel (with a nonce so a repeat tap re-fires)
  * and the nomad module brings its browser window forward on that page. This
  * is the exact reverse of nomad's openLxmf → lxmf.url_web; decoupled — we only
- * write the var, nomad reacts. */
+ * write the var, nomad reacts.
+ *
+ * RRC room links work the same way towards the rrc app: a tap writes
+ * `rrc.url_web` = "<hub>[/<room>]|<nonce>" and rrc joins the room on that hub. */
 const NOMAD_HASH_RE = /^[0-9a-f]{32}$/
 
 export interface MsgSegment {
   text: string
   link: { hash: string; path: string } | null   // Nomad page link → nomad browser
+  rrc: { hub: string; room: string } | null     // RRC hub/room link → rrc app
   web: string | null                             // http(s) URL → opens in a new tab
 }
 
-/** Split message content into plain-text runs, Nomad-link runs, and http(s)
- *  web-link runs. A Nomad link is a 32-hex node hash + ":" + a "/"-rooted page
- *  path; a web link is an http:// or https:// URL. Trailing sentence
- *  punctuation is kept outside either link. */
+/* RRC links, one alternative per form:
+ *   rrc://[#]<room>@<hub>
+ *   rrc://<hub>[:<dest>][/[#]<room>]
+ *   rrc@<hub>
+ *   #<room>@<hub>                         (bare: at the start, or after
+ *                                          whitespace, "(" or ",")
+ * Room = [A-Za-z0-9][A-Za-z0-9_.-]*; hub/dest = 32 hex, any case. A hub
+ * written after "@" may be a 64-hex hash, cut to its first 32. */
+const RRC_ROOM = '[A-Za-z0-9][A-Za-z0-9_.\\-]*'
+const RRC_HUB = '([0-9a-fA-F]{32})(?:[0-9a-fA-F]{32})?(?![0-9A-Za-z_])'
+const RRC_LINK = `rrc(?::\\/\\/(?:#?(${RRC_ROOM})@${RRC_HUB}`
+  + `|([0-9a-fA-F]{32})(?::[0-9a-fA-F]{32})?(?:\\/#?(${RRC_ROOM}))?(?![0-9A-Za-z_]))`
+  + `|@${RRC_HUB})`
+  + `|#(${RRC_ROOM})@${RRC_HUB}`
+
+/** Split message content into plain-text runs, Nomad-link runs, RRC-link runs
+ *  and http(s) web-link runs. A Nomad link is a 32-hex node hash + ":" + a
+ *  "/"-rooted page path; an RRC link is one of the forms above, the rrc forms
+ *  not preceded by a word character; a web link is an http:// or https:// URL.
+ *  Trailing sentence punctuation is kept outside any link, and a room drops
+ *  trailing "." / "-". */
 export function segmentMessage(content: string): MsgSegment[] {
-  const re = /(https?:\/\/\S+)|([0-9a-fA-F]{32}):(\/\S+)/g
+  const re = new RegExp(`(https?:\\/\\/\\S+)|([0-9a-fA-F]{32}):(\\/\\S+)|${RRC_LINK}`, 'g')
   const out: MsgSegment[] = []
   const trailing = /[.,;:!?)\]}'"]+$/
+  const plain = (text: string): MsgSegment => ({ text, link: null, rrc: null, web: null })
   let last = 0
   let m: RegExpExecArray | null
   while ((m = re.exec(content))) {
@@ -774,21 +796,29 @@ export function segmentMessage(content: string): MsgSegment[] {
       const url = m[1].replace(trailing, '')
       if (!url) continue
       end = m.index + url.length
-      seg = { text: url, link: null, web: url }
-    } else {                                      // Nomad page link
+      seg = { ...plain(url), web: url }
+    } else if (m[2]) {                            // Nomad page link
       // Don't match inside a longer hex run (e.g. a 64-hex id).
       if (m.index > 0 && /[0-9a-fA-F]/.test(content[m.index - 1]!)) continue
       const path = m[3]!.replace(trailing, '')
       if (!path) continue
       end = m.index + 33 + path.length            // 32 hex + ':' + path
-      seg = { text: content.slice(m.index, end), link: { hash: m[2]!.toLowerCase(), path }, web: null }
+      seg = { ...plain(content.slice(m.index, end)), link: { hash: m[2]!.toLowerCase(), path } }
+    } else {                                      // RRC link
+      const prev = m.index > 0 ? content[m.index - 1]! : ' '
+      if (m[9] ? !/[\s(,]/.test(prev) : /[0-9A-Za-z_]/.test(prev)) continue
+      end = m.index + m[0].length
+      const room = (m[4] ?? m[7] ?? m[9] ?? '').replace(/[.-]+$/, '')
+      if (m[7]) end -= m[7].length - room.length  // room ends the link: shed the stripped tail
+      const hub = (m[5] ?? m[6] ?? m[8] ?? m[10])!.toLowerCase()
+      seg = { ...plain(content.slice(m.index, end)), rrc: { hub, room } }
     }
-    if (m.index > last) out.push({ text: content.slice(last, m.index), link: null, web: null })
+    if (m.index > last) out.push(plain(content.slice(last, m.index)))
     out.push(seg)
     last = end
     re.lastIndex = end
   }
-  if (last < content.length) out.push({ text: content.slice(last), link: null, web: null })
+  if (last < content.length) out.push(plain(content.slice(last)))
   return out
 }
 
@@ -865,6 +895,15 @@ export function openNomad(hash: string, path: string) {
   if (!NOMAD_HASH_RE.test(h)) return
   const p = (path || '/page/index.mu').trim()
   useDeviceStore().sendJson(nest('nomad.url_web', `${h}:${p}|${Date.now()}`))
+}
+
+/** Open an RRC hub (and room, when the link names one) tapped in a message:
+ *  writes the rrc app's shared sentinel, nonce'd so a repeat tap re-fires. */
+export function openRrc(hub: string, room: string) {
+  const h = hub.trim().toLowerCase()
+  if (!NOMAD_HASH_RE.test(h)) return
+  const r = room.trim().replace(/^#+/, '')
+  useDeviceStore().sendJson(nest('rrc.url_web', `${h}${r ? `/${r}` : ''}|${Date.now()}`))
 }
 
 /* ── The composable ─────────────────────────────────────────────────── */

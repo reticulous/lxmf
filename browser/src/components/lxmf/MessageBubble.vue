@@ -58,6 +58,9 @@
           v-if="seg.link" class="nomad-link"
           @click.stop="openNomad(seg.link.hash, seg.link.path)"
         >{{ seg.text }}</a><a
+          v-else-if="seg.rrc" class="nomad-link"
+          @click.stop="openRrc(seg.rrc.hub, seg.rrc.room)"
+        >{{ seg.text }}</a><a
           v-else-if="seg.web" class="nomad-link"
           :href="seg.web" target="_blank" rel="noopener noreferrer" @click.stop
         >{{ seg.text }}</a><span v-else>{{ seg.text }}</span></template></div>
@@ -120,7 +123,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { matClose, matReply, matInfo, matDelete, matDownload, matLink }
   from '@quasar/extras/material-icons'
 import DeliveryTicks from './DeliveryTicks.vue'
-import { type GroupSender, type Message, type QuoteView, segmentMessage, openNomad,
+import { type GroupSender, type Message, type QuoteView, segmentMessage, openNomad, openRrc,
          formatMsgTime, lxmfStatusName, LxmfStatus, LXMF_TRIES_GAVEUP } from '../../modules/lxmf'
 
 const props = defineProps<{
@@ -149,7 +152,7 @@ const sdPie = computed(() => {
   return `M${cx} ${cy}V${cy - r}A${r} ${r} 0 ${f > 0.5 ? 1 : 0} 1 ${x.toFixed(2)} ${y.toFixed(2)}Z`
 })
 
-/* Split the body into text + tappable Nomad-page-link runs. */
+/* Split the body into text + tappable Nomad-page, RRC-room and web-link runs. */
 const segments = computed(() => segmentMessage(props.sender ? props.sender.body : props.m.content))
 const emit = defineEmits<{
   resend: [m: Message]
@@ -294,7 +297,8 @@ const delivered = computed(() =>
 .row.out .bubble { background: #2c6bed; border-bottom-right-radius: 4px; }
 .row.in  .bubble { background: #2a2a2a; border-bottom-left-radius: 4px; }
 .bubble.muted { opacity: 0.55; }
-/* Nomad page links quoted in a message — tap opens the Nomad browser. Matches
+/* Links quoted in a message — a Nomad page opens the Nomad browser, an RRC
+   link the RRC app, a web URL a new tab. Matches
    the micron renderer's link blue; lighter on the blue outbound bubble. */
 .nomad-link { color: #6db3ff; text-decoration: underline; cursor: pointer; word-break: break-all; }
 .nomad-link:hover { color: #9ccbff; }

@@ -175,6 +175,12 @@ renders as a tappable link. Activating one writes `nomad.url_web` /
 `nomad.url_lcd` (same nonce trick), and [nomad](../nomad)'s browser comes
 forward on that page — the symmetric counterpart of the `lxmf.url_*` keys above.
 
+RRC links are tappable the same way: `rrc://#<room>@<hub>` (the `#` optional),
+`rrc://<hub>[:<dest>][/<room>]`, `rrc@<hub>`, and the bare `#<room>@<hub>` at the
+start of the text or after whitespace, `(` or `,`. A tap writes `rrc.url_web` /
+`rrc.url_lcd` = `<hub>[/<room>]|<nonce>` and the [RRC](../rrc) app joins the
+room on that hub.
+
 ## Identities
 
 Per loaded identity you can observe:
