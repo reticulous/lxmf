@@ -189,6 +189,61 @@ export interface Message {
   // that answer landed — `groupReceiptsTs` moves with every answer.
   groupReceipts?: string
   groupReceiptsTs?: number
+  // FIELD_SELF_DESTRUCT: seconds after it is first shown (`openedTs`, unix s,
+  // 0 = not yet) that it disappears; 0 = never. `sdNote` is SdNote.
+  selfDestruct?: number
+  sdNote?: SdNote
+  openedTs?: number
+}
+
+/** A message's `sd_note`: it set the conversation's timer, or it came without
+ *  one while the conversation has one. */
+export enum SdNote { None = 0, Set = 1, Unsupported = 2 }
+
+/** The timer choices offered, seconds; 0 = off. */
+export const SELF_DESTRUCT_CHOICES = [0, 28 * 86400, 7 * 86400, 86400, 8 * 3600, 3600, 300, 30]
+
+/** "off", "4 weeks", "1 day", "8 hrs", "5 min", "30 sec" — the firmware's
+ *  lxmfSelfDestructLabel. */
+export function selfDestructLabel(s: number): string {
+  if (!s) return 'off'
+  const units: [number, string, string][] = [
+    [7 * 86400, 'week', 'weeks'], [86400, 'day', 'days'], [3600, 'hr', 'hrs'],
+    [60, 'min', 'min'], [1, 'sec', 'sec'],
+  ]
+  for (const [sec, one, many] of units) {
+    if (s % sec) continue
+    const k = s / sec
+    return `${k} ${k === 1 ? one : many}`
+  }
+  return `${s} sec`
+}
+
+/** The empty message that set the timer: a centred line, not a bubble. */
+export function isSdNotice(m: Message): boolean {
+  return m.sdNote === SdNote.Set && !m.content && !m.bodyAbsent
+}
+
+/** On a timer — the notice that set one is not. */
+export function sdTimed(m: Message): boolean {
+  return (m.selfDestruct ?? 0) > 0 && !isSdNotice(m)
+}
+
+/** Past its time at `now` (unix s). */
+export function sdExpired(m: Message, now: number): boolean {
+  return sdTimed(m) && (m.openedTs ?? 0) > 0 && now >= m.openedTs! + m.selfDestruct!
+}
+
+/** What is left of the timer, 0..1. */
+export function sdLeft(m: Message, now: number): number {
+  const sd = m.selfDestruct ?? 0, op = m.openedTs ?? 0
+  if (!sd || !op) return 1
+  return Math.max(0, Math.min(1, (op + sd - now) / sd))
+}
+
+/** What is said for a message that set the timer. */
+export function sdNoticeText(m: Message, name: string): string {
+  return `${m.dir === 'in' ? name : 'You'} set disappearing messages to ${selfDestructLabel(m.selfDestruct ?? 0)}`
 }
 
 /** What a group's own notice reports (message field `group_event`). */
@@ -365,6 +420,7 @@ export interface Contact {
   pn: string           // per-contact propagation node (32-hex); '' / all-zero = none set
   group: boolean       // this peer is an LXMF group (s.lxmf.id.<n>.contacts.<peer>.group)
   groupState: GroupState  // where this account stands in it; Member on a non-group
+  selfDestruct: number    // the conversation's disappearing-messages timer, s; 0 = off
 }
 
 /** A group slot on this device (`s.lxmf.id.<n>.kind = group`): its own
@@ -865,6 +921,12 @@ export interface UseLxmf {
   pnStatus: (hash: string) => { lastCheckS: number; lastErr: string; lastGot: number } | null
   /** Set / clear ('') the per-contact propagation node. */
   setContactPn: (peer: string, hash: string) => void
+  /** Set the conversation's disappearing-messages timer (s, 0 = off) and tell the peer. */
+  setSelfDestruct: (peer: string, seconds: number) => Promise<void>
+  /** Start the timers of these messages: they are on screen now. */
+  markOpened: (peer: string, keys: string[], now: number) => void
+  /** Delete every message in the conversation whose timer has run out. */
+  expire: (peer: string) => Promise<void>
   cancel: (peer: string, key: string) => Promise<void>
   deleteMessage: (peer: string, key: string) => Promise<void>
   deleteConversation: (peer: string) => Promise<void>
@@ -1036,6 +1098,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
         pn: str(c.pn),
         group: num(c.group) === 1,
         groupState: num(c.group_state) as GroupState,
+        selfDestruct: num(c.self_destruct),
       }
     }
     return out
@@ -1191,6 +1254,9 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       command: num(r.command) === 1,
       groupReceipts: str(r.group_receipts),
       groupReceiptsTs: num(r.group_receipts_ts),
+      selfDestruct: num(r.self_destruct),
+      sdNote: num(r.sd_note) as SdNote,
+      openedTs: num(r.opened_ts),
     }
   }
 
@@ -1298,6 +1364,8 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
       ts: Math.floor(Date.now() / 1000),
     }
     if (opts?.method) rec.method = opts.method
+    const sd = num(device.get(`s.lxmf.id.${n}.contacts.${peer}.self_destruct`))
+    if (sd) rec.self_destruct = sd
     /* A reply names the message it answers by its id; the quote is the
      * fragment of it the user picked out, and rides only with the reference it
      * belongs to. */
@@ -1367,6 +1435,23 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     })
   }
   const announceNow = () => sendQ('announce').enqueue('1')
+
+  /* Set the conversation's timer; the firmware tells the peer with an empty
+   * message carrying it. */
+  const setSelfDestruct = (peer: string, seconds: number) => {
+    const n = activeId.value
+    return queue(`lxmf.id.${n}.cmd.self_destruct`).enqueue(`${peer}/${seconds}`, {
+      settle: () => num(device.get(`s.lxmf.id.${n}.contacts.${peer}.self_destruct`)) === seconds,
+    })
+  }
+  /* A timed message starts its timer the first time it is shown. */
+  const markOpened = (peer: string, keys: string[], now: number) => {
+    const n = activeId.value
+    for (const k of keys) device.set(`s.lxmf.id.${n}.msgs.${peer}.${k}.opened_ts`, now)
+  }
+  /* Delete everything in the conversation whose timer has run out. */
+  const expire = (peer: string) =>
+    queue(`lxmf.id.${activeId.value}.cmd.expire`).enqueue(peer)
 
   /* Whether this identity's mail belongs to a proxy server — the firmware's
    * own `proxy_role`, which is what decides where a send goes. Read rather
@@ -1579,7 +1664,7 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     reachability, contactOf, draftFor, setDraft, openPeer,
     send, resend, resendVia, retryNow, cancel, deleteMessage, deleteConversation,
     pnNodes, pnAdd, pnRemove, pnMove, pnSetName, pnSetCheck, pnSyncNow,
-    pnStatus, setContactPn,
+    pnStatus, setContactPn, setSelfDestruct, markOpened, expire,
     markConversationRead, announceNow, linkState, toggleLink, proxied,
     ping, pingResult, fetchBody, peerMeas,
     createIdentity, importIdentity, destroyIdentity, setEnabled,

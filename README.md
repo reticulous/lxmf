@@ -129,6 +129,8 @@ key. Presence = request in flight; absence = done.
 | `lxmf.id.<n>.cmd.cancel` | `<peer>/<key>`, or bare `all` | cancel an in-flight send; `all` finishes every outbound of this identity that has not finished. The fan-out is done on lxmf's task because this key is self-clearing — a writer looping over it would overwrite each value before the task read it |
 | `lxmf.id.<n>.cmd.delete` | `<peer>/<key>`, or bare `<peer>` | delete one message; bare `<peer>` deletes the whole conversation (and the contact with it). A proxied outbound is dropped on the proxy too (`DROP`), so a message deleted here is not still being sent by a machine elsewhere. Deleting one message counts it back out of the conversation directory — `count` always, and `unread` when it was an inbound past the read watermark — since those are maintained counters rather than derived, and a deleted message must not go on lighting the badge |
 | `lxmf.id.<n>.cmd.prune` | `<peer>/<seconds>` | delete messages in that conversation but keep the contact: all of them for `0`, else those whose `ts` is more than that many seconds old. Drafts stay. Each goes through the single-message delete (proxy `DROP`, counters); a conversation left empty also has its preview cleared and is marked `kept`, so it stays in the contact list at zero messages. By age needs `sys.time.valid` and is refused without it |
+| `lxmf.id.<n>.cmd.self_destruct` | `<peer>/<seconds>` | set that conversation's disappearing-messages timer (`0` = off) and tell the peer with an empty message carrying it (see **Disappearing messages**). Refused on a group |
+| `lxmf.id.<n>.cmd.expire` | `<peer>` | delete every message in that conversation whose timer has run out. One key for all of them, because a frontend writing `cmd.delete` per message would overwrite each value before the task read it |
 | `lxmf.id.<n>.cmd.retry` | `<peer>/<key>` | try this one again NOW. Proxied, that is a `RETRY` frame naming the record — the body is already on the server, and putting it back on the air to say "again" would cost the whole message to carry one bit. Unproxied it is an ordinary send, since this device owns the queue |
 | `lxmf.id.<n>.cmd.announce` | any | emit a delivery announce for identity `n` now |
 | `lxmf.id.<n>.cmd.ping` | `<peer>` | probe that contact — a link establishment where there is no link, else one packet on the open one (see **Ping**) |
@@ -434,6 +436,53 @@ MeshChatX and Columba use the same two fields and draw our replies as replies.
 Upstream's clients (Sideband, NomadNet, MeshChat) implement neither, so a reply
 reaches them as an ordinary message: nothing breaks, the quote is simply not
 drawn.
+
+## Disappearing messages
+
+```
+A → B   LXM ""            fields: { 0x100: 86400 }     A set the timer to 1 day
+A → B   LXM "see you"     fields: { 0x100: 86400 }     every message after carries it
+B → A   LXM "ok"          fields: { 0x100: 86400 }     B's messages carry it too
+B → A   LXM "hm"          fields: { 0x100: 3600 }      a new value: B changed it
+C → A   LXM "hi"          (no 0x100)                   C's client has no such thing
+A → B   LXM ""            fields: { 0x100: 0 }         A turned it off, deliberately
+```
+
+`FIELD_SELF_DESTRUCT` (`0x100`) is a 4-byte signed int (msgpack `int32`): how
+many seconds after a message is first shown it disappears, `0` meaning off. It
+is ours; nothing upstream defines it, and a client that does not know it skips
+it like any unknown field.
+
+**Setting it.** The conversation info page (web and LCD) has a **Disappearing
+messages** choice: Off, 4 weeks, 1 week, 1 day, 8 hrs, 1 hr, 5 min, 30 sec. A
+change is stored on the contact (`contacts.<peer>.self_destruct`) and sent to
+the peer at once as an empty message carrying the new value — `0` included, so
+turning it off is said too. The conversation shows "You set disappearing
+messages to 1 day". From then on every message to that peer carries the value;
+with it off, none carries the field.
+
+**Receiving it.** An empty message with the field is the peer's change: it is
+drawn as "Ann set disappearing messages to 1 hr" and the value becomes the
+conversation's. A message with text whose value differs from the conversation's
+does the same — the notice that set it was presumably missed — and the line is
+drawn above it. A message with **no** field while the conversation's timer is on
+comes from a client without the feature: "⚠ Ann does not support disappearing
+messages" floats under the header, once, while any such message is on screen.
+With the timer off, a missing field says nothing, which is why turning it off is
+sent rather than simply stopping.
+
+**Disappearing.** A message on a timer stores when it was first drawn
+(`opened_ts`); both frontends check every such message before drawing it, skip
+it once its time is up, and have it deleted (`cmd.expire`). An open conversation
+is checked every second, so messages also go while being looked at. Each carries
+a small stopwatch whose face empties as the time runs out — twelve steps on the
+LCD (`timer-1` … `timer-12`). A message that disappears takes its words out of
+the conversation list's preview, and the conversation stays a contact when its
+last message goes. Nothing is opened, so nothing disappears, before the device
+has the time (`sys.time.valid`).
+
+Groups do not take part: a group's info page has no such choice, and the field
+is ignored on group messages.
 
 ## Groups
 
@@ -1114,6 +1163,7 @@ hide_name        a group: 1 (default) = its announce carries no name
 group_owner      a group's owning account slot on the device that made it
 ended            a deleted group: wall-clock s it was deleted; 0 = live
 contacts.<peer>.{hash,pubkey,nick,display_name,trust,last_seen,pn}   address book (firmware stubs on first inbound/outbound; display_name follows the peer's announces; pubkey = the contact's own key, so verifying a message from them needs no route and no announce; pn = this contact's propagation node, all-zero = none)
+contacts.<peer>.self_destruct  the conversation's disappearing-messages timer, s; 0 = off
 contacts.<peer>.group        1 = this peer is a group
 contacts.<peer>.group_state  that group as this account sees it: 0 member,
                              1 leaving, 2 left, 3 removed, 4 deleted
@@ -1124,7 +1174,13 @@ contacts.<peer>.members      a group's members as this account knows them,
 msgs.<peer>.<key>.{dir,status,tries,peer,title,content,reply_to,reply_quote,method,ts,recv_ts,
                    read,message_id,body_absent,body_size,handed,told,offered,
                    via_link,proxy_status,group_from,orig_id,group_event,
-                   group_subjects,group_data,group_name,group_receipts,group_receipts_ts,command}
+                   group_subjects,group_data,group_name,group_receipts,group_receipts_ts,command,
+                   self_destruct,sd_note,opened_ts}
+                                 self_destruct = FIELD_SELF_DESTRUCT s, 0 = none;
+                                 sd_note 1 = this message set the timer, 2 = it
+                                 came without one while the conversation has
+                                 one; opened_ts = unix s a frontend first drew
+                                 it, 0 = not yet;
                                  group_from/orig_id = FIELD_GROUP's writer and
                                  the 3-byte id of their message (group_from =
                                  the group itself on what it says; the 3 bytes
@@ -1326,10 +1382,12 @@ message view.
 The page opens with a row of buttons, each sized to its own text: **Delete**
 and **Ping**. On the web, Delete removes the whole conversation and the contact
 behind an "Are you sure?" confirm. On the LCD it opens a choice with nothing
-preselected: the conversation and contact info, the messages only, or the
-messages older than 1 day, 3 days, 1 week or 1 month (the by-age choices appear
+preselected: the conversation and contact info, the messages only, or **Delete
+older than** with the age picked from a dropdown beside it — 1 day, 3 days,
+1 week or 1 month — so the whole choice fits the screen (the by-age row appears
 only once `sys.time.valid` is set). Each choice leads to a second confirm that
-names exactly what goes. The web Ping result is a
+names exactly what goes. Under the hash, both pages carry the **Disappearing
+messages** choice (see **Disappearing messages**). The web Ping result is a
 popover under the button, dismissed by a touch anywhere; the LCD's is inline
 under the button row instead, which leaves the button reachable so a re-measure
 is one press.

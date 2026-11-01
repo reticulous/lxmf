@@ -96,6 +96,8 @@
                 @toggle-link="p => lxmf.toggleLink(p)"
                 @back="lxmf.activePeer.value = ''"
                 @read="p => lxmf.markConversationRead(p)"
+                @opened="(p, keys, now) => lxmf.markOpened(p, keys, now)"
+                @expire="p => lxmf.expire(p).catch(() => {})"
               />
               <!-- A group this account is no longer in takes nothing more: the
                    composer gives way to the one line that says why. -->
@@ -130,6 +132,7 @@
           @close="showContact = false"
           @delete-conversation="onDeleteConversation"
           @set-pn="(peer, hash) => lxmf.setContactPn(peer, hash)"
+          @set-self-destruct="(peer, s) => lxmf.setSelfDestruct(peer, s).catch(() => {})"
           @ping="onPing"
           @add-members="(g, peers) => lxmf.addGroupMembers(g, peers)"
           @remove-member="(g, peer) => lxmf.removeGroupMember(g, peer)"

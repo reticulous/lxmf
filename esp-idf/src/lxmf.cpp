@@ -105,6 +105,7 @@ enum : int {
     LXMF_FIELD_RENDERER         = 0x0F,
     LXMF_FIELD_REPLY_TO         = 0x30,   /* Bytes, full LXMessage.hash of the replied-to message */
     LXMF_FIELD_REPLY_QUOTE      = 0x31,   /* Bytes, quoted content (UTF-8) */
+    LXMF_FIELD_SELF_DESTRUCT    = 0x100,  /* int32 seconds after opening; 0 = off */
 };
 
 /* ─────────────── state ─────────────── */
@@ -563,6 +564,9 @@ static const sdb_schema& lxmfMsgSchema()
                                    * (/leave, /info, /members, /member): never
                                    * drawn, never the conversation's preview */
          .u32("group_receipts_ts")/* moves every time an /info answer lands */
+         .u32("self_destruct")    /* FIELD_SELF_DESTRUCT seconds; 0 = none */
+         .u8("sd_note")           /* LXMF_SD_NOTE_* */
+         .u32("opened_ts")        /* unix s a frontend first showed it; 0 = not yet */
          .text("title").text("content")
          .text("reply_quote")   /* the fragment of the replied-to message this
                                  * one quotes (FIELD_REPLY_QUOTE); empty when the
@@ -621,6 +625,7 @@ static const sdb_schema& lxmfContactSchema()
          .u8("group")           /* 1 = this peer is a group */
          .u8("member")          /* in a group's own slot: 1 = a member */
          .u8("group_state")     /* a group as its member sees it: LXMF_GROUP_ST_* */
+         .u32("self_destruct")  /* the conversation's SELF_DESTRUCT seconds; 0 = off */
          .u8("kept")            /* 1 = a contact even with no messages: the
                                 * user emptied the conversation (cmd.prune)
                                 * but kept the contact. Without it count 0
@@ -784,6 +789,88 @@ static int bumpConvDirectory(int n, const std::string& peer, int ts_s,
         storageSet(contactPath(n, peer, "unread").c_str(),
                    storageGetInt(contactPath(n, peer, "unread").c_str(), 0) + 1);
     return recv;
+}
+
+std::string lxmfSelfDestructLabel(uint32_t s)
+{
+    if (s == 0) return "off";
+    struct U { uint32_t sec; const char* one; const char* many; };
+    static const U units[] = {
+        { 7 * 86400, "week", "weeks" }, { 86400, "day", "days" },
+        { 3600, "hr", "hrs" }, { 60, "min", "min" }, { 1, "sec", "sec" },
+    };
+    for (const U& u : units) {
+        if (s % u.sec) continue;
+        uint32_t k = s / u.sec;
+        return std::to_string(k) + " " + (k == 1 ? u.one : u.many);
+    }
+    return std::to_string(s) + " sec";
+}
+
+/* What the conversation list says for a message that set the timer. */
+static std::string sdPreview(uint32_t s)
+{
+    return "Disappearing messages: " + lxmfSelfDestructLabel(s);
+}
+
+/* An inbound message's FIELD_SELF_DESTRUCT (`sd`, -1 = absent) against the
+ * conversation's own setting: a different value is the peer changing it, and
+ * becomes ours; no field while ours is on is a peer without the feature. Writes
+ * the record's self_destruct/sd_note and the contact's setting, inside the
+ * caller's bracket. Returns the sd_note. */
+static uint8_t sdHear(int n, const std::string& peer, const std::string& mid,
+                      int32_t sd, bool empty)
+{
+    uint32_t cur = (uint32_t)storageGetInt(contactPath(n, peer, "self_destruct").c_str(), 0);
+    uint8_t note = LXMF_SD_NOTE_NONE;
+    if (sd >= 0) {
+        if ((uint32_t)sd != cur) {
+            storageSet(contactPath(n, peer, "self_destruct").c_str(), (int)sd);
+            note = LXMF_SD_NOTE_SET;
+        } else if (empty) {
+            note = LXMF_SD_NOTE_SET;
+        }
+        if (sd > 0)
+            storageSet(msgPath(n, peer, mid, "self_destruct").c_str(), (int)sd);
+    } else if (cur > 0) {
+        note = LXMF_SD_NOTE_UNSUPPORTED;
+    }
+    if (note)
+        storageSet(msgPath(n, peer, mid, "sd_note").c_str(), (int)note);
+    return note;
+}
+
+static bool idIsServerHosted(int n);   /* fwd */
+
+/* The SELF_DESTRUCT an outbound carries. A message not yet packed takes the
+ * conversation's setting (`*stamp` = write it onto the record); a record that
+ * already has one keeps it, so a re-pack yields the same wire. A server
+ * hosting the account takes the value its client sent and nothing else.
+ * `*field` is what goes on the wire, -1 = no field. */
+static uint32_t sdOutbound(int n, const std::string& peer, const std::string& mid,
+                           bool* stamp, int32_t* field)
+{
+    uint32_t sd = (uint32_t)storageGetInt(msgPath(n, peer, mid, "self_destruct").c_str(), 0);
+    bool set = storageGetInt(msgPath(n, peer, mid, "sd_note").c_str(), 0) == LXMF_SD_NOTE_SET;
+    *stamp = false;
+    if (!sd && !set && !idIsServerHosted(n) &&
+        storageGetStr(msgPath(n, peer, mid, "message_id").c_str(), "").empty()) {
+        sd = (uint32_t)storageGetInt(contactPath(n, peer, "self_destruct").c_str(), 0);
+        *stamp = sd > 0;
+    }
+    if (field) *field = (sd > 0 || set) ? (int32_t)sd : -1;
+    return sd;
+}
+
+/* The conversation-list preview for an outbound: its content, or for the empty
+ * message that set the timer, what it set. */
+static std::string sdPreviewOr(int n, const std::string& peer, const std::string& mid,
+                               const std::string& content)
+{
+    if (content.empty() &&
+        storageGetInt(msgPath(n, peer, mid, "sd_note").c_str(), 0) == LXMF_SD_NOTE_SET)
+        return sdPreview((uint32_t)storageGetInt(msgPath(n, peer, mid, "self_destruct").c_str(), 0));
+    return content;
 }
 
 /* One-time directory backfill. Migration moved message bodies into the record
@@ -1155,6 +1242,26 @@ static bool mpReadUint(mpScan& s, uint64_t& out)
     return false;
 }
 
+/* Read the next element as a signed integer. Returns false if not int-like. */
+static bool mpReadInt(mpScan& s, int64_t& out)
+{
+    size_t snap = s.i;
+    if (s.i >= s.n) return false;
+    uint8_t b = s.p[s.i];
+    uint64_t v;
+    int w = b == 0xD0 ? 1 : b == 0xD1 ? 2 : b == 0xD2 ? 4 : b == 0xD3 ? 8 : 0;
+    if (!w) {
+        if (!mpReadUint(s, v)) return false;
+        out = (b >= 0xE0) ? (int64_t)(int8_t)b : (int64_t)v;
+        return true;
+    }
+    ++s.i;
+    if (!mpReadBe(s, w, v)) { s.i = snap; return false; }
+    int sh = 64 - 8 * w;
+    out = (int64_t)(v << sh) >> sh;
+    return true;
+}
+
 /* Read the next element as a string/bin/raw. Returns false if not. */
 static bool mpReadStrOrBin(mpScan& s, std::string& out)
 {
@@ -1282,6 +1389,7 @@ struct LxmFields {
     /* The group's own name, on a members answer (6, 7): how a member learns
      * it when the group keeps it out of its announce. */
     std::string group_name;
+    int32_t     self_destruct = -1;   /* FIELD_SELF_DESTRUCT seconds, -1 = absent */
 };
 
 /* What the group itself says (FIELD_GROUP element [2]). 1–4 are notices to
@@ -1346,7 +1454,15 @@ static std::vector<uint8_t> lxmPackPayload(uint64_t ts_ms, std::string_view titl
     if (quote)                         field_count++;
     bool group = fields.group_from.size() >= 6 && fields.orig_id.size() == 6;
     if (group)                         field_count++;
+    bool sd = fields.self_destruct >= 0;
+    if (sd)                            field_count++;
     mpPackMapHeader(out, field_count);
+    if (sd) {
+        mpPackInt(out, LXMF_FIELD_SELF_DESTRUCT);
+        uint32_t v = (uint32_t)fields.self_destruct;
+        out.push_back(0xD2);
+        for (int i = 3; i >= 0; --i) out.push_back((uint8_t)((v >> (8*i)) & 0xFF));
+    }
     if (reply) {
         mpPackInt(out, LXMF_FIELD_REPLY_TO);
         /* FIELD_REPLY_TO is the raw 32-byte replied-to message hash. */
@@ -1510,6 +1626,11 @@ static bool lxmParsePayload(const uint8_t* p, size_t n,
             if (!mpReadStrOrBin(s, q)) { if (!mpScanNext(s)) return false; continue; }
             if (fields_out && q.size() <= LXMF_REPLY_QUOTE_MAX)
                 fields_out->reply_quote = std::move(q);
+        } else if (key == LXMF_FIELD_SELF_DESTRUCT) {
+            int64_t v = 0;
+            if (!mpReadInt(s, v)) { if (!mpScanNext(s)) return false; continue; }
+            if (fields_out)
+                fields_out->self_destruct = v <= 0 ? 0 : v > INT32_MAX ? INT32_MAX : (int32_t)v;
         } else if (key == LXMF_FIELD_TICKET) {
             /* Capture the raw msgpack value span regardless of its shape
              * (str/bin/array) so it can be logged. We don't yet cache or
@@ -3046,6 +3167,8 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
         storageGetStr(msgPath(id.index, peer_hex, mid, "group_subjects").c_str(), "");
     fields.group_data  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_data").c_str(), "");
     fields.group_name  = storageGetStr(msgPath(id.index, peer_hex, mid, "group_name").c_str(), "");
+    bool sdStamp = false;
+    uint32_t sd = sdOutbound(id.index, peer_hex, mid, &sdStamp, &fields.self_destruct);
 
     /* Outbound stamp: pay the recipient's advertised proof-of-work cost,
      * but only when generation is enabled and they actually advertise a
@@ -3102,9 +3225,11 @@ static bool resolveOutboundWire(lxmf_id_t& id, const std::string& peer_hex,
     storageSet(msgPath(id.index, peer_hex, mid, "message_id").c_str(), msg_id_hex.c_str());
     storageSet(msgPath(id.index, peer_hex, mid, "ts").c_str(),         (int)(ts_ms / 1000));
     storageSet(msgPath(id.index, peer_hex, mid, "status").c_str(), (int)LXMF_ST_QUEUED);
+    if (sdStamp)
+        storageSet(msgPath(id.index, peer_hex, mid, "self_destruct").c_str(), (int)sd);
     if (first) {
         int recv = bumpConvDirectory(id.index, peer_hex, (int)(ts_ms / 1000),
-                          storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str()),
+                          sdPreviewOr(id.index, peer_hex, mid, content),
                           /*inbound=*/false);
         storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
     }
@@ -4380,7 +4505,16 @@ static void onInboundLxm(lxmf_id_t& id, const uint8_t* wire, size_t n, bool via_
      * re-trigger the on-device UI rebuild. */
     setIntIfChanged(contactPath(id.index, sh_hex, "last_seen"),
                     (int)(nowUnixMs() / 60000) * 60);
-    int recv = bumpConvDirectory(id.index, sh_hex, (int)(ts / 1000), content, /*inbound=*/true);
+    bool sdNotice = false;
+    if (fields.group_from.empty() &&
+        storageGetInt(contactPath(id.index, sh_hex, "group").c_str(), 0) == 0) {
+        bool empty = title.empty() && content.empty();
+        sdNotice = sdHear(id.index, sh_hex, mid_hex, fields.self_destruct, empty) ==
+                       LXMF_SD_NOTE_SET && empty;
+    }
+    int recv = bumpConvDirectory(id.index, sh_hex, (int)(ts / 1000),
+                                 sdNotice ? sdPreview((uint32_t)fields.self_destruct) : content,
+                                 /*inbound=*/true);
     storageSet(msgPath(id.index, sh_hex, mid_hex, "recv_ts").c_str(), recv);
     storageEnd();
 
@@ -5790,6 +5924,14 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
                            fr.group_subjects.c_str());
             }
         }
+        if (fr.self_destruct)
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "self_destruct").c_str(),
+                       (int)fr.self_destruct);
+        if (fr.sd_note)
+            storageSet(msgPath(id.index, peer_hex, mid_hex, "sd_note").c_str(), (int)fr.sd_note);
+        if (fr.sd_note == LXMF_SD_NOTE_SET)
+            storageSet(contactPath(id.index, peer_hex, "self_destruct").c_str(),
+                       (int)fr.self_destruct);
     }
     storageSet(msgPath(id.index, peer_hex, mid_hex, "body_size").c_str(), (int)fr.size);
     storageSet(msgPath(id.index, peer_hex, mid_hex, "body_absent").c_str(), withheld ? 1 : 0);
@@ -5813,8 +5955,10 @@ static bool proxyStoreInbound(lxmf_id_t& id, const LxmproxyFrame& fr)
         /* A withheld body has no preview to show, so the title stands in — the
          * conversation list would otherwise say nothing at all about a message
          * that has arrived. */
+        bool sdNotice = fr.sd_note == LXMF_SD_NOTE_SET && fr.size == 0 && fr.title.empty();
         int recv = bumpConvDirectory(id.index, peer_hex, (int)fr.ts,
-                                     withheld ? fr.title : fr.content,
+                                     sdNotice ? sdPreview(fr.self_destruct)
+                                              : withheld ? fr.title : fr.content,
                                      /*inbound=*/true);
         storageSet(msgPath(id.index, peer_hex, mid_hex, "recv_ts").c_str(), recv);
     }
@@ -5881,9 +6025,14 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
      * last. `recv_ts` is the once-marker: bumpConvDirectory returns it and
      * nothing else writes it, so a resend after a reconnect finds it set and
      * does not count the same message twice. */
+    bool sdStamp = false;
+    uint32_t sd = sdOutbound(id.index, peer_hex, mid, &sdStamp, nullptr);
+    if (sdStamp)
+        storageSet(msgPath(id.index, peer_hex, mid, "self_destruct").c_str(), (int)sd);
     if (storageGetInt(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), 0) == 0 &&
         storageGetInt(msgPath(id.index, peer_hex, mid, "command").c_str(), 0) == 0) {
-        int recv = bumpConvDirectory(id.index, peer_hex, ts, content,
+        int recv = bumpConvDirectory(id.index, peer_hex, ts,
+                                     sdPreviewOr(id.index, peer_hex, mid, content),
                                      /*inbound=*/false);
         storageSet(msgPath(id.index, peer_hex, mid, "recv_ts").c_str(), recv);
     }
@@ -5903,7 +6052,10 @@ static void proxySend(lxmf_id_t& id, const std::string& peer_hex,
     std::vector<uint8_t> f = lxmproxyBuildSend(mid, dh, (uint32_t)ts, title, content,
                                                rt, rt_len, reply_quote,
                                                method.c_str(),
-                                               have_pn ? pnh : nullptr);
+                                               have_pn ? pnh : nullptr,
+                                               sd,
+                                               (uint32_t)storageGetInt(msgPath(id.index, peer_hex, mid,
+                                                                               "sd_note").c_str(), 0));
     uint32_t opaque = 0;
     if (!proxySendFrame(id.index, f, &opaque)) {
         /* No Channel, or the send was refused: the message waits locally with
@@ -8042,11 +8194,28 @@ static void processDelete(lxmf_id_t& id, const std::string& peer_hex,
         int  ts      = storageGetInt(msgPath(id.index, peer_hex, mid, "ts").c_str(), 0);
         int  count   = storageGetInt(contactPath(id.index, peer_hex, "count").c_str(), 0);
         int  unread  = storageGetInt(contactPath(id.index, peer_hex, "unread").c_str(), 0);
+        /* A message that disappears takes its words out of the list too. */
+        bool sdPrev = false;
+        bool sdMsg = storageGetInt(msgPath(id.index, peer_hex, mid, "self_destruct").c_str(), 0) > 0;
+        if (sdMsg) {
+            std::string c = storageGetStr(msgPath(id.index, peer_hex, mid, "content").c_str(), "");
+            std::string p;
+            for (char ch : c) {
+                if (p.size() >= 80) break;
+                p += (ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : ch;
+            }
+            sdPrev = !p.empty() &&
+                     storageGetStr(contactPath(id.index, peer_hex, "preview").c_str(), "") == p;
+        }
         storageBegin();
         if (count > 0)
             storageSet(contactPath(id.index, peer_hex, "count").c_str(), count - 1);
         if (inbound && unread > 0 && ts > convReadTs(id.index, peer_hex))
             storageSet(contactPath(id.index, peer_hex, "unread").c_str(), unread - 1);
+        if (sdPrev)
+            storageSet(contactPath(id.index, peer_hex, "preview").c_str(), "");
+        if (sdMsg && count <= 1)
+            storageSet(contactPath(id.index, peer_hex, "kept").c_str(), 1);
         storageEnd();
     }
 
@@ -8122,6 +8291,60 @@ static void processPrune(lxmf_id_t& id, const std::string& peer_hex,
     }
     info("id %d: pruned %zu msg(s) from %s (age %lds), %d left", id.index,
          doomed.size(), peer_hex.c_str(), age_s, kept);
+}
+
+/* cmd.self_destruct — set the conversation's timer and tell the peer: an empty
+ * message carrying the new value (0 included, so turning it off is said). */
+static void processSelfDestruct(lxmf_id_t& id, const std::string& peer_hex,
+                                const std::string& secs)
+{
+    uint8_t dh[16];
+    char* end = nullptr;
+    long v = std::strtol(secs.c_str(), &end, 10);
+    if (peer_hex.size() != 32 || !hexToDestHash(peer_hex, dh) || secs.empty() || *end ||
+        v < 0 || v > INT32_MAX) {
+        warn("id %d: cmd.self_destruct needs <peer>/<seconds> (got %s/%s)",
+             id.index, peer_hex.c_str(), secs.c_str());
+        return;
+    }
+    if (idIsGroup(id.index) ||
+        storageGetInt(contactPath(id.index, peer_hex, "group").c_str(), 0) != 0) {
+        warn("id %d: cmd.self_destruct on a group", id.index);
+        return;
+    }
+    std::string k = newOutKey();
+    storageBegin();
+    storageSet(contactPath(id.index, peer_hex, "self_destruct").c_str(), (int)v);
+    storageSet(msgPath(id.index, peer_hex, k, "dir").c_str(),     "out");
+    storageSet(msgPath(id.index, peer_hex, k, "peer").c_str(),    peer_hex.c_str());
+    storageSet(msgPath(id.index, peer_hex, k, "title").c_str(),   "");
+    storageSet(msgPath(id.index, peer_hex, k, "content").c_str(), "");
+    storageSet(msgPath(id.index, peer_hex, k, "self_destruct").c_str(), (int)v);
+    storageSet(msgPath(id.index, peer_hex, k, "sd_note").c_str(), (int)LXMF_SD_NOTE_SET);
+    storageSet(msgPath(id.index, peer_hex, k, "ts").c_str(), (int)(wallUnixMs() / 1000));
+    storageSet(msgPath(id.index, peer_hex, k, "status").c_str(), (int)LXMF_ST_QUEUED);
+    storageEnd();
+    info("id %d: disappearing messages with %s set to %s", id.index, peer_hex.c_str(),
+         lxmfSelfDestructLabel((uint32_t)v).c_str());
+    processSend(id, peer_hex, k);
+}
+
+/* cmd.expire — delete every message in the conversation whose timer has run
+ * out: opened `opened_ts`, gone `self_destruct` seconds later. */
+static void processExpire(lxmf_id_t& id, const std::string& peer_hex)
+{
+    if (storageGetInt("sys.time.valid", 0) == 0) return;
+    const long now = (long)(wallUnixMs() / 1000);
+    std::vector<std::string> doomed;
+    for (const auto& key : collectTokens(msgPrefix(id.index, peer_hex))) {
+        long sd = storageGetInt(msgPath(id.index, peer_hex, key, "self_destruct").c_str(), 0);
+        long op = storageGetInt(msgPath(id.index, peer_hex, key, "opened_ts").c_str(), 0);
+        if (sd > 0 && op > 0 && now >= op + sd) doomed.push_back(key);
+    }
+    for (const auto& key : doomed) processDelete(id, peer_hex, key);
+    if (!doomed.empty())
+        info("id %d: %zu disappearing msg(s) gone from %s", id.index, doomed.size(),
+             peer_hex.c_str());
 }
 
 /* ── group membership ── */
@@ -8677,6 +8900,12 @@ static void handleIdCmd(int n, const char* key, const char* val)
         }
         else if (std::strcmp(verb, "prune") == 0) {
             processPrune(id, peer_hex, mid);
+        }
+        else if (std::strcmp(verb, "self_destruct") == 0) {
+            processSelfDestruct(id, peer_hex, mid);
+        }
+        else if (std::strcmp(verb, "expire") == 0) {
+            processExpire(id, peer_hex);
         }
         else if (std::strcmp(verb, "link_open") == 0) {
             uint8_t dh[16];

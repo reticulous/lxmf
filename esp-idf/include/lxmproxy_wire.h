@@ -6,11 +6,12 @@
  *   S → C   SERVING  [ok, reason]                     the account is on the air
  *   S → C   MSG      [msg_id, peer, name, ts, title, size, body?, reply_to, quote,
  *                     group_from, orig_id, group_event, group_subjects, group_data,
- *                     group_name]
+ *                     group_name, self_destruct, sd_note]
  *   C → S   FETCH    [msg_id, peer]                   a withheld body
  *   S → C   BODY     [msg_id, peer, content, reply_to, quote]  Resource when large
  *   C → S   HANDED   [msg_id, peer]                   after persist
- *   C → S   SEND     [local_key, peer, ts, title, content, reply_to, quote, method, pn]
+ *   C → S   SEND     [local_key, peer, ts, title, content, reply_to, quote, method, pn,
+ *                     self_destruct, sd_note]
  *   S → C   STATUS   [key, peer, status, ts, message_id?]  once: how it went
  *   C ↔ S   CONFIG   [map]                            account settings
  *   S → C   STATE    [map]                            what only the server knows
@@ -102,7 +103,8 @@ enum LxmproxyFrameType : uint8_t {
     /* S→C  [4, msg_id b32, peer b16, peer_name str, ts u32, title str,
      *          size u32, body str|nil, reply_to b32|nil, quote str,
      *          group_from b16|nil, orig_id b3|nil, group_event u32,
-     *          group_subjects str, group_data str, group_name str]
+     *          group_subjects str, group_data str, group_name str,
+     *          self_destruct u32, sd_note u32]
      * One inbound message the server holds and the client does not. `size` is
      * the body length whether or not the body rides along; a nil body is a
      * withheld one the client fetches on demand. `peer_name` is an
@@ -131,7 +133,8 @@ enum LxmproxyFrameType : uint8_t {
     LXMPROXY_FR_HANDED   = 7,
 
     /* C→S  [8, local_key str, peer b16, ts u32, title str, content str,
-     *          reply_to b32|nil, quote str, method str, pn b16|nil]
+     *          reply_to b32|nil, quote str, method str, pn b16|nil,
+     *          self_destruct u32, sd_note u32]
      * Reproduce this draft on the server and send it. `local_key` is the
      * client's own `o_<unix_ms>_<rand4>`, and it is the idempotency key: a SEND
      * repeated after a reconnect meets the same record and gets the same
@@ -251,6 +254,8 @@ struct LxmproxyFrame {
     std::string group_subjects;         /* comma-separated 32-hex */
     std::string group_data;             /* an answer's data, as lxmf stores it */
     std::string group_name;             /* a members answer: the group's name */
+    uint32_t    self_destruct = 0;      /* MSG / SEND: the record's self_destruct */
+    uint32_t    sd_note = 0;            /* MSG / SEND: the record's sd_note */
 
     /* SEND */
     std::string key;                    /* the client's local key, or a message id */
@@ -292,7 +297,8 @@ std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                       uint32_t group_event,
                                       const std::string& group_subjects,
                                       const std::string& group_data,
-                                      const std::string& group_name);
+                                      const std::string& group_name,
+                                      uint32_t self_destruct, uint32_t sd_note);
 std::vector<uint8_t> lxmproxyBuildFetch(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                         const uint8_t peer[LXMPROXY_DEST_LEN]);
 std::vector<uint8_t> lxmproxyBuildBody(const uint8_t msg_id[LXMPROXY_MID_LEN],
@@ -308,7 +314,8 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
                                        const std::string& content,
                                        const uint8_t* reply_to, size_t reply_len,
                                        const std::string& reply_quote,
-                                       const char* method, const uint8_t* pn);
+                                       const char* method, const uint8_t* pn,
+                                       uint32_t self_destruct, uint32_t sd_note);
 std::vector<uint8_t> lxmproxyBuildStatus(const std::string& key,
                                          const uint8_t peer[LXMPROXY_DEST_LEN],
                                          uint32_t status,

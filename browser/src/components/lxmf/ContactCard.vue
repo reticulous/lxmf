@@ -132,6 +132,14 @@
            resend dialog for this contact's messages. A group relays live and
            has none. -->
       <template v-if="!group">
+      <!-- A change is sent to the peer as an empty message carrying it. -->
+      <div class="sect">Disappearing messages</div>
+      <select class="pnsel" :value="sdCur" @change="onSdSelect">
+        <option v-for="s in sdChoices" :key="s" :value="s">
+          {{ s ? selfDestructLabel(s) : 'Off' }}
+        </option>
+      </select>
+
       <div class="sect">Propagation node</div>
       <select class="pnsel" :value="pnSelValue" @change="onPnSelect">
         <option value="">None</option>
@@ -163,7 +171,7 @@ import { computed, ref } from 'vue'
 import { matArrowBack, matVerifiedUser, matContentCopy, matCheck, matPersonRemove }
   from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
-import { hasDest, pingLinkLines, peerMeasOf, GroupState,
+import { hasDest, pingLinkLines, peerMeasOf, GroupState, SELF_DESTRUCT_CHOICES, selfDestructLabel,
          type Contact, type GroupMember, type GroupSlot, type PingResult, type PnNode,
          type Reachability }
   from '../../modules/lxmf'
@@ -192,9 +200,20 @@ const props = withDefaults(defineProps<{
   roster?: GroupMember[]
 }>(), { group: false, ownedGroup: null, members: () => [], addable: () => [], selfDest: '',
         groupState: () => GroupState.Member, roster: () => [] })
+/* The conversation's timer; a value the peer chose that is not among ours is
+ * offered too, so the select can show it. */
+const sdCur = computed(() => props.contact?.selfDestruct ?? 0)
+const sdChoices = computed(() =>
+  SELF_DESTRUCT_CHOICES.includes(sdCur.value) ? SELF_DESTRUCT_CHOICES
+                                              : [...SELF_DESTRUCT_CHOICES, sdCur.value])
+function onSdSelect(e: Event) {
+  emit('set-self-destruct', props.peer, Number((e.target as HTMLSelectElement).value))
+}
+
 const emit = defineEmits<{
   close: []
   'delete-conversation': [peer: string]
+  'set-self-destruct': [peer: string, seconds: number]
   'set-pn': [peer: string, hash: string]
   ping: [peer: string]
   'add-members': [g: number, peers: string[]]

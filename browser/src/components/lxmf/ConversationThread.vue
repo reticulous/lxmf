@@ -32,23 +32,37 @@
 
     <!-- Floating sticky date: the day of the content at the top of the viewport,
          shown while scrolling when no inline separator is up there; fades after 2s. -->
-    <div class="stickyday" :class="{ show: stickyShow }">{{ stickyDay }}</div>
+    <!-- A message on screen came without the timer this conversation has:
+         said once, floating, however many such messages are in view. -->
+    <div v-if="sdWarnShow" class="sdwarn">
+      <q-icon :name="matWarning" size="13px" /> {{ name }} does not support disappearing messages
+    </div>
+    <div class="stickyday" :class="{ show: stickyShow, below: sdWarnShow }">{{ stickyDay }}</div>
 
     <div ref="scroller" class="scroll" @scroll="onScroll">
-      <div v-if="buckets.length === 0" class="empty">
+      <div v-if="shown.length === 0" class="empty">
         No messages in this conversation yet.
       </div>
-      <template v-for="b in buckets" :key="b.day">
+      <template v-for="b in shown" :key="b.day">
         <div class="daysep"><span>{{ b.day }}</span></div>
         <template v-for="m in b.messages" :key="m.key">
+        <div v-if="m.sdNote === SdNote.Unsupported" class="sdw-anchor" />
         <!-- A notice from the group itself — who joined, left, was removed,
              or that it is gone: a line of the conversation, not a message
              anybody wrote. -->
         <div v-if="isGroupNotice(m)" :id="`msg-${m.key}`" class="notice">
           <span>{{ m.content }}</span>
         </div>
+        <div v-else-if="isSdNotice(m)" :id="`msg-${m.key}`" class="notice">
+          <span>{{ sdNoticeText(m, name) }}</span>
+        </div>
+        <template v-else>
+        <div v-if="m.sdNote === SdNote.Set" class="notice">
+          <span>{{ sdNoticeText(m, name) }}</span>
+        </div>
         <MessageBubble
-          v-else :m="m" :proxied="proxied"
+          :m="m" :proxied="proxied"
+          :sd-left="sdTimed(m) ? sdLeft(m, now) : null"
           :quote="quoteFor(m)"
           :sender="senders.get(m.key)?.g ?? null"
           :show-sender="senders.get(m.key)?.first ?? false"
@@ -60,6 +74,7 @@
           @reply="(m2, frag) => emit('msg-reply', m2, frag)"
           @quote-open="jumpTo"
         />
+        </template>
         </template>
       </template>
     </div>
@@ -79,11 +94,12 @@ const leftAt = new Map<string, number | null>()
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { matArrowBack, matInfo, matLink, matLinkOff } from '@quasar/extras/material-icons'
+import { matArrowBack, matInfo, matLink, matLinkOff, matWarning } from '@quasar/extras/material-icons'
 import PeerAvatar from './PeerAvatar.vue'
 import MessageBubble from './MessageBubble.vue'
 import ContactSignal from './ContactSignal.vue'
-import { quoteView, replyTarget, groupSender, isGroupNotice,
+import { quoteView, replyTarget, groupSender, isGroupNotice, isSdNotice, sdTimed, sdExpired,
+         sdLeft, sdNoticeText, SdNote,
          type GroupSender, type Message, type Reachability } from '../../modules/lxmf'
 
 const props = defineProps<{
@@ -121,7 +137,60 @@ const emit = defineEmits<{
   'toggle-link': [peer: string]
   back: []
   read: [peer: string]
+  /* These timed messages are on screen for the first time: start their timers. */
+  opened: [peer: string, keys: string[], now: number]
+  /* Something in this conversation has run out of time: delete it. */
+  expire: [peer: string]
 }>()
+
+/* Disappearing messages. The clock ticks only while something here is on a
+ * timer; what has run out is not drawn, and the firmware is asked to delete it
+ * (once per message). What is drawn for the first time starts its timer. */
+const now = ref(Math.floor(Date.now() / 1000))
+const timeValid = () => now.value > 1700000000
+let sdClock: ReturnType<typeof setInterval> | undefined
+const hasTimed = computed(() => props.buckets.some(b => b.messages.some(sdTimed)))
+watch(hasTimed, on => {
+  if (on && !sdClock) sdClock = setInterval(() => { now.value = Math.floor(Date.now() / 1000) }, 1000)
+  if (!on && sdClock) { clearInterval(sdClock); sdClock = undefined }
+}, { immediate: true })
+
+const shown = computed(() => {
+  if (!timeValid()) return props.buckets
+  return props.buckets
+    .map(b => ({ day: b.day, messages: b.messages.filter(m => !sdExpired(m, now.value)) }))
+    .filter(b => b.messages.length)
+})
+const askedExpire = new Set<string>()
+const askedOpen = new Set<string>()
+watch([() => props.buckets, now], () => {
+  if (!timeValid() || !props.peer) return
+  const all = props.buckets.flatMap(b => b.messages)
+  if (all.some(m => sdExpired(m, now.value) && !askedExpire.has(m.key))) {
+    for (const m of all) if (sdExpired(m, now.value)) askedExpire.add(m.key)
+    emit('expire', props.peer)
+  }
+  const fresh = all.filter(m => sdTimed(m) && !m.openedTs && !askedOpen.has(m.key)).map(m => m.key)
+  if (fresh.length) {
+    fresh.forEach(k => askedOpen.add(k))
+    emit('opened', props.peer, fresh, now.value)
+  }
+}, { immediate: true, deep: true })
+
+/* The "does not support" line: up while a message that earned it is in view. */
+const sdWarnShow = ref(false)
+function updateSdWarn() {
+  const el = scroller.value
+  if (!el) { sdWarnShow.value = false; return }
+  const top = el.scrollTop, bottom = top + el.clientHeight
+  let on = false
+  el.querySelectorAll<HTMLElement>('.sdw-anchor').forEach(a => {
+    const y = a.offsetTop
+    if (y >= top - 40 && y <= bottom) on = true
+  })
+  sdWarnShow.value = on
+}
+watch(shown, () => nextTick(updateSdWarn), { deep: true })
 
 const reachLine = computed(() => {
   const r = props.reach
@@ -255,7 +324,7 @@ function updateSticky() {
   stickyTimer = setTimeout(() => { stickyShow.value = false }, 2000)
 }
 
-function onScroll() { remember(props.peer); maybeRead(); updateSticky() }
+function onScroll() { remember(props.peer); maybeRead(); updateSticky(); updateSdWarn() }
 
 onMounted(() => {
   document.addEventListener('visibilitychange', maybeRead)
@@ -266,6 +335,7 @@ onBeforeUnmount(() => {
    * left like any other, so record it on the way out. */
   remember(props.peer)
   if (stickyTimer) clearTimeout(stickyTimer)
+  if (sdClock) clearInterval(sdClock)
   document.removeEventListener('visibilitychange', maybeRead)
   window.removeEventListener('focus', maybeRead)
 })
@@ -315,6 +385,15 @@ onBeforeUnmount(() => {
   opacity: 0; transition: opacity 0.3s;
 }
 .stickyday.show { opacity: 1; }
+.stickyday.below { top: 78px; }
+.sdwarn {
+  position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+  z-index: 6; pointer-events: none; max-width: 90%;
+  display: flex; align-items: center; gap: 4px;
+  background: #5a4a1a; color: #ffe08a;
+  font-size: calc(11px * var(--rfs, 1)); padding: 2px 10px; border-radius: 6px;
+}
+.sdw-anchor { height: 0; }
 .empty { color: #888; font-style: italic; text-align: center; padding: 20px; font-size: calc(13px * var(--rfs, 1)); }
 .daysep { text-align: center; margin: 10px 0 6px; }
 .daysep span {

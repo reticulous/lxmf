@@ -278,3 +278,18 @@ bool lxmfDestroyIdentity(int n, bool sync = false);
  *  that every frontend describes the same measurement the same way; the browser
  *  mirror is `peerMeasOf` + `pingLinkLines` in lxmf/browser. */
 std::string lxmfPingLink(const std::string& peer_hex, const char* sep = "\n");
+
+/* SELF_DESTRUCT choices offered by the frontends, seconds; 0 = off. */
+static constexpr uint32_t LXMF_SELF_DESTRUCT_CHOICES[] = {
+    0, 28 * 86400, 7 * 86400, 86400, 8 * 3600, 3600, 300, 30,
+};
+
+/* A message record's `sd_note`. */
+enum : uint8_t {
+    LXMF_SD_NOTE_NONE        = 0,
+    LXMF_SD_NOTE_SET         = 1,   /* this message set the conversation's timer */
+    LXMF_SD_NOTE_UNSUPPORTED = 2,   /* no field, though the conversation has a timer */
+};
+
+/** "off", "4 weeks", "1 day", "8 hrs", "5 min", "30 sec", … */
+std::string lxmfSelfDestructLabel(uint32_t seconds);

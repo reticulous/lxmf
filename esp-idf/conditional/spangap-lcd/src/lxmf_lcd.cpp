@@ -205,6 +205,9 @@ struct Msg {
     uint8_t group_event = 0;
     std::string group_subjects;
     bool command = false;     /* a command this device sent a group — never drawn */
+    uint32_t self_destruct = 0;   /* seconds after opening it disappears; 0 = never */
+    uint8_t  sd_note = 0;         /* LXMF_SD_NOTE_* */
+    long     opened_ts = 0;       /* unix s first shown; 0 = not yet */
 };
 
 struct Ann { std::string hash, name; long last = 0; };   /* a heard announce */
@@ -218,7 +221,11 @@ std::vector<Msg>  g_msgs;               /* non-draft messages for the open conve
  * thread: a stage transition updates one glyph, a new message appends one
  * bubble, and only a structural change (delete/reorder) falls back to a full
  * rebuild. `meta` is the bubble's meta row (timestamp + delivery glyph). */
-struct BubbleRef { std::string mid; uint8_t status; uint8_t tries; lv_obj_t* meta; };
+struct BubbleRef {
+    std::string mid; uint8_t status; uint8_t tries; lv_obj_t* meta;
+    int sdStep = 0;             /* the timer face drawn; 0 = no timer */
+    bool sdWarn = false;        /* "does not support disappearing messages" above it */
+};
 std::vector<BubbleRef> g_bubbles;
 std::vector<Ann>  g_anns;               /* heard announces (on-the-mesh column) */
 std::unordered_map<std::string, size_t> g_annIx;   /* hash -> index in g_anns (O(1) name/last lookup) */
@@ -351,6 +358,9 @@ std::vector<std::pair<lv_obj_t*, long>> g_dateSeps;   /* separator widget + its 
 lv_obj_t* s_stickyDate = nullptr;          /* floating date pill below the header */
 lv_obj_t* s_stickyLbl  = nullptr;
 lv_timer_t* g_stickyFadeTimer = nullptr;   /* fades the sticky 2 s after the last scroll */
+lv_obj_t* s_sdWarn    = nullptr;           /* floating "does not support disappearing messages" */
+lv_obj_t* s_sdWarnLbl = nullptr;
+lv_timer_t* g_sdTimer = nullptr;           /* 1 s: timer faces move on, and expiry */
 lv_obj_t* s_threadName = nullptr;       /* header peer-name label */
 lv_obj_t* s_threadDown = nullptr;       /* header scroll-to-bottom chevron (hidden at bottom) */
 lv_obj_t* s_threadLink = nullptr;       /* header link indicator/toggle image (chain=up, broken-chain=down) */
@@ -400,6 +410,7 @@ void updatePageButtons(size_t total);
 void showLoading(bool on);
 void beginThreadLoad();
 void updateStickyDate();
+void updateSdWarn();
 void showContacts();
 void setActiveTab(int n, bool keepScroll = false);
 void openThread(const std::string& peer);
@@ -660,6 +671,47 @@ void msgCb(const char* key, const char* val) {
     else if (!strcmp(field, "group_event")) m->group_event = val ? (uint8_t)atoi(val) : 0;
     else if (!strcmp(field, "group_subjects")) m->group_subjects = val ? val : "";
     else if (!strcmp(field, "command"))     m->command = val && atoi(val) != 0;
+    else if (!strcmp(field, "self_destruct")) m->self_destruct = val ? (uint32_t)atol(val) : 0;
+    else if (!strcmp(field, "sd_note"))     m->sd_note = val ? (uint8_t)atoi(val) : 0;
+    else if (!strcmp(field, "opened_ts"))   m->opened_ts = val ? atol(val) : 0;
+}
+
+/* The empty message that set the conversation's timer: a centred line. */
+bool isSdNotice(const Msg& m) {
+    return m.sd_note == LXMF_SD_NOTE_SET && m.content.empty() && !m.body_absent;
+}
+
+/* A message on a timer — the notice that set one is not. */
+bool sdTimed(const Msg& m) { return m.self_destruct > 0 && !isSdNotice(m); }
+
+bool sdTimeValid() { return storageGetInt("sys.time.valid", 0) != 0; }
+
+/* Past its time: opened, and self_destruct seconds gone since. */
+bool sdExpired(const Msg& m, long now) {
+    return sdTimed(m) && m.opened_ts > 0 && now >= m.opened_ts + (long)m.self_destruct;
+}
+
+/* Which of the 12 timer faces: how much of it is left, in twelfths, 1..12. */
+int sdStep(uint32_t sd, long opened, long now) {
+    if (opened <= 0 || sd == 0) return 12;
+    long left = opened + (long)sd - now;
+    if (left <= 0) return 1;
+    int s = (int)((left * 12 + sd - 1) / sd);
+    return s < 1 ? 1 : s > 12 ? 12 : s;
+}
+
+const char* sdIconName(int step) {
+    static const char* const kNames[] = {
+        "timer-1", "timer-2", "timer-3", "timer-4",  "timer-5",  "timer-6",
+        "timer-7", "timer-8", "timer-9", "timer-10", "timer-11", "timer-12",
+    };
+    return kNames[(step < 1 ? 1 : step > 12 ? 12 : step) - 1];
+}
+
+/* "You set disappearing messages to 1 day" / "Ann set …". */
+std::string sdNoticeText(const Msg& m) {
+    return (m.in ? peerName(m.peer) : std::string("You")) +
+           " set disappearing messages to " + lxmfSelfDestructLabel(m.self_destruct);
 }
 
 /* A line the group itself wrote ("Ann added Bob"): drawn as a centred system
@@ -798,6 +850,13 @@ void sendMessage(const std::string& peer, const std::string& text,
         setf("reply_to", reply_to.c_str());
         if (!quote.empty()) setf("reply_quote", quote.c_str());
     }
+    char ck[112];
+    snprintf(ck, sizeof ck, "s.lxmf.id.%d.contacts.%s.self_destruct", g_id, peer.c_str());
+    uint32_t sd = (uint32_t)storageGetInt(ck, 0);
+    if (sd) {
+        snprintf(k, sizeof k, "%s.self_destruct", base);
+        storageSet(k, (int)sd);
+    }
     /* Optimistic status: QUEUED (not draft) so the bubble appears the instant we
        send (renders as the "..." in-flight chip). The lxmf task drives it on. */
     snprintf(k, sizeof k, "%s.status", base);
@@ -822,6 +881,7 @@ void sendMessage(const std::string& peer, const std::string& text,
     m.ts = ts; m.in = false;
     m.reply_to = reply_to;
     m.reply_quote = quote;
+    m.self_destruct = sd;
     g_msgs.push_back(std::move(m));
 }
 
@@ -1012,7 +1072,13 @@ bool applyThreadIcons() {
     lcdIconRequest("reply", actionIconPx());
     lcdIconRequest("info", actionIconPx());
     lcdIconRequest("trash", actionIconPx());
-    return lcdIconReady("send", sendIconPx())
+    bool timers = true;
+    for (int s = 1; s <= 12; s++) {
+        lcdIconRequest(sdIconName(s), tickIconPx());
+        timers = timers && lcdIconReady(sdIconName(s), tickIconPx());
+    }
+    return timers
+        && lcdIconReady("send", sendIconPx())
         && lcdIconReady("link", linkIconPx())
         && lcdIconReady("link-off", linkIconPx())
         && lcdIconReady("tick-sent", tickIconPx())
@@ -1237,6 +1303,7 @@ void beginThreadLoad() {
     g_nomadTargets.clear();
     g_dateSeps.clear();
     if (s_stickyDate) lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
+    if (s_sdWarn)     lv_obj_add_flag(s_sdWarn, LV_OBJ_FLAG_HIDDEN);
     /* Drop any composer-pin spacer left by the prior thread (scrollThreadBottom),
      * else it shifts the centred "<loading conversation>" placeholder downward. */
     if (s_msgList) lv_obj_set_style_pad_top(s_msgList, THREAD_PAD_TOP, 0);
@@ -1377,7 +1444,7 @@ void buildThreadShell() {
     /* A scroll takes the message actions away with it: they are anchored to a
      * bubble, and scrolling is how you leave that bubble. */
     lv_obj_add_event_cb(s_msgList, [](lv_event_t*) {
-        updateThreadDownVis(); updateStickyDate(); dismissMsgActions();
+        updateThreadDownVis(); updateStickyDate(); updateSdWarn(); dismissMsgActions();
     }, LV_EVENT_SCROLL, nullptr);
 
     /* Floating sticky date pill, pinned just under the header (a child of the
@@ -1397,6 +1464,26 @@ void buildThreadShell() {
     lv_obj_add_flag(s_stickyDate, LV_OBJ_FLAG_HIDDEN);
     s_stickyLbl = mkLabel(s_stickyDate, "", lv_color_black());
     lv_obj_set_style_text_font(s_stickyLbl, kFontSmall, 0);
+
+    /* "<peer> does not support disappearing messages": floats under the header
+     * while a message that came without the timer is on screen, once however
+     * many of them are. */
+    s_sdWarn = lv_obj_create(s_thread);
+    lv_obj_remove_style_all(s_sdWarn);
+    lv_obj_add_flag(s_sdWarn, LV_OBJ_FLAG_FLOATING);
+    lv_obj_set_size(s_sdWarn, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(s_sdWarn, lv_pct(95), 0);
+    lv_obj_align(s_sdWarn, LV_ALIGN_TOP_MID, 0, HDR_H + 3);
+    lv_obj_set_style_bg_color(s_sdWarn, lv_color_hex(0x5a4a1a), 0);
+    lv_obj_set_style_bg_opa(s_sdWarn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_sdWarn, 4, 0);
+    lv_obj_set_style_pad_hor(s_sdWarn, 8, 0);
+    lv_obj_set_style_pad_ver(s_sdWarn, 2, 0);
+    lv_obj_remove_flag(s_sdWarn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_sdWarn, LV_OBJ_FLAG_HIDDEN);
+    s_sdWarnLbl = mkLabel(s_sdWarn, "", lv_color_hex(0xffe08a));
+    lv_obj_set_style_text_font(s_sdWarnLbl, kFontSmall, 0);
+    lv_label_set_long_mode(s_sdWarnLbl, LV_LABEL_LONG_WRAP);
 
     /* "Load earlier messages" — first child of the scroll area, above the bubbles;
      * shown only when the window doesn't reach the oldest message. */
@@ -1639,7 +1726,8 @@ void buildThreadShell() {
     lv_obj_set_style_pad_hor(s_histList, 4, 0);
     lv_obj_set_style_pad_ver(s_histList, 1, 0);
     lv_obj_set_style_pad_row(s_histList, 1, 0);
-    lv_obj_add_event_cb(s_histList, [](lv_event_t*) { updateStickyDate(); }, LV_EVENT_SCROLL, nullptr);
+    lv_obj_add_event_cb(s_histList, [](lv_event_t*) { updateStickyDate(); updateSdWarn(); },
+                        LV_EVENT_SCROLL, nullptr);
 
     s_histEarlier = lv_button_create(s_histList);
     lv_obj_remove_style_all(s_histEarlier);
@@ -2211,6 +2299,13 @@ void fillMeta(lv_obj_t* meta, const Msg& m) {
         std::string fmt = storageGetStr("s.lxmf.msg_time_format", "%H:%M");
         strftime(tbuf, sizeof tbuf, fmt.c_str(), &tmv);
     }
+    if (sdTimed(m)) {
+        lv_obj_t* ti = makeDeliveryTicks(meta, sdIconName(sdStep(m.self_destruct, m.opened_ts,
+                                                                 (long)time(nullptr))));
+        lv_obj_set_style_image_recolor(ti, lv_color_hex(0xc0c8d0), 0);
+        lv_obj_set_style_image_recolor_opa(ti, LV_OPA_COVER, 0);
+    }
+
     lv_obj_t* tl = lv_label_create(meta);        /* time (right, small) */
     lv_obj_set_style_text_font(tl, kFontSmall, 0);
     lv_obj_set_style_text_color(tl, lv_color_hex(0xc0c8d0), 0);
@@ -2464,7 +2559,7 @@ void flashTimerCb(lv_timer_t*) {
 /* Mark a bubble just scrolled to, briefly — long enough to find it by eye. */
 void flashBubble(lv_obj_t* row) {
     if (!row) return;
-    lv_obj_t* bub = lv_obj_get_child(row, 0);
+    lv_obj_t* bub = lv_obj_get_child(row, -1);     /* last: a timer notice may lead the row */
     if (!bub) return;
     if (g_flashTimer) { lv_timer_delete(g_flashTimer); flashTimerCb(nullptr); }
     g_flashObj = bub;
@@ -2868,7 +2963,7 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr,
      * no balloon. Its label stands where a bubble's meta row would, two levels
      * under the row, so the lookups that find a row by its meta find this one.
      * A long press offers only deleting it. */
-    if (isGroupNotice(m)) {
+    if (isGroupNotice(m) || isSdNotice(m)) {
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
         lv_obj_t* wrap = lv_obj_create(row);
         lv_obj_remove_style_all(wrap);
@@ -2881,7 +2976,8 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr,
         lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_max_width(l, 240, 0);
-        lv_label_set_text(l, printable(m.content, false).c_str());
+        lv_label_set_text(l, isSdNotice(m) ? sdNoticeText(m).c_str()
+                                           : printable(m.content, false).c_str());
         lv_obj_add_flag(wrap, LV_OBJ_FLAG_CLICKABLE);
         auto* k = new std::string(m.key);
         lv_obj_add_event_cb(wrap, [](lv_event_t* e) {
@@ -2892,6 +2988,22 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr,
             delete (std::string*)lv_event_get_user_data(e);
         }, LV_EVENT_DELETE, k);
         return BubbleRef{ m.key, m.status, m.tries, l };
+    }
+
+    /* A message whose timer differs from the last one heard: the change it
+     * makes is said above it, as if its notice had come first. */
+    if (m.sd_note == LXMF_SD_NOTE_SET) {
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              m.in ? LV_FLEX_ALIGN_START : LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_START);
+        lv_obj_t* l = lv_label_create(row);
+        lv_obj_set_width(l, lv_pct(100));
+        lv_obj_set_style_pad_ver(l, 2, 0);
+        lv_obj_set_style_text_font(l, kFontSmall, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(0x8a93a0), 0);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(l, sdNoticeText(m).c_str());
     }
 
     lv_obj_t* bub = lv_obj_create(row);
@@ -2980,7 +3092,10 @@ BubbleRef addBubble(const Msg& m, int topMargin, lv_obj_t* container = nullptr,
     lv_obj_add_flag(bub, LV_OBJ_FLAG_CLICKABLE);
     bindMsgDetail(bub, m.key);
 
-    return BubbleRef{ m.key, m.status, m.tries, meta };
+    BubbleRef r{ m.key, m.status, m.tries, meta };
+    if (sdTimed(m)) r.sdStep = sdStep(m.self_destruct, m.opened_ts, (long)time(nullptr));
+    r.sdWarn = m.sd_note == LXMF_SD_NOTE_UNSUPPORTED;
+    return r;
 }
 
 /* ---- day separators (anchored to recv_ts) + floating sticky date ---- */
@@ -3077,9 +3192,97 @@ void updateStickyDate() {
         updateStickyFor(s_msgList, s_bubbles, g_dateSeps);
 }
 
+/* The unsupported-timer warning is up while any message that earned it is in
+ * the viewport; the date pill moves down under it. */
+void updateSdWarn() {
+    if (!s_sdWarn) return;
+    bool hist = s_histWrap && !lv_obj_has_flag(s_histWrap, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t* list = hist ? s_histList : s_msgList;
+    lv_obj_t* bubs = hist ? s_histBubbles : s_bubbles;
+    const std::vector<BubbleRef>& refs = hist ? g_histRefs : g_bubbles;
+    bool show = false;
+    if (list && bubs) {
+        int32_t top = lv_obj_get_scroll_y(list), h = lv_obj_get_height(list);
+        int32_t off = lv_obj_get_y(bubs);
+        for (auto& r : refs) {
+            if (!r.sdWarn || !r.meta || !lv_obj_is_valid(r.meta)) continue;
+            lv_obj_t* row = lv_obj_get_parent(lv_obj_get_parent(r.meta));
+            if (!row) continue;
+            int32_t y = off + lv_obj_get_y(row);
+            if (y + lv_obj_get_height(row) > top && y < top + h) { show = true; break; }
+        }
+    }
+    int32_t dateY = HDR_H + 3;
+    if (show) {
+        lv_label_set_text(s_sdWarnLbl, (std::string(LV_SYMBOL_WARNING " ") + peerName(g_curPeer) +
+                                        " does not support disappearing messages").c_str());
+        lv_obj_remove_flag(s_sdWarn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_update_layout(s_sdWarn);
+        dateY += lv_obj_get_height(s_sdWarn) + 2;
+    } else {
+        lv_obj_add_flag(s_sdWarn, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_stickyDate) lv_obj_align(s_stickyDate, LV_ALIGN_TOP_MID, 0, dateY);
+}
+
+/* Once a second while a conversation on a timer is open: the faces move on,
+ * and what has run out goes (rebuildThread purges it first). */
+void sdTickCb(lv_timer_t*) {
+    if (!s_thread || lv_obj_has_flag(s_thread, LV_OBJ_FLAG_HIDDEN) || g_curPeer.empty()) return;
+    if (!sdTimeValid()) return;
+    for (auto& m : g_msgs)
+        if (m.peer == g_curPeer && sdTimed(m)) { rebuildThread(); return; }
+}
+
+/* Before anything of the open conversation is drawn: what has run out of time
+ * is dropped from the model (keeping the page windows on the messages they
+ * held) and the firmware is asked to delete it. */
+void sdPurge() {
+    if (g_id < 0 || g_curPeer.empty() || !sdTimeValid()) return;
+    long now = (long)time(nullptr);
+    size_t lo = g_winLo, hi = g_winHi, hlo = h_winLo, hhi = h_winHi;
+    size_t ix = 0;                     /* the message's place before any went */
+    bool any = false;
+    for (auto it = g_msgs.begin(); it != g_msgs.end(); ix++) {
+        if (it->peer != g_curPeer) { ++it; ix--; continue; }
+        if (!sdExpired(*it, now)) { ++it; continue; }
+        if (g_replyKey == it->key) cancelReply();
+        if (ix < lo) g_winLo--;
+        if (ix < hi) g_winHi--;
+        if (ix < hlo) h_winLo--;
+        if (ix < hhi) h_winHi--;
+        it = g_msgs.erase(it);
+        any = true;
+    }
+    if (any) {
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.cmd.expire", g_id);
+        storageSet(k, g_curPeer.c_str());
+    }
+}
+
+/* A message on a timer starts it the first time it is drawn. */
+void sdMarkOpened(const std::vector<const Msg*>& ms) {
+    if (g_id < 0 || !sdTimeValid()) return;
+    long now = (long)time(nullptr);
+    bool open = false;
+    for (const Msg* c : ms) {
+        if (!sdTimed(*c) || c->opened_ts > 0) continue;
+        Msg* m = const_cast<Msg*>(c);
+        m->opened_ts = now;
+        char k[160];
+        snprintf(k, sizeof k, "s.lxmf.id.%d.msgs.%s.%s.opened_ts", g_id, m->peer.c_str(),
+                 m->key.c_str());
+        if (!open) { storageBegin(); open = true; }
+        storageSet(k, (int)now);
+    }
+    if (open) storageEnd();
+}
+
 void rebuildThread() {
     if (!s_bubbles || g_curPeer.empty()) return;
     refreshFont();
+    sdPurge();
 
     /* Order = arrival order = the record store's arena order (g_msgs is loaded in
        that order). We deliberately do NOT sort by ts: the ESP RTC drifts too far
@@ -3101,6 +3304,7 @@ void rebuildThread() {
     updatePageButtons(total);
 
     std::vector<const Msg*> ms(all.begin() + g_winLo, all.begin() + g_winHi);
+    sdMarkOpened(ms);
 
     /* Date anchor = recv_ts, or ts when recv_ts is unset (an optimistic just-sent
        bubble, or anything an older writer left at 0) — so a message never produces
@@ -3139,15 +3343,20 @@ void rebuildThread() {
 
     if (matchN == g_bubbles.size()) {                    /* existing bubbles are a prefix */
         bool resized = false;
-        for (size_t i = 0; i < g_bubbles.size(); i++)
-            if (ms[i]->status != g_bubbles[i].status || ms[i]->tries != g_bubbles[i].tries) {
-                if (isGroupNotice(*ms[i])) continue;      /* no meta row to re-render */
+        long now = (long)time(nullptr);
+        for (size_t i = 0; i < g_bubbles.size(); i++) {
+            int step = sdTimed(*ms[i]) ? sdStep(ms[i]->self_destruct, ms[i]->opened_ts, now) : 0;
+            if (ms[i]->status != g_bubbles[i].status || ms[i]->tries != g_bubbles[i].tries ||
+                step != g_bubbles[i].sdStep) {
+                if (isGroupNotice(*ms[i]) || isSdNotice(*ms[i])) continue;   /* no meta row */
                 fillMeta(g_bubbles[i].meta, *ms[i]);     /* status name + glyph re-render */
                 layoutMeta(lv_obj_get_parent(g_bubbles[i].meta), g_bubbles[i].meta, ms[i]->status);
                 g_bubbles[i].status = ms[i]->status;
                 g_bubbles[i].tries  = ms[i]->tries;
+                g_bubbles[i].sdStep = step;
                 resized = true;                          /* the hug/unhug changes bubble height */
             }
+        }
         bool appended = false;
         for (size_t i = g_bubbles.size(); i < ms.size(); i++) {
             maybeSep(i);
@@ -3163,6 +3372,7 @@ void rebuildThread() {
             else             updateThreadDownVis();       /* scrolled up reading history — don't yank */
         }
         if (appended && wasAtBottom && lcdAwake()) markRead(g_curPeer);   /* new msg in view → keep unread at 0 */
+        updateSdWarn();
         return;
     }
 
@@ -3179,6 +3389,7 @@ void rebuildThread() {
                                       nullptr, prevMsg(i)));
     }
     scrollThreadBottom(false);                          /* newest + compose at bottom */
+    updateSdWarn();
 }
 
 /* ---- history overlay (older messages, browsed off the resident newest page) ---- */
@@ -3198,6 +3409,7 @@ void updateHistButtons(size_t /*total*/) {
  * its day, exactly as the resident page does. */
 void renderHistory() {
     if (!s_histBubbles || g_curPeer.empty()) return;
+    sdPurge();
     std::vector<const Msg*> all;
     for (auto& m : g_msgs) if (m.peer == g_curPeer) all.push_back(&m);
     size_t total = all.size();
@@ -3210,6 +3422,7 @@ void renderHistory() {
     g_histRefs.clear();
 
     std::vector<const Msg*> ms(all.begin() + h_winLo, all.begin() + h_winHi);
+    sdMarkOpened(ms);
     auto anchorOf   = [](const Msg* m) -> long { return m->recv_ts > 0 ? m->recv_ts : m->ts; };
     auto prevAnchor = [&](size_t i) -> long {
         if (i > 0) return anchorOf(ms[i - 1]);
@@ -3238,6 +3451,7 @@ void renderHistory() {
     if (row) lv_obj_scroll_to_y(s_histList, lv_obj_get_y(s_histBubbles) + lv_obj_get_y(row), LV_ANIM_OFF);
     else     lv_obj_scroll_to_y(s_histList, LV_COORD_MAX, LV_ANIM_OFF);
     g_histAnchor.clear();
+    updateSdWarn();
 }
 
 /* Show the overlay on the page holding `ix` (an index into the curPeer slice),
@@ -3581,13 +3795,15 @@ void infoBack() {
  * contact: 0 = every message, else messages older than that many seconds. */
 struct DelOpt { const char* label; const char* what; long age; };
 const DelOpt kDelOpts[] = {
-    { "Delete conversation and contact info", "",              -1 },
-    { "Delete messages only",                 "",               0 },
-    { "Delete messages older than 1 day",     "1 day",      86400 },
-    { "Delete messages older than 3 days",    "3 days",   3*86400 },
-    { "Delete messages older than 1 week",    "1 week",   7*86400 },
-    { "Delete messages older than 1 month",   "1 month", 30*86400 },
+    { "Delete conversation and contact info", "",       -1 },
+    { "Delete messages only",                 "",        0 },
+    { "",                              "1 day",      86400 },
+    { "",                              "3 days",   3*86400 },
+    { "",                              "1 week",   7*86400 },
+    { "",                              "1 month", 30*86400 },
 };
+const intptr_t DEL_FIRST_AGE = 2;       /* kDelOpts from here on are the by-age ones */
+intptr_t g_delAgeIx = DEL_FIRST_AGE;    /* the age the dropdown shows */
 
 void onConfirmDelete(lv_event_t* e) {
     const DelOpt& o = kDelOpts[(intptr_t)lv_event_get_user_data(e)];
@@ -3724,11 +3940,8 @@ void showDeleteChoice(lv_event_t*) {
                                  LV_EVENT_CLICKED, nullptr);
         if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
     }
-    for (intptr_t i = 0; i < (intptr_t)(sizeof kDelOpts / sizeof kDelOpts[0]); i++) {
-        if (kDelOpts[i].age > 0 && !timeOk) continue;
-        /* The whole-conversation delete is a group's only once it has ended. */
-        if (grp && kDelOpts[i].age < 0 && gst < GS_LEFT) continue;
-        lv_obj_t* b = lv_button_create(box);
+    auto delButton = [](lv_obj_t* parent, const char* text, intptr_t opt) {
+        lv_obj_t* b = lv_button_create(parent);
         lv_obj_remove_style_all(b);
         lv_obj_set_size(b, lv_pct(100), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(b, lv_color_hex(0x5a2a2a), 0);
@@ -3736,15 +3949,47 @@ void showDeleteChoice(lv_event_t*) {
         lv_obj_set_style_radius(b, 4, 0);
         lv_obj_set_style_pad_ver(b, 4, 0);
         lv_obj_set_style_pad_hor(b, 8, 0);
-        lv_obj_t* l = mkLabel(b, grp && kDelOpts[i].age < 0 ? "Delete group"
-                                                             : kDelOpts[i].label,
-                              lv_color_white());
+        lv_obj_t* l = mkLabel(b, text, lv_color_white());
         lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(l, lv_pct(100));
         lv_obj_add_event_cb(b, [](lv_event_t* e) {
-            showDeleteFinal((intptr_t)lv_event_get_user_data(e));
-        }, LV_EVENT_CLICKED, (void*)i);
+            intptr_t o = (intptr_t)lv_event_get_user_data(e);
+            showDeleteFinal(o < 0 ? g_delAgeIx : o);
+        }, LV_EVENT_CLICKED, (void*)opt);
         if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), b);
+        return b;
+    };
+    /* The whole-conversation delete is a group's only once it has ended. */
+    if (!(grp && gst < GS_LEFT))
+        delButton(box, grp ? "Delete group" : kDelOpts[0].label, 0);
+    delButton(box, kDelOpts[1].label, 1);
+    if (timeOk) {
+        /* By age: one button, the age picked beside it. */
+        lv_obj_t* row = lv_obj_create(box);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* b = delButton(row, "Delete older than", -1);
+        lv_obj_set_width(b, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(b, 1);
+        lv_obj_t* dd = lv_dropdown_create(row);
+        lv_obj_set_width(dd, LV_SIZE_CONTENT);
+        lv_obj_set_style_text_font(dd, kFont, 0);
+        lv_obj_set_style_text_font(lv_dropdown_get_list(dd), kFont, 0);
+        lv_obj_set_style_pad_ver(dd, 3, 0);
+        std::string opts;
+        for (intptr_t i = DEL_FIRST_AGE; i < (intptr_t)(sizeof kDelOpts / sizeof kDelOpts[0]); i++)
+            opts += std::string(i == DEL_FIRST_AGE ? "" : "\n") + kDelOpts[i].what;
+        lv_dropdown_set_options(dd, opts.c_str());
+        lv_dropdown_set_selected(dd, (uint32_t)(g_delAgeIx - DEL_FIRST_AGE));
+        lv_obj_add_event_cb(dd, [](lv_event_t* e) {
+            g_delAgeIx = DEL_FIRST_AGE +
+                (intptr_t)lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(e)));
+        }, LV_EVENT_VALUE_CHANGED, nullptr);
+        if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), dd);
     }
     lv_obj_t* cnc = lv_button_create(box);
     lv_obj_remove_style_all(cnc);
@@ -4045,6 +4290,42 @@ void showInfo(const std::string& peer) {
             });
     }
     if (isGrp) { deferFocus(back); return; }
+
+    /* Disappearing messages: a change is sent to the peer as an empty message
+     * carrying the new value, and every message after carries it too. */
+    mkLabel(body, "Disappearing messages", lv_color_hex(0x8a93a0));
+    lv_obj_t* sdd = lv_dropdown_create(body);
+    lv_obj_set_width(sdd, lv_pct(100));
+    lv_obj_set_style_text_font(sdd, kFont, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(sdd), kFont, 0);
+    auto* sdv = new std::vector<uint32_t>;
+    uint32_t sdCur = g_id < 0 ? 0 :
+        (uint32_t)storageGetInt(("s.lxmf.id." + std::to_string(g_id) +
+                                 ".contacts." + peer + ".self_destruct").c_str(), 0);
+    std::string sdOpts;
+    int sdSel = -1;
+    auto sdAdd = [&](uint32_t s) {
+        std::string l = s ? lxmfSelfDestructLabel(s) : std::string("Off");
+        sdOpts += (sdOpts.empty() ? "" : "\n") + l;
+        if (s == sdCur) sdSel = (int)sdv->size();
+        sdv->push_back(s);
+    };
+    for (uint32_t s : LXMF_SELF_DESTRUCT_CHOICES) sdAdd(s);
+    if (sdSel < 0) sdAdd(sdCur);                    /* a value the peer chose, not offered here */
+    lv_dropdown_set_options(sdd, sdOpts.c_str());
+    lv_dropdown_set_selected(sdd, sdSel);
+    lv_obj_add_event_cb(sdd, [](lv_event_t* e) {
+        auto* v = static_cast<std::vector<uint32_t>*>(lv_event_get_user_data(e));
+        uint32_t sel = lv_dropdown_get_selected(static_cast<lv_obj_t*>(lv_event_get_target(e)));
+        if (!v || sel >= v->size() || g_id < 0 || g_infoPeer.empty()) return;
+        char k[48];
+        snprintf(k, sizeof k, "lxmf.id.%d.cmd.self_destruct", g_id);
+        storageSet(k, (g_infoPeer + "/" + std::to_string((*v)[sel])).c_str());
+    }, LV_EVENT_VALUE_CHANGED, sdv);
+    lv_obj_add_event_cb(sdd, [](lv_event_t* e) {
+        delete static_cast<std::vector<uint32_t>*>(lv_event_get_user_data(e));
+    }, LV_EVENT_DELETE, sdv);
+    if (lcdInputGroup()) lv_group_add_obj(lcdInputGroup(), sdd);
 
     /* Per-contact propagation node — offered as the second option of the
      * resend dialog for this contact's messages. Options: none, the
@@ -5601,6 +5882,8 @@ void onLayerDelete(lv_event_t*) {
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr;
     s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
     s_stickyDate = nullptr; s_stickyLbl = nullptr;
+    s_sdWarn = nullptr; s_sdWarnLbl = nullptr;
+    if (g_sdTimer) { lv_timer_delete(g_sdTimer); g_sdTimer = nullptr; }
     s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
     s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
     g_histDateSeps.clear();
@@ -5644,6 +5927,8 @@ void lxmfApp(void* arg) {
     s_thread = nullptr; s_msgList = nullptr; s_bubbles = nullptr; s_compose = nullptr;
     s_earlierBtn = nullptr; s_newerBtn = nullptr; s_newerLbl = nullptr; s_loading = nullptr;
     s_stickyDate = nullptr; s_stickyLbl = nullptr;
+    s_sdWarn = nullptr; s_sdWarnLbl = nullptr;
+    g_sdTimer = lv_timer_create(sdTickCb, 1000, nullptr);   /* prior onLayerDelete freed the last */
     s_histWrap = nullptr; s_histList = nullptr; s_histBubbles = nullptr;
     s_histEarlier = nullptr; s_histNewer = nullptr; s_histNewerLbl = nullptr;
     s_send = nullptr; s_sendIcon = nullptr; s_rc = nullptr; s_comp = nullptr; s_composePill = nullptr; s_collapsePill = nullptr;

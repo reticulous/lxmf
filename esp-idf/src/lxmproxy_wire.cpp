@@ -233,10 +233,11 @@ std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
                                       uint32_t group_event,
                                       const std::string& group_subjects,
                                       const std::string& group_data,
-                                      const std::string& group_name)
+                                      const std::string& group_name,
+                                      uint32_t self_destruct, uint32_t sd_note)
 {
     std::vector<uint8_t> o;
-    mpArr(o, 16);
+    mpArr(o, 18);
     mpUint(o, LXMPROXY_FR_MSG);
     mpBin(o, msg_id, LXMPROXY_MID_LEN);
     mpBin(o, peer, LXMPROXY_DEST_LEN);
@@ -253,6 +254,8 @@ std::vector<uint8_t> lxmproxyBuildMsg(const uint8_t msg_id[LXMPROXY_MID_LEN],
     mpStr(o, group_subjects);
     mpStr(o, group_data);
     mpStr(o, group_name);
+    mpUint(o, self_destruct);
+    mpUint(o, sd_note);
     return o;
 }
 
@@ -301,10 +304,11 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
                                        const std::string& content,
                                        const uint8_t* reply_to, size_t reply_len,
                                        const std::string& reply_quote,
-                                       const char* method, const uint8_t* pn)
+                                       const char* method, const uint8_t* pn,
+                                       uint32_t self_destruct, uint32_t sd_note)
 {
     std::vector<uint8_t> o;
-    mpArr(o, 10);
+    mpArr(o, 12);
     mpUint(o, LXMPROXY_FR_SEND);
     mpStr(o, local_key);
     mpBin(o, peer, LXMPROXY_DEST_LEN);
@@ -315,6 +319,8 @@ std::vector<uint8_t> lxmproxyBuildSend(const std::string& local_key,
     mpStr(o, reply_quote);
     mpStrC(o, method);
     mpBinOrNil(o, pn, LXMPROXY_DEST_LEN);
+    mpUint(o, self_destruct);
+    mpUint(o, sd_note);
     return o;
 }
 
@@ -446,7 +452,7 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             return true;
         }
         case LXMPROXY_FR_MSG: {
-            if (cnt < 16) return false;
+            if (cnt < 18) return false;
             if (!mpInBinN(s, out.msg_id, LXMPROXY_MID_LEN, &out.have_msg_id)) return false;
             if (!mpInBinN(s, out.peer, LXMPROXY_DEST_LEN, &out.have_peer))    return false;
             if (!out.have_msg_id || !out.have_peer) return false;
@@ -470,6 +476,8 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             if (!mpInStr(s, out.group_subjects)) return false;
             if (!mpInStr(s, out.group_data))     return false;
             if (!mpInStr(s, out.group_name))     return false;
+            if (!mpInUint(s, out.self_destruct)) return false;
+            if (!mpInUint(s, out.sd_note))       return false;
             return true;
         }
         case LXMPROXY_FR_FETCH:
@@ -491,7 +499,7 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             return true;
         }
         case LXMPROXY_FR_SEND: {
-            if (cnt < 10) return false;
+            if (cnt < 12) return false;
             if (!mpInStr(s, out.key))                                      return false;
             if (!mpInBinN(s, out.peer, LXMPROXY_DEST_LEN, &out.have_peer)) return false;
             if (!out.have_peer)                                            return false;
@@ -502,6 +510,8 @@ bool lxmproxyParse(const uint8_t* p, size_t n, LxmproxyFrame& out)
             if (!mpInStr(s, out.reply_quote))                              return false;
             if (!mpInStr(s, out.method))                                   return false;
             if (!mpInBinN(s, out.pn, LXMPROXY_DEST_LEN, &out.have_pn))     return false;
+            if (!mpInUint(s, out.self_destruct))                           return false;
+            if (!mpInUint(s, out.sd_note))                                 return false;
             out.have_body = true;
             return true;
         }

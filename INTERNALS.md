@@ -86,6 +86,14 @@ architecture and resolves several behaviours the storage model forces.
 12. **Groups** (§8d). A group is an identity slot that re-sends what its
     members send it. Upstream reserves `FIELD_GROUP` and defines nothing for
     it; this gives it a shape and needs nothing of a member's client.
+13. **Disappearing messages** (`FIELD_SELF_DESTRUCT = 0x100`, README
+    "Disappearing messages"). A per-conversation timer, announced to the peer
+    by an empty message carrying it and then carried by every message. The
+    firmware decides what an inbound value means (`sdHear`: a change, or a
+    client without the feature), the frontends stamp `opened_ts` when they
+    first draw a message and skip what has run out, and `cmd.expire` deletes it
+    — one key per conversation, since a per-message `cmd.delete` loop would
+    overwrite its own self-clearing key.
 
 ### Not present (upstream features deliberately unbuilt)
 
@@ -248,11 +256,13 @@ as raw 32 B on the wire (`lxmPackPayload` converts both ways).
 COMMANDS/RESULTS, 0x0B GROUP, 0x0C TICKET, 0x0D EVENT, 0x0E RNR_REFS, 0x0F
 RENDERER, 0x30 REPLY_TO, 0x31 REPLY_QUOTE, 0x40 REACTION, 0x41 COMMENT,
 0x42 CONTINUATION, 0xFB-0xFD CUSTOM_*, 0xFE NON_SPECIFIC, 0xFF DEBUG`.
-`RENDERER ∈ {PLAIN, MICRON, MARKDOWN, BBCODE}`.
+`RENDERER ∈ {PLAIN, MICRON, MARKDOWN, BBCODE}`. Ours, above that range:
+`0x100 SELF_DESTRUCT` (msgpack int32, seconds after first display; 0 = off).
 
 Of those, this implementation packs and parses `REPLY_TO` (raw 32 B message
-hash), `REPLY_QUOTE` (UTF-8 fragment of the quoted message)
-and `GROUP` (its shapes are in §8d),
+hash), `REPLY_QUOTE` (UTF-8 fragment of the quoted message),
+`SELF_DESTRUCT` (always packed `0xD2` + 4 bytes; read from any int encoding,
+a negative value read as 0) and `GROUP` (its shapes are in §8d),
 parses and logs `TICKET`, and skips the rest without failing the parse. The quote is optional
 and travels only when the user picked a fragment out of the message they are
 replying to; a plain reply carries `REPLY_TO` alone and each end draws the
@@ -1286,6 +1296,7 @@ contacts.<m>.group_state u8 that group as this account sees it: 0 member, 1 leav
 contacts.<m>.member      u8 in a group's own slot: 1 = a member; a removed one stays at 0
 contacts.<m>.members     a group: its members as this account knows them, "hex32|name" lines
 contacts.<m>.{hash,pubkey,nick,display_name,trust,last_seen,count,last_ts,preview,preview_mine,unread,read_ts,pn,kept}   (browser-mirrored record store, schema 2, one record per peer — NOT cfgRoot; firmware stubs on first inbound/outbound; display_name re-written from every announce; pubkey = X25519 ‖ Ed25519, 64 B, written from an announce or a message that verifies and handed back to rnsd's directory at boot (lxmfSyncContactKey), so a discarded directory image costs routes and not verification; pn = the client-set per-contact propagation node, all-zero = none; kept = 1 once cmd.prune has emptied the conversation, so the peer stays a contact at count 0 (both frontends list `count > 0 || kept`); count/unread are maintained counters — bumpConvDirectory adds on write and processDelete subtracts on a single-message delete, so neither is ever re-derived from the store)
+contacts.<m>.self_destruct u32 the conversation's SELF_DESTRUCT, s; 0 = off. Set by cmd.self_destruct and by an inbound value that differs (sdHear); on a proxy server, also by the client's SEND, so both ends judge inbound against the same value
 
 msgs.<id>.dir            in | out
 msgs.<id>.status         u8 code — merged lifecycle stage + failure reason (see below)
@@ -1315,6 +1326,9 @@ msgs.<id>.group_name     a members answer's group name, kept likewise
 msgs.<id>.group_receipts "hex6:status,…" — who has this message, from /info
 msgs.<id>.group_receipts_ts u32 moves with every /info answer
 msgs.<id>.group_event    u8 a group notice: 1 added, 2 removed, 3 left, 4 deleted; 0 = none
+msgs.<id>.self_destruct  u32 FIELD_SELF_DESTRUCT s; 0 = none. An outbound takes the contact's value when first packed (sdOutbound) and keeps it, so a re-pack yields the same wire; a server-hosted slot takes only what its client's SEND said
+msgs.<id>.sd_note        u8 1 = this message set the conversation's timer (drawn as a notice line; alone when the body is empty), 2 = it came without the field while the conversation's timer was on (the "does not support" warning)
+msgs.<id>.opened_ts      u32 unix s a frontend first drew it; 0 = not yet. Client-owned like `read`. self_destruct seconds after it, cmd.expire deletes the record (processExpire); the empty notice that set a timer has none of its own
 msgs.<id>.group_subjects whom a notice names, comma-separated 32-hex
                          (group_event: 1 added, 2 removed, 3 left, 4 deleted, 5 info, 6 members, 7 member)
 ```

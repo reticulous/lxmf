@@ -69,6 +69,13 @@
       <div class="meta">
         <span v-if="m.dir === 'out' && !delivered"
               class="statusName">{{ statusName }}</span>
+        <!-- Disappearing: a stopwatch whose face empties as the time runs out. -->
+        <svg v-if="sdLeft != null" class="sdtimer" viewBox="2.4 3.5 19.2 19.2" width="13" height="13">
+          <rect x="10.8" y="4.4" width="2.4" height="1.6" rx="0.4" fill="currentColor" />
+          <circle cx="12" cy="13.2" r="6.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <circle v-if="sdLeft >= 0.999" cx="12" cy="13.2" r="4.3" fill="currentColor" />
+          <path v-else-if="sdLeft > 0" :d="sdPie" fill="currentColor" />
+        </svg>
         <span class="time">{{ clock }}</span>
         <!-- Carried by a link of ours rather than by the machine that holds
              our address. Only while proxied, where the two are different
@@ -130,7 +137,17 @@ const props = defineProps<{
   sender?: GroupSender | null
   /* Draw the sender's name — the first bubble of a run from that member. */
   showSender?: boolean
+  /* On a disappearing timer: how much of it is left, 0..1. Null = no timer. */
+  sdLeft?: number | null
 }>()
+
+/* The timer face's remaining wedge, clockwise from twelve. */
+const sdPie = computed(() => {
+  const f = props.sdLeft ?? 0, r = 4.3, cx = 12, cy = 13.2
+  const a = 2 * Math.PI * f
+  const x = cx + r * Math.sin(a), y = cy - r * Math.cos(a)
+  return `M${cx} ${cy}V${cy - r}A${r} ${r} 0 ${f > 0.5 ? 1 : 0} 1 ${x.toFixed(2)} ${y.toFixed(2)}Z`
+})
 
 /* Split the body into text + tappable Nomad-page-link runs. */
 const segments = computed(() => segmentMessage(props.sender ? props.sender.body : props.m.content))
@@ -298,6 +315,7 @@ const delivered = computed(() =>
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .time { font-variant-numeric: tabular-nums; }
+.sdtimer { flex: none; }
 .chip { display: inline-flex; align-items: center; color: #8a93a0; }
 .chip.ok  { color: #4abf6a; }
 .chip.bad { color: #d9534f; }
