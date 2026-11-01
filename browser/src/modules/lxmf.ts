@@ -1020,13 +1020,18 @@ export function useLxmf(identity?: number | Ref<number>): UseLxmf {
     _shippedThreads.add(path)
   }
 
-  /* A (re)dump is a new stream, and the device's open set went with the old one:
-   * forget what we were shipped and re-ask for the conversation on screen, or it
-   * sits there quietly not updating. */
-  watch(() => device.syncEpoch, (epoch) => {
+  /* The conversation on screen is always one the device is mirroring. A
+   * (re)dump is a new stream, and the device's open set went with the old one:
+   * forget what we were shipped and re-ask. Immediate, because an instance can
+   * mount after the stream synced — a Messages window appears only once its
+   * identity is usable, which after a reboot is seconds past the dump — with a
+   * selection restored from the module and a mirror left over from the old
+   * stream; nothing else would ask, and the pane would sit there quietly not
+   * updating. */
+  watch([() => device.syncEpoch, () => activePeer.value], ([epoch, peer]) => {
     if (_shippedEpoch !== epoch) { _shippedEpoch = epoch; _shippedThreads.clear() }
-    if (activePeer.value) shipThread(activePeer.value)
-  })
+    if (peer && device.synced) shipThread(peer)
+  }, { immediate: true })
   const contacts = computed<Record<string, Contact>>(() => {
     const raw = device.get(`s.lxmf.id.${activeId.value}.contacts`) ?? {}
     const out: Record<string, Contact> = {}
