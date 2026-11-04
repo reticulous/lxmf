@@ -21,8 +21,14 @@
 #include "spangap.h"
 #include "ports.h"
 #include "rnsd.h"     /* SHA-256, sign/verify, dest-hash, recall, request_path */
-#if CONFIG_STRADDLE_AUDIO
-#include "audio.h"    /* audioPlayWav — message-notification sound (optional dep) */
+/* The notification sound needs the optional spangap/audio straddle AND a
+ * speaker: only a board with one turns CONFIG_AUDIO_OUT_ENABLE on, which is
+ * also what builds the audio engine that plays it. */
+#if CONFIG_STRADDLE_AUDIO && CONFIG_AUDIO_OUT_ENABLE
+#define LXMF_SOUND 1
+#include "audio.h"    /* audioPlayWav — message-notification sound */
+#else
+#define LXMF_SOUND 0
 #endif
 
 #include "freertos/FreeRTOS.h"
@@ -3624,10 +3630,10 @@ static void processReady(lxmf_id_t& id, const std::string& peer_hex,
 /* Play the message-notification sound on a genuinely-new inbound message.
  * Gated on s.lxmf.sound_enabled; the path (s.lxmf.sound) defaults to the
  * bundled /fixed/lxmf/ding.wav but the user can point it elsewhere. No-op
- * unless the optional spangap/audio engine is staged. */
+ * unless the audio engine is staged and the board has a speaker. */
 static void lxmfNotifySound()
 {
-#if CONFIG_STRADDLE_AUDIO
+#if LXMF_SOUND
     if (storageGetInt("s.lxmf.sound_enabled", 1) == 0) return;
     std::string p = storageGetStr("s.lxmf.sound", FS_FIXED "/lxmf/ding.wav");
     if (p.empty()) return;

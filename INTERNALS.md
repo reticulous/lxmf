@@ -75,7 +75,8 @@ architecture and resolves several behaviours the storage model forces.
    self-contained SHA-256/HMAC/HKDF kept off the shared HW SHA engine (§8).
 10. **Notification sound** — inbound delivery plays `s.lxmf.sound` through
     the optional spangap/audio engine, every call site gated on
-    `CONFIG_STRADDLE_AUDIO`.
+    `CONFIG_STRADDLE_AUDIO && CONFIG_AUDIO_OUT_ENABLE` (the engine is staged
+    on boards without a speaker too; only a board with one turns output on).
 11. **The proxy client** (§8c). An account can live on an always-on device
     instead of this one: the server holds the same keys, registers and
     announces the same `lxmf.delivery`, and this end holds a permanently-open

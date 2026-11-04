@@ -19,11 +19,14 @@ platforms: [idf]
 requires:
   - reticulous/rns
 # The message-notification sound (s.lxmf.sound) plays through the optional
-# spangap/audio engine, but lxmf does NOT stage it — audio is board hardware,
-# staged by boards that have it (e.g. hw-lilygo-tdeck additional-installs it). Every
-# call site is gated on CONFIG_STRADDLE_AUDIO, so a build without audio still
-# links (just no notification sound) — that's how heltec/generic reticulous
-# builds stay audio-free while the T-Deck gets the ping.
+# spangap/audio engine, but lxmf does NOT stage it. Staging spangap/audio does
+# not mean there is a speaker (the reticulous buildable stages it on every board
+# for voice, and it builds its engine only on a board with a mic or a speaker),
+# so every call site is gated on CONFIG_STRADDLE_AUDIO &&
+# CONFIG_AUDIO_OUT_ENABLE: the speaker switch a board with one turns on (e.g.
+# hw-lilygo-tdeck). A build without spangap/audio, or a board without a
+# speaker, still links and compiles no sound path — the heltec boards stay
+# silent while the T-Deck gets the ping.
 # Boot-registered Services, folded into the generated boot dispatcher. Runs in
 # the straddle band; `requires: reticulous/rns` puts rnsd ahead of both.
 #   - LxmfService (core): brings up the lxmf task — always started, even on a

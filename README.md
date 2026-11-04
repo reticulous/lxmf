@@ -1473,9 +1473,11 @@ lxmf/
 - [rns](../rns) — the Reticulum stack; lxmf is a consumer over rnsd's ITS
   ports and byte-array API. Interfaces are decoupled — pick whichever ones
   suit the deployment.
-- [audio](../audio) — soft, default-on dependency (`spangap/audio`) for the
-  notification sound; pruned silently when absent (every call site is gated,
-  so a build without it still links, just with no sound).
+- [audio](../audio) — optional (`spangap/audio`, which lxmf does not stage
+  itself) for the notification sound; every call site is gated, so a build
+  without it still links, just with no sound. The sound also needs a speaker:
+  on a board that stages spangap/audio with output off
+  (`CONFIG_AUDIO_OUT_ENABLE` unset) no sound path is compiled.
 
 The other direction: [lxmproxy](../lxmproxy) — the proxy SERVER — requires this
 straddle. The client half and the shared frame codec are here, so every node can
